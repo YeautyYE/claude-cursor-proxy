@@ -67,9 +67,14 @@ interface ToolSlot {
  * of typed, downstream-agnostic ReducerEvents consumed by both the
  * streaming and non-streaming frontends.
  */
+export interface ReducerStats {
+  chunkCount: number
+}
+
 export async function* reduceUpstream(
   upstream: ReadableStream<Uint8Array>,
   log: Logger,
+  stats?: ReducerStats,
 ): AsyncGenerator<ReducerEvent> {
   let nextBlockIndex = 0
   let thinkingIndex: number | undefined
@@ -114,14 +119,17 @@ export async function* reduceUpstream(
     }
 
     if (VERBOSE) {
-      const d = chunk.choices?.[0]?.delta
+      const choice = chunk.choices?.[0]
+      const d = choice?.delta
       log.debug("upstream chunk", {
         hasReasoning: typeof d?.reasoning_content === "string",
         hasContent: typeof d?.content === "string" && d.content.length > 0,
         toolCalls: d?.tool_calls?.length,
-        finish: chunk.choices?.[0]?.finish_reason,
+        finish: choice?.finish_reason ?? null,
       })
     }
+
+    if (stats) stats.chunkCount++
 
     if (chunk.error) {
       throw new UpstreamStreamError("failed", chunk.error.message || "Upstream error")
