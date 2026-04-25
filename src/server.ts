@@ -187,11 +187,23 @@ function wrapStreamResponse(
       reader.cancel().catch(() => {})
     },
   })
+  const headers = new Headers(resp.headers)
+  headers.delete("content-encoding")
+  headers.delete("content-length")
+  headers.delete("transfer-encoding")
   return new Response(stream, {
     status: resp.status,
     statusText: resp.statusText,
-    headers: resp.headers,
+    headers,
   })
+}
+
+function redactedQuery(url: URL): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of url.searchParams) {
+    out[k] = REDACT_KEYS.has(k.toLowerCase()) ? `[redacted len=${v.length}]` : v
+  }
+  return out
 }
 
 function jsonError(status: number, type: string, message: string): Response {
