@@ -501,5 +501,5 @@ bun build ./src/cli.ts --compile --outfile ~/.local/bin/claude-code-proxy
   hunk-level git staging for AI agents
 - [workmux](https://github.com/raine/workmux): manage parallel AI coding tasks
   in separate git worktrees with tmux
-- [consult-llm-mcp](https://github.com/raine/consult-llm-mcp): MCP server for
-  consulting external LLMs (Gemini, Codex, etc.) from inside Claude Code
+- [consult-llm](https://github.com/raine/consult-llm): Consult other AI models
+  from your agent workflow
