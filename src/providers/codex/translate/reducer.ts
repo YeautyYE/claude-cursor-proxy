@@ -1,4 +1,4 @@
-import { parseSseStream } from "../../../sse.ts";
+import { createSseStreamStats, parseSseStream, type SseStreamStats } from "../../../sse.ts";
 import type { Logger } from "../../../log.ts";
 import { logVerbose } from "../../../config.ts";
 
@@ -75,9 +75,23 @@ function sanitizeToolArgs(name: string, args: string): string {
  * response.failed/response.error. Any usage that arrived before the
  * failure is discarded.
  */
+export interface UpstreamStreamDiagnostics {
+  stats: SseStreamStats;
+  lastEventType?: string;
+  sawTerminalEvent: boolean;
+}
+
+export function createUpstreamStreamDiagnostics(): UpstreamStreamDiagnostics {
+  return {
+    stats: createSseStreamStats(),
+    sawTerminalEvent: false,
+  };
+}
+
 export async function* reduceUpstream(
   upstream: ReadableStream<Uint8Array>,
   log: Logger,
+  diagnostics = createUpstreamStreamDiagnostics(),
 ): AsyncGenerator<ReducerEvent> {
   const blocksByOutputIndex = new Map<number, BlockState>();
   const itemIdToOutputIndex = new Map<string, number>();
@@ -86,7 +100,7 @@ export async function* reduceUpstream(
   let finalUsage: CodexUsage | undefined;
   let incomplete = false;
 
-  for await (const evt of parseSseStream(upstream)) {
+  for await (const evt of parseSseStream(upstream, diagnostics.stats)) {
     if (!evt.data) continue;
     let p: any;
     try {
@@ -96,6 +110,7 @@ export async function* reduceUpstream(
       continue;
     }
     const t: string = p.type || evt.event || "";
+    diagnostics.lastEventType = t;
 
     if (logVerbose())
       log.debug("upstream event", { type: t, output_index: p.output_index, item_id: p.item_id });
@@ -229,6 +244,7 @@ export async function* reduceUpstream(
     }
 
     if (t === "response.completed" || t === "response.incomplete") {
+      diagnostics.sawTerminalEvent = true;
       finalUsage = p.response?.usage;
       const reason = p.response?.incomplete_details?.reason;
       if (

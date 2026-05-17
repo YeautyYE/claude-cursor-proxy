@@ -107,6 +107,7 @@ async function doFetch(
     headers,
     body: JSON.stringify(body),
     signal,
+    verbose: true,
   });
 }
 

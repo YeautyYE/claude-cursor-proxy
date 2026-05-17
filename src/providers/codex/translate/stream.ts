@@ -1,6 +1,11 @@
 import { encodeSseEvent } from "../../../sse.ts";
 import type { Logger } from "../../../log.ts";
-import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts";
+import {
+  createUpstreamStreamDiagnostics,
+  mapUsageToAnthropic,
+  reduceUpstream,
+  UpstreamStreamError,
+} from "./reducer.ts";
 
 /**
  * Translate a Codex Responses SSE stream into Anthropic SSE events.
@@ -16,6 +21,8 @@ export function translateStream(
     messageId: string;
     model: string;
     log: Logger;
+    signal?: AbortSignal;
+    upstreamHeaders?: Headers;
     onFinish?: (finish: {
       stopReason: "end_turn" | "tool_use" | "max_tokens";
       usage?: Parameters<typeof mapUsageToAnthropic>[0];
@@ -29,6 +36,7 @@ export function translateStream(
         controller.enqueue(encoder.encode(encodeSseEvent(event, data)));
       };
       const activeTools = new Map<number, { id: string; name: string }>();
+      const diagnostics = createUpstreamStreamDiagnostics();
       let messageStarted = false;
       const ensureMessageStart = () => {
         if (messageStarted) return;
@@ -55,7 +63,12 @@ export function translateStream(
       };
 
       try {
-        for await (const e of reduceUpstream(upstream, opts.log)) {
+        opts.log.info("upstream stream start", {
+          upstreamHeaders: opts.upstreamHeaders
+            ? Object.fromEntries(opts.upstreamHeaders.entries())
+            : undefined,
+        });
+        for await (const e of reduceUpstream(upstream, opts.log, diagnostics)) {
           switch (e.kind) {
             case "text-start":
               ensureMessageStart();
@@ -121,6 +134,8 @@ export function translateStream(
             message: err.message,
             activeToolNames,
             activeToolCalls,
+            clientAborted: opts.signal?.aborted ?? false,
+            diagnostics: describeDiagnostics(diagnostics),
           });
           ensureMessageStart();
           emit("error", {
@@ -132,9 +147,11 @@ export function translateStream(
           });
         } else {
           opts.log.error("stream translation error", {
-            err: String(err),
+            err: describeError(err),
             activeToolNames,
             activeToolCalls,
+            clientAborted: opts.signal?.aborted ?? false,
+            diagnostics: describeDiagnostics(diagnostics),
           });
           ensureMessageStart();
           emit("error", {
@@ -143,8 +160,52 @@ export function translateStream(
           });
         }
       } finally {
+        opts.log.info("upstream stream end", { diagnostics: describeDiagnostics(diagnostics) });
         controller.close();
       }
     },
   });
+}
+
+function describeDiagnostics(diagnostics: ReturnType<typeof createUpstreamStreamDiagnostics>) {
+  const now = Date.now();
+  return {
+    bytesRead: diagnostics.stats.bytesRead,
+    chunkCount: diagnostics.stats.chunkCount,
+    eventCount: diagnostics.stats.eventCount,
+    durationMs: now - diagnostics.stats.startedAt,
+    msSinceLastChunk: diagnostics.stats.lastChunkAt ? now - diagnostics.stats.lastChunkAt : undefined,
+    msSinceLastEvent: diagnostics.stats.lastEventAt ? now - diagnostics.stats.lastEventAt : undefined,
+    lastEventType: diagnostics.lastEventType,
+    sawTerminalEvent: diagnostics.sawTerminalEvent,
+  };
+}
+
+function describeError(err: unknown) {
+  if (!(err instanceof Error)) return { message: String(err) };
+  const detail = err as Error & {
+    code?: unknown;
+    errno?: unknown;
+    cause?: unknown;
+  };
+  return {
+    name: err.name,
+    message: err.message,
+    code: detail.code,
+    errno: detail.errno,
+    cause: describeCause(detail.cause),
+    stack: err.stack,
+  };
+}
+
+function describeCause(cause: unknown): unknown {
+  if (!(cause instanceof Error)) return cause;
+  const detail = cause as Error & { code?: unknown; errno?: unknown };
+  return {
+    name: cause.name,
+    message: cause.message,
+    code: detail.code,
+    errno: detail.errno,
+    stack: cause.stack,
+  };
 }

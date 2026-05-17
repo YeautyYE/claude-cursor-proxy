@@ -261,6 +261,8 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       messageId,
       model: body.model,
       log: ctx.childLogger("codex.stream"),
+      signal: ctx.signal,
+      upstreamHeaders: upstream.headers,
       onFinish: logVerbose()
         ? (finish) => {
             const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined;
