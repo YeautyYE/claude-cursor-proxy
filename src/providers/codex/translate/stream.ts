@@ -137,6 +137,7 @@ export function translateStream(
               });
               break;
             case "tool-progress":
+            case "progress":
               emitPingIfStale();
               break;
             case "tool-stop":

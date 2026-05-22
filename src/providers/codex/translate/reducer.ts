@@ -29,6 +29,7 @@ export type ReducerEvent =
   | { kind: "tool-start"; index: number; id: string; name: string }
   | { kind: "tool-delta"; index: number; partialJson: string }
   | { kind: "tool-progress"; index: number }
+  | { kind: "progress" }
   | { kind: "tool-stop"; index: number }
   | { kind: "finish"; stopReason: StopReason; usage: CodexUsage | undefined };
 
@@ -124,6 +125,11 @@ export async function* reduceUpstream(
           p.rate_limits?.primary?.reset_after_seconds,
         );
       }
+      yield { kind: "progress" };
+      continue;
+    }
+    if (t === "keepalive") {
+      yield { kind: "progress" };
       continue;
     }
     if (t === "response.failed" || t === "response.error" || t === "error") {

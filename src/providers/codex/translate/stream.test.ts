@@ -86,6 +86,35 @@ describe("translateStream", () => {
     }
   });
 
+  it("emits keepalive pings for upstream keepalive events", async () => {
+    Date.now = () => now;
+    try {
+      const chunks = [
+        sse("response.output_item.added", {
+          output_index: 0,
+          item: { type: "message", id: "msg_upstream" },
+        }),
+        sse("keepalive", {}),
+        sse("keepalive", {}),
+        sse("response.completed", { response: { usage: {} } }),
+      ];
+
+      const output = await collect(
+        translateStream(upstreamFromChunks(chunks, 16_000), {
+          messageId: "msg_1",
+          model: "gpt-5.5",
+          log: silentLog,
+        }),
+      );
+
+      expect(output.match(/event: ping/g)?.length).toBeGreaterThanOrEqual(2);
+      expect(output).toContain("event: message_stop");
+    } finally {
+      Date.now = realNow;
+      now = 0;
+    }
+  });
+
   it("treats aborted upstream reads as cancellation", async () => {
     const abort = new AbortController();
     abort.abort();
