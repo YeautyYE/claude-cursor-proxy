@@ -129,6 +129,22 @@ function resolveServiceTier(modelServiceTier?: ServiceTier): ServiceTier | undef
   return normalizeServiceTier(tier);
 }
 
+export function normalizeStrictJsonSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(normalizeStrictJsonSchema);
+  if (!isRecord(schema)) return schema;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema)) {
+    out[key] = normalizeStrictJsonSchema(value);
+  }
+
+  if (isRecord(out.properties)) {
+    out.required = Object.keys(out.properties);
+  }
+
+  return out;
+}
+
 export function translateRequest(
   req: AnthropicRequest,
   opts: TranslateOptions = {},
@@ -143,7 +159,7 @@ export function translateRequest(
     text.format = {
       type: "json_schema",
       name: fmt.name ?? "response",
-      schema: fmt.schema,
+      schema: normalizeStrictJsonSchema(fmt.schema),
       strict: true,
     };
   }

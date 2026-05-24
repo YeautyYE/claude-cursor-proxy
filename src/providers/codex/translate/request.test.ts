@@ -139,6 +139,35 @@ describe("translateRequest", () => {
     );
   });
 
+  it("requires every JSON schema property for strict responses", () => {
+    const translated = translateRequest({
+      ...baseRequest,
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              reason: { type: "string" },
+              impossible: { type: "boolean" },
+            },
+            required: ["ok", "reason"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    expect(translated.text?.format).toMatchObject({
+      type: "json_schema",
+      schema: {
+        required: ["ok", "reason", "impossible"],
+      },
+      strict: true,
+    });
+  });
+
   it("returns only the expected top-level upstream request fields", () => {
     const translated = translateRequest({
       ...baseRequest,
