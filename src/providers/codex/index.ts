@@ -53,6 +53,37 @@ function sessionState(sessionId?: string): SessionTimelineState | undefined {
   return state;
 }
 
+function readToolSchemaSummary(tools: { name: string; parameters: unknown; strict?: boolean }[] | undefined) {
+  const read = tools?.find((tool) => tool.name === "Read");
+  if (!read) return undefined;
+  const parameters = read.parameters;
+  const properties =
+    parameters && typeof parameters === "object" && !Array.isArray(parameters)
+      ? (parameters as { properties?: unknown }).properties
+      : undefined;
+  return {
+    strict: read.strict,
+    schema: summarizeSchema(parameters),
+    properties: summarizeSchema(properties),
+  };
+}
+
+function summarizeSchema(value: unknown): Record<string, unknown> {
+  const json = JSON.stringify(value ?? null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { type: typeof value, jsonLength: json.length, preview: json.slice(0, 500) };
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    jsonLength: json.length,
+    keys: Object.keys(record),
+    type: record.type,
+    required: record.required,
+    additionalProperties: record.additionalProperties,
+    preview: json.slice(0, 500),
+  };
+}
+
 function usageWindowTokens(usage: {
   input_tokens: number;
   output_tokens: number;
@@ -203,6 +234,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     resolvedModel,
     inputItems: translated.input.length,
     tools: translated.tools?.length ?? 0,
+    readToolSchema: readToolSchemaSummary(translated.tools),
     hasInstructions: !!translated.instructions,
     requestedMaxTokens: body.max_tokens,
     hasContextManagement: contextManagement !== undefined,
@@ -220,6 +252,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       translatedInputTokens,
       inputItems: translated.input.length,
       translatedToolCount: translated.tools?.length ?? 0,
+      readToolSchema: readToolSchemaSummary(translated.tools),
       hasInstructions: !!translated.instructions,
       requestedMaxTokens: body.max_tokens,
       hasContextManagement: contextManagement !== undefined,

@@ -79,11 +79,34 @@ function sanitizeToolArgs(name: string, args: string): string {
 }
 
 function toolArgSummary(args: string): Record<string, unknown> {
+  const trimmed = args.trimEnd();
   return {
     length: args.length,
+    trimmedLength: trimmed.length,
+    trailingWhitespace: args.length - trimmed.length,
     prefix: args.slice(0, 120),
     suffix: args.slice(-120),
   };
+}
+
+function toolArgJsonState(args: string): Record<string, unknown> {
+  const trimmed = args.trimEnd();
+  try {
+    const parsed = JSON.parse(trimmed);
+    return {
+      parseOk: true,
+      parsedKeys: parsed && typeof parsed === "object" && !Array.isArray(parsed) ? Object.keys(parsed) : undefined,
+      trimmedLength: trimmed.length,
+      trailingWhitespace: args.length - trimmed.length,
+    };
+  } catch (err) {
+    return {
+      parseOk: false,
+      parseError: err instanceof Error ? err.message : String(err),
+      trimmedLength: trimmed.length,
+      trailingWhitespace: args.length - trimmed.length,
+    };
+  }
 }
 
 function logBufferedToolProgress(log: Logger, state: ToolState, force = false): void {
@@ -105,10 +128,20 @@ function logBufferedToolProgress(log: Logger, state: ToolState, force = false): 
   });
 }
 
-function throwIfBufferedToolExceeded(state: ToolState): void {
+function throwIfBufferedToolExceeded(log: Logger, state: ToolState): void {
   if (!state.bufferUntilDone) return;
   const elapsedMs = Date.now() - state.startedAt;
   if (state.argsAccum.length <= BUFFERED_TOOL_MAX_ARGS_BYTES && elapsedMs <= BUFFERED_TOOL_MAX_DURATION_MS) return;
+  log.warn("buffered tool arguments exceeded safe limits", {
+    outputIndex: state.outputIndex,
+    index: state.index,
+    callId: state.callId,
+    name: state.name,
+    deltaCount: state.deltaCount,
+    elapsedMs,
+    args: toolArgSummary(state.argsAccum),
+    json: toolArgJsonState(state.argsAccum),
+  });
   throw new UpstreamStreamError(
     "failed",
     `Buffered ${state.name} tool arguments exceeded safe limits`,
@@ -135,6 +168,7 @@ function describeOpenBlock(outputIndex: number, state: BlockState): Record<strin
     bufferUntilDone: state.bufferUntilDone,
     emittedArgs: state.emittedArgs,
     args: toolArgSummary(state.argsAccum),
+    json: toolArgJsonState(state.argsAccum),
   };
 }
 
@@ -278,7 +312,7 @@ export async function* reduceUpstream(
       state.deltaCount += 1;
       state.hadDelta = true;
       logBufferedToolProgress(log, state);
-      throwIfBufferedToolExceeded(state);
+      throwIfBufferedToolExceeded(log, state);
       if (!state.bufferUntilDone) {
         state.emittedArgs = true;
         yield { kind: "tool-delta", index: state.index, partialJson: delta };
