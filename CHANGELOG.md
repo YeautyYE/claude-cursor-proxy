@@ -2,8 +2,7 @@
 
 ## v0.0.15 (2026-05-30)
 
-- Non-streaming Anthropic requests now return non-streamed responses unless streaming is explicitly requested.
-- Codex now follows Claude Code's selected reasoning effort by default, while still respecting explicit effort overrides.
+- Anthropic requests that omit `stream` now receive JSON responses, fixing Claude Code `/model` validation through the proxy.
 
 ## v0.0.14 (2026-05-30)
 
