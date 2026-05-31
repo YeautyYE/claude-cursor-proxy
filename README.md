@@ -109,8 +109,9 @@ would 400 because no provider claims it, so set
 # Codex
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.5 \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini \
+ANTHROPIC_MODEL=gpt-5.5[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini[1m] \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -138,8 +139,9 @@ Or set it persistently in `~/.claude/settings.json`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
     "ANTHROPIC_AUTH_TOKEN": "unused",
-    "ANTHROPIC_MODEL": "gpt-5.5",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini",
+    "ANTHROPIC_MODEL": "gpt-5.5[1m]",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini[1m]",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 272000,
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
   }
@@ -153,21 +155,16 @@ unknown models, Claude Code uses its own fallback context size. The `[1m]` suffi
 is a local Claude Code hint that raises that compaction threshold. It is useful
 only when the upstream model can actually handle a window that large.
 
-Use the plain Codex model name for Codex models, such as `gpt-5.5` or
-`gpt-5.4-mini`. The proxy strips a trailing `[1m]` for compatibility before
-sending the request upstream, but the suffix has already affected Claude Code's
-local compaction decision. It does not increase Codex's upstream context window.
+Use the `[1m]` suffix for Codex and Kimi models so Claude Code uses a larger
+local compaction threshold, such as `gpt-5.5[1m]`, `gpt-5.4-mini[1m]`, or
+`kimi-for-coding[1m]`. The proxy strips a trailing `[1m]` before sending the
+request upstream. The suffix affects Claude Code's local compaction decision and
+does not increase the upstream model's context window.
 
 Official Codex metadata reports `gpt-5.5` with a 272K-token window, not a 1M
-window. The official Codex client compacts against that metadata, around 90
-percent of the model window, about 244.8K tokens for `gpt-5.5`.
-
-That means `gpt-5.5[1m]` can make Claude Code wait longer than official Codex
-would before compacting, while the proxy still sends `gpt-5.5` to an upstream
-model with the real 272K limit. This can produce upstream context-window errors.
-
-Kimi can still use `kimi-for-coding[1m]` if you want Claude Code to use a larger
-local compaction threshold for that provider.
+window. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.5[1m]` so
+Claude Code does not compact too early, while still compacting before the real
+upstream limit.
 
 If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
@@ -192,8 +189,9 @@ the default.
 if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
     export ANTHROPIC_BASE_URL="http://localhost:18765"
     export ANTHROPIC_AUTH_TOKEN="unused"
-    export ANTHROPIC_MODEL="gpt-5.5"
-    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini"
+    export ANTHROPIC_MODEL="gpt-5.5[1m]"
+    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini[1m]"
+    export CLAUDE_CODE_AUTO_COMPACT_WINDOW="272000"
     export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
     export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1"
 fi
