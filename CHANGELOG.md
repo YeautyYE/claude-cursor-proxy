@@ -3,7 +3,7 @@
 ## v0.0.18 (2026-06-09)
 
 - Cursor sessions now stop heartbeat traffic after streams close, reducing stray connection errors.
-- Codex now preserves runtime system messages so session-provided guidance is retained across requests.
+- Codex now treats runtime system messages as developer guidance instead of assistant output, preventing Claude Code reminders from being repeated.
 
 ## v0.0.17 (2026-06-08)
 
