@@ -1,65 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { translateStream } from "./stream.ts";
-
-const silentLog = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-  child: () => silentLog,
-};
-
-function sse(type: string, payload: Record<string, unknown>): string {
-  return `data: ${JSON.stringify({ type, ...payload })}\n\n`;
-}
-
-function upstreamFromChunks(chunks: string[], advanceMs = 0): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder();
-  let index = 0;
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (index >= chunks.length) {
-        controller.close();
-        return;
-      }
-      now += advanceMs;
-      controller.enqueue(encoder.encode(chunks[index++]));
-    },
-  });
-}
-
-function abortingUpstream(err: Error): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      controller.error(err);
-    },
-  });
-}
-
-function upstreamThatErrorsAfterChunks(chunks: string[], err: Error): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder();
-  let index = 0;
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (index >= chunks.length) {
-        controller.error(err);
-        return;
-      }
-      controller.enqueue(encoder.encode(chunks[index++]));
-    },
-  });
-}
-
-async function collect(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let out = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) return out;
-    out += decoder.decode(value, { stream: true });
-  }
-}
+import {
+  abortingUpstream,
+  collect,
+  sse,
+  silentLog,
+  upstreamFromChunks,
+  upstreamThatErrorsAfterChunks,
+} from "./test-helpers.ts";
 
 let now = 0;
 const realNow = Date.now;
@@ -83,7 +31,9 @@ describe("translateStream", () => {
       ];
 
       const output = await collect(
-        translateStream(upstreamFromChunks(chunks, 16_000), {
+        translateStream(upstreamFromChunks(chunks, () => {
+          now += 16_000;
+        }), {
           messageId: "msg_1",
           model: "gpt-5.5",
           log: silentLog,
@@ -118,7 +68,9 @@ describe("translateStream", () => {
       ];
 
       const output = await collect(
-        translateStream(upstreamFromChunks(chunks, 16_000), {
+        translateStream(upstreamFromChunks(chunks, () => {
+          now += 16_000;
+        }), {
           messageId: "msg_1",
           model: "gpt-5.5",
           log: silentLog,
@@ -202,7 +154,9 @@ describe("translateStream", () => {
       ];
 
       const output = await collect(
-        translateStream(upstreamFromChunks(chunks, 121_000), {
+        translateStream(upstreamFromChunks(chunks, () => {
+          now += 121_000;
+        }), {
           messageId: "msg_1",
           model: "gpt-5.5",
           log: silentLog,

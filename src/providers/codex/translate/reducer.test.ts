@@ -1,27 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { reduceUpstream } from "./reducer.ts";
-
-const silentLog = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-  child: () => silentLog,
-};
-
-function sse(type: string, payload: Record<string, unknown>): string {
-  return `data: ${JSON.stringify({ type, ...payload })}\n\n`;
-}
-
-function upstreamFromChunks(chunks: string[]): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder();
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
-      controller.close();
-    },
-  });
-}
+import { sse, silentLog, upstreamFromChunks } from "./test-helpers.ts";
 
 async function events(chunks: string[]) {
   const out = [];
