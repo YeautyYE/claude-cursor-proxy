@@ -17,6 +17,24 @@ export function assertValidEffort(effort: unknown): void {
   }
 }
 
+export type AnthropicToolChoice = "auto" | "none" | "required" | { type: "function"; name: string };
+
+export function mapToolChoice(
+  choice?: AnthropicRequest["tool_choice"],
+): AnthropicToolChoice {
+  if (!choice) return "auto";
+  switch (choice.type) {
+    case "auto":
+      return "auto";
+    case "none":
+      return "none";
+    case "any":
+      return "required";
+    case "tool":
+      return choice.name ? { type: "function", name: choice.name } : "required";
+  }
+}
+
 export function flattenSystemText(system: AnthropicRequest["system"]): string | undefined {
   if (!system) return undefined;
   const blocks: AnthropicTextBlock[] =

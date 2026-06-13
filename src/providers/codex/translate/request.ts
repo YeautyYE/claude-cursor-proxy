@@ -7,6 +7,7 @@ import type {
 import { codexEffort, codexServiceTier } from "../../../config.ts";
 import {
   assertValidEffort,
+  mapToolChoice as mapAnthropicToolChoice,
   flattenSystemText,
   imageBlockToUrl,
   normalizeContent,
@@ -199,17 +200,9 @@ export function translateRequest(
 }
 
 function mapToolChoice(choice: AnthropicRequest["tool_choice"]): ResponsesRequest["tool_choice"] {
-  if (!choice) return "auto";
-  switch (choice.type) {
-    case "auto":
-      return "auto";
-    case "none":
-      return "none";
-    case "any":
-      return "required";
-    case "tool":
-      return choice.name ? { type: "function", name: choice.name } : "required";
-  }
+  const mapped = mapAnthropicToolChoice(choice);
+  if (mapped === "auto" || mapped === "none" || mapped === "required") return mapped;
+  return { type: "function", name: mapped.name };
 }
 
 export const buildInstructions = flattenSystemText;

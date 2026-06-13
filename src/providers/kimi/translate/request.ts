@@ -6,6 +6,7 @@ import type {
 } from "../../../anthropic/schema.ts";
 import {
   assertValidEffort,
+  mapToolChoice as mapAnthropicToolChoice,
   flattenSystemText,
   imageBlockToUrl,
   isToolResultImageBlock,
@@ -121,17 +122,9 @@ function mapReasoningEffort(
 }
 
 function mapToolChoice(choice: AnthropicRequest["tool_choice"]): KimiToolChoice {
-  if (!choice) return "auto";
-  switch (choice.type) {
-    case "auto":
-      return "auto";
-    case "none":
-      return "none";
-    case "any":
-      return "required";
-    case "tool":
-      return choice.name ? { type: "function", function: { name: choice.name } } : "required";
-  }
+  const mapped = mapAnthropicToolChoice(choice);
+  if (mapped === "auto" || mapped === "none" || mapped === "required") return mapped;
+  return { type: "function", function: { name: mapped.name } };
 }
 
 export const buildSystemMessage = flattenSystemText;
