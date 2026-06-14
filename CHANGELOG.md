@@ -3,8 +3,6 @@
 ## v0.0.19 (2026-06-14)
 
 - Codex now supports Claude Code hosted web search through Codex's native web search, including domain filters and search usage accounting. ([#10](https://github.com/raine/claude-code-proxy/issues/10))
-- Codex web search results now appear in Claude Code's expected format instead of showing up as empty search results. ([#10](https://github.com/raine/claude-code-proxy/issues/10))
-- Upstream streaming read failures now return clearer provider errors instead of looking like malformed successful responses.
 
 ## v0.0.18 (2026-06-09)
 
