@@ -10,6 +10,7 @@ import {
   buildCursorReadResultFromNativeToolResult,
   buildCursorShellStreamResultFromNativeToolResult,
   buildCursorWriteResultFromNativeToolResult,
+  CURSOR_OUTPUT_IDLE_TIMEOUT_MS,
   cursorReadArgs,
   cursorShellStreamArgs,
   cursorWriteArgs,
@@ -74,6 +75,8 @@ interface CursorBridgeState {
   traffic?: RequestContext["traffic"];
   onSession?: (sessionId: string) => void;
   allowedToolNames?: ReadonlySet<string>;
+  outputSeen: boolean;
+  outputIdleTimeoutMs: number;
 }
 
 const bridgeStates = new Map<string, CursorBridgeState>();
@@ -143,6 +146,7 @@ export function createCursorShellToolBridge(opts: {
   proto?: CursorProto;
   onSession?: (sessionId: string) => void;
   allowedToolNames?: ReadonlySet<string>;
+  outputIdleTimeoutMs?: number;
 }): {
   readHandler: (exec: CursorReadExec, append: CursorAppendMessage) => Promise<void>;
   shellStreamHandler: (exec: CursorShellStreamExec, append: CursorAppendMessage) => Promise<void>;
@@ -160,6 +164,8 @@ export function createCursorShellToolBridge(opts: {
     traffic: opts.traffic,
     onSession: opts.onSession,
     allowedToolNames: opts.allowedToolNames,
+    outputSeen: false,
+    outputIdleTimeoutMs: opts.outputIdleTimeoutMs ?? CURSOR_OUTPUT_IDLE_TIMEOUT_MS,
   };
 
   const notifyTool = (tool: PendingNativeTool) => {
@@ -283,6 +289,7 @@ export function createCursorShellToolBridge(opts: {
       state.iterator = decodeCursorStream(upstream, opts.proto, {
         traffic: opts.traffic,
         log: opts.log,
+        outputIdleTimeoutMs: 0,
       });
       bridgeStates.set(opts.sessionId, state);
       return streamBridgeUntilToolOrEnd(state, signal);
@@ -417,20 +424,50 @@ function streamBridgeUntilToolOrEnd(
         while (!signal?.aborted) {
           const next = state.pendingNext ?? state.iterator.next();
           state.pendingNext = next;
-          const result = await Promise.race([
+          let idleTimer: ReturnType<typeof setTimeout> | undefined;
+          const race: Array<Promise<
+            | { type: "event"; value: IteratorResult<CursorStreamEvent> }
+            | { type: "tool"; tool: PendingNativeTool }
+            | { type: "idle" }
+          >> = [
             next.then((value) => ({ type: "event" as const, value })),
             waitForPendingTool(state).then((tool) => ({ type: "tool" as const, tool })),
-          ]);
+          ];
+          if (state.outputSeen && state.outputIdleTimeoutMs > 0) {
+            race.push(new Promise<{ type: "idle" }>((resolve) => {
+              idleTimer = setTimeout(() => resolve({ type: "idle" }), state.outputIdleTimeoutMs);
+            }));
+          }
+          const result = await Promise.race(race).finally(() => {
+            if (idleTimer) clearTimeout(idleTimer);
+          });
 
           if (result.type === "tool") {
             emitToolUseAndPause(result.tool);
             return;
           }
 
+          if (result.type === "idle") {
+            state.log.warn("cursor bridge stream idle after output", {
+              idleMs: state.outputIdleTimeoutMs,
+            });
+            state.traffic?.writeJsonEvent("040-cursor-event", {
+              type: "end",
+              reason: "output_idle_timeout",
+              idleMs: state.outputIdleTimeoutMs,
+            });
+            state.pendingNext = undefined;
+            await state.iterator.return?.(undefined);
+            break;
+          }
+
           state.pendingNext = undefined;
           if (result.value.done) break;
           const event = result.value.value;
           state.traffic?.writeJsonEvent("040-cursor-event", event);
+          if (event.type === "thinking_delta" || event.type === "text_delta" || event.type === "usage") {
+            state.outputSeen = true;
+          }
           switch (event.type) {
             case "session":
               state.onSession?.(event.sessionId);

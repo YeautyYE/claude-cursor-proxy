@@ -46,6 +46,7 @@ export interface CursorProviderDeps {
   loadAuth: () => Promise<CursorAuth | undefined>;
   runAgent: (opts: CursorRunOptions) => Promise<ReadableStream<Uint8Array>>;
   proto?: CursorProto;
+  bridgeOutputIdleTimeoutMs?: number;
 }
 
 const defaultDeps: CursorProviderDeps = {
@@ -110,6 +111,7 @@ async function handleMessages(
       proto: deps.proto,
       onSession,
       allowedToolNames,
+      outputIdleTimeoutMs: deps.bridgeOutputIdleTimeoutMs,
     })
     : undefined;
   const bridgeRead = canBridgeCursorReadTool(body);

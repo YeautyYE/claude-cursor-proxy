@@ -127,7 +127,7 @@ export class CursorError extends Error {
 }
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
-const OUTPUT_IDLE_TIMEOUT_MS = 30_000;
+export const CURSOR_OUTPUT_IDLE_TIMEOUT_MS = 30_000;
 
 export async function runCursorAgent(opts: CursorRunOptions): Promise<ReadableStream<Uint8Array>> {
   const proto = opts.proto ?? loadCursorProto();
@@ -1049,7 +1049,7 @@ export async function* decodeCursorStream(
   let outputSeen = false;
   try {
     while (true) {
-      const idleMs = opts.outputIdleTimeoutMs ?? OUTPUT_IDLE_TIMEOUT_MS;
+      const idleMs = opts.outputIdleTimeoutMs ?? CURSOR_OUTPUT_IDLE_TIMEOUT_MS;
       const read = await readWithOutputIdleTimeout(reader, outputSeen ? idleMs : undefined);
       if (read === "idle") {
         opts.log?.warn("cursor stream idle after output", { idleMs });

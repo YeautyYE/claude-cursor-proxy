@@ -28,28 +28,35 @@ type CursorSseEvent = (Awaited<ReturnType<typeof collectCursorSse>>)[number];
 type CursorProviderOptions = NonNullable<Parameters<typeof createCursorProvider>[0]>;
 type CursorRunAgent = CursorProviderOptions["runAgent"];
 
-function createCursorTestProvider(runAgent: CursorRunAgent) {
+function createCursorTestProvider(
+  runAgent: CursorRunAgent,
+  overrides: Partial<CursorProviderOptions> = {},
+) {
   return createCursorProvider({
     loadAuth: async () => ({ accessToken: "token", source: "test" }),
     runAgent,
     proto: fakeProto,
+    ...overrides,
   });
 }
 
 function createRunStreamHarness(
-  initialServerMessage: Record<string, any>,
+  initialServerMessage: Record<string, any> | Array<Record<string, any>>,
   onWrite: (
     message: Record<string, any>,
     serverController: ReadableStreamDefaultController<Uint8Array>,
   ) => Promise<void> | void,
 ) {
+  const initialServerMessages = Array.isArray(initialServerMessage)
+    ? initialServerMessage
+    : [initialServerMessage];
   const sentFrames: Array<Record<string, any>> = [];
   let serverController!: ReadableStreamDefaultController<Uint8Array>;
   const serverReadable = new ReadableStream<Uint8Array>({
     start(controller) {
       serverController = controller;
       queueMicrotask(() => {
-        controller.enqueue(frame(initialServerMessage));
+        for (const message of initialServerMessages) controller.enqueue(frame(message));
       });
     },
   });
@@ -306,6 +313,93 @@ describe("Cursor provider messages", () => {
       message.execClientMessage?.shellStream?.stdout?.data === "should-not-run"
     )).toBe(false);
     expect(getTextDeltaEvent(resumeEvents)?.data.delta.text).toBe("resumed after native shell");
+    expectMessageStopReason(resumeEvents, "end_turn");
+    expectMessageStop(resumeEvents);
+  });
+
+  it("keeps native shell bridge state while a long Claude Bash result is pending", async () => {
+    let finalResponseSent = false;
+    const { sentFrames, runAgent } = createRunStreamHarness(
+      [
+        { interactionUpdate: { textDelta: { text: "preparing consult" } } },
+        {
+          message: {
+            case: "execServerMessage",
+            value: {
+              id: 31,
+              execId: "exec-long-shell",
+              message: {
+                case: "shellStreamArgs",
+                value: {
+                  command: "consult-llm --task review",
+                  workingDirectory: "/tmp",
+                  timeout: 300000,
+                },
+              },
+            },
+          },
+        },
+      ],
+      (message, serverController) => {
+        if (message.execClientMessage?.shellStream?.exit && !finalResponseSent) {
+          finalResponseSent = true;
+          enqueueFinalAssistantResponse(serverController, "review results consumed", "12", "4");
+        }
+      },
+    );
+    const provider = createCursorTestProvider(runAgent, { bridgeOutputIdleTimeoutMs: 5 });
+
+    const initial = await provider.handleMessages(
+      {
+        model: "cursor",
+        stream: true,
+        tools: [{ name: "Bash", input_schema: { type: "object" } }],
+        messages: [{ role: "user", content: "review change" }],
+      },
+      fakeCursorCtx({ sessionId: "session-long-shell" }),
+    );
+    const initialEvents = await collectCursorSse(initial);
+    const toolStart = getToolUseStartEvent(initialEvents);
+
+    expect(getTextDeltaEvent(initialEvents)?.data.delta.text).toBe("preparing consult");
+    expect(toolStart?.data.content_block.name).toBe("Bash");
+    expectMessageStopReason(initialEvents, "tool_use");
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const resume = await provider.handleMessages(
+      {
+        model: "cursor",
+        stream: true,
+        messages: [
+          {
+            role: "assistant",
+            content: [{
+              type: "tool_use",
+              id: toolStart!.data.content_block.id,
+              name: "Bash",
+              input: { command: "consult-llm --task review" },
+            }],
+          },
+          {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: toolStart!.data.content_block.id,
+              content: "consult findings",
+              is_error: false,
+            }],
+          },
+        ],
+      },
+      fakeCursorCtx({ sessionId: "session-long-shell" }),
+    );
+    const resumeEvents = await collectCursorSse(resume);
+
+    expect(sentFrames.some((message) =>
+      message.execClientMessage?.shellStream?.stdout?.data === "consult findings"
+    )).toBe(true);
+    expect(getTextDeltaEvent(resumeEvents)?.data.delta.text).toBe("review results consumed");
     expectMessageStopReason(resumeEvents, "end_turn");
     expectMessageStop(resumeEvents);
   });
