@@ -41,7 +41,7 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5.5",
 ];
 
-const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
+pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -61,10 +61,11 @@ impl Registry {
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
-            handlers.insert(
-                name.clone(),
-                Arc::new(PlaceholderProvider::new(name, entries.clone())) as Arc<dyn Provider>,
-            );
+            let handler: Arc<dyn Provider> = match name.as_str() {
+                "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
+                _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
+            };
+            handlers.insert(name.clone(), handler);
         }
 
         Self {

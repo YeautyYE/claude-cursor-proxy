@@ -4,6 +4,7 @@ pub mod config;
 pub mod logging;
 pub mod paths;
 pub mod provider;
+pub mod providers;
 pub mod registry;
 pub mod retry;
 pub mod server;

@@ -94,3 +94,19 @@ fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     assert!(kimi_pos < cursor_pos);
     Ok(())
 }
+
+#[test]
+fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("kimi");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid","userId":"u"}"#,
+    )?;
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.args(["kimi", "auth", "status"]);
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.assert().success().stdout(contains("User: u"));
+    Ok(())
+}

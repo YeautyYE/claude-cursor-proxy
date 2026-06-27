@@ -35,6 +35,17 @@ struct FileConfig {
     #[serde(rename = "aliasProvider")]
     pub alias_provider: Option<String>,
     pub log: Option<FileLog>,
+    pub kimi: Option<KimiConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct KimiConfig {
+    #[serde(rename = "userAgent")]
+    pub user_agent: Option<String>,
+    #[serde(rename = "oauthHost")]
+    pub oauth_host: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +170,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_LOG_STDERR") {
         out.push("log.stderr (env)".to_string());
     }
+    if env.contains_key("CCP_KIMI_OAUTH_HOST") {
+        out.push("kimi.oauthHost (env)".to_string());
+    }
+    if env.contains_key("CCP_KIMI_BASE_URL") {
+        out.push("kimi.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_KIMI_USER_AGENT") {
+        out.push("kimi.userAgent (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(p) = file_cfg.port {
             out.push(format!("port: {p}"));
@@ -180,4 +200,55 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
 
 pub fn is_verbose() -> bool {
     log_verbose()
+}
+
+pub fn kimi_oauth_host() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir) {
+        if let Some(kimi) = file.kimi {
+            if let Some(host) = kimi.oauth_host {
+                return host;
+            }
+        }
+    }
+    "https://auth.kimi.com".to_string()
+}
+
+pub fn kimi_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir) {
+        if let Some(kimi) = file.kimi {
+            if let Some(url) = kimi.base_url {
+                return url;
+            }
+        }
+    }
+    "https://api.kimi.com/coding/v1".to_string()
+}
+
+pub fn kimi_user_agent(default: &str) -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
+        return raw.clone();
+    }
+    if let Some(raw) = env.get("CCP_USER_AGENT") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir) {
+        if let Some(kimi) = file.kimi {
+            if let Some(ua) = kimi.user_agent {
+                return ua;
+            }
+        }
+    }
+    default.to_string()
 }
