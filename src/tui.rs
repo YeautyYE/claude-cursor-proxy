@@ -84,7 +84,15 @@ pub fn run_monitor(
                         app.selected = app.selected.saturating_sub(1)
                     }
                     KeyCode::Enter => app.detail = true,
-                    KeyCode::Esc => app.detail = false,
+                    KeyCode::Esc => {
+                        if app.show_help {
+                            app.show_help = false;
+                        } else if app.show_setup {
+                            app.show_setup = false;
+                        } else {
+                            app.detail = false;
+                        }
+                    }
                     _ => {}
                 },
                 Event::Resize(_, _) => {}
@@ -141,11 +149,6 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            if app.show_setup {
-                Constraint::Length(10)
-            } else {
-                Constraint::Length(0)
-            },
             Constraint::Percentage(40),
             Constraint::Percentage(25),
             Constraint::Percentage(35),
@@ -154,24 +157,18 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         .split(area);
 
     render_header(frame, root[0], app, state);
-    if app.show_setup {
-        frame.render_widget(
-            Paragraph::new(app.setup_text.as_str())
-                .style(Style::default().fg(DIM_WHITE).bg(PANEL_BG))
-                .block(panel("Setup", false))
-                .wrap(Wrap { trim: false }),
-            root[1],
-        );
-    }
     if app.detail {
-        render_session_detail(frame, root[2], state, app.selected);
+        render_session_detail(frame, root[1], state, app.selected);
     } else {
-        render_sessions(frame, root[2], &state.sessions, app.selected);
+        render_sessions(frame, root[1], &state.sessions, app.selected);
     }
-    render_active(frame, root[3], &state.active, app.tick);
-    render_recent(frame, root[4], &state.recent);
-    render_footer(frame, root[5], app);
+    render_active(frame, root[2], &state.active, app.tick);
+    render_recent(frame, root[3], &state.recent);
+    render_footer(frame, root[4], app);
 
+    if app.show_setup {
+        render_setup_overlay(frame, area, &app.setup_text);
+    }
     if app.show_help {
         render_help_overlay(frame, area);
     }
@@ -633,11 +630,11 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let lines = [
         ("q / Ctrl-C", "quit proxy"),
         ("?", "toggle help"),
-        ("b", "toggle setup panel"),
+        ("b", "toggle setup"),
         ("j / Down", "next session"),
         ("k / Up", "previous session"),
         ("Enter", "session detail"),
-        ("Esc", "leave detail"),
+        ("Esc", "close overlay / detail"),
     ];
     let content = lines
         .into_iter()
@@ -651,6 +648,55 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(content).style(Style::default().bg(BG)),
+        inner,
+    );
+}
+
+fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: &str) {
+    let width = 84.min(area.width.saturating_sub(4)).max(36);
+    let content_height = setup_text.lines().count() as u16;
+    let height = (content_height + 4)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" Setup ", Style::default().fg(TEAL)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEAL))
+        .style(Style::default().bg(BG));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = setup_text
+        .lines()
+        .map(|line| {
+            let style = if line.starts_with("export ") {
+                Style::default().fg(WHITE)
+            } else {
+                Style::default().fg(DIM_WHITE)
+            };
+            Line::from(vec![Span::raw("  "), Span::styled(line.to_string(), style)])
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Esc", Style::default().fg(TEAL)),
+        Span::styled(" close  ", Style::default().fg(DIM)),
+        Span::styled("b", Style::default().fg(TEAL)),
+        Span::styled(" toggle setup", Style::default().fg(DIM)),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
         inner,
     );
 }
