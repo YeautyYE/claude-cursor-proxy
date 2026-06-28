@@ -341,7 +341,7 @@ fn render_sessions(
         let marker = if index == selected { ">" } else { " " };
         Row::new(vec![
             Cell::from(Span::styled(marker, Style::default().fg(TEAL))),
-            text_cell(shorten(&session.label(), 26)),
+            text_cell(session.label()),
             number_cell(session.active_count.to_string()),
             number_cell(session.request_count.to_string()),
             number_cell(session.failure_count.to_string()),
@@ -365,7 +365,7 @@ fn render_sessions(
         rows,
         [
             Constraint::Length(1),
-            Constraint::Percentage(24),
+            Constraint::Length(36),
             Constraint::Length(6),
             Constraint::Length(5),
             Constraint::Length(5),
@@ -618,13 +618,4 @@ fn format_system_time(time: SystemTime) -> String {
         (seconds % 3600) / 60,
         seconds % 60
     )
-}
-
-fn shorten(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut out: String = value.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('~');
-    out
 }
