@@ -41,6 +41,9 @@ pub fn accumulate_response_with_traffic(
     let mut deferred_text_parts: Vec<String> = Vec::new();
 
     enum BlockKind {
+        Thinking {
+            text: String,
+        },
         Text {
             text: String,
         },
@@ -60,6 +63,21 @@ pub fn accumulate_response_with_traffic(
         match event {
             ReducerEvent::WebSearch { .. } => {
                 web_search_events.push(event.clone());
+            }
+            ReducerEvent::ThinkingStart { index } => {
+                blocks.push(AccumulatedBlock {
+                    index: *index,
+                    kind: BlockKind::Thinking {
+                        text: String::new(),
+                    },
+                });
+            }
+            ReducerEvent::ThinkingDelta { index, text } => {
+                if let Some(block) = blocks.iter_mut().rev().find(|b| b.index == *index)
+                    && let BlockKind::Thinking { text: t } = &mut block.kind
+                {
+                    t.push_str(text);
+                }
             }
             ReducerEvent::TextStart { index } => {
                 blocks.push(AccumulatedBlock {
@@ -113,21 +131,22 @@ pub fn accumulate_response_with_traffic(
 
     let text_from_deferred: String = deferred_text_parts.join("");
 
-    // Build content array
-    let mut content: Vec<Value> = Vec::new();
+    let mut indexed_content: Vec<(usize, Value)> = Vec::new();
 
-    // Add web search compat blocks
     if !web_search_events.is_empty() {
         let compat_blocks = build_web_search_compat_blocks(&web_search_events, &text_from_deferred);
         for block in &compat_blocks {
             match &block.content {
                 WebSearchCompatContent::ServerToolUse { id, name, input } => {
-                    content.push(serde_json::json!({
-                        "type": "server_tool_use",
-                        "id": id,
-                        "name": name,
-                        "input": input,
-                    }));
+                    indexed_content.push((
+                        block.index,
+                        serde_json::json!({
+                            "type": "server_tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        }),
+                    ));
                 }
                 WebSearchCompatContent::WebSearchToolResult {
                     tool_use_id,
@@ -143,39 +162,65 @@ pub fn accumulate_response_with_traffic(
                             })
                         })
                         .collect();
-                    content.push(serde_json::json!({
-                        "type": "web_search_tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": result_content,
-                    }));
+                    indexed_content.push((
+                        block.index,
+                        serde_json::json!({
+                            "type": "web_search_tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": result_content,
+                        }),
+                    ));
                 }
             }
         }
     }
 
-    // Add accumulated blocks
     for block in &blocks {
         match &block.kind {
+            BlockKind::Thinking { text } => {
+                if !text.is_empty() {
+                    indexed_content.push((
+                        block.index,
+                        serde_json::json!({
+                            "type": "thinking",
+                            "thinking": text,
+                            "signature": "",
+                        }),
+                    ));
+                }
+            }
             BlockKind::Text { text } => {
                 if !text.is_empty() {
-                    content.push(serde_json::json!({
-                        "type": "text",
-                        "text": text,
-                    }));
+                    indexed_content.push((
+                        block.index,
+                        serde_json::json!({
+                            "type": "text",
+                            "text": text,
+                        }),
+                    ));
                 }
             }
             BlockKind::Tool { id, name, args } => {
                 let parsed = serde_json::from_str::<Value>(args)
                     .unwrap_or_else(|_| Value::String(args.clone()));
-                content.push(serde_json::json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": parsed,
-                }));
+                indexed_content.push((
+                    block.index,
+                    serde_json::json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": parsed,
+                    }),
+                ));
             }
         }
     }
+
+    indexed_content.sort_by_key(|(index, _)| *index);
+    let content: Vec<Value> = indexed_content
+        .into_iter()
+        .map(|(_, content)| content)
+        .collect();
 
     let response = serde_json::json!({
         "id": message_id,
@@ -362,6 +407,126 @@ mod tests {
         assert_eq!(content[1]["type"], "web_search_tool_result");
         // Third should be text
         assert_eq!(content[2]["type"], "text");
+    }
+
+    #[test]
+    fn accumulate_reasoning_summary_as_thinking_before_text() {
+        let upstream = format!(
+            "{}{}{}{}{}{}{}",
+            sse_event(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "output_index":0,"summary_index":0,"delta":"part one"
+                })
+            ),
+            sse_event(
+                "response.reasoning_summary_part.added",
+                json!({
+                    "output_index":0,
+                    "summary_index":1,
+                    "part":{"type":"summary_text","text":""}
+                })
+            ),
+            sse_event(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "output_index":0,"summary_index":1,"delta":"part two"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                json!({
+                    "output_index":1,"delta":"answer"
+                })
+            ),
+            format!(
+                "{}{}",
+                sse_event(
+                    "response.output_item.done",
+                    json!({
+                        "output_index":1,"item":{"type":"message"}
+                    })
+                ),
+                sse_event(
+                    "response.completed",
+                    json!({
+                        "response":{"id":"resp_1","usage":{}}
+                    })
+                )
+            ),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
+        let content = response["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "part one\n\npart two");
+        assert_eq!(content[0]["signature"], "");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "answer");
+    }
+
+    #[test]
+    fn accumulate_empty_reasoning_summary_emits_no_thinking() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                json!({
+                    "output_index":1,"delta":"answer"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
+        let content = response["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "answer");
     }
 
     #[test]

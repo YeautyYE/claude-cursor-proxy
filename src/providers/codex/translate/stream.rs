@@ -10,6 +10,7 @@ use super::web_search_compat::build_web_search_compat_blocks;
 
 #[allow(dead_code)]
 enum OpenBlock {
+    Thinking,
     Text,
     Tool { id: String, name: String },
 }
@@ -71,6 +72,47 @@ fn emit_content_event(
     event: &ReducerEvent,
 ) -> bool {
     match event {
+        ReducerEvent::ThinkingStart { index } => {
+            ensure_message_start(out, traffic, message_started, message_id, model);
+            open_blocks.insert(*index, OpenBlock::Thinking);
+            emit(
+                out,
+                traffic,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                }),
+            );
+            true
+        }
+        ReducerEvent::ThinkingDelta { index, text } => {
+            emit(
+                out,
+                traffic,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": text}
+                }),
+            );
+            true
+        }
+        ReducerEvent::ThinkingStop { index } => {
+            open_blocks.remove(index);
+            emit(
+                out,
+                traffic,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+            true
+        }
         ReducerEvent::TextStart { index } => {
             ensure_message_start(out, traffic, message_started, message_id, model);
             open_blocks.insert(*index, OpenBlock::Text);
@@ -177,7 +219,10 @@ fn emit_content_event(
 fn is_content_event(event: &ReducerEvent) -> bool {
     matches!(
         event,
-        ReducerEvent::TextStart { .. }
+        ReducerEvent::ThinkingStart { .. }
+            | ReducerEvent::ThinkingDelta { .. }
+            | ReducerEvent::ThinkingStop { .. }
+            | ReducerEvent::TextStart { .. }
             | ReducerEvent::TextDelta { .. }
             | ReducerEvent::TextStop { .. }
             | ReducerEvent::ToolStart { .. }
@@ -527,5 +572,119 @@ mod tests {
             out.contains("web_search_tool_result"),
             "missing web_search_tool_result"
         );
+    }
+
+    #[test]
+    fn stream_translates_reasoning_summary_to_thinking() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse_event(
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({
+                    "output_index":0,"summary_index":0,"delta":"Working it out"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "output_index":1,"delta":"answer"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        assert!(out.contains("\"type\":\"thinking\""));
+        assert!(out.contains("\"signature\":\"\""));
+        assert!(out.contains("\"type\":\"thinking_delta\""));
+        assert!(out.contains("\"thinking\":\"Working it out\""));
+        assert!(out.contains("event: message_stop"));
+        assert!(
+            out.find("\"type\":\"thinking_delta\"").unwrap()
+                < out.find("\"type\":\"text_delta\"").unwrap()
+        );
+    }
+
+    #[test]
+    fn stream_omits_empty_reasoning_summary() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "output_index":1,"delta":"answer"
+                })
+            ),
+            format!(
+                "{}{}",
+                sse_event(
+                    "response.output_item.done",
+                    serde_json::json!({
+                        "output_index":1,"item":{"type":"message"}
+                    })
+                ),
+                sse_event(
+                    "response.completed",
+                    serde_json::json!({
+                        "response":{"id":"resp_1","usage":{}}
+                    })
+                )
+            ),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        assert!(!out.contains("\"type\":\"thinking\""));
+        assert!(!out.contains("\"type\":\"thinking_delta\""));
+        assert!(out.contains("event: message_stop"));
     }
 }

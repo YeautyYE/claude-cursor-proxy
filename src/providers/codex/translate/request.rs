@@ -78,6 +78,8 @@ pub struct ResponsesRequest {
 pub struct ResponsesReasoning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +217,10 @@ fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Erro
     Ok(effort)
 }
 
+fn reasoning_summary_requested(summary: Option<&str>) -> bool {
+    !matches!(summary, Some("off" | "none"))
+}
+
 const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex"];
 
 fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
@@ -314,8 +320,14 @@ pub fn translate_request(
     let codex_effort = to_codex_effort(effort);
     let resolved_effort = resolve_effort(codex_effort)?;
     if let Some(ref eff) = resolved_effort {
+        let summary = if reasoning_summary_requested(config::codex_reasoning_summary().as_deref()) {
+            Some("auto".to_string())
+        } else {
+            None
+        };
         out.reasoning = Some(ResponsesReasoning {
             effort: Some(eff.clone()),
+            summary,
         });
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
@@ -674,7 +686,9 @@ mod tests {
         }))
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
-        assert!(out.reasoning.is_some());
+        let reasoning = out.reasoning.unwrap();
+        assert!(matches!(reasoning.effort, Some(Effort::Medium)));
+        assert_eq!(reasoning.summary.as_deref(), Some("auto"));
         assert_eq!(
             out.include,
             Some(vec!["reasoning.encrypted_content".to_string()])
@@ -691,6 +705,15 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Xhigh)));
+    }
+
+    #[test]
+    fn reasoning_summary_override_values() {
+        assert!(reasoning_summary_requested(None));
+        assert!(reasoning_summary_requested(Some("auto")));
+        assert!(reasoning_summary_requested(Some("detailed")));
+        assert!(!reasoning_summary_requested(Some("off")));
+        assert!(!reasoning_summary_requested(Some("none")));
     }
 
     #[test]

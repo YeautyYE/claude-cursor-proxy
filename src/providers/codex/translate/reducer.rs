@@ -61,6 +61,16 @@ pub const TERM_DONE: &str = "response.done";
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
+    ThinkingStart {
+        index: usize,
+    },
+    ThinkingDelta {
+        index: usize,
+        text: String,
+    },
+    ThinkingStop {
+        index: usize,
+    },
     TextStart {
         index: usize,
     },
@@ -159,6 +169,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut item_id_to_output_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut anthropic_index = 0usize;
+    let mut thinking_index: Option<usize> = None;
     let mut saw_tool_use = false;
     let mut final_usage: Option<CodexUsage> = None;
     let mut response_id: Option<String> = None;
@@ -208,6 +219,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     },
                 );
             }
+        }
+    }
+
+    fn close_thinking(out: &mut Vec<ReducerEvent>, thinking_index: &mut Option<usize>) {
+        if let Some(index) = thinking_index.take() {
+            out.push(ReducerEvent::ThinkingStop { index });
         }
     }
 
@@ -305,6 +322,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             }
 
             if item_type == "message" {
+                close_thinking(&mut out, &mut thinking_index);
                 let idx = anthropic_index;
                 anthropic_index += 1;
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
@@ -322,6 +340,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             }
 
             if item_type == "function_call" {
+                close_thinking(&mut out, &mut thinking_index);
                 saw_tool_use = true;
                 let idx = anthropic_index;
                 anthropic_index += 1;
@@ -360,7 +379,36 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             continue;
         }
 
+        if t == "response.reasoning_summary_part.added" {
+            if let Some(index) = thinking_index {
+                out.push(ReducerEvent::ThinkingDelta {
+                    index,
+                    text: "\n\n".to_string(),
+                });
+            }
+            continue;
+        }
+
+        if t == "response.reasoning_summary_text.delta" {
+            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if delta.is_empty() {
+                continue;
+            }
+            if thinking_index.is_none() {
+                let index = anthropic_index;
+                anthropic_index += 1;
+                thinking_index = Some(index);
+                out.push(ReducerEvent::ThinkingStart { index });
+            }
+            out.push(ReducerEvent::ThinkingDelta {
+                index: thinking_index.unwrap(),
+                text: delta.to_string(),
+            });
+            continue;
+        }
+
         if t == "response.output_text.delta" {
+            close_thinking(&mut out, &mut thinking_index);
             let output_index = p
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -472,10 +520,17 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let item = p.get("item");
 
-            // Handle web search call done
+            if let Some(item_val) = item
+                && item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning")
+            {
+                close_thinking(&mut out, &mut thinking_index);
+                continue;
+            }
+
             if let Some(item_val) = item
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("web_search_call")
             {
+                close_thinking(&mut out, &mut thinking_index);
                 let idx = anthropic_index;
                 anthropic_index += 1;
                 let result_index = anthropic_index;
@@ -500,9 +555,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             };
 
             if let Some(item_val) = item {
-                if item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-                    continue;
-                }
                 if let BlockState::Tool {
                     args_accum,
                     name,
@@ -596,6 +648,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             diagnostics: Some(diagnostics),
         });
     }
+
+    close_thinking(&mut out, &mut thinking_index);
 
     let stop_reason: StopReason = if incomplete {
         STOP_MAX_TOKENS
@@ -1180,5 +1234,202 @@ mod tests {
         assert_eq!(mapped.input_tokens, 80);
         assert_eq!(mapped.output_tokens, 50);
         assert_eq!(mapped.cache_read_input_tokens, 20);
+    }
+
+    #[test]
+    fn reduce_reasoning_summary_before_text() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"Plan"})
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"ning"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({"output_index":1,"delta":"answer"})
+            ),
+            format!(
+                "{}{}",
+                sse(
+                    "response.output_item.done",
+                    json!({"output_index":1,"item":{"type":"message"}})
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":{}}})
+                )
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(matches!(
+            out.iter()
+                .find(|event| matches!(event, ReducerEvent::ThinkingStart { .. })),
+            Some(ReducerEvent::ThinkingStart { index: 0 })
+        ));
+        let thinking_text: String = out
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_text, "Planning");
+        let thinking_stop = out
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+            .unwrap();
+        let text_start = out
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::TextStart { .. }))
+            .unwrap();
+        assert!(thinking_stop < text_start);
+        assert!(matches!(
+            out.iter()
+                .find(|event| matches!(event, ReducerEvent::TextStart { .. })),
+            Some(ReducerEvent::TextStart { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn reduce_empty_reasoning_summary_emits_no_thinking() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
+            ),
+            format!(
+                "{}{}{}",
+                sse(
+                    "response.output_text.delta",
+                    json!({"output_index":1,"delta":"answer"})
+                ),
+                sse(
+                    "response.output_item.done",
+                    json!({"output_index":1,"item":{"type":"message"}})
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":{}}})
+                )
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(!out.iter().any(|event| matches!(
+            event,
+            ReducerEvent::ThinkingStart { .. }
+                | ReducerEvent::ThinkingDelta { .. }
+                | ReducerEvent::ThinkingStop { .. }
+        )));
+    }
+
+    #[test]
+    fn reduce_multiple_reasoning_summary_parts() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"part one"})
+            ),
+            sse(
+                "response.reasoning_summary_part.added",
+                json!({"output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}})
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":1,"delta":"part two"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let deltas: Vec<&str> = out
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["part one", "\n\n", "part two"]);
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reduce_two_reasoning_items() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"first"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":1,"summary_index":0,"delta":"second"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":1,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, ReducerEvent::ThinkingStart { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+                .count(),
+            2
+        );
+        let deltas: Vec<&str> = out
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["first", "second"]);
     }
 }

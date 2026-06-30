@@ -52,6 +52,8 @@ struct CodexConfig {
     pub previous_response_id: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
+    #[serde(rename = "reasoningSummary")]
+    pub reasoning_summary: Option<String>,
     #[serde(rename = "effort")]
     pub effort: Option<String>,
     #[serde(rename = "model")]
@@ -204,6 +206,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_KIMI_USER_AGENT") {
         out.push("kimi.userAgent (env)".to_string());
     }
+    if env
+        .get("CCP_CODEX_REASONING_SUMMARY")
+        .is_some_and(|raw| !raw.is_empty())
+    {
+        out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(p) = file_cfg.port {
             out.push(format!("port: {p}"));
@@ -218,6 +226,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(v) = log.stderr {
                 out.push(format!("log.stderr: {v}"));
             }
+        }
+        if let Some(codex) = file_cfg.codex
+            && let Some(summary) = codex.reasoning_summary
+            && !summary.is_empty()
+        {
+            out.push("codex.reasoningSummary (config)".to_string());
         }
     }
     out
@@ -373,6 +387,24 @@ pub fn codex_effort() -> Option<String> {
     None
 }
 
+pub fn codex_reasoning_summary() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env
+        .get("CCP_CODEX_REASONING_SUMMARY")
+        .filter(|raw| !raw.is_empty())
+    {
+        return Some(raw.clone());
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(summary) = codex.reasoning_summary.filter(|raw| !raw.is_empty())
+    {
+        return Some(summary);
+    }
+    None
+}
+
 pub fn codex_model() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_MODEL") {
@@ -497,6 +529,7 @@ mod tests {
             std::env::remove_var("CCP_CONFIG_DIR");
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
+            std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
         }
     }
 
@@ -623,5 +656,41 @@ mod tests {
         let loaded = load_config();
         assert!(loaded.log_verbose);
         assert!(loaded.log_stderr);
+    }
+
+    #[test]
+    fn codex_reasoning_summary_reads_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"reasoningSummary":"off"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn codex_reasoning_summary_env_overrides_config_and_empty_falls_through() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"reasoningSummary":"off"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        {
+            let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "auto");
+            assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
+        }
+        {
+            let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "");
+            assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
+        }
     }
 }
