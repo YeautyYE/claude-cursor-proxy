@@ -615,12 +615,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             final_usage = p.get("response").map(parse_codex_usage);
-            let reason = p
-                .get("response")
-                .and_then(|r| r.get("incomplete_details"))
-                .and_then(|d| d.get("reason"))
-                .and_then(|v| v.as_str());
-            if t == "response.incomplete" || reason.is_some() {
+            if response_is_incomplete(&p, &t) {
                 incomplete = true;
             }
             continuation_eligible =
@@ -727,6 +722,21 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_u64()),
     }
+}
+
+fn response_is_incomplete(payload: &serde_json::Value, event_type: &str) -> bool {
+    event_type == "response.incomplete"
+        || payload
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(|v| v.as_str())
+            == Some("incomplete")
+        || payload
+            .get("response")
+            .and_then(|r| r.get("incomplete_details"))
+            .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str())
+            .is_some()
 }
 
 fn should_buffer_tool_args(name: &str) -> bool {
@@ -953,7 +963,7 @@ mod tests {
             sse(
                 "response.completed",
                 json!({
-                    "response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":1}}
+                    "response":{"id":"resp_1","status":"completed","incomplete_details":null,"usage":{"input_tokens":5,"output_tokens":1}}
                 })
             ),
         );
@@ -1148,6 +1158,27 @@ mod tests {
         {
             assert_eq!(*stop_reason, "max_tokens");
             assert!(!continuation_eligible);
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_completed_with_null_incomplete_details_is_end_turn() {
+        let upstream = sse(
+            "response.completed",
+            json!({"response":{"id":"resp_1","status":"completed","incomplete_details":null,"usage":{}}}),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            stop_reason,
+            continuation_eligible,
+            ..
+        } = last
+        {
+            assert_eq!(*stop_reason, "end_turn");
+            assert!(continuation_eligible);
         } else {
             panic!("expected Finish");
         }

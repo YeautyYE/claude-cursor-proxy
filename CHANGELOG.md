@@ -14,6 +14,9 @@
 - Codex WebSocket requests use the gateway-compatible request shape, so
   `claude -p` jobs and release changelog generation avoid unsupported-parameter
   failures.
+- Codex WebSocket streaming responses report completed turns as `end_turn`
+  when the gateway sends `incomplete_details: null`, preventing false output
+  limit recovery loops in Claude Code.
 
 ## v0.1.2 (2026-06-30)
 

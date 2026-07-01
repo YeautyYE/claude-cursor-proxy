@@ -522,12 +522,7 @@ impl LiveStreamTranslator {
         }
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
-        let incomplete = payload.get("type").and_then(|v| v.as_str())
-            == Some("response.incomplete")
-            || payload
-                .get("response")
-                .and_then(|r| r.get("incomplete_details"))
-                .is_some();
+        let incomplete = response_is_incomplete(payload);
         let stop_reason = if incomplete {
             STOP_MAX_TOKENS
         } else if self.saw_tool_use {
@@ -598,6 +593,21 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_u64()),
     }
+}
+
+fn response_is_incomplete(payload: &serde_json::Value) -> bool {
+    payload.get("type").and_then(|v| v.as_str()) == Some("response.incomplete")
+        || payload
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(|v| v.as_str())
+            == Some("incomplete")
+        || payload
+            .get("response")
+            .and_then(|r| r.get("incomplete_details"))
+            .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str())
+            .is_some()
 }
 
 fn sanitize_tool_args(name: &str, args: &str) -> String {
@@ -695,12 +705,23 @@ mod tests {
             }),
             json!({
                 "type": "response.completed",
-                "response": {"id": "resp_1", "usage": {"input_tokens": 2, "output_tokens": 1}}
+                "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {"input_tokens": 2, "output_tokens": 1}}
             }),
         ]);
         assert!(out.contains("content_block_stop"));
         assert!(out.contains("message_delta"));
+        assert!(out.contains(r#""stop_reason":"end_turn""#));
         assert!(out.contains("message_stop"));
+    }
+
+    #[test]
+    fn completed_response_with_null_incomplete_details_is_end_turn() {
+        let out = render(vec![json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {}}
+        })]);
+        assert!(out.contains(r#""stop_reason":"end_turn""#));
+        assert!(!out.contains(r#""stop_reason":"max_tokens""#));
     }
 
     #[test]
