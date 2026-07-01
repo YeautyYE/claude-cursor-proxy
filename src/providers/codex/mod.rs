@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
-use crate::anthropic::sse::encode_sse_event;
 use crate::config;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
@@ -127,7 +126,7 @@ impl Provider for CodexProvider {
         }
         if want_stream && matches!(config::codex_transport(), config::CodexTransport::WebSocket) {
             let upstream_events = match client
-                .stream_codex_websocket_events(&translated, &ctx, Some(&continuation))
+                .stream_codex_websocket_events(&translated, &ctx, None)
                 .await
             {
                 Ok(events) => events,
@@ -136,7 +135,7 @@ impl Provider for CodexProvider {
                     return map_codex_error_to_response(&e);
                 }
             };
-            return live_stream_response(upstream_events, message_id, model, ctx, translated);
+            return live_stream_response(upstream_events, message_id, model, ctx).await;
         }
 
         let upstream = match client
@@ -274,69 +273,127 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
-fn live_stream_response(
+async fn live_stream_response(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     message_id: String,
     model: &str,
     ctx: RequestContext,
-    request_body: translate::request::ResponsesRequest,
+) -> Response {
+    let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
+
+    while let Some(item) = upstream_events.recv().await {
+        let payload = match item {
+            Ok(payload) => payload,
+            Err(err) => {
+                clear_continuation(ctx.session_id.as_deref());
+                return map_codex_error_to_response(&err);
+            }
+        };
+        let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
+        {
+            Ok(result) => result,
+            Err(message) => {
+                clear_continuation(ctx.session_id.as_deref());
+                return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
+            }
+        };
+        if !chunk.is_empty() {
+            record_live_stream_progress(&ctx, &chunk);
+            if terminal {
+                clear_continuation(ctx.session_id.as_deref());
+                return single_live_stream_response(chunk);
+            }
+            return remaining_live_stream_response(upstream_events, translator, chunk, ctx);
+        }
+        if terminal {
+            clear_continuation(ctx.session_id.as_deref());
+            return empty_live_stream_response();
+        }
+    }
+
+    clear_continuation(ctx.session_id.as_deref());
+    json_error(
+        StatusCode::BAD_GATEWAY,
+        "api_error",
+        "WebSocket connection closed before terminal Codex response event",
+    )
+}
+
+fn translate_live_stream_payload(
+    translator: &mut LiveStreamTranslator,
+    payload: &serde_json::Value,
+    ctx: &RequestContext,
+) -> Result<(Vec<u8>, bool), String> {
+    let terminal = is_codex_terminal_event(payload);
+    let chunk = translator.accept(payload, ctx.traffic.as_deref())?;
+    Ok((chunk, terminal))
+}
+
+fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.stream_progress(
+            &ctx.req_id,
+            chunk.len() as u64,
+            count_sse_events(chunk),
+            None,
+            None,
+        );
+    }
+}
+
+fn single_live_stream_response(chunk: Vec<u8>) -> Response {
+    event_stream_response(futures_util::stream::once(async move {
+        Ok::<Bytes, std::io::Error>(Bytes::from(chunk))
+    }))
+}
+
+fn empty_live_stream_response() -> Response {
+    event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
+}
+
+fn remaining_live_stream_response(
+    mut upstream_events: websocket::CodexWebSocketEventReceiver,
+    mut translator: LiveStreamTranslator,
+    first_chunk: Vec<u8>,
+    ctx: RequestContext,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let req_id = ctx.req_id.clone();
-    let session_id = ctx.session_id.clone();
-    let traffic = ctx.traffic.clone();
-    let monitor = ctx.monitor.clone();
-    let model = model.to_string();
-
     tokio::spawn(async move {
-        let mut translator = LiveStreamTranslator::new(message_id, model);
-        let mut upstream_body = Vec::new();
-
+        if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
+            return;
+        }
         while let Some(item) = upstream_events.recv().await {
             match item {
                 Ok(payload) => {
-                    upstream_body.extend_from_slice(&encode_sse_event(None, &payload.to_string()));
-                    let terminal = is_codex_terminal_event(&payload);
-                    let chunk = match translator.accept(&payload, traffic.as_deref()) {
-                        Ok(chunk) => chunk,
-                        Err(message) => {
-                            clear_continuation(session_id.as_deref());
-                            let _ = tx.send(Err(stream_error(message))).await;
-                            return;
-                        }
-                    };
+                    let (chunk, terminal) =
+                        match translate_live_stream_payload(&mut translator, &payload, &ctx) {
+                            Ok(result) => result,
+                            Err(message) => {
+                                clear_continuation(ctx.session_id.as_deref());
+                                let _ = tx.send(Err(stream_error(message))).await;
+                                return;
+                            }
+                        };
                     if !chunk.is_empty() {
-                        if let Some(monitor) = monitor.as_ref() {
-                            monitor.stream_progress(
-                                &req_id,
-                                chunk.len() as u64,
-                                count_sse_events(&chunk),
-                                None,
-                                None,
-                            );
-                        }
+                        record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             return;
                         }
                     }
                     if terminal {
-                        update_continuation_from_upstream(
-                            session_id.as_deref(),
-                            &request_body,
-                            &upstream_body,
-                        );
+                        clear_continuation(ctx.session_id.as_deref());
                         return;
                     }
                 }
                 Err(err) => {
-                    clear_continuation(session_id.as_deref());
+                    clear_continuation(ctx.session_id.as_deref());
                     let _ = tx.send(Err(stream_error(codex_error_message(&err)))).await;
                     return;
                 }
             }
         }
 
-        clear_continuation(session_id.as_deref());
+        clear_continuation(ctx.session_id.as_deref());
         let _ = tx
             .send(Err(stream_error(
                 "WebSocket connection closed before terminal Codex response event",
@@ -347,6 +404,13 @@ fn live_stream_response(
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
+    event_stream_response(stream)
+}
+
+fn event_stream_response<S>(stream: S) -> Response
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
     let headers = [
         (http::header::CONTENT_TYPE, "text/event-stream"),
         (http::header::CACHE_CONTROL, "no-cache"),

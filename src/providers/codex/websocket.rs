@@ -209,7 +209,6 @@ fn is_response_event(payload: &serde_json::Value) -> bool {
 }
 
 fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
-    // Check error.code == "previous_response_not_found"
     if let Some(code) = payload
         .get("error")
         .and_then(|e| e.get("code"))

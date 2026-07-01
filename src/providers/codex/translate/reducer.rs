@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn map_usage_subtracts_cached() {
+    fn map_usage_reports_cached_prompt_tokens() {
         let usage = CodexUsage {
             input_tokens: Some(100),
             output_tokens: Some(50),

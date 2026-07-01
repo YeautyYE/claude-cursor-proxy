@@ -5,6 +5,12 @@
 - Codex WebSocket streaming requests forward Anthropic SSE chunks as upstream
   events arrive, so long compaction responses show progress before the terminal
   Codex event.
+- Codex WebSocket streaming requests return structured JSON for upstream errors
+  that arrive before any downstream SSE chunk, preserving diagnostics such as
+  context-window failures.
+- Codex WebSocket live streaming sends full requests on fresh WebSocket
+  connections, avoiding invalid `previous_response_id` references from earlier
+  connections.
 
 ## v0.1.2 (2026-06-30)
 

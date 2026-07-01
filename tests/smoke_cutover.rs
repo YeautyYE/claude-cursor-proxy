@@ -245,6 +245,32 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
     addr_str
 }
 
+async fn spawn_websocket_error_upstream(message: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let _ = ws.next().await;
+            let event = json!({
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "param": "input",
+                    "message": message
+                }
+            });
+            let _ = ws.send(Message::Text(event.to_string())).await;
+        }
+    });
+
+    addr_str
+}
+
 async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -696,6 +722,101 @@ async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
         !text.contains("message_stop"),
         "stream finished too early: {text}"
     );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_returns_json_for_early_error() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let upstream = spawn_websocket_error_upstream("input exceeds context window").await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "response body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"]["message"], "input exceeds context window");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_omits_previous_response_id() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_sequence_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"}
+        ]
+    }))
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&second_body).contains("second"),
+        "second response body: {}",
+        String::from_utf8_lossy(&second_body)
+    );
+
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 2, "expected two upstream websocket requests");
+    assert!(guard[0].get("previous_response_id").is_none());
+    assert!(guard[1].get("previous_response_id").is_none());
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]
