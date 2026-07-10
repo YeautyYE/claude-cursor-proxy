@@ -17,13 +17,13 @@ pub const ALLOWED_MODELS: &[&str] = &[
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
-    ("haiku", "gpt-5.4-mini"),
-    ("claude-haiku-4-5", "gpt-5.4-mini"),
-    ("claude-haiku-4-5-20251001", "gpt-5.4-mini"),
-    ("sonnet", "gpt-5.4"),
-    ("claude-sonnet-4-6", "gpt-5.4"),
-    ("opus", "gpt-5.5"),
-    ("claude-opus-4-7", "gpt-5.5"),
+    ("haiku", "gpt-5.6-luna"),
+    ("claude-haiku-4-5", "gpt-5.6-luna"),
+    ("claude-haiku-4-5-20251001", "gpt-5.6-luna"),
+    ("sonnet", "gpt-5.6-terra"),
+    ("claude-sonnet-4-6", "gpt-5.6-terra"),
+    ("opus", "gpt-5.6-sol"),
+    ("claude-opus-4-7", "gpt-5.6-sol"),
 ];
 
 #[derive(Debug, Clone)]
@@ -124,21 +124,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn haiku_resolves_to_mini() {
+    fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
-        assert_eq!(r.model, "gpt-5.4-mini");
+        assert_eq!(r.model, "gpt-5.6-luna");
     }
 
     #[test]
-    fn sonnet_resolves_to_gpt5_4() {
+    fn sonnet_resolves_to_terra() {
         let r = resolve_model_request("sonnet");
-        assert_eq!(r.model, "gpt-5.4");
+        assert_eq!(r.model, "gpt-5.6-terra");
     }
 
     #[test]
-    fn opus_resolves_to_gpt5_5() {
+    fn opus_resolves_to_sol() {
         let r = resolve_model_request("opus");
-        assert_eq!(r.model, "gpt-5.5");
+        assert_eq!(r.model, "gpt-5.6-sol");
     }
 
     #[test]

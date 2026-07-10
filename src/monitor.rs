@@ -790,7 +790,7 @@ mod tests {
     fn resolved_model_appends_to_incoming_alias() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
-        monitor.provider_selected("r1", "codex", "claude-sonnet-4-6");
+        monitor.provider_selected("r1", "codex", "claude-sonnet-4-6", None);
         monitor.model_resolved("r1", "gpt-5.4");
 
         let state = monitor.snapshot();
@@ -804,7 +804,7 @@ mod tests {
     fn identical_resolved_model_is_shown_once() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
-        monitor.provider_selected("r1", "codex", "gpt-5.6-sol");
+        monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
         monitor.model_resolved("r1", "gpt-5.6-sol");
 
         let state = monitor.snapshot();
