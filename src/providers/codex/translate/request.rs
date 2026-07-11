@@ -217,15 +217,21 @@ fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
 }
 
 fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
-    let override_effort = config::codex_effort();
-    if let Some(ref val) = override_effort {
+    resolve_effort_override(effort, config::codex_effort().as_deref())
+}
+
+fn resolve_effort_override(
+    effort: Option<Effort>,
+    override_effort: Option<&str>,
+) -> Result<Option<Effort>, anyhow::Error> {
+    if let Some(val) = override_effort {
         let valid = ["none", "low", "medium", "high", "xhigh", "max"];
-        if !valid.contains(&val.as_str()) {
+        if !valid.contains(&val) {
             anyhow::bail!(
                 "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
             );
         }
-        return Ok(Some(match val.as_str() {
+        return Ok(Some(match val {
             "max" => Effort::Max,
             "xhigh" => Effort::Xhigh,
             "high" => Effort::High,
@@ -838,45 +844,7 @@ fn unsupported_tool_result_block_to_string(block: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use serde_json::json;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
-    struct EnvVarGuard {
-        _lock: MutexGuard<'static, ()>,
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-            let previous = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self {
-                _lock: lock,
-                key,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(previous) = &self.previous {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
 
     fn opts() -> TranslateOptions {
         TranslateOptions {
@@ -1049,15 +1017,8 @@ mod tests {
 
     #[test]
     fn translate_effort_override_max_maps_to_max() {
-        let _env = EnvVarGuard::set("CCP_CODEX_EFFORT", "max");
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.5",
-            "messages": [{"role":"user", "content":"hello"}],
-            "output_config": {"effort": "low"}
-        }))
-        .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
+        let effort = resolve_effort_override(Some(Effort::Low), Some("max")).unwrap();
+        assert!(matches!(effort, Some(Effort::Max)));
     }
 
     #[test]
