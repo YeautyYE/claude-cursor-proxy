@@ -568,7 +568,7 @@ fn render_active(
             request.status.label(),
             "upstream" | "streaming" | "selected" | "started"
         ) {
-            format!("{} {}", spinner(tick), request.status.label())
+            format!("{}{}", spinner(tick), request.status.label())
         } else {
             request.status.label().to_string()
         };
@@ -1099,6 +1099,21 @@ mod tests {
         assert_centered(&events, "No events", 4);
         assert!(!events_text.contains("time"));
         assert!(events_text.contains("No events"));
+    }
+
+    #[test]
+    fn active_status_keeps_full_label_at_narrow_width() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.upstream_started("request-1");
+        let state = monitor.snapshot();
+
+        let active = draw(88, 6, |frame| {
+            render_active(frame, frame.area(), &state.active, 0)
+        });
+
+        let active_text = buffer_text(&active);
+        assert!(active_text.contains("⠋upstream"), "{active_text}");
     }
 
     #[test]
