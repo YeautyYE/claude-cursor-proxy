@@ -275,6 +275,12 @@ the change immediately; existing sessions keep whatever they started with.
 
 Upstream: `https://chatgpt.com/backend-api/codex/responses` (Responses API).
 
+OpenAI's Thibault Sottiaux has publicly welcomed using Codex through other coding
+harnesses:
+
+> [Share the recipe. People want to know how to use GPT-5.6 Sol in CC. We don't
+> discriminate on the harness.](https://x.com/thsottiaux/status/2075830097488249060)
+
 Set `ANTHROPIC_MODEL` to a model your ChatGPT subscription is allowed to use.
 Append `-fast` to a Codex model name to request Codex fast mode for that request
 without restarting the proxy. For example, `gpt-5.6-sol-fast` is sent upstream as
@@ -780,8 +786,10 @@ CCP_TRAFFIC_LOG=1`.
 
 ## Limitations
 
-- **Terms of service:** using the Codex, Kimi, or Cursor backends from a non-official
-  client is a gray area. Use at your own risk.
+- **Terms of service:** OpenAI has [publicly welcomed using Codex through other
+  coding harnesses](https://x.com/thsottiaux/status/2075830097488249060), though
+  this does not guarantee future policy or account enforcement. Using the Kimi
+  or Cursor backends from an unofficial client may carry account risk.
 - **Rate limits:** shared across all clients of your upstream account. Codex's
   `codex.rate_limits.limit_reached` and Kimi's HTTP 429 are both surfaced as
   HTTP 429 with `retry-after`.
