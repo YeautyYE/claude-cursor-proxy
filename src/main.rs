@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config,
+    config, logging,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
@@ -97,6 +97,7 @@ fn main() -> Result<()> {
                         .map_err(|err| anyhow::anyhow!(err))
                 }
                 ServeMode::Monitor => {
+                    let _stderr_guard = logging::suppress_stderr();
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let listener = runtime.block_on(server::bind_proxy_listener(effective_port))?;

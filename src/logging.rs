@@ -4,9 +4,12 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+
+static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 pub const REDACT_KEYS: [&str; 14] = [
     "authorization",
@@ -27,6 +30,28 @@ pub const REDACT_KEYS: [&str; 14] = [
 
 pub fn log_file() -> std::path::PathBuf {
     paths::log_file()
+}
+
+#[must_use]
+pub struct StderrSuppressionGuard;
+
+impl Drop for StderrSuppressionGuard {
+    fn drop(&mut self) {
+        STDERR_SUPPRESSION_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub fn suppress_stderr() -> StderrSuppressionGuard {
+    STDERR_SUPPRESSION_DEPTH.fetch_add(1, Ordering::Relaxed);
+    StderrSuppressionGuard
+}
+
+fn stderr_suppressed() -> bool {
+    STDERR_SUPPRESSION_DEPTH.load(Ordering::Relaxed) > 0
+}
+
+fn should_mirror_to_stderr(level: &str) -> bool {
+    !stderr_suppressed() && (matches!(level, "warn" | "error") || config::log_stderr())
 }
 
 #[derive(Clone)]
@@ -78,7 +103,7 @@ impl Logger {
 
         let line = Value::Object(body).to_string();
 
-        let mirror_to_stderr = matches!(level, "warn" | "error") || config::log_stderr();
+        let mirror_to_stderr = should_mirror_to_stderr(level);
         if mirror_to_stderr {
             let _ = writeln!(io::stderr(), "{line}");
         }
@@ -198,4 +223,40 @@ fn redact_key_redaction(value: Value) -> Value {
 
 pub fn redacted_keys() -> HashSet<&'static str> {
     REDACT_KEYS.iter().copied().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn stderr_suppression_disables_level_mirroring() {
+        let _lock = STDERR_TEST_LOCK.lock().unwrap();
+        assert!(should_mirror_to_stderr("warn"));
+
+        {
+            let _guard = suppress_stderr();
+            assert!(!should_mirror_to_stderr("warn"));
+            assert!(!should_mirror_to_stderr("error"));
+        }
+
+        assert!(should_mirror_to_stderr("warn"));
+    }
+
+    #[test]
+    fn stderr_suppression_supports_nested_guards() {
+        let _lock = STDERR_TEST_LOCK.lock().unwrap();
+        let outer = suppress_stderr();
+        let inner = suppress_stderr();
+        assert!(!should_mirror_to_stderr("warn"));
+
+        drop(inner);
+        assert!(!should_mirror_to_stderr("warn"));
+
+        drop(outer);
+        assert!(should_mirror_to_stderr("warn"));
+    }
 }
