@@ -7,8 +7,8 @@ use claude_code_proxy::logging::{create_logger, redact_value};
 use claude_code_proxy::paths::{self, DirResolverEnv};
 use claude_code_proxy::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
 use claude_code_proxy::traffic::{
-    TrafficCaptureOptions, create_traffic_capture, redact_traffic, sanitize_path_part,
-    traffic_capture_enabled_for_env,
+    MAX_SSE_CAPTURE_BYTES, TrafficCaptureOptions, create_traffic_capture, redact_traffic,
+    sanitize_path_part, traffic_capture_enabled_for_env,
 };
 use serde_json::Map;
 use serde_json::json;
@@ -136,6 +136,26 @@ fn traffic_capture_helpers() {
             .unwrap()
             .contains("redacted")
     );
+    assert_eq!(
+        redact_traffic(&json!({"user_id":"person","note":"Bearer secret"}))["user_id"],
+        "[redacted len=6]"
+    );
+    let secrets = json!({
+        "access_token":"access-secret",
+        "nested":[{"refresh_token":"refresh-secret","oauth_token":"oauth-secret"}],
+        "identity":{"email":"person@example.test"},
+        "user":{"message":"Bearer text is ordinary message content"}
+    });
+    let redacted = redact_traffic(&secrets).to_string();
+    for secret in [
+        "access-secret",
+        "refresh-secret",
+        "oauth-secret",
+        "person@example.test",
+    ] {
+        assert!(!redacted.contains(secret));
+    }
+    assert!(redacted.contains("Bearer text is ordinary message content"));
 
     unsafe {
         env::set_var("CCP_TRAFFIC_LOG", "1");
@@ -152,6 +172,27 @@ fn traffic_capture_helpers() {
 
     capture.write_text("020-note", "hello");
     capture.write_json("030-req", &json!({"token":"abc"}));
+    let event = json!({"type":"response.completed","refresh_token":"secret"});
+    let mut stream_capture = capture.stream_capture();
+    for _ in 0..(MAX_SSE_CAPTURE_BYTES / 100 + 2) {
+        stream_capture.upstream_event(Some("response.completed"), &event);
+    }
+    stream_capture.finish(&capture, json!({"kind":"test"}));
+    let transcript = std::fs::read_to_string(
+        std::fs::read_dir(capture.root())
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                path.file_name()?
+                    .to_string_lossy()
+                    .ends_with("032-upstream-response-body.sse")
+                    .then_some(path)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(transcript.len() <= MAX_SSE_CAPTURE_BYTES);
+    assert!(!transcript.contains("secret"));
     unsafe {
         env::remove_var("CCP_TRAFFIC_LOG");
     }

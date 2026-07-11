@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::reducer::{ReducerEvent, reduce_upstream_bytes};
+use crate::traffic::TrafficCapture;
 use serde_json::Value;
 
 pub fn accumulate_response(
@@ -8,12 +9,58 @@ pub fn accumulate_response(
     message_id: &str,
     model: &str,
 ) -> anyhow::Result<Value> {
+    accumulate_response_with_traffic(upstream, message_id, model, None)
+}
+
+pub fn accumulate_response_with_traffic(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+) -> anyhow::Result<Value> {
+    let mut capture = traffic.map(TrafficCapture::stream_capture);
+    let mut decoder = super::stream::SseDecoder::default();
+    let events = match decoder.push(upstream) {
+        Ok(events) => events,
+        Err(error) => {
+            if let Some(capture) = capture.as_mut() {
+                capture.malformed("decoder", "malformed_sse");
+            }
+            finish_capture(capture.take(), traffic, "error");
+            return Err(error);
+        }
+    };
+    if let Some(capture) = capture.as_mut() {
+        for event in events {
+            match serde_json::from_str::<Value>(&event.data) {
+                Ok(value) => capture.upstream_event(event.event.as_deref(), &value),
+                Err(_) => capture.malformed("json", "malformed_event"),
+            }
+        }
+    }
+    if let Err(error) = decoder.finish() {
+        if let Some(capture) = capture.as_mut() {
+            capture.malformed("decoder", "incomplete_stream");
+        }
+        finish_capture(capture.take(), traffic, "error");
+        return Err(error);
+    }
     let mut blocks: Vec<Value> = Vec::new();
     let mut block_positions = HashMap::new();
     let mut stop = "end_turn".to_string();
     let mut input = 0;
     let mut output = 0;
-    for event in reduce_upstream_bytes(upstream)? {
+    let reduced = match reduce_upstream_bytes(upstream) {
+        Ok(events) => events,
+        Err(error) => {
+            if let Some(capture) = capture.as_mut() {
+                capture.malformed("reducer", "invalid_event");
+            }
+            finish_capture(capture.take(), traffic, "error");
+            return Err(error);
+        }
+    };
+    for event in reduced {
         match event {
             ReducerEvent::ThinkingStart(index) => {
                 block_positions.insert(index, blocks.len());
@@ -67,7 +114,16 @@ pub fn accumulate_response(
                     .and_then(|position| blocks.get_mut(*position))
                 {
                     let raw = block.get("_args").and_then(Value::as_str).unwrap_or("{}");
-                    block["input"] = serde_json::from_str(raw)?;
+                    match serde_json::from_str(raw) {
+                        Ok(input) => block["input"] = input,
+                        Err(error) => {
+                            if let Some(capture) = capture.as_mut() {
+                                capture.malformed("reducer", "invalid_tool_arguments");
+                            }
+                            finish_capture(capture.take(), traffic, "error");
+                            return Err(error.into());
+                        }
+                    }
                     block.as_object_mut().unwrap().remove("_args");
                 }
             }
@@ -83,9 +139,25 @@ pub fn accumulate_response(
             _ => {}
         }
     }
-    Ok(
-        serde_json::json!({"id":message_id,"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":stop,"stop_sequence":null,"usage":{"input_tokens":input,"output_tokens":output}}),
-    )
+    let response = serde_json::json!({"id":message_id,"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":stop,"stop_sequence":null,"usage":{"input_tokens":input,"output_tokens":output}});
+    if let Some(mut capture) = capture {
+        capture.downstream_event("response", response.clone());
+        finish_capture(Some(capture), traffic, "completed");
+    }
+    Ok(response)
+}
+
+fn finish_capture(
+    capture: Option<crate::traffic::StreamTrafficCapture>,
+    traffic: Option<&TrafficCapture>,
+    outcome: &str,
+) {
+    if let (Some(capture), Some(traffic)) = (capture, traffic) {
+        capture.finish(
+            traffic,
+            serde_json::json!({"kind":"non_streaming","outcome":outcome}),
+        );
+    }
 }
 
 #[cfg(test)]

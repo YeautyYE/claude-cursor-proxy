@@ -23,11 +23,11 @@ use crate::anthropic::{
 };
 use crate::monitor::MonitorHandle;
 use crate::provider::{CliHandlers, Provider, RequestContext};
-use crate::registry::GROK_MODELS;
+use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
 use self::auth::token_store::file_store;
 use self::translate::{
-    accumulate::accumulate_response,
+    accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model},
     request::translate_request,
     stream::{SseDecoder, StreamTranslator, stream_error},
@@ -99,7 +99,7 @@ impl Provider for GrokProvider {
             monitor.model_resolved(&ctx.req_id, &resolved);
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match self.client.post(&translated).await {
+        let upstream = match self.client.post(&translated, ctx.traffic.clone()).await {
             Ok(response) => response,
             Err(error) => return map_error(error),
         };
@@ -110,18 +110,26 @@ impl Provider for GrokProvider {
                 requested,
                 ctx.monitor.clone(),
                 ctx.req_id.clone(),
+                ctx.traffic.clone(),
             )
         } else {
             let upstream_bytes = match upstream.into_bytes().await {
                 Ok(bytes) => bytes,
-                Err(error) => return map_error(error),
+                Err(error) => {
+                    write_error(ctx.traffic.as_deref(), "body_read", "transport");
+                    return map_error(error);
+                }
             };
-            match accumulate_response(
+            match accumulate_response_with_traffic(
                 &upstream_bytes,
                 &format!("msg_{}", uuid::Uuid::new_v4().simple()),
                 &requested,
+                ctx.traffic.as_deref(),
             ) {
                 Ok(value) => {
+                    if let Some(traffic) = ctx.traffic.as_ref() {
+                        traffic.write_json("051-downstream-response", &value);
+                    }
                     if let Some(monitor) = ctx.monitor.as_ref() {
                         monitor.usage_updated(
                             &ctx.req_id,
@@ -135,11 +143,14 @@ impl Provider for GrokProvider {
                     }
                     (StatusCode::OK, Json(value)).into_response()
                 }
-                Err(_) => json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    "Grok response is invalid",
-                ),
+                Err(_) => {
+                    write_error(ctx.traffic.as_deref(), "accumulate", "invalid_response");
+                    json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "Grok response is invalid",
+                    )
+                }
             }
         }
     }
@@ -183,8 +194,16 @@ fn stream_response(
     model: String,
     monitor: Option<MonitorHandle>,
     req_id: String,
+    traffic: Option<Arc<crate::traffic::TrafficCapture>>,
 ) -> Response {
-    stream_body(response.into_stream(), message_id, model, monitor, req_id)
+    stream_body(
+        response.into_stream(),
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+    )
 }
 
 fn stream_body<S>(
@@ -193,6 +212,7 @@ fn stream_body<S>(
     model: String,
     monitor: Option<MonitorHandle>,
     req_id: String,
+    traffic: Option<Arc<crate::traffic::TrafficCapture>>,
 ) -> Response
 where
     S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin + Send + 'static,
@@ -208,6 +228,8 @@ where
         req_id,
         bytes: 0,
         chunks: 0,
+        stream_capture: traffic.as_ref().map(|traffic| traffic.stream_capture()),
+        traffic,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
@@ -236,6 +258,8 @@ struct GrokStreamState<S> {
     req_id: String,
     bytes: u64,
     chunks: u64,
+    stream_capture: Option<StreamTrafficCapture>,
+    traffic: Option<Arc<crate::traffic::TrafficCapture>>,
 }
 
 impl<S> GrokStreamState<S>
@@ -253,12 +277,13 @@ where
         loop {
             let chunk = match self.upstream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail()),
+                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
                 None => {
                     if self.decoder.finish().is_err() || !self.reducer.finished() {
-                        return Some(self.fail());
+                        return Some(self.fail_at("decoder", "incomplete_stream"));
                     }
                     self.terminal = true;
+                    self.finish_capture(true);
                     return None;
                 }
             };
@@ -269,17 +294,25 @@ where
             }
             let events = match self.decoder.push(&chunk) {
                 Ok(events) => events,
-                Err(_) => return Some(self.fail()),
+                Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
             };
             let mut out = Vec::new();
             for event in events {
                 let value: serde_json::Value = match serde_json::from_str(&event.data) {
                     Ok(value) => value,
-                    Err(_) => return Some(self.fail()),
+                    Err(_) => {
+                        if let Some(capture) = self.stream_capture.as_mut() {
+                            capture.malformed("json", "malformed_event");
+                        }
+                        return Some(self.fail_at("json", "malformed_event"));
+                    }
                 };
+                if let Some(capture) = self.stream_capture.as_mut() {
+                    capture.upstream_event(event.event.as_deref(), &value);
+                }
                 let reduced = match self.reducer.push(value) {
                     Ok(events) => events,
-                    Err(_) => return Some(self.fail()),
+                    Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
                 };
                 let usage = reduced.iter().find_map(|event| match event {
                     translate::reducer::ReducerEvent::Finish {
@@ -291,7 +324,7 @@ where
                 });
                 match self.translator.render(reduced) {
                     Ok(bytes) => out.extend(bytes),
-                    Err(_) => return Some(self.fail()),
+                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
                 }
                 if let Some((input_tokens, output_tokens)) = usage
                     && let Some(monitor) = self.monitor.as_ref()
@@ -300,18 +333,98 @@ where
                 }
                 if self.reducer.finished() {
                     self.terminal = true;
+                    self.capture_downstream(&out);
+                    self.finish_capture(true);
                     return if out.is_empty() { None } else { Some(out) };
                 }
             }
             if !out.is_empty() {
+                self.capture_downstream(&out);
                 return Some(out);
             }
         }
     }
 
-    fn fail(&mut self) -> Vec<u8> {
+    fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
         self.error_sent = true;
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.malformed(stage, kind);
+            capture.downstream_event("error", serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}}));
+        }
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_json("060-grok-stream-error", &serde_json::json!({"stage":stage,"kind":kind,"bytes":self.bytes,"chunks":self.chunks}));
+        }
+        self.finish_capture(false);
         stream_error()
+    }
+
+    fn capture_downstream(&mut self, bytes: &[u8]) {
+        let Some(capture) = self.stream_capture.as_mut() else {
+            return;
+        };
+        let mut decoder = SseDecoder::default();
+        if let Ok(events) = decoder.push(bytes) {
+            for event in events {
+                if let Ok(data) = serde_json::from_str(&event.data) {
+                    capture.downstream_event(event.event.as_deref().unwrap_or("message"), data);
+                }
+            }
+        }
+    }
+
+    fn finish_capture(&mut self, completed: bool) {
+        if let (Some(capture), Some(traffic)) = (self.stream_capture.take(), self.traffic.as_ref())
+        {
+            capture.finish(
+                traffic,
+                serde_json::json!({
+                    "kind": if completed { "stream_completion" } else { "stream_error" },
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+    }
+}
+
+impl<S> Drop for GrokStreamState<S> {
+    fn drop(&mut self) {
+        if self.terminal || self.stream_capture.is_none() {
+            return;
+        }
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_json(
+                "060-grok-stream-abandoned",
+                &serde_json::json!({
+                    "stage": "downstream",
+                    "kind": "client_disconnect",
+                    "reason": "downstream_body_dropped",
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+        if let (Some(capture), Some(traffic)) = (self.stream_capture.take(), self.traffic.as_ref())
+        {
+            capture.finish(
+                traffic,
+                serde_json::json!({
+                    "kind": "stream_abandoned",
+                    "reason": "downstream_body_dropped",
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+    }
+}
+
+fn write_error(traffic: Option<&crate::traffic::TrafficCapture>, stage: &str, kind: &str) {
+    if let Some(traffic) = traffic {
+        traffic.write_json(
+            "060-grok-stream-error",
+            &serde_json::json!({"stage":stage,"kind":kind}),
+        );
     }
 }
 
@@ -389,7 +502,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::monitor::{EndpointKind, MonitorHandle};
+    use crate::traffic::test_capture;
     use http_body_util::BodyExt;
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -425,6 +540,7 @@ mod tests {
             "grok-4.5".into(),
             Some(monitor.clone()),
             "req_1".into(),
+            None,
         );
         let _ = response.into_body().collect().await.unwrap();
 
@@ -456,6 +572,7 @@ mod tests {
             "grok-4.5".into(),
             None,
             "req_1".into(),
+            None,
         );
         let mut body = response.into_body();
 
@@ -499,5 +616,210 @@ mod tests {
                 .expect("downstream EOF waited for upstream EOF")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_downstream_body_finalizes_partial_capture() {
+        let temp = TempDir::new().unwrap();
+        let traffic = Arc::new(test_capture(temp.path().join("traffic")));
+        let (tx, rx) = mpsc::channel(2);
+        let response = stream_body(
+            ChannelStream(rx),
+            "msg_1".into(),
+            "grok-4.5".into(),
+            None,
+            "req_1".into(),
+            Some(traffic),
+        );
+        let mut body = response.into_body();
+
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        )))
+        .await
+        .unwrap();
+        let _ = body.frame().await.unwrap().unwrap();
+        drop(body);
+
+        let entries: Vec<_> = std::fs::read_dir(temp.path().join("traffic"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let abandoned = entries
+            .iter()
+            .find(|path| path.to_string_lossy().contains("060-grok-stream-abandoned"))
+            .unwrap();
+        let summary = entries
+            .iter()
+            .find(|path| path.to_string_lossy().contains("061-grok-stream-summary"))
+            .unwrap();
+        let abandoned: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(abandoned).unwrap()).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(summary).unwrap()).unwrap();
+        assert_eq!(abandoned["kind"], "client_disconnect");
+        assert_eq!(summary["completion"]["kind"], "stream_abandoned");
+        assert_eq!(summary["completion"]["reason"], "downstream_body_dropped");
+        assert_eq!(summary["completion"]["chunks"], 1);
+        assert!(summary["upstream_events"]["captured"].as_u64().unwrap() > 0);
+        assert!(summary["downstream_events"]["captured"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_capture_writes_redacted_complete_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let traffic = Arc::new(test_capture(temp.path().join("traffic")));
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+        ))]);
+        let response = stream_body(
+            upstream,
+            "msg_1".into(),
+            "grok-4.5".into(),
+            None,
+            "req_1".into(),
+            Some(traffic),
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("tool_use"));
+        let names: Vec<_> = std::fs::read_dir(temp.path().join("traffic"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains("032-upstream-response-body.sse"))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains("061-grok-stream-summary"))
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_capture_records_fragmented_search_and_tool_events() {
+        let temp = TempDir::new().unwrap();
+        let traffic = Arc::new(test_capture(temp.path().join("traffic")));
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"fir",
+            )),
+            Ok(Bytes::from_static(
+                b"st\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_1".into(),
+            "grok-4.5".into(),
+            None,
+            "req_1".into(),
+            Some(traffic),
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("tool_use"));
+        let captured = capture_contents(temp.path().join("traffic"));
+        assert!(captured.contains("x_search"));
+        assert!(captured.contains("function_call"));
+        assert!(captured.contains("stream_completion"));
+    }
+
+    #[tokio::test]
+    async fn streaming_capture_records_malformed_and_failed_streams() {
+        for (payload, stage) in [
+            (b"data: {bad json}\n\n".as_slice(), "json"),
+            (
+                b"data: {\"type\":\"response.failed\",\"response\":{}}\n\n".as_slice(),
+                "reducer",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let traffic = Arc::new(test_capture(temp.path().join("traffic")));
+            let response = stream_body(
+                futures_util::stream::iter(vec![Ok(Bytes::copy_from_slice(payload))]),
+                "msg_1".into(),
+                "grok-4.5".into(),
+                None,
+                "req_1".into(),
+                Some(traffic),
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("event: error"));
+            let captured = capture_contents(temp.path().join("traffic"));
+            assert!(captured.contains(&format!("\"stage\": \"{stage}\"")));
+            assert!(captured.contains("stream_error"));
+        }
+    }
+
+    #[test]
+    fn non_streaming_malformed_capture_keeps_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        let traffic = test_capture(temp.path().join("traffic"));
+        assert!(
+            accumulate_response_with_traffic(
+                b"data: {bad json}\n\n",
+                "msg_1",
+                "grok-4.5",
+                Some(&traffic),
+            )
+            .is_err()
+        );
+        let captured = capture_contents(temp.path().join("traffic"));
+        assert!(captured.contains("malformed_event"));
+        assert!(captured.contains("\"outcome\": \"error\""));
+    }
+
+    #[test]
+    fn transport_failure_capture_contains_no_credentials() {
+        let temp = TempDir::new().unwrap();
+        let traffic = test_capture(temp.path().join("traffic"));
+        client::capture_failure(Some(&traffic), "transport", "transport", 1);
+        let captured = capture_contents(temp.path().join("traffic"));
+        assert!(captured.contains("transport"));
+        for secret in [
+            "Bearer token",
+            "refresh-secret",
+            "oauth-code",
+            "person@example.com",
+        ] {
+            assert!(!captured.contains(secret));
+        }
+    }
+
+    fn capture_contents(root: std::path::PathBuf) -> String {
+        let mut captured = String::new();
+        let mut pending = vec![root];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    captured.push_str(&std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+        captured
+    }
+
+    #[test]
+    fn non_streaming_capture_writes_response_and_redacts_secrets() {
+        let temp = TempDir::new().unwrap();
+        let traffic = test_capture(temp.path().join("traffic"));
+        let upstream = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\",\"access_token\":\"secret\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let value = accumulate_response_with_traffic(upstream, "msg_1", "grok-4.5", Some(&traffic))
+            .unwrap();
+        traffic.write_json("051-downstream-response", &value);
+        let mut captured = String::new();
+        for entry in std::fs::read_dir(temp.path().join("traffic")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                captured.push_str(&std::fs::read_to_string(path).unwrap());
+            }
+        }
+        assert!(captured.contains("[redacted len=6]"));
+        assert!(!captured.contains("secret"));
     }
 }
