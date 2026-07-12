@@ -6,7 +6,7 @@ Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, or **Cursor**.
 
 [Quick start](#quick-start) · [Providers](#providers) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
-[Limitations](#limitations)
+[Switching models](#switching-models-and-backends) · [Limitations](#limitations)
 
 ## Why?
 
@@ -180,7 +180,8 @@ accumulates a non-streaming Anthropic response for Claude Code. Disabling Claude
 Code's streaming-to-non-streaming fallback avoids retrying a partially completed
 stream in a way that can duplicate tool calls.
 
-Or set it persistently in `~/.claude/settings.json`:
+If the proxy is your everyday default and you rarely need native Anthropic in
+the same Claude config, put the env in `~/.claude/settings.json`:
 
 ```json
 {
@@ -195,6 +196,10 @@ Or set it persistently in `~/.claude/settings.json`:
   }
 }
 ```
+
+If you switch backends often, leave those proxy vars out of settings and use
+one of the process-start patterns in
+[Switching models and backends](#switching-models-and-backends).
 
 ### 5. Context window size
 
@@ -218,60 +223,6 @@ If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
 `/compact` still works, but you risk hitting real upstream limits before
 Claude Code can compact for you.
-
-## Toggling between proxy and direct Anthropic
-
-If you still have an Anthropic subscription you want to fall back to, you can
-put a small wrapper in front of `claude` that only injects the proxy env vars
-when a flag file exists, plus a toggle script to flip the flag. Leave
-`~/.claude/settings.json` free of proxy env vars so direct-to-Anthropic remains
-the default.
-
-`~/.local/bin/claude` (ahead of the real `claude` on `PATH`):
-
-```bash
-#!/bin/bash
-# Wrapper that optionally routes to claude-code-proxy.
-# Active when ~/.claude/claude-code-proxy-enabled exists.
-
-if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
-    export ANTHROPIC_BASE_URL="http://localhost:18765"
-    export ANTHROPIC_AUTH_TOKEN="unused"
-    export ANTHROPIC_MODEL="gpt-5.6-sol[1m]"
-    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.6-luna[1m]"
-    export CLAUDE_CODE_AUTO_COMPACT_WINDOW="372000"
-    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
-    export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK="1"
-fi
-
-exec "$HOME/.local/bin/claude" "$@"
-```
-
-Adjust the exec path if the real `claude` binary lives elsewhere on your
-system (e.g. `$(bun pm bin -g)/claude`, `$HOME/.claude/local/claude`).
-
-`claude-proxy-toggle` (anywhere on your `PATH`):
-
-```bash
-#!/bin/bash
-# Toggle claude-code-proxy routing for the claude wrapper.
-set -euo pipefail
-
-flag="$HOME/.claude/claude-code-proxy-enabled"
-
-if [ -f "$flag" ]; then
-    rm "$flag"
-    echo "proxy: off"
-else
-    mkdir -p "$(dirname "$flag")"
-    touch "$flag"
-    echo "proxy: on"
-fi
-```
-
-Run `claude-proxy-toggle` to flip between routing through the proxy (Codex /
-Kimi) and talking to Anthropic directly. New or continued `claude` sessions pick up
-the change immediately; existing sessions keep whatever they started with.
 
 ## Providers
 
@@ -796,6 +747,210 @@ CCP_TRAFFIC_LOG=1`.
   `CCP_CONFIG_DIR` is set, Cursor tokens are written to `cursor/auth.json` under
   that directory, including on macOS.
   `CCP_CURSOR_AUTH_TOKEN` overrides local proxy-owned storage.
+
+## Switching models and backends
+
+Claude Code binds the API base URL and auth when the process starts. Switching
+**backends** (proxy vs direct Anthropic, or a different Anthropic-compatible
+host) is a launch-time concern. Switching **models while already pointed at
+this proxy** can often stay in-session, because the proxy routes each request
+by model id.
+
+This project does not ship a universal profile manager. Use process env, a
+tiny shell wrapper, or Claude Code's own `/model` when the base URL already
+points here.
+
+### Choose a pattern
+
+| Goal | Pattern |
+| --- | --- |
+| Always use the proxy | Put proxy env in `~/.claude/settings.json` (see [Quick start](#4-point-claude-code-at-it)) |
+| Try one model once | Prefix `claude` with env vars, or use a shell alias |
+| Flip proxy on/off without editing JSON | Flag-file wrapper + toggle script |
+| Stay on the proxy, change model | `/model`, `--model`, or change `ANTHROPIC_MODEL` for new sessions |
+
+### One-shot launch and aliases
+
+Any of the `ANTHROPIC_BASE_URL=... claude` examples in
+[Quick start](#4-point-claude-code-at-it) are one-shots: they do not rewrite
+settings. Shell aliases are enough for daily muscle memory:
+
+```sh
+alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+alias cgrok='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+```
+
+### Sticky proxy on/off (recommended multi-backend setup)
+
+If you still use an Anthropic subscription sometimes, leave proxy env out of
+`~/.claude/settings.json` and inject it only when a flag file exists. Put a
+wrapper ahead of the real `claude` on `PATH`, and point `exec` at the real
+binary (not back at the wrapper).
+
+Example wrapper:
+
+```bash
+#!/usr/bin/env bash
+# Optionally route Claude Code through claude-code-proxy.
+# Active when ~/.claude/claude-code-proxy-enabled exists.
+set -euo pipefail
+
+# Path to the real Claude Code binary. Do not point this at this script.
+real_claude="${REAL_CLAUDE:-$HOME/.local/bin/claude}"
+
+if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
+  model_file="$HOME/.claude/claude-code-proxy-model"
+  main_model="gpt-5.6-sol[1m]"
+  small_model="gpt-5.6-luna[1m]"
+
+  if [ -f "$model_file" ]; then
+    main_model="$(tr -d '[:space:]' <"$model_file")"
+    case "$main_model" in
+      gpt-5.6-sol|gpt-5.6-sol\[1m\])
+        main_model="gpt-5.6-sol[1m]"
+        small_model="gpt-5.6-luna[1m]"
+        ;;
+      gpt-5.5|gpt-5.5\[1m\])
+        main_model="gpt-5.5[1m]"
+        small_model="gpt-5.4-mini[1m]"
+        ;;
+      kimi|kimi-for-coding|kimi-for-coding\[1m\])
+        main_model="kimi-for-coding[1m]"
+        small_model="kimi-for-coding[1m]"
+        ;;
+      grok|grok-4.5)
+        main_model="grok-4.5"
+        small_model="grok-4.5"
+        ;;
+      composer|composer-2.5-fast)
+        main_model="composer-2.5-fast"
+        small_model="composer-2.5-fast"
+        ;;
+      *)
+        small_model="$main_model"
+        ;;
+    esac
+  fi
+
+  export ANTHROPIC_BASE_URL="http://localhost:18765"
+  export ANTHROPIC_AUTH_TOKEN="unused"
+  export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$main_model}"
+  export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-$small_model}"
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+
+  case "$main_model" in
+    gpt-5.6-sol\[1m\]|gpt-5.6-luna\[1m\]|gpt-5.6-terra\[1m\])
+      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-372000}"
+      ;;
+  esac
+fi
+
+exec "$real_claude" "$@"
+```
+
+If the wrapper itself is installed as `~/.local/bin/claude`, set
+`REAL_CLAUDE` to the underlying binary under
+`~/.local/share/claude/versions/` (or another path that is not this script).
+
+Toggle script (`claude-proxy-toggle` on your `PATH`):
+
+```bash
+#!/usr/bin/env bash
+# Toggle claude-code-proxy routing for the Claude wrapper.
+set -euo pipefail
+
+flag="$HOME/.claude/claude-code-proxy-enabled"
+
+if [ -f "$flag" ]; then
+  rm "$flag"
+  echo "proxy: off"
+else
+  mkdir -p "$(dirname "$flag")"
+  touch "$flag"
+  echo "proxy: on"
+fi
+```
+
+Optional sticky default proxy model:
+
+```bash
+#!/usr/bin/env bash
+# Usage: claude-proxy-model [model-id]
+# With no args, print the current sticky proxy model.
+set -euo pipefail
+
+model_file="$HOME/.claude/claude-code-proxy-model"
+default_model="gpt-5.6-sol[1m]"
+
+if [ "${1:-}" = "" ]; then
+  if [ -f "$model_file" ]; then
+    tr -d '[:space:]' <"$model_file"
+    printf '\n'
+  else
+    printf '%s\n' "$default_model"
+  fi
+  exit 0
+fi
+
+mkdir -p "$(dirname "$model_file")"
+printf '%s\n' "$1" >"$model_file"
+echo "proxy model: $1"
+```
+
+Examples:
+
+```sh
+claude-proxy-toggle                 # proxy on/off for new sessions
+claude-proxy-model grok-4.5         # sticky default while proxy is on
+claude-proxy-model gpt-5.6-sol[1m]
+ANTHROPIC_MODEL=kimi-for-coding[1m] claude   # one-shot override
+```
+
+New Claude sessions pick up flag/model changes. A session that is already
+running keeps the env it started with.
+
+### Switch models while staying on the proxy
+
+While `ANTHROPIC_BASE_URL` already points at this proxy, Claude Code can change
+the request model without a new backend:
+
+- start a session with a different `ANTHROPIC_MODEL`
+- pass `claude --model <id>`
+- use Claude Code's `/model` command in-session
+
+The proxy chooses the upstream provider from the model id on each request, so
+`gpt-5.6-sol`, `kimi-for-coding`, `grok-4.5`, and `cursor:...` can share one
+`serve` process.
+
+To populate Claude Code's model picker from the proxy's `/v1/models` catalog,
+enable gateway discovery when launching:
+
+```sh
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+ANTHROPIC_BASE_URL=http://localhost:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  claude
+```
+
+`/model` only changes the model id. It does not move a session from the proxy
+to direct Anthropic or the other way around. For that, start a new process with
+different env (or flip the flag-file wrapper and open a new session).
+
+### What this project does not manage
+
+- multi-provider profile GUIs or account managers
+- rewriting `~/.claude/settings.json` for each switch
+- mid-session base URL / auth changes
+- IDE or Desktop launch wiring outside process env
+
+If you need a cross-app profile switcher, use a dedicated tool for that. For
+Claude Code + this proxy, process-start env plus `/model` on the proxy is the
+supported shape.
 
 ## Limitations
 
