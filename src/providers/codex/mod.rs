@@ -410,12 +410,23 @@ async fn live_stream_response_once(
             Ok(result) => result,
             Err(message) => {
                 if retryable_live_start_payload(&payload, &message) {
+                    let lower_message = message.to_ascii_lowercase();
                     let status = websocket::event_error_status(&payload).unwrap_or_else(|| {
+                        let error = payload.get("error").or_else(|| {
+                            payload.get("response").and_then(|value| value.get("error"))
+                        });
+                        let overloaded = error.is_some_and(|error| {
+                            error.get("code").and_then(|value| value.as_str())
+                                == Some("overloaded_error")
+                                || error.get("type").and_then(|value| value.as_str())
+                                    == Some("overloaded_error")
+                        });
                         if payload.get("type").and_then(|value| value.as_str())
                             == Some("codex.rate_limits")
+                            || lower_message.contains("rate limit")
                         {
                             429
-                        } else if message.to_ascii_lowercase().contains("overloaded") {
+                        } else if overloaded || lower_message.contains("overloaded") {
                             529
                         } else {
                             503
@@ -424,8 +435,8 @@ async fn live_stream_response_once(
                     return LiveStreamStart::Retry {
                         error: client::CodexError {
                             status,
-                            message,
-                            detail: None,
+                            message: message.clone(),
+                            detail: Some(message),
                             retry_after: retry_after_from_live_payload(&payload),
                             origin: client::CodexErrorOrigin::WebSocket,
                         },
