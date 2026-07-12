@@ -201,11 +201,14 @@ pub struct CodexResponse {
 // Client
 // ---------------------------------------------------------------------------
 
+const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
+
 pub struct CodexHttpClient {
     client: reqwest::Client,
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     base_url: String,
     header_timeout_ms: u64,
+    body_idle_timeout_ms: u64,
     #[allow(dead_code)]
     header_timeout_retries: u32,
 }
@@ -222,12 +225,12 @@ impl CodexHttpClient {
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_millis(timeout_ms + 10_000))
                 .build()
                 .expect("failed to create HTTP client"),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
+            body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             header_timeout_retries: 1,
         }
     }
@@ -242,6 +245,7 @@ impl CodexHttpClient {
             auth_manager,
             base_url,
             header_timeout_ms: 60_000,
+            body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             header_timeout_retries: 1,
         }
     }
@@ -251,6 +255,7 @@ impl CodexHttpClient {
         client: reqwest::Client,
         base_url: String,
         header_timeout_ms: u64,
+        body_idle_timeout_ms: u64,
         header_timeout_retries: u32,
     ) -> Self {
         Self {
@@ -258,6 +263,7 @@ impl CodexHttpClient {
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             header_timeout_ms,
+            body_idle_timeout_ms,
             header_timeout_retries,
         }
     }
@@ -624,7 +630,7 @@ impl CodexHttpClient {
         let send_fut = req_builder.body(body_json.to_string()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
-        let resp = tokio::time::timeout(header_timeout_dur, send_fut)
+        let mut resp = tokio::time::timeout(header_timeout_dur, send_fut)
             .await
             .map_err(|_| CodexError {
                 status: 0,
@@ -663,7 +669,36 @@ impl CodexHttpClient {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
-        let body_bytes = resp.bytes().await.unwrap_or_default().to_vec();
+        let mut body_bytes = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(
+                Duration::from_millis(self.body_idle_timeout_ms),
+                resp.chunk(),
+            )
+            .await
+            .map_err(|_| CodexError {
+                status: 0,
+                message: format!(
+                    "Timed out waiting {}ms for the next Codex response body chunk",
+                    self.body_idle_timeout_ms
+                ),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?
+            .map_err(|e| CodexError {
+                status: 0,
+                message: format!("Transport error reading Codex response body: {e}"),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+
+            let Some(chunk) = chunk else {
+                break;
+            };
+            body_bytes.extend_from_slice(&chunk);
+        }
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_upstream_response_capture(
@@ -891,6 +926,123 @@ fn should_reset_websocket_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn http_test_auth() -> StoredAuth {
+        StoredAuth {
+            access: "test".into(),
+            refresh: String::new(),
+            account_id: Some("acct".into()),
+            expires: u64::MAX,
+        }
+    }
+
+    fn http_test_context() -> RequestContext {
+        RequestContext {
+            req_id: "http-body-test".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    fn http_test_client(base_url: String, body_idle_timeout_ms: u64) -> CodexHttpClient {
+        CodexHttpClient::new_for_test(
+            reqwest::Client::new(),
+            base_url,
+            100,
+            body_idle_timeout_ms,
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn active_http_body_can_exceed_header_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in [b"a".as_slice(), b"b", b"c"] {
+                stream.write_all(b"1\r\n").await.unwrap();
+                stream.write_all(chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(45)).await;
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        let response = http_test_client(format!("http://{addr}/responses"), 80)
+            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .await
+            .expect("active body should not hit a whole-request timeout");
+        server.await.unwrap();
+
+        assert_eq!(response.body, b"abc");
+    }
+
+    #[tokio::test]
+    async fn stalled_http_body_hits_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let result = http_test_client(format!("http://{addr}/responses"), 30)
+            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .await;
+        server.await.unwrap();
+        let error = result.err().expect("stalled body should time out");
+
+        assert!(error.message.contains("next Codex response body chunk"));
+        assert_eq!(error.detail.as_deref(), Some("http_response_body"));
+    }
+
+    #[tokio::test]
+    async fn reset_http_body_returns_transport_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\npartial")
+                .await
+                .unwrap();
+        });
+
+        let result = http_test_client(format!("http://{addr}/responses"), 100)
+            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .await;
+        server.await.unwrap();
+        let error = result.err().expect("truncated body should fail");
+
+        assert!(
+            error
+                .message
+                .contains("Transport error reading Codex response body")
+        );
+        assert_eq!(error.detail.as_deref(), Some("http_response_body"));
+    }
 
     #[test]
     fn codex_error_display() {
