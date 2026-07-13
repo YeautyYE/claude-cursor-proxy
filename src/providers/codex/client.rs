@@ -84,6 +84,14 @@ impl std::fmt::Display for CodexTransportError {
 // Header builder
 // ---------------------------------------------------------------------------
 
+fn default_user_agent(use_responses_lite: bool) -> String {
+    if use_responses_lite {
+        RESPONSES_LITE_ORIGINATOR.to_string()
+    } else {
+        format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"))
+    }
+}
+
 pub fn build_codex_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
@@ -137,8 +145,7 @@ pub fn build_codex_headers(
             header_value("x-codex-window-id", &window_id)?,
         );
     }
-    let user_agent =
-        config::codex_user_agent(&format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION")));
+    let user_agent = config::codex_user_agent(&default_user_agent(use_responses_lite));
     if !user_agent.is_empty() {
         headers.insert(
             http::header::USER_AGENT,
@@ -1713,6 +1720,7 @@ mod tests {
             "true"
         );
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(default_user_agent(true), "codex_cli_rs");
     }
 
     #[test]
