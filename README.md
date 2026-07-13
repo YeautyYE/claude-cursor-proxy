@@ -153,7 +153,7 @@ ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -202,7 +202,7 @@ the same Claude config, put the env in `~/.claude/settings.json`:
     "ANTHROPIC_AUTH_TOKEN": "unused",
     "ANTHROPIC_MODEL": "gpt-5.6-sol[1m]",
     "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-luna[1m]",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 372000,
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 272000,
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
   }
@@ -226,10 +226,9 @@ local compaction threshold, such as `gpt-5.6-sol[1m]`, `gpt-5.6-luna[1m]`, or
 request upstream. The suffix affects Claude Code's local compaction decision and
 does not increase the upstream model's context window.
 
-Official Codex metadata reports the GPT-5.6 Codex models with a 372K-token
-window. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000` with `gpt-5.6-sol[1m]` so
-Claude Code does not compact too early, while still compacting before the real
-upstream limit.
+GPT-5.6 Codex accepts up to 272K tokens through ChatGPT subscriptions. Set
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.6-sol[1m]` so Claude Code
+compacts before the upstream limit.
 
 If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
@@ -792,7 +791,7 @@ Any of the `ANTHROPIC_BASE_URL=... claude` examples in
 settings. Shell aliases are enough for daily muscle memory:
 
 ```sh
-alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 alias cgrok='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 ```
 
@@ -857,7 +856,7 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
 
   case "$main_model" in
     gpt-5.6-sol\[1m\]|gpt-5.6-luna\[1m\]|gpt-5.6-terra\[1m\])
-      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-372000}"
+      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
       ;;
   esac
 fi
