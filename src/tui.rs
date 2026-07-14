@@ -101,12 +101,12 @@ const ACTIVE_TABLE_HEADERS: [(&str, Alignment); 9] = [
     ("Started", Alignment::Left),
     ("Provider", Alignment::Left),
     ("Model", Alignment::Left),
-    ("", Alignment::Left),
     ("Effort", Alignment::Left),
     ("Endpoint", Alignment::Left),
     ("Status", Alignment::Left),
     ("Rate", Alignment::Right),
     ("Elapsed", Alignment::Right),
+    ("", Alignment::Left),
 ];
 
 const RECENT_TABLE_HEADERS: [(&str, Alignment); 10] = [
@@ -732,7 +732,7 @@ fn token_sparkline_line(
     ])
 }
 
-fn session_value_width(header: &str, values: impl Iterator<Item = String>, maximum: u16) -> u16 {
+fn table_value_width(header: &str, values: impl Iterator<Item = String>, maximum: u16) -> u16 {
     values
         .map(|value| value.chars().count())
         .chain(std::iter::once(header.chars().count()))
@@ -746,35 +746,35 @@ fn session_table_widths(
     show_sparkline: bool,
     show_full_provider: bool,
 ) -> Vec<Constraint> {
-    let project_width = session_value_width(
+    let project_width = table_value_width(
         "Project",
         sessions
             .iter()
             .map(|session| session.project.as_deref().unwrap_or("-").to_string()),
         18,
     );
-    let active_width = session_value_width(
+    let active_width = table_value_width(
         "A",
         sessions
             .iter()
             .map(|session| session.active_count.to_string()),
         4,
     );
-    let request_width = session_value_width(
+    let request_width = table_value_width(
         "R",
         sessions
             .iter()
             .map(|session| session.request_count.to_string()),
         4,
     );
-    let failure_width = session_value_width(
+    let failure_width = table_value_width(
         "F",
         sessions
             .iter()
             .map(|session| session.failure_count.to_string()),
         4,
     );
-    let provider_width = session_value_width(
+    let provider_width = table_value_width(
         if show_full_provider {
             "Provider"
         } else {
@@ -785,33 +785,33 @@ fn session_table_widths(
             .map(|session| session.provider.as_deref().unwrap_or("-").to_string()),
         10,
     );
-    let effort_width = session_value_width(
+    let effort_width = table_value_width(
         "Effort",
         sessions
             .iter()
             .map(|session| session.effort.as_deref().unwrap_or("-").to_string()),
         7,
     );
-    let input_width = session_value_width(
+    let input_width = table_value_width(
         "In",
         sessions
             .iter()
             .map(|session| compact_tokens(session.input_tokens)),
         9,
     );
-    let output_width = session_value_width(
+    let output_width = table_value_width(
         "Out",
         sessions
             .iter()
             .map(|session| compact_tokens(session.output_tokens)),
         9,
     );
-    let rate_width = session_value_width(
+    let rate_width = table_value_width(
         "Rate",
         sessions.iter().map(|session| session.rate().label()),
         12,
     );
-    let status_width = session_value_width(
+    let status_width = table_value_width(
         "Status",
         sessions.iter().map(|session| session.last_status.clone()),
         10,
@@ -916,6 +916,68 @@ fn render_sessions(
     frame.render_widget(table, area);
 }
 
+fn active_table_widths(active: &[ActiveRequest]) -> Vec<Constraint> {
+    let provider_width = table_value_width(
+        "Provider",
+        active
+            .iter()
+            .map(|request| request.provider.as_deref().unwrap_or("-").to_string()),
+        10,
+    );
+    let model_width = table_value_width(
+        "Model",
+        active
+            .iter()
+            .map(|request| request.model.as_deref().unwrap_or("-").to_string()),
+        ACTIVE_MODEL_WIDTH,
+    );
+    let effort_width = table_value_width(
+        "Effort",
+        active
+            .iter()
+            .map(|request| request.effort.as_deref().unwrap_or("-").to_string()),
+        7,
+    );
+    let endpoint_width = table_value_width(
+        "Endpoint",
+        active
+            .iter()
+            .map(|request| request.endpoint.label().to_string()),
+        12,
+    );
+    let status_width = table_value_width(
+        "Status",
+        active
+            .iter()
+            .map(|request| format!("{} {}", spinner(0), request.status.label())),
+        14,
+    );
+    let rate_width = table_value_width(
+        "Rate",
+        active.iter().map(|request| request.rate().label()),
+        12,
+    );
+    let elapsed_width = table_value_width(
+        "Elapsed",
+        active
+            .iter()
+            .map(|request| format_duration(request.elapsed())),
+        9,
+    );
+
+    vec![
+        Constraint::Length(8),
+        Constraint::Length(provider_width),
+        Constraint::Length(model_width),
+        Constraint::Length(effort_width),
+        Constraint::Length(endpoint_width),
+        Constraint::Length(status_width),
+        Constraint::Length(rate_width),
+        Constraint::Length(elapsed_width),
+        Constraint::Fill(1),
+    ]
+}
+
 fn render_active(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -927,17 +989,7 @@ fn render_active(
         return;
     }
 
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(ACTIVE_MODEL_WIDTH),
-        Constraint::Fill(1),
-        Constraint::Length(6),
-        Constraint::Length(8),
-        Constraint::Length(14),
-        Constraint::Length(10),
-        Constraint::Length(9),
-    ];
+    let widths = active_table_widths(active);
     let model_width = table_column_width(area, &widths, 2);
     let rows = active.iter().map(|request| {
         let status = if matches!(
@@ -952,12 +1004,12 @@ fn render_active(
             muted_cell(format_system_time(request.started_at)),
             provider_cell(request.provider.as_deref()),
             model_cell(request.model.as_deref(), model_width),
-            muted_cell(""),
             text_cell(request.effort.as_deref().unwrap_or("-")),
             muted_cell(request.endpoint.label()),
             Cell::from(Span::styled(status, status_style(request.status.label()))),
             rate_cell(request.rate().label()),
             number_cell(format_duration(request.elapsed())),
+            muted_cell(""),
         ])
         .style(Style::default().bg(PANEL_BG))
     });
@@ -1541,8 +1593,8 @@ mod tests {
         assert_eq!(
             table_header_labels(&ACTIVE_TABLE_HEADERS),
             [
-                "Started", "Provider", "Model", "", "Effort", "Endpoint", "Status", "Rate",
-                "Elapsed",
+                "Started", "Provider", "Model", "Effort", "Endpoint", "Status", "Rate", "Elapsed",
+                "",
             ]
         );
         assert_eq!(
@@ -1563,7 +1615,7 @@ mod tests {
             table_header_labels(&EVENTS_TABLE_HEADERS),
             ["Time", "Status", "Provider", "Model", "Message"]
         );
-        assert_eq!(ACTIVE_TABLE_HEADERS[7], ("Rate", Alignment::Right));
+        assert_eq!(ACTIVE_TABLE_HEADERS[6], ("Rate", Alignment::Right));
         assert_eq!(RECENT_TABLE_HEADERS[6], ("Rate", Alignment::Right));
     }
 
@@ -1638,25 +1690,20 @@ mod tests {
     }
 
     #[test]
-    fn active_model_column_is_bounded_while_spacer_expands() {
-        let widths = [
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(ACTIVE_MODEL_WIDTH),
-            Constraint::Fill(1),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(9),
-        ];
-        let narrow_model = table_column_width(Rect::new(0, 0, 110, 10), &widths, 2);
-        let wide_model = table_column_width(Rect::new(0, 0, 212, 10), &widths, 2);
-        let narrow_spacer = table_column_width(Rect::new(0, 0, 110, 10), &widths, 3);
-        let wide_spacer = table_column_width(Rect::new(0, 0, 212, 10), &widths, 3);
+    fn active_columns_fit_content_and_leave_extra_space_at_the_end() {
+        let state = mock_state();
+        let widths = active_table_widths(&state.active);
+        let narrow_area = Rect::new(0, 0, 110, 10);
+        let wide_area = Rect::new(0, 0, 212, 10);
+        let narrow_model = table_column_width(narrow_area, &widths, 2);
+        let wide_model = table_column_width(wide_area, &widths, 2);
+        let narrow_spacer = table_column_width(narrow_area, &widths, 8);
+        let wide_spacer = table_column_width(wide_area, &widths, 8);
 
         assert!(narrow_model <= usize::from(ACTIVE_MODEL_WIDTH));
-        assert_eq!(wide_model, usize::from(ACTIVE_MODEL_WIDTH));
+        assert!(wide_model <= usize::from(ACTIVE_MODEL_WIDTH));
+        assert_eq!(table_column_width(wide_area, &widths, 3), 6);
+        assert_eq!(table_column_width(wide_area, &widths, 4), 12);
         assert!(wide_spacer > narrow_spacer);
     }
 
