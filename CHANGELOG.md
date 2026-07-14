@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.19 (2026-07-15)
+
+- The monitor shows project and session context at more terminal widths while
+  preserving key request details in narrower layouts.
+
 ## v0.1.18 (2026-07-15)
 
 - Codex preserves encrypted reasoning across turns, improving continuity when
