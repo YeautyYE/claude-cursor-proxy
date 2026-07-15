@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use tokio::sync::oneshot;
 
@@ -881,7 +881,8 @@ fn render_sessions(
     let table = Table::new(rows, widths.clone())
         .header(column_header(&columns))
         .block(panel("Sessions", focused));
-    frame.render_widget(table, area);
+    let mut table_state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1163,7 +1164,8 @@ fn render_recent(
     let table = Table::new(rows, widths.clone())
         .header(column_header(&columns))
         .block(panel("Recent requests", focused));
-    frame.render_widget(table, area);
+    let mut table_state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2174,6 +2176,38 @@ mod tests {
             render_events(frame, frame.area(), &completed_state.recent)
         });
         assert!(buffer_text(&events).contains("No events"));
+    }
+
+    #[test]
+    fn selected_rows_scroll_into_table_viewports() {
+        let state = mock_state();
+        let sessions = (0..12)
+            .map(|index| {
+                let mut session = state.sessions[0].clone();
+                session.session_id = Some(format!("row-{index:04}"));
+                session
+            })
+            .collect::<Vec<_>>();
+        let session_buffer = draw(120, 6, |frame| {
+            render_sessions(frame, frame.area(), &sessions, 11, true)
+        });
+        let session_text = buffer_text(&session_buffer);
+        assert!(session_text.contains("row-0011"), "{session_text}");
+        assert!(!session_text.contains("row-0000"), "{session_text}");
+
+        let recent = (0..12)
+            .map(|index| {
+                let mut request = state.recent[0].clone();
+                request.project = Some(format!("row-{index:04}"));
+                request
+            })
+            .collect::<Vec<_>>();
+        let recent_buffer = draw(120, 6, |frame| {
+            render_recent(frame, frame.area(), &recent, 11, true)
+        });
+        let recent_text = buffer_text(&recent_buffer);
+        assert!(recent_text.contains("row-0011"), "{recent_text}");
+        assert!(!recent_text.contains("row-0000"), "{recent_text}");
     }
 
     #[test]
