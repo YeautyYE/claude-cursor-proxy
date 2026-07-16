@@ -8,6 +8,10 @@ Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, or **Cursor**.
 [How it works](#how-it-works) · [Configuration](#configuration) ·
 [Switching models](#switching-models-and-backends) · [Limitations](#limitations)
 
+> [!TIP]
+> I'm building [aven](https://github.com/raine/aven), a local-first task manager
+> for power users and agents who live in the terminal.
+
 ## Why?
 
 I feel Claude Code is still the best harness around, despite occasional
