@@ -6,6 +6,8 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 ## Unreleased
 
 - Renamed crate/binary to `claude-cursor-bridge`; config/state dirs to `claude-cursor-bridge` (legacy `claude-code-proxy` auth paths still read as fallback). Env prefix remains `CCP_*`.
+- Cursor live path latency: cheaper `message_start` token seeding (no full prompt re-render), shorter tool-batch quiet window (25ms), non-blocking text-delta fan-out, tighter SSE coalesce cap.
+- Emulate Anthropic hosted `web_search_20250305` (DuckDuckGo HTML → `server_tool_use` / `web_search_tool_result` SSE) so Claude Code `WebSearch` and `/deep-research` nested searches work through the bridge.
 
 ## v0.1.21 (2026-07-15)
 
