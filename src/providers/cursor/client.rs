@@ -834,11 +834,14 @@ fn append_connect_frame(body: &mut Vec<u8>, frame: &ConnectFrame) {
     body.extend_from_slice(&encode_connect_frame(&frame.payload, frame.flags));
 }
 
-fn frame_payload_bytes(frame: &ConnectFrame) -> Option<Vec<u8>> {
+fn frame_payload_bytes(frame: &ConnectFrame) -> Option<bytes::Bytes> {
     if frame.flags & FLAG_GZIP != 0 {
-        super::connect::decode_gzip_frame(&frame.payload).ok()
+        super::connect::decode_gzip_frame(&frame.payload)
+            .ok()
+            .map(bytes::Bytes::from)
     } else {
-        Some(frame.payload.to_vec())
+        // Cheap refcount bump — classify_frame is on the buffered path too.
+        Some(frame.payload.clone())
     }
 }
 
@@ -865,7 +868,7 @@ fn classify_frame(frame: &ConnectFrame) -> FrameClass {
     let Some(payload) = frame_payload_bytes(frame) else {
         return class;
     };
-    let Ok(msg) = proto::AgentServerMessage::decode(&payload[..]) else {
+    let Ok(msg) = proto::AgentServerMessage::decode(payload.as_ref()) else {
         return class;
     };
     if let Some(update) = msg.interaction_update {

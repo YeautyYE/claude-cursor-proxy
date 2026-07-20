@@ -130,6 +130,8 @@ pub struct ActiveRequest {
     pub generation_started_at: Option<SystemTime>,
     generation_started_instant: Option<Instant>,
     generation_initial_output_tokens: u64,
+    /// True once Out > 0 has started the tok/s clock (excludes pre-token silence).
+    pub output_throughput_clock: bool,
     pub generation_finished_at: Option<SystemTime>,
     pub generation_duration: Option<Duration>,
     pub status: RequestStatus,
@@ -147,13 +149,17 @@ impl ActiveRequest {
     }
 
     pub fn rate(&self) -> Throughput {
-        throughput(
+        let tokens = if self.output_throughput_clock {
             self.output_tokens
-                .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens)),
-            self.streamed_bytes,
-            self.stream_chunks,
-            self.generation_duration.unwrap_or(Duration::ZERO),
-        )
+                .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens))
+        } else {
+            None
+        };
+        let elapsed = self
+            .generation_started_instant
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        throughput(tokens, self.streamed_bytes, self.stream_chunks, elapsed)
     }
 }
 
@@ -172,6 +178,8 @@ pub struct CompletedRequest {
     pub generation_started_at: Option<SystemTime>,
     generation_started_instant: Option<Instant>,
     generation_initial_output_tokens: u64,
+    /// See [`ActiveRequest`]'s `output_throughput_clock`.
+    pub output_throughput_clock: bool,
     pub generation_finished_at: Option<SystemTime>,
     pub generation_duration: Option<Duration>,
     pub status: RequestStatus,
@@ -187,9 +195,14 @@ pub struct CompletedRequest {
 
 impl CompletedRequest {
     pub fn rate(&self) -> Throughput {
-        throughput(
+        let tokens = if self.output_throughput_clock {
             self.output_tokens
-                .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens)),
+                .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens))
+        } else {
+            None
+        };
+        throughput(
+            tokens,
             self.streamed_bytes,
             self.stream_chunks,
             self.generation_duration.unwrap_or(Duration::ZERO),
@@ -302,6 +315,21 @@ impl MonitorHandle {
         }
     }
 
+    /// Best-effort publish for the SSE hot path.
+    ///
+    /// Never blocks behind a TUI `snapshot()` that holds the monitor lock while
+    /// cloning session tables. Dropped updates are fine — the next successful
+    /// progress / terminal usage event refreshes In/Out.
+    pub fn try_publish(&self, event: MonitorEvent) -> bool {
+        match self.store.try_lock() {
+            Ok(mut store) => {
+                store.apply(event);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn snapshot(&self) -> MonitorState {
         match self.store.lock() {
             Ok(store) => store.snapshot(),
@@ -399,6 +427,24 @@ impl MonitorHandle {
             input_tokens,
             output_tokens,
         });
+    }
+
+    /// Non-blocking variant of [`Self::stream_progress`] for per-delta SSE.
+    pub fn try_stream_progress(
+        &self,
+        request_id: impl Into<String>,
+        bytes: u64,
+        chunks: u64,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> bool {
+        self.try_publish(MonitorEvent::StreamProgress {
+            request_id: request_id.into(),
+            bytes,
+            chunks,
+            input_tokens,
+            output_tokens,
+        })
     }
 
     pub fn usage_updated(

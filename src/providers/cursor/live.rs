@@ -2122,18 +2122,21 @@ fn publish_live_usage(
         return;
     }
     let (input_tokens, output_tokens) = encoder.current_usage();
-    // Interval-gated (or forced). Safe to take the monitor lock briefly — this
-    // is not on the unthrottled per-delta path.
-    handle.stream_progress(
-        req_id,
-        *pending_bytes,
-        *pending_chunks,
-        Some(input_tokens).filter(|v| *v > 0),
-        Some(output_tokens).filter(|v| *v > 0),
-    );
-    *pending_bytes = 0;
-    *pending_chunks = 0;
-    *last_publish = Instant::now();
+    let input = Some(input_tokens).filter(|v| *v > 0);
+    let output = Some(output_tokens).filter(|v| *v > 0);
+    let published = if force {
+        // Begin / finalize must land so TUI In/Out is not stuck on a stale seed.
+        handle.stream_progress(req_id, *pending_bytes, *pending_chunks, input, output);
+        true
+    } else {
+        // try_lock: never stall token emission behind TUI snapshot cloning.
+        handle.try_stream_progress(req_id, *pending_bytes, *pending_chunks, input, output)
+    };
+    if published {
+        *pending_bytes = 0;
+        *pending_chunks = 0;
+        *last_publish = Instant::now();
+    }
 }
 
 pub fn live_sse_response(
