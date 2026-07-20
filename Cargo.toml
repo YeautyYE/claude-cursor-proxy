@@ -1,11 +1,17 @@
 [package]
-name = "claude-code-proxy"
+name = "claude-cursor-bridge"
 version = "0.1.21"
-description = "Anthropic-compatible proxy for Claude Code provider backends"
+description = "Stable Cursor reverse-proxy bridge so Claude Code can run Cursor models (Fable 5 and more)"
 edition = "2024"
-authors = ["Claude Code Proxy contributors"]
+rust-version = "1.85"
+authors = ["YeautyYE", "claude-cursor-bridge contributors"]
 license = "MIT"
 publish = false
+repository = "https://github.com/YeautyYE/claude-cursor-bridge"
+homepage = "https://github.com/YeautyYE/claude-cursor-bridge"
+readme = "README.md"
+keywords = ["claude-code", "cursor", "proxy", "bridge", "anthropic"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -26,7 +32,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "http2"] }
+# socks: honor ALL_PROXY=socks5h://...
+# macos-system-configuration: pick up macOS System Proxy (Clash/Surge) even
+# when launchd/shell did not export HTTP_PROXY — critical for Cursor region.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "http2", "socks", "macos-system-configuration"] }
 base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"

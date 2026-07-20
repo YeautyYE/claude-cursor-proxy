@@ -68,13 +68,14 @@ pub fn record_session_request(
         next.affinity_provider = Some(match provider_name {
             "codex" => AliasProvider::Codex,
             "kimi" => AliasProvider::Kimi,
-            _ => next.affinity_provider.unwrap_or(AliasProvider::Codex),
+            "cursor" => AliasProvider::Cursor,
+            _ => next.affinity_provider.unwrap_or(AliasProvider::Cursor),
         });
     }
 
-    if !store.map.contains_key(id) {
-        store.order.push_back(id.to_string());
-    }
+    // True LRU: move touched sessions to the back so eviction drops cold ones.
+    store.order.retain(|item| item != id);
+    store.order.push_back(id.to_string());
     store.map.insert(id.to_string(), next.clone());
 
     while store.order.len() > MAX_SESSIONS {
@@ -89,7 +90,7 @@ pub fn record_session_request(
 }
 
 fn is_alias_routable_provider(name: &str) -> bool {
-    matches!(name, "codex" | "kimi")
+    matches!(name, "codex" | "kimi" | "cursor")
 }
 
 #[cfg(test)]

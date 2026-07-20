@@ -1,12 +1,12 @@
-use claude_code_proxy::anthropic::{
+use claude_cursor_bridge::anthropic::{
     encode_sse_event, parse_sse_events, parse_sse_events_with_stats, schema::MessagesRequest,
 };
-use claude_code_proxy::auth::{AuthStorage, InMemoryAuthStore};
-use claude_code_proxy::config::{AliasProvider, load_config};
-use claude_code_proxy::logging::{create_logger, redact_value};
-use claude_code_proxy::paths::{self, DirResolverEnv};
-use claude_code_proxy::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
-use claude_code_proxy::traffic::{
+use claude_cursor_bridge::auth::{AuthStorage, InMemoryAuthStore};
+use claude_cursor_bridge::config::{AliasProvider, load_config};
+use claude_cursor_bridge::logging::{create_logger, redact_value};
+use claude_cursor_bridge::paths::{self, DirResolverEnv};
+use claude_cursor_bridge::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
+use claude_cursor_bridge::traffic::{
     MAX_SSE_CAPTURE_BYTES, TrafficCaptureOptions, create_traffic_capture, redact_traffic,
     sanitize_path_part, traffic_capture_enabled_for_env,
 };
@@ -71,7 +71,7 @@ fn path_resolvers_cover_platform_rules() {
     };
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/home/u/.config/claude-code-proxy"
+        "/home/u/.config/claude-cursor-bridge"
     );
 
     let deps = DirResolverEnv {
@@ -81,7 +81,7 @@ fn path_resolvers_cover_platform_rules() {
     };
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/x/claude-code-proxy"
+        "/x/claude-cursor-bridge"
     );
 
     let deps = DirResolverEnv {
@@ -91,7 +91,7 @@ fn path_resolvers_cover_platform_rules() {
     };
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
-        "C:/Users/u/AppData/Roaming/claude-code-proxy"
+        "C:/Users/u/AppData/Roaming/claude-cursor-bridge"
     );
 }
 
@@ -261,7 +261,10 @@ fn config_env_precedence_and_defaults() {
 
 #[test]
 fn alias_provider_has_expected_default() {
-    assert!(matches!(load_config().alias_provider, AliasProvider::Codex));
+    assert!(matches!(
+        load_config().alias_provider,
+        AliasProvider::Cursor
+    ));
 }
 
 #[test]

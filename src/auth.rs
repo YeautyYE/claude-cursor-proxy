@@ -262,6 +262,9 @@ where
                 .write(&self.service, &self.account, &raw)
                 .is_ok()
             {
+                // Keep file in sync: load() prefers the file over keychain, so an
+                // stale auth.json would otherwise shadow a successful keychain login.
+                let _ = self.file_store.save(value);
                 return Ok(());
             }
             return self.file_store.save(value);

@@ -1,12 +1,14 @@
 // End-to-end tests for local server health, provider routing, Kimi, Codex HTTP,
 // and Codex WebSocket through in-process mock upstreams with isolated auth.
 
+#![allow(clippy::await_holding_lock)]
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
-use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
-use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
-use claude_code_proxy::{registry::Registry, server::app};
+use claude_cursor_bridge::providers::codex::continuation::clear_all_continuations_for_tests;
+use claude_cursor_bridge::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
+use claude_cursor_bridge::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -117,7 +119,7 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
 fn traffic_files(state_dir: &Path) -> Vec<PathBuf> {
     collect_files(
         &state_dir
-            .join("claude-code-proxy")
+            .join("claude-cursor-bridge")
             .join("traffic")
             .join("smoke-session"),
     )

@@ -88,7 +88,7 @@ fn default_user_agent(use_responses_lite: bool) -> String {
     if use_responses_lite {
         RESPONSES_LITE_ORIGINATOR.to_string()
     } else {
-        format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"))
+        format!("claude-cursor-bridge/{}", env!("CARGO_PKG_VERSION"))
     }
 }
 

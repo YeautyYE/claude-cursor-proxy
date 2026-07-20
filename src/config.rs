@@ -9,6 +9,7 @@ use crate::paths;
 pub enum AliasProvider {
     Codex,
     Kimi,
+    Cursor,
 }
 
 impl AliasProvider {
@@ -16,6 +17,7 @@ impl AliasProvider {
         match self {
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
+            AliasProvider::Cursor => "cursor",
         }
     }
 }
@@ -71,6 +73,12 @@ struct CursorConfig {
     pub base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
+    #[serde(rename = "clientType")]
+    pub client_type: Option<String>,
+    #[serde(rename = "clientCommit")]
+    pub client_commit: Option<String>,
+    #[serde(rename = "ghostMode")]
+    pub ghost_mode: Option<bool>,
     #[serde(rename = "agentBundle")]
     pub agent_bundle: Option<String>,
 }
@@ -100,9 +108,10 @@ struct FileLog {
 }
 
 fn parse_alias(raw: &str) -> Option<AliasProvider> {
-    match raw {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
+        "cursor" => Some(AliasProvider::Cursor),
         _ => None,
     }
 }
@@ -121,7 +130,9 @@ pub fn load_config() -> LoadedConfig {
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
         port: 18765,
-        alias_provider: AliasProvider::Codex,
+        // Default Anthropic-style aliases (haiku/sonnet/fable/…) through Cursor so
+        // Claude Code's stock model names work without a separate Codex login.
+        alias_provider: AliasProvider::Cursor,
         log_verbose: false,
         log_stderr: false,
         config_dir: config_dir.clone(),
@@ -228,6 +239,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_CURSOR_CLIENT_VERSION") {
         out.push("cursor.clientVersion (env)".to_string());
+    }
+    if env.contains_key("CCP_CURSOR_CLIENT_TYPE") {
+        out.push("cursor.clientType (env)".to_string());
+    }
+    if env.contains_key("CCP_CURSOR_CLIENT_COMMIT") {
+        out.push("cursor.clientCommit (env)".to_string());
+    }
+    if env.contains_key("CCP_CURSOR_GHOST_MODE") {
+        out.push("cursor.ghostMode (env)".to_string());
     }
     if env.contains_key("CCP_KIMI_USER_AGENT") {
         out.push("kimi.userAgent (env)".to_string());
@@ -549,16 +569,202 @@ pub fn cursor_base_url() -> String {
 pub fn cursor_client_version() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
-        return raw.clone();
+        let t = raw.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(cursor) = file.cursor
         && let Some(version) = cursor.client_version
     {
-        return version;
+        let t = version.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
     }
-    "0.48.5".to_string()
+    // Official Cursor CLI sends `cli-<install-version>` e.g. cli-2026.07.16-899851b.
+    // Auto-detect from ~/.local/share/cursor-agent/versions when present.
+    if let Some(detected) = detect_installed_cursor_cli_version() {
+        return format!("cli-{detected}");
+    }
+    "cli-2026.07.16-899851b".to_string()
+}
+
+/// Cursor `x-cursor-client-type` header.
+/// Official agent CLI defaults to `cli` (see surface:"cli" in cursor-agent index.js).
+/// Set `CCP_CURSOR_CLIENT_TYPE=ide` only when intentionally spoofing the desktop app.
+pub fn cursor_client_type() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_CLIENT_TYPE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(client_type) = cursor.client_type
+    {
+        let trimmed = client_type.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "cli".to_string()
+}
+
+/// Detect installed Cursor Agent CLI version directory name
+/// (e.g. `2026.07.16-899851b` under `~/.local/share/cursor-agent/versions/`).
+pub fn detect_installed_cursor_cli_version() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let versions_dir = std::path::PathBuf::from(home).join(".local/share/cursor-agent/versions");
+    let mut best: Option<String> = None;
+    if let Ok(rd) = std::fs::read_dir(&versions_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name.starts_with('.') {
+                continue;
+            }
+            // Prefer lexicographically latest (YYYY.MM.DD-hash sorts well).
+            if best
+                .as_ref()
+                .map(|b| name.as_str() > b.as_str())
+                .unwrap_or(true)
+            {
+                best = Some(name);
+            }
+        }
+    }
+    best
+}
+
+/// Optional `x-cursor-client-commit` (Cursor IDE sends the app commit hash).
+pub fn cursor_client_commit() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_CLIENT_COMMIT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(commit) = cursor.client_commit
+    {
+        let trimmed = commit.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    // Regular (non-Anysphere) IDE builds omit commit; only send when env/config set.
+    None
+}
+
+/// Cursor `x-ghost-mode` header.
+/// Official CLI defaults to `true` when privacyCache.ghostMode is unset
+/// (`return typeof r !== "boolean" || r`).
+pub fn cursor_ghost_mode() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_GHOST_MODE") {
+        return parse_env_bool(raw);
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(ghost) = cursor.ghost_mode
+    {
+        return ghost;
+    }
+    true
+}
+
+/// Whether to attach IDE-only fingerprint headers (device-type/os/arch/checksum…).
+/// Official CLI Agent path does NOT set these; only the IDE `ccf()` helper does.
+/// Profiles: `cli` (default) | `ide`
+pub fn cursor_client_profile() -> String {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CLIENT_PROFILE") {
+        let t = raw.trim().to_ascii_lowercase();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    "cli".to_string()
+}
+
+/// Request timeout for Cursor Agent runs (seconds).
+/// Default 90s: long enough for a short Fable reply, short enough to surface hangs
+/// (BiDi waiting for tools) instead of sitting on "upstream" for 5+ minutes.
+pub fn cursor_request_timeout_secs() -> u64 {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_TIMEOUT_SECS")
+        && let Ok(n) = raw.trim().parse::<u64>()
+        && n > 0
+    {
+        return n.min(3600);
+    }
+    90
+}
+
+pub fn cursor_client_os() -> String {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CLIENT_OS") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    match std::env::consts::OS {
+        "macos" => "darwin".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn cursor_client_arch() -> String {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CLIENT_ARCH") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64".to_string(),
+        "x86_64" => "x64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn cursor_timezone() -> Option<String> {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_TIMEZONE") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    // Best-effort: leave unset if we cannot resolve; IDE uses Intl timezone.
+    None
+}
+
+pub fn cursor_client_key() -> Option<String> {
+    std::env::var("CCP_CURSOR_CLIENT_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn cursor_session_id() -> Option<String> {
+    std::env::var("CCP_CURSOR_SESSION_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_env_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {

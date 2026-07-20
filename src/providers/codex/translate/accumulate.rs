@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn accumulate_reasoning_summary_as_thinking_before_text() {
         let upstream = format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             sse_event(
                 "response.reasoning_summary_text.delta",
                 json!({
@@ -462,20 +462,17 @@ mod tests {
                     "output_index":1,"delta":"answer"
                 })
             ),
-            format!(
-                "{}{}",
-                sse_event(
-                    "response.output_item.done",
-                    json!({
-                        "output_index":1,"item":{"type":"message"}
-                    })
-                ),
-                sse_event(
-                    "response.completed",
-                    json!({
-                        "response":{"id":"resp_1","usage":{}}
-                    })
-                )
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
             ),
         );
         let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();

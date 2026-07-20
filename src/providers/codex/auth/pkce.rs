@@ -132,7 +132,7 @@ mod tests {
         let pkce = generate_pkce();
         let expected_hash = Sha256::digest(pkce.verifier.as_bytes());
         let expected_challenge =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected_hash);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_hash);
         assert_eq!(pkce.challenge, expected_challenge);
     }
 
@@ -163,7 +163,7 @@ mod tests {
         assert!(url.contains("scope=openid+profile+email+offline_access"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
-        assert!(url.contains("originator=claude-code-proxy"));
+        assert!(url.contains("originator=claude-cursor-bridge"));
         assert!(url.contains("state=state"));
     }
 

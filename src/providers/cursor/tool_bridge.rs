@@ -54,14 +54,21 @@ pub enum PendingCursorTool {
         working_directory: String,
         timeout_ms: u64,
     },
+    /// Any Claude tool name (Glob, Grep, …) from native Cursor mapping.
+    Generic {
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 impl PendingCursorTool {
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Read { .. } => "Read",
             Self::Write { .. } => "Write",
             Self::Bash { .. } => "Bash",
+            Self::Generic { name, .. } => name.as_str(),
         }
     }
 
@@ -69,13 +76,15 @@ impl PendingCursorTool {
         match self {
             Self::Read { tool_use_id, .. }
             | Self::Write { tool_use_id, .. }
-            | Self::Bash { tool_use_id, .. } => tool_use_id,
+            | Self::Bash { tool_use_id, .. }
+            | Self::Generic { tool_use_id, .. } => tool_use_id,
         }
     }
 
     /// Build the JSON input that matches the Claude tool_use block.
     pub fn input_json(&self) -> serde_json::Value {
         match self {
+            Self::Generic { input, .. } => input.clone(),
             Self::Read { path, .. } => {
                 serde_json::json!({ "file_path": path })
             }
@@ -251,10 +260,9 @@ pub fn advertised_tool_names(body: &MessagesRequest) -> Option<BTreeSet<String>>
     if names.is_empty() { None } else { Some(names) }
 }
 
-/// Whether the request can use the Cursor native tool bridge.
+/// Whether the request can use the Cursor native / XML tool bridge.
 ///
-/// Returns `true` when the request is streaming, has a session id, and
-/// advertises at least one of Read, Write, or Bash.
+/// Full Claude Code agent mode: streaming + session id + any advertised tools.
 pub fn can_bridge_cursor_native_tools(body: &MessagesRequest, session_id: Option<&str>) -> bool {
     let _sid = match session_id {
         Some(id) if !id.is_empty() => id,
@@ -263,11 +271,7 @@ pub fn can_bridge_cursor_native_tools(body: &MessagesRequest, session_id: Option
     if !body.stream {
         return false;
     }
-    let names = match advertised_tool_names(body) {
-        Some(n) => n,
-        None => return false,
-    };
-    names.contains("Read") || names.contains("Write") || names.contains("Bash")
+    advertised_tool_names(body).is_some_and(|n| !n.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -377,11 +381,9 @@ pub fn build_read_result_from_native(
 
     let read_result = if result.is_error {
         serde_json::json!({
-            "success": {
+            "error": {
                 "path": path,
-                "content": content,
-                "totalLines": lines,
-                "fileSize": file_size
+                "error": content
             }
         })
     } else {
@@ -556,6 +558,30 @@ pub fn start_cursor_tool_bridge(
             CursorStreamEvent::ThinkingDelta { text } => {
                 framer.emit_thinking_delta(text);
             }
+            CursorStreamEvent::NativeTool {
+                tool_use_id,
+                name,
+                input,
+            } => {
+                if paused {
+                    state.remaining_events.push(event.clone());
+                    continue;
+                }
+                let Some(emit_name) =
+                    resolve_advertised_name(name, state.allowed_tool_names.as_ref())
+                else {
+                    // Tool not in Claude Code's advertised set — skip.
+                    continue;
+                };
+                let input_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                framer.emit_tool_pause(tool_use_id, &emit_name, &input_json);
+                state.pending_tool = Some(PendingCursorTool::Generic {
+                    tool_use_id: tool_use_id.clone(),
+                    name: emit_name,
+                    input: input.clone(),
+                });
+                paused = true;
+            }
             CursorStreamEvent::TextDelta { text } => {
                 let recovered = state.xml_parser.push(text);
                 for recovered_event in &recovered {
@@ -588,11 +614,21 @@ pub fn start_cursor_tool_bridge(
             CursorStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
-                ..
+                cache_read_tokens,
+                cache_write_tokens,
             } => {
-                framer.record_usage(*input_tokens, *output_tokens, 0, 0);
+                framer.record_usage(
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                );
                 state.input_tokens = *input_tokens;
                 state.output_tokens = *output_tokens;
+            }
+            CursorStreamEvent::OutputTokenDelta { tokens } => {
+                framer.add_output_tokens(*tokens);
+                state.output_tokens = state.output_tokens.saturating_add(*tokens);
             }
             CursorStreamEvent::Session { .. } => {
                 // Session info is not mapped to SSE events
@@ -704,6 +740,10 @@ pub fn resume_cursor_tool_bridge(
             std::time::Duration::from_millis(0),
             working_directory,
         ),
+        PendingCursorTool::Generic { .. } => {
+            // Generic tools are fulfilled by Claude Code; no Cursor protocol result needed.
+            vec![]
+        }
     };
 
     // Generate SSE continuation from remaining events
@@ -752,13 +792,36 @@ pub fn resume_cursor_tool_bridge(
                 CursorStreamEvent::Usage {
                     input_tokens,
                     output_tokens,
-                    ..
+                    cache_read_tokens,
+                    cache_write_tokens,
                 } => {
                     if !paused_again {
-                        framer.record_usage(*input_tokens, *output_tokens, 0, 0);
+                        framer.record_usage(
+                            *input_tokens,
+                            *output_tokens,
+                            *cache_read_tokens,
+                            *cache_write_tokens,
+                        );
+                    }
+                }
+                CursorStreamEvent::OutputTokenDelta { tokens } => {
+                    if !paused_again {
+                        framer.add_output_tokens(*tokens);
                     }
                 }
                 CursorStreamEvent::Session { .. } => {}
+                CursorStreamEvent::NativeTool {
+                    tool_use_id,
+                    name,
+                    input,
+                } => {
+                    if !paused_again {
+                        let input_json =
+                            serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                        framer.emit_tool_pause(tool_use_id, name, &input_json);
+                        paused_again = true;
+                    }
+                }
                 CursorStreamEvent::End => {
                     if !paused_again {
                         // Flush before finalizing
@@ -817,6 +880,56 @@ pub fn resume_cursor_tool_bridge(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Pick a Claude-advertised tool name for a mapped Cursor tool, or None to skip.
+fn resolve_advertised_name(
+    mapped_name: &str,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    let Some(allowed) = allowed else {
+        return Some(mapped_name.to_string());
+    };
+    if allowed.contains(mapped_name) {
+        return Some(mapped_name.to_string());
+    }
+    // Common Claude Code aliases / fallbacks.
+    let fallbacks: &[&str] = match mapped_name {
+        "Bash" => &["Bash", "Shell", "bash"],
+        "Read" => &["Read", "read_file", "ReadFile"],
+        "Write" => &["Write", "write_file", "WriteFile", "Edit"],
+        "Grep" => &["Grep", "grep", "Search"],
+        "Glob" => &["Glob", "glob", "Find"],
+        "WebSearch" => &["WebSearch", "web_search"],
+        "WebFetch" => &["WebFetch", "web_fetch", "Fetch"],
+        "TodoWrite" => &["TodoWrite"],
+        "TodoRead" => &["TodoRead"],
+        "AskUserQuestion" => &["AskUserQuestion", "AskQuestion"],
+        "CreatePlan" => &["CreatePlan", "Plan"],
+        _ => &[],
+    };
+    for cand in fallbacks {
+        if allowed.contains(*cand) {
+            return Some((*cand).to_string());
+        }
+    }
+    if mapped_name.contains("__") {
+        if let Some(hit) = allowed.iter().find(|n| n.as_str() == mapped_name) {
+            return Some(hit.clone());
+        }
+        let suffix = mapped_name.rsplit("__").next().unwrap_or(mapped_name);
+        if let Some(hit) = allowed.iter().find(|n| n.ends_with(&format!("__{suffix}"))) {
+            return Some(hit.clone());
+        }
+    }
+    // Last resort: if Bash is allowed, shell-ify unknown tools were already Bash.
+    if mapped_name == "Bash" && allowed.iter().any(|n| n.eq_ignore_ascii_case("bash")) {
+        return allowed
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case("bash"))
+            .cloned();
+    }
+    None
+}
 
 /// Create a `PendingCursorTool` from a recovered XML tool_use event.
 fn pending_from_recovered_tool(
@@ -998,6 +1111,23 @@ mod tests {
         assert_eq!(msg["readResult"]["success"]["path"], "/tmp/a");
         assert_eq!(msg["readResult"]["success"]["content"], "file content");
         assert_eq!(msg["readResult"]["success"]["totalLines"], 1);
+    }
+
+    #[test]
+    fn read_result_from_error_uses_the_error_variant() {
+        let exec = CursorExec {
+            id: Some(1),
+            exec_id: None,
+            args: serde_json::json!({"file_path": "/tmp/missing"}),
+        };
+        let result = CursorNativeToolResult {
+            content: "file not found".into(),
+            is_error: true,
+        };
+        let msg = build_read_result_from_native(&exec, &result);
+        assert!(msg["readResult"].get("success").is_none());
+        assert_eq!(msg["readResult"]["error"]["path"], "/tmp/missing");
+        assert_eq!(msg["readResult"]["error"]["error"], "file not found");
     }
 
     #[test]

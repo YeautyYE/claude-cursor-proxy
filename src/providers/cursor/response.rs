@@ -17,11 +17,23 @@ pub enum CursorStreamEvent {
     TextDelta {
         text: String,
     },
+    /// Native Cursor tool call (InteractionUpdate.tool_call_started or Exec* args).
+    /// Mapped to Claude Code Anthropic tool names/inputs.
+    NativeTool {
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
         cache_read_tokens: u64,
         cache_write_tokens: u64,
+    },
+    /// Incremental output/thinking tokens from Cursor `token_delta`.
+    /// Must not wipe input/cache counters the way a full `Usage` snapshot would.
+    OutputTokenDelta {
+        tokens: u64,
     },
     End,
 }
@@ -64,10 +76,10 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
     for frame in &frames {
         if frame.flags & FLAG_END != 0 {
             // Check for Connect error in end frame
-            if !frame.payload.is_empty() {
-                if let Some(err) = parse_connect_error(&frame.payload) {
-                    return Err(CursorDecodeError::ConnectEnd(err));
-                }
+            if !frame.payload.is_empty()
+                && let Some(err) = parse_connect_error(&frame.payload)
+            {
+                return Err(CursorDecodeError::ConnectEnd(err));
             }
             events.push(CursorStreamEvent::End);
             continue;
@@ -96,6 +108,8 @@ pub fn decode_cursor_upstream(
     let mut text_content = String::new();
     let mut final_input_tokens: u64 = 0;
     let mut final_output_tokens: u64 = 0;
+    let mut final_cache_read: u64 = 0;
+    let mut final_cache_write: u64 = 0;
 
     for event in &events {
         match event {
@@ -103,17 +117,29 @@ pub fn decode_cursor_upstream(
             CursorStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
-                ..
+                cache_read_tokens,
+                cache_write_tokens,
             } => {
                 final_input_tokens = *input_tokens;
                 final_output_tokens = *output_tokens;
+                final_cache_read = *cache_read_tokens;
+                final_cache_write = *cache_write_tokens;
+            }
+            CursorStreamEvent::OutputTokenDelta { tokens } => {
+                final_output_tokens = final_output_tokens.saturating_add(*tokens);
             }
             CursorStreamEvent::End => break,
             _ => {}
         }
     }
 
-    let input_tokens = final_input_tokens.max(estimate_input_tokens(&text_content));
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
+        crate::providers::cursor::sse::normalize_cursor_usage_for_anthropic(
+            final_input_tokens.max(estimate_input_tokens(&text_content)),
+            final_output_tokens,
+            final_cache_read,
+            final_cache_write,
+        );
 
     Ok(serde_json::json!({
         "id": message_id,
@@ -127,9 +153,9 @@ pub fn decode_cursor_upstream(
         "stop_sequence": null,
         "usage": {
             "input_tokens": input_tokens,
-            "output_tokens": final_output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_write_tokens,
+            "cache_read_input_tokens": cache_read_tokens
         }
     }))
 }
@@ -140,43 +166,70 @@ fn estimate_input_tokens(_content: &str) -> u64 {
 }
 
 fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEvent>) {
-    // Check for exec_server_message with session info
     if let Some(ref exec) = msg.exec_server_message {
-        if let Some(ref session_id) = exec.notes_session_id {
-            if !session_id.is_empty() {
-                events.push(CursorStreamEvent::Session {
-                    session_id: session_id.clone(),
-                });
-            }
+        if let Some(ref sid) = exec.exec_id
+            && !sid.is_empty()
+        {
+            events.push(CursorStreamEvent::Session {
+                session_id: sid.clone(),
+            });
+        }
+        // BiDi exec tool requests (not request_context) → Claude tool_use.
+        if exec.request_context_args.is_none()
+            && let Some(mapped) = super::native_tools::map_exec_server_message(exec)
+        {
+            events.push(CursorStreamEvent::NativeTool {
+                tool_use_id: mapped.tool_use_id,
+                name: mapped.name,
+                input: mapped.input,
+            });
         }
     }
 
     if let Some(ref update) = msg.interaction_update {
         // Thinking delta
-        if let Some(ref td) = update.thinking_delta {
-            if !td.text.is_empty() {
-                events.push(CursorStreamEvent::ThinkingDelta {
-                    text: td.text.clone(),
-                });
-            }
+        if let Some(ref td) = update.thinking_delta
+            && !td.text.is_empty()
+        {
+            events.push(CursorStreamEvent::ThinkingDelta {
+                text: td.text.clone(),
+            });
         }
 
         // Text delta
-        if let Some(ref td) = update.text_delta {
-            if !td.text.is_empty() {
-                events.push(CursorStreamEvent::TextDelta {
-                    text: td.text.clone(),
-                });
-            }
+        if let Some(ref td) = update.text_delta
+            && !td.text.is_empty()
+        {
+            events.push(CursorStreamEvent::TextDelta {
+                text: td.text.clone(),
+            });
         }
 
-        // Turn ended (usage + end)
+        // tool_call_started/completed belong to Cursor's UI transcript. Local
+        // execution is requested separately by ExecServerMessage and only that
+        // message carries the ids needed to return a native result.
+
+        // Token delta is an incremental output/thinking signal — never a full
+        // usage snapshot. Mapping it to Usage{input:0,..} previously wiped the
+        // status bar down to In:1 Out:N.
+        if let Some(ref td) = update.token_delta
+            && td.tokens > 0
+        {
+            events.push(CursorStreamEvent::OutputTokenDelta {
+                tokens: td.tokens as u64,
+            });
+        }
+
+        // Turn ended (usage + end) — fields are optional on wire
         if let Some(ref te) = update.turn_ended {
             events.push(CursorStreamEvent::Usage {
-                input_tokens: te.input_tokens,
-                output_tokens: te.output_tokens,
-                cache_read_tokens: te.cache_read_tokens,
-                cache_write_tokens: te.cache_write_tokens,
+                input_tokens: te.input_tokens.unwrap_or(0),
+                output_tokens: te
+                    .output_tokens
+                    .unwrap_or(0)
+                    .saturating_add(te.reasoning_tokens.unwrap_or(0)),
+                cache_read_tokens: te.cache_read_tokens.unwrap_or(0),
+                cache_write_tokens: te.cache_write_tokens.unwrap_or(0),
             });
             events.push(CursorStreamEvent::End);
         }
@@ -231,9 +284,21 @@ mod tests {
     #[test]
     fn decodes_session_event() {
         let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
             interaction_update: None,
+            kv_server_message: None,
+            interaction_query: None,
             exec_server_message: Some(ExecServerMessage {
-                notes_session_id: Some("session-123".to_string()),
+                id: 0,
+                exec_id: Some("session-123".to_string()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: None,
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
             }),
         };
         let mut payload = Vec::new();

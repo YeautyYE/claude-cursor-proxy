@@ -1,3 +1,4 @@
+use anyhow::Context;
 use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -7,10 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
 use crate::{config, paths};
 
-pub const KEYCHAIN_SERVICE: &str = "claude-code-proxy.cursor";
+pub const KEYCHAIN_SERVICE: &str = "claude-cursor-bridge.cursor";
 pub const KEYCHAIN_ACCOUNT: &str = "auth";
 
-const REFRESH_EXPIRY_SKEW_MS: u64 = 60_000;
+/// Refresh when access JWT is within this window of expiry (align with Codex 5min).
+const REFRESH_EXPIRY_SKEW_MS: u64 = 5 * 60_000;
 const CURSOR_WEBSITE_URL: &str = "https://cursor.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -83,12 +85,64 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
             return Ok(Some(auth));
         }
 
-        let Some(refreshed) = refresh_cursor_auth(refresh_token)? else {
-            return Ok(Some(auth));
+        match refresh_cursor_auth(refresh_token) {
+            Ok(Some(refreshed)) => {
+                let new_refresh = if refreshed.refresh_token.is_empty() {
+                    auth.refresh_token.clone()
+                } else {
+                    Some(refreshed.refresh_token)
+                };
+                self.save_auth(StoredCursorAuth {
+                    access_token: refreshed.access_token,
+                    refresh_token: new_refresh,
+                    api_key: auth.api_key.clone(),
+                })
+                .map(Some)
+            }
+            Ok(None) => {
+                // Refresh rejected — only hard-fail if already expired.
+                if expires <= now_ms() {
+                    anyhow::bail!(
+                        "Cursor access token expired and refresh failed. Run `claude-cursor-bridge cursor auth login`."
+                    );
+                }
+                Ok(Some(auth))
+            }
+            Err(err) => {
+                if expires <= now_ms() {
+                    Err(err).context("Cursor token refresh failed after access token expiry")
+                } else {
+                    // Still usable for a short while; surface on next hard expiry.
+                    Ok(Some(auth))
+                }
+            }
+        }
+    }
+
+    /// Unconditional refresh using the stored refresh token (upstream 401 recovery).
+    pub fn force_refresh(&self) -> anyhow::Result<Option<CursorAuth>> {
+        let Some(stored) = self.store.load()? else {
+            return Ok(None);
+        };
+        if stored.access_token.trim().is_empty() {
+            return Ok(None);
+        }
+        let auth = enrich(stored.clone(), self.auth_path());
+        let Some(refresh_token) = auth.refresh_token.as_deref() else {
+            anyhow::bail!(
+                "No Cursor refresh token available (env tokens cannot auto-renew). Run `claude-cursor-bridge cursor auth login`."
+            );
+        };
+        let refreshed = refresh_cursor_auth(refresh_token)?
+            .ok_or_else(|| anyhow::anyhow!("Cursor /auth/refresh returned non-success"))?;
+        let new_refresh = if refreshed.refresh_token.is_empty() {
+            auth.refresh_token.clone()
+        } else {
+            Some(refreshed.refresh_token)
         };
         self.save_auth(StoredCursorAuth {
             access_token: refreshed.access_token,
-            refresh_token: Some(refreshed.refresh_token),
+            refresh_token: new_refresh,
             api_key: auth.api_key,
         })
         .map(Some)
@@ -134,7 +188,165 @@ pub fn load_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
             "environment".to_string(),
         )));
     }
-    file_store().load_auth()
+    if let Some(auth) = file_store().load_auth()? {
+        return Ok(Some(auth));
+    }
+    // Optional: reuse official Cursor CLI keychain when proxy store is empty.
+    if cli_keychain_fallback_enabled()
+        && let Some(auth) = load_official_cli_keychain_auth()?
+    {
+        return Ok(Some(auth));
+    }
+    // Non-macOS / file-store CLI credentials (~/.config/cursor/auth.json).
+    if cli_keychain_fallback_enabled()
+        && let Some(auth) = load_official_cli_auth_json()?
+    {
+        return Ok(Some(auth));
+    }
+    Ok(None)
+}
+
+fn cli_keychain_fallback_enabled() -> bool {
+    match std::env::var("CCP_CURSOR_CLI_KEYCHAIN_FALLBACK") {
+        Ok(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | ""
+        ),
+        // Default on so `agent` login / CLI auth.json can power the proxy without re-login.
+        Err(_) => true,
+    }
+}
+
+/// Read Cursor Agent's Keychain item (`cursor-access-token` / `cursor-user`).
+fn load_official_cli_keychain_auth() -> anyhow::Result<Option<CursorAuth>> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::auth::{Keychain, SystemKeychain};
+        let raw = match SystemKeychain.read("cursor-access-token", "cursor-user") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let Some(token) = raw.filter(|t| !t.trim().is_empty()) else {
+            return Ok(None);
+        };
+        // CLI sometimes stores a bare JWT, sometimes JSON with accessToken.
+        let stored = if token.trim_start().starts_with('{') {
+            match serde_json::from_str::<StoredCursorAuth>(&token) {
+                Ok(s) if !s.access_token.trim().is_empty() => s,
+                _ => {
+                    // Try common CLI shapes.
+                    let parsed: serde_json::Value = match serde_json::from_str(&token) {
+                        Ok(v) => v,
+                        Err(_) => return Ok(None),
+                    };
+                    let access = parsed
+                        .get("accessToken")
+                        .or_else(|| parsed.get("access_token"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if access.is_empty() {
+                        return Ok(None);
+                    }
+                    StoredCursorAuth {
+                        access_token: access,
+                        refresh_token: parsed
+                            .get("refreshToken")
+                            .or_else(|| parsed.get("refresh_token"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        api_key: None,
+                    }
+                }
+            }
+        } else {
+            StoredCursorAuth {
+                access_token: token,
+                refresh_token: None,
+                api_key: None,
+            }
+        };
+        Ok(Some(enrich(
+            stored,
+            "macos-keychain:cursor-access-token".to_string(),
+        )))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Read official Cursor CLI `auth.json` (Linux/Windows / file credential store).
+fn load_official_cli_auth_json() -> anyhow::Result<Option<CursorAuth>> {
+    let candidates = official_cli_auth_json_candidates();
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let access = parsed
+            .get("accessToken")
+            .or_else(|| parsed.get("access_token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if access.is_empty() {
+            continue;
+        }
+        let stored = StoredCursorAuth {
+            access_token: access,
+            refresh_token: parsed
+                .get("refreshToken")
+                .or_else(|| parsed.get("refresh_token"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            api_key: parsed
+                .get("apiKey")
+                .or_else(|| parsed.get("api_key"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+        return Ok(Some(enrich(
+            stored,
+            format!("cli-auth.json:{}", path.display()),
+        )));
+    }
+    Ok(None)
+}
+
+fn official_cli_auth_json_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs_home() {
+        out.push(home.join(".config/cursor/auth.json"));
+        out.push(home.join(".cursor/auth.json"));
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        out.insert(0, std::path::PathBuf::from(xdg).join("cursor/auth.json"));
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        out.push(std::path::PathBuf::from(appdata).join("Cursor/auth.json"));
+    }
+    out
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Force a refresh from the file/keychain store (ignores env-only tokens).
+pub fn force_refresh_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
+    if env_cursor_token().is_some() {
+        anyhow::bail!(
+            "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-bridge cursor auth login`, or supply a fresh token."
+        );
+    }
+    file_store().force_refresh()
 }
 
 /// Load only the bearer token for call sites that do not need auth metadata.
@@ -160,8 +372,9 @@ pub fn cursor_auth_location() -> String {
 pub fn missing_auth_message() -> String {
     [
         "Cursor authentication was not found.",
-        "Run `claude-code-proxy cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
-        "The proxy stores Cursor credentials in its own claude-code-proxy.cursor storage, not Cursor Agent's Keychain/auth.json.",
+        "Run `claude-cursor-bridge cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
+        "On macOS the proxy also falls back to Cursor Agent Keychain (cursor-access-token) when CCP_CURSOR_CLI_KEYCHAIN_FALLBACK is on (default).",
+        "On Linux/Windows it also reads ~/.config/cursor/auth.json when that fallback is enabled.",
     ]
     .join(" ")
 }
@@ -172,7 +385,7 @@ pub fn expired_auth_message(auth: &CursorAuth) -> String {
         .map(format_unix_ms)
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "Cursor access token from {} is expired or near expiry ({}). Run `claude-code-proxy cursor auth login` again or set CCP_CURSOR_AUTH_TOKEN.",
+        "Cursor access token from {} is expired or near expiry ({}). Run `claude-cursor-bridge cursor auth login` again or set CCP_CURSOR_AUTH_TOKEN.",
         auth.source, expires
     )
 }
@@ -260,7 +473,9 @@ pub fn wait_for_cursor_login(
 }
 
 fn refresh_cursor_auth(refresh_token: &str) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
     let url = format!(
         "{}/auth/refresh",
         config::cursor_base_url().trim_end_matches('/')
@@ -279,9 +494,25 @@ fn refresh_cursor_auth(refresh_token: &str) -> anyhow::Result<Option<RefreshResp
 }
 
 fn parse_cursor_auth_tokens(parsed: &serde_json::Value) -> Option<RefreshResponse> {
+    let access_token = parsed
+        .get("accessToken")
+        .or_else(|| parsed.get("access_token"))?
+        .as_str()?
+        .to_string();
+    if access_token.is_empty() {
+        return None;
+    }
+    // Refresh responses sometimes omit a rotated refresh token — keep empty and
+    // let callers preserve the previous one.
+    let refresh_token = parsed
+        .get("refreshToken")
+        .or_else(|| parsed.get("refresh_token"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(RefreshResponse {
-        access_token: parsed.get("accessToken")?.as_str()?.to_string(),
-        refresh_token: parsed.get("refreshToken")?.as_str()?.to_string(),
+        access_token,
+        refresh_token,
     })
 }
 

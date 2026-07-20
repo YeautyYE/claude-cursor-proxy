@@ -5,26 +5,42 @@ use super::proto::{AgentServerMessage, InteractionUpdate, TextDelta, ThinkingDel
 
 pub(crate) fn text_frame(text: &str) -> Vec<u8> {
     encode_agent_message(AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
-            thinking_delta: None,
+            heartbeat: None,
             text_delta: Some(TextDelta {
                 text: text.to_string(),
             }),
+            tool_call_started: None,
+            tool_call_completed: None,
+            thinking_delta: None,
+            thinking_completed: None,
+            token_delta: None,
             turn_ended: None,
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     })
 }
 
 pub(crate) fn thinking_frame(text: &str) -> Vec<u8> {
     encode_agent_message(AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            text_delta: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: Some(ThinkingDelta {
                 text: text.to_string(),
             }),
-            text_delta: None,
+            thinking_completed: None,
+            token_delta: None,
             turn_ended: None,
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     })
 }
@@ -40,16 +56,25 @@ pub(crate) fn usage_frame_full(
     cache_write: u64,
 ) -> Vec<u8> {
     encode_agent_message(AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
-            thinking_delta: None,
+            heartbeat: None,
             text_delta: None,
+            tool_call_started: None,
+            tool_call_completed: None,
+            thinking_delta: None,
+            thinking_completed: None,
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_tokens: cache_read,
-                cache_write_tokens: cache_write,
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cache_read_tokens: Some(cache_read),
+                cache_write_tokens: Some(cache_write),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     })
 }

@@ -6,7 +6,7 @@ use tempfile::TempDir;
 /// fallback also resolves within the temp dir.
 fn codex_cmd() -> (Command, TempDir) {
     let temp = TempDir::new().unwrap();
-    let mut cmd = Command::cargo_bin("claude-code-proxy").unwrap();
+    let mut cmd = Command::cargo_bin("claude-cursor-bridge").unwrap();
     cmd.args(["codex", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.env("HOME", temp.path());

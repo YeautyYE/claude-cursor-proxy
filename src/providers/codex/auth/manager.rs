@@ -47,7 +47,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
     pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
         let stored = self.load_auth()?.ok_or_else(|| {
-            anyhow::anyhow!("Not authenticated. Run: claude-code-proxy codex auth login")
+            anyhow::anyhow!("Not authenticated. Run: claude-cursor-bridge codex auth login")
         })?;
 
         if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
@@ -231,10 +231,20 @@ mod tests {
         let server_refreshes = refreshes.clone();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let read = stream.read(&mut request).unwrap();
-            assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).contains("refresh_token=stale"));
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let expected = b"refresh_token=stale";
+            while !request
+                .windows(expected.len())
+                .any(|window| window == expected)
+            {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before the form body arrived");
+                request.extend_from_slice(&chunk[..read]);
+            }
             server_refreshes.fetch_add(1, Ordering::SeqCst);
 
             let body = br#"{"access_token":"rotated","refresh_token":"rotated-refresh","expires_in":3600}"#;

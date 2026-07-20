@@ -1,5 +1,12 @@
 # Changelog
 
+Project renamed to **claude-cursor-bridge** — public repo [YeautyYE/claude-cursor-bridge](https://github.com/YeautyYE/claude-cursor-bridge).
+Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
+
+## Unreleased
+
+- Renamed crate/binary to `claude-cursor-bridge`; config/state dirs to `claude-cursor-bridge` (legacy `claude-code-proxy` auth paths still read as fallback). Env prefix remains `CCP_*`.
+
 ## v0.1.21 (2026-07-15)
 
 - The monitor shows session token activity trends at common terminal widths,

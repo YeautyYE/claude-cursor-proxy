@@ -5,7 +5,7 @@ use crate::{
     project,
     provider::RequestContext,
     registry::{Registry, normalize_incoming_model},
-    session::{self, SessionState},
+    session::{self},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
 use axum::{
@@ -103,6 +103,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
     let state = Arc::new(AppState { registry, monitor });
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/models", get(handler_models))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .fallback(fallback_handler)
@@ -117,6 +118,72 @@ struct AppState {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+/// Anthropic/OpenAI-compatible model list.
+///
+/// Prefer a union of Cursor's live `GetUsableModels` catalog (when auth is
+/// available) and the registry so Codex/Kimi/Grok ids stay discoverable.
+///
+/// Cursor fable-family ids are rewritten through [`anthropic_list_model_id`] so
+/// Claude Code sees a `[1m]` marker (1M context) on this surface.
+async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    use crate::providers::cursor::model::{anthropic_list_model_id, cursor_anthropic_surface_models};
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut data: Vec<Value> = Vec::new();
+
+    let push = |data: &mut Vec<Value>,
+                seen: &mut std::collections::BTreeSet<String>,
+                id: String,
+                owned_by: &str| {
+        if seen.insert(id.clone()) {
+            data.push(json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": owned_by,
+            }));
+        }
+    };
+
+    if let Ok(Some(auth)) = crate::providers::cursor::auth::load_cursor_auth() {
+        let client = crate::providers::cursor::client::CursorHttpClient::new();
+        if let Ok(ids) = client.fetch_usable_models(&auth.access_token).await {
+            for id in ids {
+                // Fable catalog → …[1m]; other catalog ids unchanged.
+                push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
+            }
+        }
+    }
+
+    for (id, provider) in state.registry.all_supported_models() {
+        let surface = if provider == "cursor" {
+            anthropic_list_model_id(&id)
+        } else {
+            id
+        };
+        push(&mut data, &mut seen, surface, &provider);
+    }
+
+    if data.is_empty() {
+        for id in cursor_anthropic_surface_models() {
+            push(&mut data, &mut seen, id, "cursor");
+        }
+    } else {
+        // Ensure the Fable 1M wire id is always present for gateway discovery.
+        push(
+            &mut data,
+            &mut seen,
+            anthropic_list_model_id("claude-fable-5"),
+            "cursor",
+        );
+    }
+
+    Json(json!({
+        "object": "list",
+        "data": data,
+    }))
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -164,7 +231,7 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(err) => {
             let response = json_error(
@@ -817,9 +884,4 @@ fn set_mode(path: &Path, mode: u32) {
     {
         let _ = (path, mode);
     }
-}
-
-#[allow(dead_code)]
-fn _unused(session_state: Option<&SessionState>) {
-    let _ = session_state;
 }

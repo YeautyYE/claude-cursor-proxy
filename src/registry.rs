@@ -25,17 +25,6 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
 
-const CURSOR_LEGACY_MODELS: &[&str] = &[
-    "cursor",
-    "cursor-agent",
-    "cursor-composer",
-    "cursor-composer-fast",
-    "cursor-plan",
-    "cursor-ask",
-    "composer-2.5",
-    "composer-2.5-fast",
-];
-
 pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.2",
     "gpt-5.3-codex",
@@ -185,7 +174,7 @@ pub fn is_anthropic_alias(model: &str) -> bool {
 }
 
 pub fn is_cursor_model(model: &str) -> bool {
-    if CURSOR_LEGACY_MODELS.contains(&model) {
+    if crate::providers::cursor::model::CURSOR_LEGACY_MODELS.contains(&model) {
         return true;
     }
 
@@ -305,7 +294,7 @@ fn expand_codex_models() -> Vec<String> {
 }
 
 fn build_cursor_models() -> Vec<String> {
-    let mut out: Vec<String> = CURSOR_LEGACY_MODELS
+    let mut out: Vec<String> = crate::providers::cursor::model::CURSOR_LEGACY_MODELS
         .iter()
         .map(|s| (*s).to_string())
         .collect();
@@ -346,6 +335,16 @@ mod tests {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");
+        }
+    }
+
+    #[test]
+    fn claude_aliases_route_to_cursor_when_configured() {
+        let registry = Registry::new(AliasProvider::Cursor);
+        for model in ["claude-sonnet-5", "fable", "claude-fable-5", "haiku"] {
+            let p = registry.provider_for_model(model, None);
+            assert!(p.is_some(), "{model} should route to a provider");
+            assert_eq!(p.expect("provider").name(), "cursor");
         }
     }
 

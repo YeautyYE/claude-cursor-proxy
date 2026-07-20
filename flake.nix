@@ -1,5 +1,5 @@
 {
-  description = "Anthropic-compatible proxy for Claude Code provider backends";
+  description = "Stable Cursor reverse-proxy bridge for Claude Code";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -37,15 +37,15 @@
 
             installPhase = ''
               runHook preInstall
-              install -Dm755 target/release/claude-code-proxy "$out/bin/claude-code-proxy"
+              install -Dm755 target/release/claude-cursor-bridge "$out/bin/claude-cursor-bridge"
               runHook postInstall
             '';
 
             meta = with pkgs.lib; {
               description = cargoToml.package.description;
-              homepage = "https://github.com/raine/claude-code-proxy";
+              homepage = "https://github.com/YeautyYE/claude-cursor-bridge";
               license = licenses.mit;
-              mainProgram = "claude-code-proxy";
+              mainProgram = "claude-cursor-bridge";
             };
           };
         }
@@ -54,7 +54,7 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/claude-code-proxy";
+          program = "${self.packages.${system}.default}/bin/claude-cursor-bridge";
         };
       });
 

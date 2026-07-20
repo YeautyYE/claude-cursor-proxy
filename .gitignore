@@ -1,3 +1,27 @@
 node_modules/
 dist/
 target/
+
+# Local secrets / runtime state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+auth.json
+**/auth.json
+proxy.log
+**/proxy.log
+traffic/
+
+# IDE / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local reverse-engineering / scratch (do not publish extracts)
+claudedocs/*extract*
+claudedocs/_*.py
+claudedocs/_*.txt

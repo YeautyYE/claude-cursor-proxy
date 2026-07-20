@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn stream_omits_empty_reasoning_summary() {
         let upstream = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             sse_event(
                 "response.output_item.added",
                 serde_json::json!({
@@ -677,20 +677,17 @@ mod tests {
                     "output_index":1,"delta":"answer"
                 })
             ),
-            format!(
-                "{}{}",
-                sse_event(
-                    "response.output_item.done",
-                    serde_json::json!({
-                        "output_index":1,"item":{"type":"message"}
-                    })
-                ),
-                sse_event(
-                    "response.completed",
-                    serde_json::json!({
-                        "response":{"id":"resp_1","usage":{}}
-                    })
-                )
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
             ),
         );
         let out = String::from_utf8(

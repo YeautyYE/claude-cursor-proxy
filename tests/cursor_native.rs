@@ -11,6 +11,8 @@
 //! - Registry routing
 //! - Provider end-to-end against mock upstream
 
+#![allow(clippy::await_holding_lock)]
+
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
@@ -22,22 +24,31 @@ static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[test]
 fn prost_roundtrip_preserves_cursor_server_message() {
-    use claude_code_proxy::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::proto::*;
     use prost::Message;
 
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: Some(TextDelta {
                 text: "hello".into(),
             }),
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: 7,
-                output_tokens: 2,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(7),
+                output_tokens: Some(2),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut bytes = Vec::new();
@@ -51,7 +62,7 @@ fn prost_roundtrip_preserves_cursor_server_message() {
 
 #[test]
 fn prost_roundtrip_preserves_client_message() {
-    use claude_code_proxy::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::proto::*;
     use prost::Message;
 
     let msg = AgentClientMessage {
@@ -63,24 +74,34 @@ fn prost_roundtrip_preserves_client_message() {
                         text: "hello".into(),
                         message_id: "msg-id".into(),
                         selected_context: None,
-                        mode: "AGENT_MODE_AGENT".into(),
+                        mode: 1, // AGENT_MODE_AGENT
                     }),
                 }),
+                resume_action: None,
             }),
+            model_details: None,
             mcp_tools: None,
-            conversation_id: String::new(),
+            conversation_id: None,
+            custom_system_prompt: None,
             requested_model: Some(CursorModel {
                 model_id: "gpt-5.5".into(),
+                max_mode: None,
                 parameters: vec![ModelParameter {
                     id: "context".into(),
                     value: "128k".into(),
                 }],
             }),
-            exclude_workspace_context: false,
+            exclude_workspace_context: Some(false),
+            harness: None,
             selected_subagent_models: vec![],
-            conversation_group_id: String::new(),
-            client_supports_inline_images: true,
+            conversation_group_id: None,
+            pre_fetched_blobs: vec![],
+            client_supports_inline_images: Some(true),
         }),
+        exec_client_message: None,
+        kv_client_message: None,
+        exec_client_control_message: None,
+        interaction_response: None,
         client_heartbeat: None,
     };
 
@@ -100,7 +121,7 @@ fn prost_roundtrip_preserves_client_message() {
 
 #[test]
 fn connect_frame_fixture_matches_reference_layout() {
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
 
     let frame = encode_connect_frame(b"abc", 0);
     assert_eq!(hex::encode(frame), "0000000003616263");
@@ -108,7 +129,7 @@ fn connect_frame_fixture_matches_reference_layout() {
 
 #[test]
 fn connect_frame_decode_reference() {
-    use claude_code_proxy::providers::cursor::connect::ConnectFrameDecoder;
+    use claude_cursor_bridge::providers::cursor::connect::ConnectFrameDecoder;
 
     let wire = hex::decode("0000000003616263").unwrap();
     let mut decoder = ConnectFrameDecoder::new();
@@ -120,8 +141,8 @@ fn connect_frame_decode_reference() {
 
 #[test]
 fn connect_frame_with_flags_decode() {
-    use claude_code_proxy::providers::cursor::connect::ConnectFrameDecoder;
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::connect::ConnectFrameDecoder;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
 
     let frame = encode_connect_frame(b"xyz", 0x03);
     let mut decoder = ConnectFrameDecoder::new();
@@ -139,7 +160,7 @@ fn auth_returns_token_from_env() {
     unsafe {
         std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "test-token-123");
     }
-    let token = claude_code_proxy::providers::cursor::auth::load_cursor_token();
+    let token = claude_cursor_bridge::providers::cursor::auth::load_cursor_token();
     assert_eq!(token.as_deref(), Some("test-token-123"));
     unsafe {
         std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
@@ -152,7 +173,7 @@ fn auth_returns_token_from_env() {
 
 #[test]
 fn model_resolution_resolves_cursor_agent_prefix() {
-    use claude_code_proxy::providers::cursor::model::*;
+    use claude_cursor_bridge::providers::cursor::model::*;
 
     let r = resolve_cursor_model("cursor-agent:gpt-5.5").unwrap();
     assert_eq!(r.model_id, "gpt-5.5");
@@ -161,7 +182,7 @@ fn model_resolution_resolves_cursor_agent_prefix() {
 
 #[test]
 fn model_resolution_accepts_legacy_cursor_agent() {
-    use claude_code_proxy::providers::cursor::model::*;
+    use claude_cursor_bridge::providers::cursor::model::*;
 
     let r = resolve_cursor_model("cursor-agent").unwrap();
     assert_eq!(r.mode, CursorAgentMode::Agent);
@@ -169,8 +190,8 @@ fn model_resolution_accepts_legacy_cursor_agent() {
 
 #[test]
 fn registry_routes_cursor_model_to_cursor_provider() {
-    use claude_code_proxy::Registry;
-    use claude_code_proxy::config::AliasProvider;
+    use claude_cursor_bridge::Registry;
+    use claude_cursor_bridge::config::AliasProvider;
 
     let registry = Registry::new(AliasProvider::Codex);
     let provider = registry.provider_for_model("cursor:gpt-5.5", None);
@@ -188,8 +209,8 @@ fn registry_routes_cursor_model_to_cursor_provider() {
 
 #[test]
 fn prompt_renders_system_tools_and_messages() {
-    use claude_code_proxy::MessagesRequest;
-    use claude_code_proxy::providers::cursor::request::render_cursor_prompt;
+    use claude_cursor_bridge::MessagesRequest;
+    use claude_cursor_bridge::providers::cursor::request::render_cursor_prompt_parts;
 
     let req: MessagesRequest = serde_json::from_value(serde_json::json!({
         "model": "cursor:gpt-5.5",
@@ -205,16 +226,21 @@ fn prompt_renders_system_tools_and_messages() {
     }))
     .unwrap();
 
-    let rendered = render_cursor_prompt(&req);
-    assert!(rendered.contains("<system>"));
-    assert!(rendered.contains("<user>"));
-    assert!(rendered.contains("<tools>"));
+    let parts = render_cursor_prompt_parts(&req);
+    // Default: omit Claude system on Cursor (Fable injection loops); keep chat + tools.
+    assert_eq!(parts.custom_system_prompt, None);
+    assert!(!parts.user_text.contains("be direct"));
+    assert!(!parts.user_text.contains("CLAUDE_CODE_SYSTEM"));
+    assert!(parts.user_text.contains("<user>"));
+    assert!(parts.user_text.contains("hi"));
+    assert!(parts.user_text.contains("<tools>"));
+    assert!(parts.user_text.contains("Read"));
 }
 
 #[test]
 fn selected_images_count_matches_base64_images() {
-    use claude_code_proxy::MessagesRequest;
-    use claude_code_proxy::providers::cursor::request::cursor_selected_images;
+    use claude_cursor_bridge::MessagesRequest;
+    use claude_cursor_bridge::providers::cursor::request::cursor_selected_images;
 
     let req: MessagesRequest = serde_json::from_value(serde_json::json!({
         "model": "cursor:gpt-5.5",
@@ -238,7 +264,7 @@ fn selected_images_count_matches_base64_images() {
 
 #[test]
 fn cursor_client_constructs_correct_url() {
-    use claude_code_proxy::providers::cursor::client::CursorHttpClient;
+    use claude_cursor_bridge::providers::cursor::client::CursorHttpClient;
 
     let client = CursorHttpClient::new();
     // Just ensure construction doesn't panic
@@ -247,7 +273,7 @@ fn cursor_client_constructs_correct_url() {
 
 #[test]
 fn cursor_error_display_works() {
-    use claude_code_proxy::providers::cursor::client::CursorError;
+    use claude_cursor_bridge::providers::cursor::client::CursorError;
 
     let err = CursorError::new(429, "rate limited", Some("backoff".to_string()));
     let display = format!("{err}");
@@ -258,12 +284,12 @@ fn cursor_error_display_works() {
 #[tokio::test(flavor = "current_thread")]
 async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     use axum::{Router, routing::post};
-    use claude_code_proxy::providers::cursor::client::CursorHttpClient;
-    use claude_code_proxy::providers::cursor::connect::{
+    use claude_cursor_bridge::providers::cursor::client::CursorHttpClient;
+    use claude_cursor_bridge::providers::cursor::connect::{
         ConnectFrameDecoder, encode_connect_frame,
     };
-    use claude_code_proxy::providers::cursor::proto::*;
-    use claude_code_proxy::providers::cursor::request::CursorSelectedImage;
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::request::CursorSelectedImage;
     use prost::Message;
     use std::sync::{Arc, Mutex};
 
@@ -279,16 +305,25 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
 
     let response_body = {
         let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
             interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                tool_call_started: None,
+                tool_call_completed: None,
                 thinking_delta: None,
+                thinking_completed: None,
                 text_delta: Some(TextDelta { text: "ok".into() }),
+                token_delta: None,
                 turn_ended: Some(TurnEnded {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    reasoning_tokens: None,
                 }),
             }),
+            kv_server_message: None,
+            interaction_query: None,
             exec_server_message: None,
         };
         let mut payload = Vec::new();
@@ -348,6 +383,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
                 path: "claude-image-1.png".into(),
                 mime_type: "image/png".into(),
             }],
+            Some("custom system from test"),
         )
         .await
         .expect("mock upstream request should succeed");
@@ -416,10 +452,15 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     let msg = AgentClientMessage::decode(&frames[0].payload[..]).unwrap();
     let run = msg.run_request.expect("run request");
     assert!(msg.client_heartbeat.is_none());
-    assert_eq!(run.conversation_id, "");
-    assert_eq!(run.conversation_group_id, "");
-    assert!(run.client_supports_inline_images);
-    assert!(!run.exclude_workspace_context);
+    assert!(run.conversation_id.is_none());
+    assert!(run.conversation_group_id.is_none());
+    assert_eq!(run.client_supports_inline_images, Some(true));
+    assert_eq!(
+        run.custom_system_prompt.as_deref(),
+        Some("custom system from test")
+    );
+    // Default: omit exclude_workspace_context (server rejects true on many accounts).
+    assert!(run.exclude_workspace_context.is_none());
     assert_eq!(run.requested_model.unwrap().model_id, "gpt-5.5");
     let user_message = run
         .action
@@ -430,7 +471,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         .unwrap();
     assert_eq!(user_message.text, "wire prompt");
     assert_eq!(user_message.message_id, request_id);
-    assert_eq!(user_message.mode, "AGENT_MODE_AGENT");
+    assert_eq!(user_message.mode, 1);
     let image = user_message
         .selected_context
         .unwrap()
@@ -455,22 +496,30 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
 
 #[test]
 fn response_decode_extracts_text_and_usage() {
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
-    use claude_code_proxy::providers::cursor::proto::*;
-    use claude_code_proxy::providers::cursor::response::*;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::response::*;
     use prost::Message;
 
     let mut body = Vec::new();
 
     // Text frame
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: Some(TextDelta {
                 text: "Hello".into(),
             }),
+            token_delta: None,
             turn_ended: None,
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -479,16 +528,25 @@ fn response_decode_extracts_text_and_usage() {
 
     // Usage frame
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: None,
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -498,7 +556,7 @@ fn response_decode_extracts_text_and_usage() {
     // End frame
     body.extend_from_slice(&encode_connect_frame(b"", 2));
 
-    let upstream = claude_code_proxy::providers::cursor::client::CursorUpstreamResponse {
+    let upstream = claude_cursor_bridge::providers::cursor::client::CursorUpstreamResponse {
         status: 200,
         body,
         error_detail: None,
@@ -517,19 +575,27 @@ fn response_decode_extracts_text_and_usage() {
 
 #[test]
 fn sse_parses_event_names_and_data() {
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
-    use claude_code_proxy::providers::cursor::proto::*;
-    use claude_code_proxy::providers::cursor::sse::frame_cursor_stream;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::sse::frame_cursor_stream;
     use prost::Message;
 
     let mut body = Vec::new();
 
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: Some(TextDelta { text: "hi".into() }),
+            token_delta: None,
             turn_ended: None,
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -537,16 +603,25 @@ fn sse_parses_event_names_and_data() {
     body.extend_from_slice(&encode_connect_frame(&payload, 0));
 
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: None,
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: 5,
-                output_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(5),
+                output_tokens: Some(1),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -555,7 +630,7 @@ fn sse_parses_event_names_and_data() {
 
     body.extend_from_slice(&encode_connect_frame(b"", 2));
 
-    let upstream = claude_code_proxy::providers::cursor::client::CursorUpstreamResponse {
+    let upstream = claude_cursor_bridge::providers::cursor::client::CursorUpstreamResponse {
         status: 200,
         body,
         error_detail: None,
@@ -586,26 +661,35 @@ fn sse_parses_event_names_and_data() {
 
 #[test]
 fn sse_message_delta_contains_usage() {
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
-    use claude_code_proxy::providers::cursor::proto::*;
-    use claude_code_proxy::providers::cursor::sse::frame_cursor_stream;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::sse::frame_cursor_stream;
     use prost::Message;
 
     let mut body = Vec::new();
 
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: Some(TextDelta {
                 text: "test".into(),
             }),
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: 42,
-                output_tokens: 7,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(42),
+                output_tokens: Some(7),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -613,7 +697,7 @@ fn sse_message_delta_contains_usage() {
     body.extend_from_slice(&encode_connect_frame(&payload, 0));
     body.extend_from_slice(&encode_connect_frame(b"", 2));
 
-    let upstream = claude_code_proxy::providers::cursor::client::CursorUpstreamResponse {
+    let upstream = claude_cursor_bridge::providers::cursor::client::CursorUpstreamResponse {
         status: 200,
         body,
         error_detail: None,
@@ -645,8 +729,8 @@ fn sse_message_delta_contains_usage() {
 
 #[test]
 fn registry_provider_for_legacy_cursor_model() {
-    use claude_code_proxy::Registry;
-    use claude_code_proxy::config::AliasProvider;
+    use claude_cursor_bridge::Registry;
+    use claude_cursor_bridge::config::AliasProvider;
 
     let registry = Registry::new(AliasProvider::Codex);
 
@@ -679,10 +763,10 @@ fn registry_provider_for_legacy_cursor_model() {
 #[tokio::test]
 async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     use axum::{Router, routing::post};
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
-    use claude_code_proxy::providers::cursor::proto::*;
-    use claude_code_proxy::providers::cursor::response::decode_cursor_upstream;
-    use claude_code_proxy::providers::cursor::sse::frame_cursor_stream;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::response::decode_cursor_upstream;
+    use claude_cursor_bridge::providers::cursor::sse::frame_cursor_stream;
     use prost::Message;
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -691,13 +775,21 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     let mut body = Vec::new();
 
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: Some(TextDelta {
                 text: "Hello from mock".into(),
             }),
+            token_delta: None,
             turn_ended: None,
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -705,16 +797,25 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     body.extend_from_slice(&encode_connect_frame(&payload, 0));
 
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: None,
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: 15,
-                output_tokens: 3,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(15),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -754,13 +855,13 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    use claude_code_proxy::providers::cursor::auth::load_cursor_token;
-    use claude_code_proxy::providers::cursor::client::CursorHttpClient;
+    use claude_cursor_bridge::providers::cursor::auth::load_cursor_token;
+    use claude_cursor_bridge::providers::cursor::client::CursorHttpClient;
 
     let token = load_cursor_token().unwrap();
     let client = CursorHttpClient::new();
     let upstream = client
-        .run_agent(&token, "test prompt", "cursor:gpt-5.5", &[])
+        .run_agent(&token, "test prompt", "cursor:gpt-5.5", &[], None)
         .await
         .expect("mock upstream request should succeed");
 
@@ -800,8 +901,8 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
 #[tokio::test]
 async fn cursor_provider_handle_messages_returns_anthropic_json() {
     use axum::{Router, routing::post};
-    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
-    use claude_code_proxy::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_bridge::providers::cursor::proto::*;
     use prost::Message;
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -809,18 +910,27 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
     // Build mock response
     let mut body = Vec::new();
     let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
         interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
             thinking_delta: None,
+            thinking_completed: None,
             text_delta: Some(TextDelta {
                 text: "Mock response text".into(),
             }),
+            token_delta: None,
             turn_ended: Some(TurnEnded {
-                input_tokens: 20,
-                output_tokens: 4,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(20),
+                output_tokens: Some(4),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
             }),
         }),
+        kv_server_message: None,
+        interaction_query: None,
         exec_server_message: None,
     };
     let mut payload = Vec::new();
@@ -860,9 +970,9 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Send via handle_messages (non-streaming)
-    use claude_code_proxy::provider::Provider;
-    use claude_code_proxy::provider::RequestContext;
-    use claude_code_proxy::providers::cursor::CursorProvider;
+    use claude_cursor_bridge::provider::Provider;
+    use claude_cursor_bridge::provider::RequestContext;
+    use claude_cursor_bridge::providers::cursor::CursorProvider;
 
     let provider = CursorProvider::new();
     let body = serde_json::from_value(serde_json::json!({
@@ -898,10 +1008,10 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
 #[tokio::test(flavor = "current_thread")]
 async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     use axum::{Router, routing::post};
-    use claude_code_proxy::providers::cursor::connect::{
+    use claude_cursor_bridge::providers::cursor::connect::{
         ConnectFrameDecoder, encode_connect_frame,
     };
-    use claude_code_proxy::providers::cursor::proto::*;
+    use claude_cursor_bridge::providers::cursor::proto::*;
     use prost::Message;
     use std::sync::{Arc, Mutex};
 
@@ -917,29 +1027,46 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
 
     let response_body = {
         let text_msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
             interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                tool_call_started: None,
+                tool_call_completed: None,
                 thinking_delta: None,
+                thinking_completed: None,
                 text_delta: Some(TextDelta {
                     text: "proxy path works".into(),
                 }),
+                token_delta: None,
                 turn_ended: None,
             }),
+            kv_server_message: None,
+            interaction_query: None,
             exec_server_message: None,
         };
         let mut text_payload = Vec::new();
         text_msg.encode(&mut text_payload).unwrap();
 
         let usage_msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
             interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                tool_call_started: None,
+                tool_call_completed: None,
                 thinking_delta: None,
+                thinking_completed: None,
                 text_delta: None,
+                token_delta: None,
                 turn_ended: Some(TurnEnded {
-                    input_tokens: 12,
-                    output_tokens: 3,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
+                    input_tokens: Some(12),
+                    output_tokens: Some(3),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    reasoning_tokens: None,
                 }),
             }),
+            kv_server_message: None,
+            interaction_query: None,
             exec_server_message: None,
         };
         let mut usage_payload = Vec::new();
@@ -988,7 +1115,7 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let _proxy_handle = tokio::spawn(async move {
-        claude_code_proxy::server::serve_listener(proxy_listener, None, async move {
+        claude_cursor_bridge::server::serve_listener(proxy_listener, None, async move {
             let _ = shutdown_rx.await;
         })
         .await
@@ -1055,14 +1182,1101 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
+    use axum::{Router, body::Body, http::Request, response::Response, routing::post};
+    use bytes::Bytes;
+    use claude_cursor_bridge::providers::cursor::connect::{
+        ConnectFrameDecoder, FLAG_END, encode_connect_frame,
+    };
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use futures_util::StreamExt;
+    use prost::Message;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const KV_BLOB_ID: &[u8] = b"cursor-live-state";
+    const KV_BEFORE_TOOL: &[u8] = b"state-before-tool";
+    const KV_AFTER_TOOL: &[u8] = b"state-after-tool";
+
+    // Test-local wire declarations let this integration fixture model Cursor's
+    // KV oneofs independently of the proxy's hand-written protobuf subset.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireAgentServerMessage {
+        #[prost(message, optional, tag = "4")]
+        kv_server_message: Option<WireKvServerMessage>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireAgentClientMessage {
+        #[prost(message, optional, tag = "3")]
+        kv_client_message: Option<WireKvClientMessage>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireKvServerMessage {
+        #[prost(uint32, tag = "1")]
+        id: u32,
+        #[prost(message, optional, tag = "2")]
+        get_blob_args: Option<WireGetBlobArgs>,
+        #[prost(message, optional, tag = "3")]
+        set_blob_args: Option<WireSetBlobArgs>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireKvClientMessage {
+        #[prost(uint32, tag = "1")]
+        id: u32,
+        #[prost(message, optional, tag = "2")]
+        get_blob_result: Option<WireGetBlobResult>,
+        #[prost(message, optional, tag = "3")]
+        set_blob_result: Option<WireSetBlobResult>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireGetBlobArgs {
+        #[prost(bytes = "vec", tag = "1")]
+        blob_id: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireGetBlobResult {
+        #[prost(bytes = "vec", optional, tag = "1")]
+        blob_data: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireSetBlobArgs {
+        #[prost(bytes = "vec", tag = "1")]
+        blob_id: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        blob_data: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireSetBlobResult {
+        #[prost(message, optional, tag = "1")]
+        error: Option<WireKvError>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct WireKvError {
+        #[prost(string, tag = "1")]
+        message: String,
+    }
+
+    #[derive(Default)]
+    struct ObservedBidiRun {
+        post_count: AtomicUsize,
+        client_messages: Mutex<Vec<AgentClientMessage>>,
+        kv_client_messages: Mutex<Vec<WireKvClientMessage>>,
+    }
+
+    fn server_frame(message: AgentServerMessage) -> Bytes {
+        let mut payload = Vec::new();
+        message.encode(&mut payload).unwrap();
+        encode_connect_frame(payload, 0)
+    }
+
+    fn kv_set_frame(id: u32, blob_id: &[u8], blob_data: &[u8]) -> Bytes {
+        let message = WireAgentServerMessage {
+            kv_server_message: Some(WireKvServerMessage {
+                id,
+                get_blob_args: None,
+                set_blob_args: Some(WireSetBlobArgs {
+                    blob_id: blob_id.to_vec(),
+                    blob_data: blob_data.to_vec(),
+                }),
+            }),
+        };
+        let mut payload = Vec::new();
+        message.encode(&mut payload).unwrap();
+        encode_connect_frame(payload, 0)
+    }
+
+    fn kv_get_frame(id: u32, blob_id: &[u8]) -> Bytes {
+        let message = WireAgentServerMessage {
+            kv_server_message: Some(WireKvServerMessage {
+                id,
+                get_blob_args: Some(WireGetBlobArgs {
+                    blob_id: blob_id.to_vec(),
+                }),
+                set_blob_args: None,
+            }),
+        };
+        let mut payload = Vec::new();
+        message.encode(&mut payload).unwrap();
+        encode_connect_frame(payload, 0)
+    }
+
+    fn read_exec_frame() -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: Some(ExecServerMessage {
+                id: 41,
+                exec_id: Some("exec-read-1".into()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: Some(ExecReadArgs {
+                    path: "README.md".into(),
+                    tool_call_id: "call-read-1".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
+            }),
+        })
+    }
+
+    fn read_tool_started_frame() -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "call-read-1".into(),
+                    tool_call: Some(ToolCall {
+                        shell_tool_call: None,
+                        delete_tool_call: None,
+                        glob_tool_call: None,
+                        grep_tool_call: None,
+                        read_tool_call: Some(ReadToolCall {
+                            args: Some(ReadToolArgs {
+                                path: "README.md".into(),
+                                offset: None,
+                                limit: None,
+                            }),
+                        }),
+                        edit_tool_call: None,
+                        ls_tool_call: None,
+                        ..Default::default()
+                    }),
+                    model_call_id: "model-call-read-1".into(),
+                }),
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: None,
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        })
+    }
+
+    fn final_text_frame() -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: Some(TextDelta {
+                    text: "continued on the same Cursor run".into(),
+                }),
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: None,
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        })
+    }
+
+    fn final_usage_frame() -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: Some(TurnEnded {
+                    input_tokens: Some(21),
+                    output_tokens: Some(5),
+                    cache_read_tokens: Some(3),
+                    cache_write_tokens: Some(2),
+                    reasoning_tokens: None,
+                }),
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        })
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let observed = Arc::new(ObservedBidiRun::default());
+    let observed_handler = Arc::clone(&observed);
+
+    // The mock returns response headers before consuming the request body, then
+    // reads and writes Connect frames concurrently. This is the key property
+    // needed to exercise Cursor's real HTTP/2 BiDi Run method.
+    let upstream_app = Router::new().route(
+        "/agent.v1.AgentService/Run",
+        post(move |request: Request<Body>| {
+            let observed = Arc::clone(&observed_handler);
+            async move {
+                observed.post_count.fetch_add(1, Ordering::SeqCst);
+                let (response_tx, response_rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
+
+                tokio::spawn(async move {
+                    let mut request_stream = request.into_body().into_data_stream();
+                    let mut decoder = ConnectFrameDecoder::new();
+                    let mut sent_initial_set = false;
+                    let mut sent_tool = false;
+                    let mut saw_read_result = false;
+                    let mut saw_stream_close = false;
+                    let mut sent_after_tool_set = false;
+                    let mut sent_get = false;
+
+                    while let Some(chunk) = request_stream.next().await {
+                        let chunk = match chunk {
+                            Ok(chunk) => chunk,
+                            Err(_) => break,
+                        };
+                        let frames = match decoder.push(&chunk) {
+                            Ok(frames) => frames,
+                            Err(_) => break,
+                        };
+                        for frame in frames {
+                            if let Ok(wire) = WireAgentClientMessage::decode(frame.payload.as_ref())
+                                && let Some(kv) = wire.kv_client_message
+                            {
+                                observed
+                                    .kv_client_messages
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(kv.clone());
+
+                                if kv.id == 70 && kv.set_blob_result.is_some() && !sent_tool {
+                                    assert!(
+                                        kv.set_blob_result
+                                            .as_ref()
+                                            .is_some_and(|result| result.error.is_none()),
+                                        "initial SetBlobResult returned an error"
+                                    );
+                                    sent_tool = true;
+                                    // Cursor emits this UI/transcript frame as well as the
+                                    // authoritative ExecServerMessage. It must not become
+                                    // a duplicate Anthropic tool_use block.
+                                    if response_tx
+                                        .send(Ok(read_tool_started_frame()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if response_tx.send(Ok(read_exec_frame())).await.is_err() {
+                                        return;
+                                    }
+                                }
+
+                                if kv.id == 71 && kv.set_blob_result.is_some() && !sent_get {
+                                    assert!(
+                                        kv.set_blob_result
+                                            .as_ref()
+                                            .is_some_and(|result| result.error.is_none()),
+                                        "post-tool SetBlobResult returned an error"
+                                    );
+                                    sent_get = true;
+                                    if response_tx
+                                        .send(Ok(kv_get_frame(72, KV_BLOB_ID)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+
+                                if kv.id == 72
+                                    && let Some(result) = kv.get_blob_result.as_ref()
+                                {
+                                    assert_eq!(
+                                        result.blob_data.as_deref(),
+                                        Some(KV_AFTER_TOOL),
+                                        "GetBlob did not return the latest value for the key"
+                                    );
+                                    if response_tx.send(Ok(final_text_frame())).await.is_err() {
+                                        return;
+                                    }
+                                    if response_tx.send(Ok(final_usage_frame())).await.is_err() {
+                                        return;
+                                    }
+                                    let _ = response_tx
+                                        .send(Ok(encode_connect_frame([], FLAG_END)))
+                                        .await;
+                                    return;
+                                }
+                            }
+
+                            let message = match AgentClientMessage::decode(frame.payload.as_ref()) {
+                                Ok(message) => message,
+                                Err(_) => continue,
+                            };
+                            observed
+                                .client_messages
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(message.clone());
+
+                            if message.run_request.is_some() && !sent_initial_set {
+                                sent_initial_set = true;
+                                // The model turn is gated on KV persistence: no Read exec
+                                // is emitted until the client acknowledges this SetBlob.
+                                if response_tx
+                                    .send(Ok(kv_set_frame(70, KV_BLOB_ID, KV_BEFORE_TOOL)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+
+                            if let Some(exec) = message.exec_client_message.as_ref()
+                                && exec.read_result.is_some()
+                            {
+                                saw_read_result = true;
+                            }
+                            if let Some(control) = message.exec_client_control_message.as_ref()
+                                && control
+                                    .stream_close
+                                    .as_ref()
+                                    .is_some_and(|close| close.id == 41)
+                            {
+                                saw_stream_close = true;
+                            }
+
+                            // Cursor checkpoints state again after tool execution. The
+                            // continuation remains gated until SetBlob is acknowledged,
+                            // then GetBlob proves the latest value is available.
+                            if saw_read_result && saw_stream_close && !sent_after_tool_set {
+                                sent_after_tool_set = true;
+                                if response_tx
+                                    .send(Ok(kv_set_frame(71, KV_BLOB_ID, KV_AFTER_TOOL)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let response_stream =
+                    futures_util::stream::unfold(response_rx, |mut receiver| async move {
+                        receiver.recv().await.map(|item| (item, receiver))
+                    });
+                Response::builder()
+                    .status(200)
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/connect+proto",
+                    )
+                    .body(Body::from_stream(response_stream))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_url = format!("http://{upstream_addr}");
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let proxy_handle = tokio::spawn(async move {
+        claude_cursor_bridge::server::serve_listener(proxy_listener, None, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", &upstream_url);
+        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "bidi-proxy-token");
+        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "bidi-test-version");
+        std::env::set_var("CCP_CURSOR_BIDI", "1");
+        std::env::set_var("CCP_CURSOR_HEARTBEAT_SECS", "60");
+        std::env::set_var("CCP_CURSOR_EXEC_HEARTBEAT_SECS", "1");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let client = reqwest::Client::new();
+    let session_id = "cursor-live-continuation-test";
+    let tools = serde_json::json!([{
+        "name": "Read",
+        "description": "Read a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"]
+        }
+    }]);
+
+    let first_response = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer ignored")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-session-id", session_id)
+        .json(&serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "max_tokens": 256,
+            "stream": true,
+            "tools": tools.clone(),
+            "messages": [{"role": "user", "content": "Read README.md"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_sse = tokio::time::timeout(std::time::Duration::from_secs(5), first_response.text())
+        .await
+        .expect("first Anthropic segment stayed open after tool_use")
+        .unwrap();
+    let first_events = parse_sse_events(&first_sse);
+    assert_eq!(
+        first_events
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert_eq!(first_events[1].1["content_block"]["type"], "tool_use");
+    assert_eq!(first_events[1].1["content_block"]["id"], "call-read-1");
+    assert_eq!(first_events[1].1["content_block"]["name"], "Read");
+    assert_eq!(first_events[2].1["delta"]["type"], "input_json_delta");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            first_events[2].1["delta"]["partial_json"].as_str().unwrap()
+        )
+        .unwrap(),
+        serde_json::json!({"file_path": "README.md"})
+    );
+    assert_eq!(first_events[4].1["delta"]["stop_reason"], "tool_use");
+
+    // Leave the upstream Run alive long enough to observe the per-exec heartbeat.
+    tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+
+    let second_response = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer ignored")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-session-id", session_id)
+        .json(&serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "max_tokens": 256,
+            "stream": true,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "Read README.md"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "call-read-1",
+                    "name": "Read",
+                    "input": {"file_path": "README.md"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-read-1",
+                    "content": "line one\nline two"
+                }]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+    let second_sse =
+        tokio::time::timeout(std::time::Duration::from_secs(5), second_response.text())
+            .await
+            .expect("second Anthropic segment did not finish on the original Cursor run")
+            .unwrap();
+    let second_events = parse_sse_events(&second_sse);
+    assert_eq!(
+        second_events
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert_eq!(
+        second_events[2].1["delta"]["text"],
+        "continued on the same Cursor run"
+    );
+    assert_eq!(second_events[4].1["delta"]["stop_reason"], "end_turn");
+    // Cursor turn_ended reports total input=21 with cache_read=3 + cache_write=2;
+    // Anthropic normalize → uncached input 16.
+    assert_eq!(second_events[4].1["usage"]["input_tokens"], 16);
+    // Output is max(turn_ended=5, char/4 estimate of streamed text ≈8).
+    assert_eq!(second_events[4].1["usage"]["output_tokens"], 8);
+    assert_eq!(second_events[4].1["usage"]["cache_read_input_tokens"], 3);
+    assert_eq!(
+        second_events[4].1["usage"]["cache_creation_input_tokens"],
+        2
+    );
+
+    let client_messages = observed
+        .client_messages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let kv_client_messages = observed
+        .kv_client_messages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(
+        observed.post_count.load(Ordering::SeqCst),
+        1,
+        "tool_result opened a second Cursor AgentService/Run POST"
+    );
+    assert_eq!(
+        client_messages
+            .iter()
+            .filter(|message| message.run_request.is_some())
+            .count(),
+        1,
+        "the same upstream body must contain exactly one RunRequest"
+    );
+    for id in [70, 71] {
+        let result = kv_client_messages
+            .iter()
+            .find(|message| message.id == id)
+            .and_then(|message| message.set_blob_result.as_ref())
+            .unwrap_or_else(|| panic!("missing SetBlobResult acknowledgement for KV id {id}"));
+        assert!(
+            result.error.is_none(),
+            "SetBlobResult for KV id {id} contained an error"
+        );
+    }
+    let get_result = kv_client_messages
+        .iter()
+        .find(|message| message.id == 72)
+        .and_then(|message| message.get_blob_result.as_ref())
+        .expect("missing GetBlobResult for KV id 72");
+    assert_eq!(get_result.blob_data.as_deref(), Some(KV_AFTER_TOOL));
+
+    let read_result = client_messages
+        .iter()
+        .find_map(|message| {
+            message
+                .exec_client_message
+                .as_ref()
+                .filter(|exec| exec.read_result.is_some())
+        })
+        .expect("Claude tool_result was not encoded as ExecClientMessage.read_result");
+    assert_eq!(read_result.id, 41);
+    assert_eq!(read_result.exec_id.as_deref(), Some("exec-read-1"));
+    let read_success = read_result
+        .read_result
+        .as_ref()
+        .and_then(|result| result.success.as_ref())
+        .expect("read tool_result should be a ReadSuccess");
+    assert_eq!(read_success.path, "README.md");
+    assert_eq!(read_success.content.as_deref(), Some("line one\nline two"));
+    assert_eq!(read_success.total_lines, 2);
+
+    assert!(
+        client_messages.iter().any(|message| {
+            message
+                .exec_client_control_message
+                .as_ref()
+                .and_then(|control| control.heartbeat.as_ref())
+                .is_some_and(|heartbeat| heartbeat.id == 41)
+        }),
+        "pending exec did not receive its 3s-style control heartbeat"
+    );
+    assert!(
+        client_messages.iter().any(|message| {
+            message
+                .exec_client_control_message
+                .as_ref()
+                .and_then(|control| control.stream_close.as_ref())
+                .is_some_and(|close| close.id == 41)
+        }),
+        "native exec result was not followed by stream_close"
+    );
+
+    let _ = shutdown_tx.send(());
+    upstream_handle.abort();
+    proxy_handle.abort();
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
+        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
+        std::env::remove_var("CCP_CURSOR_BIDI");
+        std::env::remove_var("CCP_CURSOR_HEARTBEAT_SECS");
+        std::env::remove_var("CCP_CURSOR_EXEC_HEARTBEAT_SECS");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same_run() {
+    use axum::{Router, body::Body, http::Request, response::Response, routing::post};
+    use bytes::Bytes;
+    use claude_cursor_bridge::providers::cursor::connect::{
+        ConnectFrameDecoder, FLAG_END, encode_connect_frame,
+    };
+    use claude_cursor_bridge::providers::cursor::proto::*;
+    use futures_util::StreamExt;
+    use prost::Message;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct ObservedParallelRun {
+        post_count: AtomicUsize,
+        client_messages: Mutex<Vec<AgentClientMessage>>,
+    }
+
+    fn server_frame(message: AgentServerMessage) -> Bytes {
+        let mut payload = Vec::new();
+        message.encode(&mut payload).unwrap();
+        encode_connect_frame(payload, 0)
+    }
+
+    fn read_exec_frame(id: u32, exec_id: &str, tool_use_id: &str, path: &str) -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            exec_server_message: Some(ExecServerMessage {
+                id,
+                exec_id: Some(exec_id.into()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: Some(ExecReadArgs {
+                    path: path.into(),
+                    tool_call_id: tool_use_id.into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+        })
+    }
+
+    fn final_text_frame() -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: Some(TextDelta {
+                    text: "both parallel reads continued on one run".into(),
+                }),
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        })
+    }
+
+    fn final_usage_frame() -> Bytes {
+        server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: Some(TurnEnded {
+                    input_tokens: Some(34),
+                    output_tokens: Some(8),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    reasoning_tokens: None,
+                }),
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        })
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let observed = Arc::new(ObservedParallelRun::default());
+    let observed_handler = Arc::clone(&observed);
+
+    let upstream_app = Router::new().route(
+        "/agent.v1.AgentService/Run",
+        post(move |request: Request<Body>| {
+            let observed = Arc::clone(&observed_handler);
+            async move {
+                observed.post_count.fetch_add(1, Ordering::SeqCst);
+                let (response_tx, response_rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
+
+                tokio::spawn(async move {
+                    let mut request_stream = request.into_body().into_data_stream();
+                    let mut decoder = ConnectFrameDecoder::new();
+                    let mut sent_tools = false;
+                    let mut read_results = BTreeMap::<u32, String>::new();
+                    let mut stream_closes = BTreeSet::<u32>::new();
+
+                    while let Some(chunk) = request_stream.next().await {
+                        let chunk = match chunk {
+                            Ok(chunk) => chunk,
+                            Err(_) => break,
+                        };
+                        let frames = match decoder.push(&chunk) {
+                            Ok(frames) => frames,
+                            Err(_) => break,
+                        };
+                        for frame in frames {
+                            let message = match AgentClientMessage::decode(frame.payload.as_ref()) {
+                                Ok(message) => message,
+                                Err(_) => continue,
+                            };
+                            observed
+                                .client_messages
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(message.clone());
+
+                            if message.run_request.is_some() && !sent_tools {
+                                sent_tools = true;
+                                if response_tx
+                                    .send(Ok(read_exec_frame(
+                                        41,
+                                        "exec-read-a",
+                                        "call-read-a",
+                                        "README.md",
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                if response_tx
+                                    .send(Ok(read_exec_frame(
+                                        42,
+                                        "exec-read-b",
+                                        "call-read-b",
+                                        "Cargo.toml",
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+
+                            if let Some(exec) = message.exec_client_message.as_ref()
+                                && let Some(success) = exec
+                                    .read_result
+                                    .as_ref()
+                                    .and_then(|result| result.success.as_ref())
+                            {
+                                read_results
+                                    .insert(exec.id, success.content.clone().unwrap_or_default());
+                            }
+                            if let Some(close) = message
+                                .exec_client_control_message
+                                .as_ref()
+                                .and_then(|control| control.stream_close.as_ref())
+                            {
+                                stream_closes.insert(close.id);
+                            }
+
+                            if read_results.len() == 2
+                                && stream_closes.contains(&41)
+                                && stream_closes.contains(&42)
+                            {
+                                assert_eq!(
+                                    read_results.get(&41).map(String::as_str),
+                                    Some("README result")
+                                );
+                                assert_eq!(
+                                    read_results.get(&42).map(String::as_str),
+                                    Some("Cargo result")
+                                );
+                                if response_tx.send(Ok(final_text_frame())).await.is_err() {
+                                    return;
+                                }
+                                if response_tx.send(Ok(final_usage_frame())).await.is_err() {
+                                    return;
+                                }
+                                let _ = response_tx
+                                    .send(Ok(encode_connect_frame([], FLAG_END)))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                });
+
+                let response_stream =
+                    futures_util::stream::unfold(response_rx, |mut receiver| async move {
+                        receiver.recv().await.map(|item| (item, receiver))
+                    });
+                Response::builder()
+                    .status(200)
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/connect+proto",
+                    )
+                    .body(Body::from_stream(response_stream))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_url = format!("http://{upstream_addr}");
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let proxy_handle = tokio::spawn(async move {
+        claude_cursor_bridge::server::serve_listener(proxy_listener, None, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", &upstream_url);
+        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "parallel-bidi-token");
+        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "parallel-bidi-test");
+        std::env::set_var("CCP_CURSOR_BIDI", "1");
+        std::env::set_var("CCP_CURSOR_HEARTBEAT_SECS", "60");
+        std::env::set_var("CCP_CURSOR_EXEC_HEARTBEAT_SECS", "60");
+        std::env::set_var("CCP_CURSOR_TOOL_BATCH_MS", "50");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let client = reqwest::Client::new();
+    let session_id = "cursor-live-parallel-continuation-test";
+    let tools = serde_json::json!([{
+        "name": "Read",
+        "description": "Read a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"]
+        }
+    }]);
+
+    let first_response = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer ignored")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-session-id", session_id)
+        .json(&serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "max_tokens": 256,
+            "stream": true,
+            "tools": tools.clone(),
+            "messages": [{"role": "user", "content": "Read both files"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first_sse = tokio::time::timeout(std::time::Duration::from_secs(5), first_response.text())
+        .await
+        .expect("parallel tool batch did not close the first Anthropic segment")
+        .unwrap();
+    let first_events = parse_sse_events(&first_sse);
+    assert_eq!(
+        first_events
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    let tool_starts: Vec<&serde_json::Value> = first_events
+        .iter()
+        .filter_map(|(name, data)| {
+            (name == "content_block_start" && data["content_block"]["type"] == "tool_use")
+                .then_some(data)
+        })
+        .collect();
+    assert_eq!(tool_starts.len(), 2);
+    assert_eq!(tool_starts[0]["index"], 0);
+    assert_eq!(tool_starts[0]["content_block"]["id"], "call-read-a");
+    assert_eq!(tool_starts[1]["index"], 1);
+    assert_eq!(tool_starts[1]["content_block"]["id"], "call-read-b");
+    assert_eq!(first_events[7].1["delta"]["stop_reason"], "tool_use");
+
+    let second_response = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer ignored")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-session-id", session_id)
+        .json(&serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "max_tokens": 256,
+            "stream": true,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "Read both files"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call-read-a", "name": "Read", "input": {"file_path": "README.md"}},
+                    {"type": "tool_use", "id": "call-read-b", "name": "Read", "input": {"file_path": "Cargo.toml"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-read-b", "content": "Cargo result"},
+                    {"type": "tool_result", "tool_use_id": "call-read-a", "content": "README result"}
+                ]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+    let second_sse =
+        tokio::time::timeout(std::time::Duration::from_secs(5), second_response.text())
+            .await
+            .expect("parallel tool results did not resume the original Cursor run")
+            .unwrap();
+    let second_events = parse_sse_events(&second_sse);
+    assert_eq!(
+        second_events
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert_eq!(
+        second_events[2].1["delta"]["text"],
+        "both parallel reads continued on one run"
+    );
+    assert_eq!(second_events[4].1["delta"]["stop_reason"], "end_turn");
+
+    let client_messages = observed
+        .client_messages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(observed.post_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client_messages
+            .iter()
+            .filter(|message| message.run_request.is_some())
+            .count(),
+        1
+    );
+    let read_result_ids: Vec<u32> = client_messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .exec_client_message
+                .as_ref()
+                .filter(|exec| exec.read_result.is_some())
+                .map(|exec| exec.id)
+        })
+        .collect();
+    assert_eq!(read_result_ids, vec![41, 42]);
+    let close_ids: Vec<u32> = client_messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .exec_client_control_message
+                .as_ref()
+                .and_then(|control| control.stream_close.as_ref())
+                .map(|close| close.id)
+        })
+        .collect();
+    assert_eq!(close_ids, vec![41, 42]);
+
+    let _ = shutdown_tx.send(());
+    upstream_handle.abort();
+    proxy_handle.abort();
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
+        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
+        std::env::remove_var("CCP_CURSOR_BIDI");
+        std::env::remove_var("CCP_CURSOR_HEARTBEAT_SECS");
+        std::env::remove_var("CCP_CURSOR_EXEC_HEARTBEAT_SECS");
+        std::env::remove_var("CCP_CURSOR_TOOL_BATCH_MS");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cursor tool bridge integration tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn bridge_start_pauses_on_tool_use_xml() {
-    use claude_code_proxy::providers::cursor::response::*;
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::response::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     // Create upstream events with a text delta containing XML tool_use
     let events = vec![
@@ -1136,8 +2350,8 @@ fn bridge_start_pauses_on_tool_use_xml() {
 
 #[test]
 fn bridge_start_passes_through_without_tool_use() {
-    use claude_code_proxy::providers::cursor::response::*;
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::response::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     let events = vec![
         CursorStreamEvent::TextDelta {
@@ -1186,8 +2400,8 @@ fn bridge_start_passes_through_without_tool_use() {
 
 #[test]
 fn bridge_start_creates_pending_tool_in_registry() {
-    use claude_code_proxy::providers::cursor::response::*;
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::response::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     // Clean state
     BridgeRegistry::clear();
@@ -1218,8 +2432,8 @@ fn bridge_start_creates_pending_tool_in_registry() {
 
 #[test]
 fn bridge_resume_continues_after_tool_use_pause() {
-    use claude_code_proxy::providers::cursor::response::*;
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::response::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     BridgeRegistry::clear();
 
@@ -1261,7 +2475,7 @@ fn bridge_resume_continues_after_tool_use_pause() {
     );
     assert!(paused);
 
-    let body: claude_code_proxy::MessagesRequest =
+    let body: claude_cursor_bridge::MessagesRequest =
         serde_json::from_value(serde_json::json!({
             "model": "cursor-test",
             "messages": [
@@ -1320,8 +2534,8 @@ fn bridge_resume_continues_after_tool_use_pause() {
 
 #[test]
 fn bridge_rejects_tool_not_in_allowed_list() {
-    use claude_code_proxy::providers::cursor::response::*;
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::response::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     BridgeRegistry::clear();
 
@@ -1361,7 +2575,7 @@ fn bridge_rejects_tool_not_in_allowed_list() {
 
 #[test]
 fn bridge_result_messages_have_correct_read_shape() {
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     let exec = CursorExec {
         id: Some(42),
@@ -1394,7 +2608,7 @@ fn bridge_result_messages_have_correct_read_shape() {
 
 #[test]
 fn bridge_result_messages_have_correct_write_shape() {
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     let exec = CursorExec {
         id: Some(99),
@@ -1444,7 +2658,7 @@ fn bridge_result_messages_have_correct_write_shape() {
 
 #[test]
 fn bridge_shell_stream_result_has_correct_shape() {
-    use claude_code_proxy::providers::cursor::tool_bridge::*;
+    use claude_cursor_bridge::providers::cursor::tool_bridge::*;
 
     let exec = CursorExec {
         id: Some(7),
@@ -1525,10 +2739,9 @@ fn parse_sse_events(sse: &str) -> Vec<(String, serde_json::Value)> {
     let mut current_event = String::new();
 
     for line in sse.lines() {
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            let data_str = &line["data: ".len()..];
+        if let Some(event) = line.strip_prefix("event: ") {
+            current_event = event.to_string();
+        } else if let Some(data_str) = line.strip_prefix("data: ") {
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
                 events.push((current_event.clone(), data));
             }

@@ -119,17 +119,57 @@ pub fn parse_connect_error(payload: &[u8]) -> Option<ConnectEndError> {
     let parsed: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let error = parsed.get("error")?;
     let code = error.get("code")?.as_str()?;
-    let message = error.get("message")?.as_str().unwrap_or("Connect error");
+    let mut message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("Connect error")
+        .to_string();
+
+    // Prefer human-readable aiserver ErrorDetails when present (e.g.
+    // ERROR_OUTDATED_CLIENT / "Update Required").
+    if let Some(detail) = extract_aiserver_detail(&parsed) {
+        message = detail;
+    }
+
     let status = match code {
         "resource_exhausted" => 429,
+        "unauthenticated" => 401,
+        "permission_denied" => 403,
+        "not_found" => 404,
         _ => 502,
     };
     Some(ConnectEndError {
         code: code.to_string(),
-        message: message.to_string(),
+        message,
         detail: parsed.to_string(),
         status,
     })
+}
+
+fn extract_aiserver_detail(parsed: &serde_json::Value) -> Option<String> {
+    let details = parsed.pointer("/error/details")?.as_array()?;
+    for entry in details {
+        let debug = entry.get("debug")?;
+        let code = debug
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ERROR");
+        let title = debug
+            .pointer("/details/title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let detail = debug
+            .pointer("/details/detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !title.is_empty() || !detail.is_empty() {
+            return Some(format!("{code}: {title} — {detail}"));
+        }
+        if code != "ERROR" {
+            return Some(code.to_string());
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +184,7 @@ impl std::fmt::Display for ConnectEndError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Connect error {}: {} ({})",
+            "Connect error {}: {} [{}]",
             self.status, self.message, self.code
         )
     }

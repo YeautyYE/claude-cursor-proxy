@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use claude_code_proxy::{
+use claude_cursor_bridge::{
     monitor::{MonitorHandle, RequestStatus},
     registry::Registry,
     server::{app, app_with_monitor, bind_proxy_listener},
