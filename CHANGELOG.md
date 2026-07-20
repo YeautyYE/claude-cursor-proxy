@@ -12,6 +12,7 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 
 ## Unreleased
 
+- When BiDi-bridging, still forward Claude-local tools (`Workflow`, `Skill`, `mcp__*`, …) into Cursor `<tools>`; only omit Cursor-native schemas (Read/Bash/…). Fixes silent drop that made `/deep-research`/skills look like plain Bash agenting. CLAUDE.md/rules in Anthropic `system` remain omitted by default (Fable injection loops).
 - Cursor live streaming latency (CLI parity): never drop thinking/text deltas under SSE backpressure (old 5ms `try_send` timeout discarded tokens); resume fan-out matches start capacity (512); prefer draining InteractionUpdates before heartbeat ticks; non-blocking exec/client heartbeats (HTTP/1 BidiAppend no longer stalls the read loop); larger upstream pump; disable SSE try_recv coalesce so tokens stream at Cursor cadence; early tool expose when quiet window already elapsed; `CCP_CURSOR_TOOL_BATCH_MS=0` honored (default remains 25ms and does not gate thinking).
 - Cheaper TTFT seeding: zero-copy Connect decode for uncompressed frames; estimate tools JSON size without re-serializing the full schema dump on every request.
 - SSE hot path: throttle + `try_lock` monitor progress publishes so TUI snapshot cloning cannot stall token emission; Bytes-clone classify path (no per-frame `to_vec`).

@@ -15,7 +15,11 @@ pub struct CursorSelectedImage {
 /// - Field 8 `custom_system_prompt` is **team-only** (else 502).
 /// - Embedding Claude Code's full system into `UserMessage` makes Fable treat it as
 ///   **prompt injection** and waste turns (live 2026-07). Default: **do not embed**.
+/// - Therefore CLAUDE.md / rules / skill *instructions* that live in Anthropic
+///   `system` are **not** sent to Cursor unless an env opt-in is set.
 /// - Agent tools still work via Anthropic tool schemas + native tool bridge.
+/// - Claude-local tools (`Workflow`, `Skill`, MCP names) stay in the `<tools>`
+///   dump even when native schemas are omitted for the BiDi bridge.
 ///
 /// Env:
 /// - `CCP_CURSOR_USE_CUSTOM_SYSTEM=1` — field 8 (team only)
@@ -59,10 +63,64 @@ const SYSTEM_CLOSE: &str = "===== END_CLAUDE_CODE_SYSTEM =====";
 /// Options controlling how Anthropic Messages become Cursor UserMessage text.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CursorPromptOptions {
-    /// Skip the `<tools>` dump (native Cursor tools / MCP path handles them).
+    /// Skip **Cursor-native** tool schemas in the `<tools>` dump (BiDi bridge
+    /// already exposes Shell/Read/…). Claude-local tools (`Workflow`, `Skill`,
+    /// `Task`, `mcp__*`, …) are still forwarded so Fable can emit them.
     pub omit_tools: bool,
     /// Only the latest user turn (used when ConversationState checkpoint exists).
     pub delta_only: bool,
+}
+
+/// Tools Cursor Agent already provides natively (or we remap from native exec).
+/// Omitting these from the prompt dump avoids tens–hundreds of k tokens of
+/// duplicate schema; Claude Code still learns them via BiDi tool calls.
+const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
+    "Bash",
+    "Shell",
+    "bash",
+    "Read",
+    "read_file",
+    "ReadFile",
+    "Write",
+    "write_file",
+    "WriteFile",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Grep",
+    "grep",
+    "Search",
+    "Glob",
+    "glob",
+    "Find",
+    "Delete",
+    "Ls",
+    "WebSearch",
+    "web_search",
+    "WebFetch",
+    "web_fetch",
+    "Fetch",
+    "TodoWrite",
+    "TodoRead",
+    "AskUserQuestion",
+    "AskQuestion",
+    "CreatePlan",
+    "Plan",
+];
+
+fn is_cursor_native_tool_name(name: &str) -> bool {
+    CURSOR_NATIVE_TOOL_NAMES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Keep Claude Code client-local tools that Cursor does not bridge natively
+/// (`Workflow`, `Skill`, `Task`, `mcp__*`, …). Anything not in
+/// [`CURSOR_NATIVE_TOOL_NAMES`] stays visible when `omit_tools` drops the
+/// native schema dump — otherwise `/deep-research` and skills degrade to
+/// plain Bash agenting.
+fn is_claude_local_tool_name(name: &str) -> bool {
+    !name.is_empty() && !is_cursor_native_tool_name(name)
 }
 
 /// Split Anthropic MessagesRequest into Cursor system vs user payloads.
@@ -118,13 +176,19 @@ pub fn render_cursor_prompt_parts_with(
         }
     }
 
-    // Tools: Anthropic top-level field. Omit when native bridge / checkpoint path
-    // can carry history — full schemas dominate Ctx (tens–hundreds of k tokens).
+    // Tools: Anthropic top-level field.
+    // - Full dump when not bridging (or CCP_CURSOR_FORCE_TOOLS_IN_PROMPT=1).
+    // - When omit_tools / delta_only: still pass Claude-local tools (Workflow,
+    //   Skill, mcp__*, …). Dropping those was a silent quality bug — Cursor
+    //   never saw `/deep-research` / skill schemas and fell back to Bash.
     let force_tools = env_flag("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
-    if force_tools || (!opts.omit_tools && !opts.delta_only) {
-        if let Some(tools) = render_tools_block(req) {
-            sections.push(tools);
-        }
+    let tools_block = if force_tools || (!opts.omit_tools && !opts.delta_only) {
+        render_tools_block(req, ToolDumpMode::All)
+    } else {
+        render_tools_block(req, ToolDumpMode::ClaudeLocalOnly)
+    };
+    if let Some(tools) = tools_block {
+        sections.push(tools);
     }
 
     CursorPromptParts {
@@ -232,26 +296,39 @@ pub fn render_cursor_prompt(req: &MessagesRequest) -> String {
     }
 }
 
-fn render_tools_block(req: &MessagesRequest) -> Option<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolDumpMode {
+    /// Every Anthropic-advertised tool (large; used when not BiDi-bridging).
+    All,
+    /// Only Claude Code client-local tools Cursor does not own natively.
+    ClaudeLocalOnly,
+}
+
+fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<String> {
     let tools = req.extra.get("tools").and_then(|v| v.as_array())?;
     if tools.is_empty() {
         return None;
     }
     let tool_lines: Vec<String> = tools
         .iter()
-        .map(|t| {
+        .filter_map(|t| {
             let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if mode == ToolDumpMode::ClaudeLocalOnly && !is_claude_local_tool_name(name) {
+                return None;
+            }
             let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
             let input_schema = t
                 .get("input_schema")
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
-            serde_json::json!({
-                "name": name,
-                "description": description,
-                "input_schema": input_schema,
-            })
-            .to_string()
+            Some(
+                serde_json::json!({
+                    "name": name,
+                    "description": description,
+                    "input_schema": input_schema,
+                })
+                .to_string(),
+            )
         })
         .collect();
     if tool_lines.is_empty() {
@@ -511,7 +588,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn omit_tools_skips_schema_dump() {
+    fn omit_tools_skips_native_schemas_but_keeps_claude_local() {
         unsafe {
             std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
@@ -520,7 +597,12 @@ mod tests {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
             "messages": [{"role": "user", "content": "hello"}],
-            "tools": [{"name": "Read", "description": "read files", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}}]
+            "tools": [
+                {"name": "Read", "description": "read files", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}},
+                {"name": "Workflow", "description": "run a workflow", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}},
+                {"name": "Skill", "description": "invoke a skill", "input_schema": {"type": "object"}},
+                {"name": "mcp__plugin__search", "description": "mcp", "input_schema": {"type": "object"}}
+            ]
         }))
         .unwrap();
         let parts = render_cursor_prompt_parts_with(
@@ -530,12 +612,22 @@ mod tests {
                 delta_only: false,
             },
         );
-        assert!(!parts.user_text.contains("<tools>"));
         assert!(parts.user_text.contains("hello"));
+        assert!(
+            parts.user_text.contains("<tools>"),
+            "claude-local tools must still reach Cursor"
+        );
+        assert!(parts.user_text.contains("\"name\":\"Workflow\""));
+        assert!(parts.user_text.contains("\"name\":\"Skill\""));
+        assert!(parts.user_text.contains("mcp__plugin__search"));
+        assert!(
+            !parts.user_text.contains("\"name\":\"Read\""),
+            "native Read schema should stay omitted when bridging"
+        );
     }
 
     #[test]
-    fn delta_only_sends_latest_user_without_history_or_tools() {
+    fn delta_only_keeps_workflow_skill_without_history() {
         unsafe {
             std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
         }
@@ -546,7 +638,10 @@ mod tests {
                 {"role": "assistant", "content": "ack"},
                 {"role": "user", "content": "second question"}
             ],
-            "tools": [{"name": "Read", "description": "x", "input_schema": {"type": "object"}}]
+            "tools": [
+                {"name": "Read", "description": "x", "input_schema": {"type": "object"}},
+                {"name": "Workflow", "description": "wf", "input_schema": {"type": "object"}}
+            ]
         }))
         .unwrap();
         let parts = render_cursor_prompt_parts_with(
@@ -558,8 +653,12 @@ mod tests {
         );
         assert!(parts.user_text.contains("second question"));
         assert!(!parts.user_text.contains("first"));
-        assert!(!parts.user_text.contains("<tools>"));
         assert!(!parts.user_text.contains("<assistant>"));
+        assert!(
+            parts.user_text.contains("\"name\":\"Workflow\""),
+            "checkpoint delta must still advertise Workflow"
+        );
+        assert!(!parts.user_text.contains("\"name\":\"Read\""));
     }
 
     #[test]

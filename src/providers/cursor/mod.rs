@@ -397,7 +397,8 @@ impl Provider for CursorProvider {
         let parts = render_cursor_prompt_parts_with(
             &body,
             CursorPromptOptions {
-                // Native BiDi tools don't need the Anthropic schema dump in user text.
+                // Native BiDi tools don't need Anthropic schemas in user text;
+                // Claude-local tools (Workflow/Skill/mcp__) are still forwarded.
                 omit_tools: bridge_eligible || continuation.has_checkpoint,
                 delta_only: continuation.has_checkpoint,
             },
