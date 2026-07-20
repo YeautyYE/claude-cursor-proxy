@@ -645,6 +645,16 @@ impl CursorSseEncoder {
         self.with_framer(|framer| framer.seed_estimated_input_tokens(tokens));
     }
 
+    /// Snapshot of the best-known Anthropic usage for TUI/monitor updates.
+    pub fn current_usage(&self) -> (u64, u64) {
+        (
+            self.state.usage_input_tokens,
+            self.state
+                .usage_output_tokens
+                .max(self.state.usage_output_estimate),
+        )
+    }
+
     pub fn emit_tool_pause(&mut self, tool_use_id: &str, tool_name: &str, partial_json: &str) {
         self.with_framer(|framer| framer.emit_tool_pause(tool_use_id, tool_name, partial_json));
     }

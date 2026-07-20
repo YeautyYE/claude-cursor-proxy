@@ -530,8 +530,14 @@ impl LiveRunRegistry {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         match runs.get(session_id) {
-            Some(LiveRunEntry::Running(handle)) => Some(Arc::clone(handle)),
-            Some(LiveRunEntry::Starting { .. }) | None => None,
+            // Completed runs (incl. terminal failures awaiting take_terminal_error)
+            // must not look "still generating" to concurrent POSTs.
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+                Some(Arc::clone(handle))
+            }
+            Some(LiveRunEntry::Running(_))
+            | Some(LiveRunEntry::Starting { .. })
+            | None => None,
         }
     }
 
@@ -1269,11 +1275,7 @@ async fn drive_live_run(
                             Ok(frames) => frames,
                             Err(error) => {
                                 let message = format!("Cursor frame decode: {error}");
-                                if pending.is_empty() {
-                                    let _ = emit_or_defer(&mut sink, &mut deferred, Err(message)).await;
-                                } else {
-                                    report_terminal_error(&mut sink, &terminal_error, message).await;
-                                }
+                                report_terminal_error(&mut sink, &terminal_error, message).await;
                                 break 'driver;
                             }
                         };
@@ -1351,11 +1353,7 @@ async fn drive_live_run(
                         {
                             continue 'driver;
                         }
-                        if pending.is_empty() {
-                            let _ = emit_or_defer(&mut sink, &mut deferred, Err(message)).await;
-                        } else {
-                            report_terminal_error(&mut sink, &terminal_error, message).await;
-                        }
+                        report_terminal_error(&mut sink, &terminal_error, message).await;
                         break 'driver;
                     }
                 }
@@ -1387,16 +1385,12 @@ async fn drive_live_run(
                 // for many minutes — inventing End after a few minutes truncates
                 // real work and also races Claude Code's ≥5m stream idle watchdog.
                 if run_started.elapsed() >= hard {
-                    if pending.is_empty() {
-                        let _ = emit_or_defer(&mut sink, &mut deferred, Err("Cursor live run hard timeout".into())).await;
+                    let message = if pending.is_empty() {
+                        "Cursor live run hard timeout".into()
                     } else {
-                        report_terminal_error(
-                            &mut sink,
-                            &terminal_error,
-                            "Cursor live run hard timeout with pending native tools".into(),
-                        )
-                        .await;
-                    }
+                        "Cursor live run hard timeout with pending native tools".into()
+                    };
+                    report_terminal_error(&mut sink, &terminal_error, message).await;
                     break 'driver;
                 }
                 if let Some(since) = pending.oldest_since() {
@@ -1427,11 +1421,21 @@ async fn drive_live_run(
                     // Thinking-only agent turns can stay quiet for a long time; only
                     // treat as stalled when no tools were advertised for this run.
                     if allowed_tool_names.is_none() {
-                        emit_or_defer(&mut sink, &mut deferred, Err("Cursor stream stalled after partial progress".into())).await;
+                        report_terminal_error(
+                            &mut sink,
+                            &terminal_error,
+                            "Cursor stream stalled after partial progress".into(),
+                        )
+                        .await;
                         break 'driver;
                     }
                 } else if !useful && last_progress.elapsed() >= setup_idle {
-                    emit_or_defer(&mut sink, &mut deferred, Err("Cursor stream produced no useful progress".into())).await;
+                    report_terminal_error(
+                        &mut sink,
+                        &terminal_error,
+                        "Cursor stream produced no useful progress".into(),
+                    )
+                    .await;
                     break 'driver;
                 }
             }
@@ -1699,13 +1703,21 @@ async fn report_terminal_error(
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     message: String,
 ) {
+    // Always stash the failure. Previously we only stored it when `sink` was
+    // None (between Anthropic segments). Idle/timeouts with a live SSE sink
+    // therefore left the registry entry looking "still generating" -> cascade
+    // of 409s for concurrent same-session POSTs.
+    {
+        let mut slot = terminal_error.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(TerminalOutcome {
+                message: message.clone(),
+                created_at: Instant::now(),
+            });
+        }
+    }
     if sink.is_some() {
         let _ = send_live_event(sink, Err(message)).await;
-    } else {
-        *terminal_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(TerminalOutcome {
-            message,
-            created_at: Instant::now(),
-        });
     }
 }
 
@@ -2031,17 +2043,38 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn publish_live_usage(
+    monitor: &Option<(crate::monitor::MonitorHandle, String)>,
+    encoder: &CursorSseEncoder,
+    bytes: usize,
+    chunks: u64,
+) {
+    let Some((handle, req_id)) = monitor else {
+        return;
+    };
+    let (input_tokens, output_tokens) = encoder.current_usage();
+    handle.stream_progress(
+        req_id,
+        bytes as u64,
+        chunks,
+        Some(input_tokens).filter(|v| *v > 0),
+        Some(output_tokens).filter(|v| *v > 0),
+    );
+}
+
 pub fn live_sse_response(
     events: mpsc::Receiver<LiveEventResult>,
     message_id: String,
     model: String,
     estimated_input_tokens: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
 ) -> Response {
     struct State {
         events: mpsc::Receiver<LiveEventResult>,
         encoder: CursorSseEncoder,
         began: bool,
         done: bool,
+        monitor: Option<(crate::monitor::MonitorHandle, String)>,
         /// Periodic Anthropic `ping` so Claude Code's stream idle watchdog
         /// (≥300s by default) does not abort during quiet Cursor thinking.
         ping: tokio::time::Interval,
@@ -2049,6 +2082,14 @@ pub fn live_sse_response(
 
     let mut encoder = CursorSseEncoder::new(message_id, model);
     encoder.seed_estimated_input_tokens(estimated_input_tokens);
+    if let Some((ref handle, ref req_id)) = monitor {
+        let (input_tokens, output_tokens) = encoder.current_usage();
+        handle.usage_updated(
+            req_id,
+            Some(input_tokens).filter(|v| *v > 0),
+            Some(output_tokens).filter(|v| *v > 0),
+        );
+    }
 
     // Claude Code: Math.max(CLAUDE_STREAM_IDLE_TIMEOUT_MS||0, 300000). Keep
     // well under that; Cursor BiDi heartbeats alone do not produce SSE bytes.
@@ -2064,6 +2105,7 @@ pub fn live_sse_response(
             encoder,
             began: false,
             done: false,
+            monitor,
             ping,
         },
         |mut state| async move {
@@ -2076,6 +2118,12 @@ pub fn live_sse_response(
                     state.encoder.begin();
                     let bytes = state.encoder.take_bytes();
                     if !bytes.is_empty() {
+                        publish_live_usage(
+                            &state.monitor,
+                            &state.encoder,
+                            bytes.len(),
+                            1,
+                        );
                         return Some((Ok::<Bytes, Infallible>(Bytes::from(bytes)), state));
                     }
                 }
@@ -2225,8 +2273,23 @@ pub fn live_sse_response(
                                 }
                                 let bytes = state.encoder.take_bytes();
                                 if !bytes.is_empty() {
+                                    publish_live_usage(
+                                        &state.monitor,
+                                        &state.encoder,
+                                        bytes.len(),
+                                        1,
+                                    );
                                     if state.encoder.is_finalized() {
                                         state.done = true;
+                                        let (input_tokens, output_tokens) =
+                                            state.encoder.current_usage();
+                                        if let Some((ref handle, ref req_id)) = state.monitor {
+                                            handle.usage_updated(
+                                                req_id,
+                                                Some(input_tokens).filter(|v| *v > 0),
+                                                Some(output_tokens).filter(|v| *v > 0),
+                                            );
+                                        }
                                     }
                                     return Some((Ok(Bytes::from(bytes)), state));
                                 }
@@ -2246,6 +2309,22 @@ pub fn live_sse_response(
                                 state.encoder.finalize();
                                 state.done = true;
                                 let bytes = state.encoder.take_bytes();
+                                if !bytes.is_empty() {
+                                    publish_live_usage(
+                                        &state.monitor,
+                                        &state.encoder,
+                                        bytes.len(),
+                                        1,
+                                    );
+                                }
+                                let (input_tokens, output_tokens) = state.encoder.current_usage();
+                                if let Some((ref handle, ref req_id)) = state.monitor {
+                                    handle.usage_updated(
+                                        req_id,
+                                        Some(input_tokens).filter(|v| *v > 0),
+                                        Some(output_tokens).filter(|v| *v > 0),
+                                    );
+                                }
                                 if bytes.is_empty() {
                                     return None;
                                 }
@@ -2589,6 +2668,72 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("event: ping"));
         assert!(text.contains(r#""type":"ping"#) || text.contains(r#""type": "ping"#));
+    }
+
+    #[test]
+    fn completed_terminal_failure_does_not_look_generating() {
+        let session = format!("fail-session-{}", uuid::Uuid::new_v4());
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "failed-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-a")])),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: "idle timeout".into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(true)),
+        });
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        if reservation.insert(handle).is_err() {
+            panic!("insert running handle");
+        }
+
+        // get() must not surface completed failures as "still generating"
+        assert!(LiveRunRegistry::get(&session).is_none());
+        assert_eq!(
+            LiveRunRegistry::take_terminal_error(&session).as_deref(),
+            Some("idle timeout")
+        );
+        assert!(LiveRunRegistry::get(&session).is_none());
+    }
+
+    #[tokio::test]
+    async fn report_terminal_error_always_stashes_even_with_live_sink() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut sink = Some(tx);
+        let terminal_error = Arc::new(Mutex::new(None));
+        report_terminal_error(&mut sink, &terminal_error, "boom".into()).await;
+        assert!(
+            terminal_error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|o| o.message == "boom")
+        );
+        let event = rx.recv().await.expect("error event");
+        assert!(event.is_err());
+    }
+
+    #[test]
+    fn live_encoder_seed_and_token_delta_reach_monitor() {
+        use crate::monitor::{EndpointKind, MonitorHandle};
+
+        let monitor = MonitorHandle::new(16);
+        monitor.request_started("req-live", Some("sess".into()), None, EndpointKind::Messages);
+        monitor.upstream_started("req-live");
+
+        let mut encoder = CursorSseEncoder::new("msg_test", "claude-fable-5");
+        encoder.seed_estimated_input_tokens(1_200);
+        encoder.push_event(&CursorStreamEvent::OutputTokenDelta { tokens: 7 });
+        let (input, output) = encoder.current_usage();
+        assert_eq!(input, 1_200);
+        assert_eq!(output, 7);
+
+        monitor.stream_progress("req-live", 64, 1, Some(input), Some(output));
+        let active = &monitor.snapshot().active[0];
+        assert_eq!(active.input_tokens, Some(1_200));
+        assert_eq!(active.output_tokens, Some(7));
     }
 
     #[test]

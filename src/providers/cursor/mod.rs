@@ -33,7 +33,7 @@ use crate::providers::cursor::auth::{
     clear_cursor_auth, expired_auth_message, force_refresh_cursor_auth, load_cursor_auth,
     missing_auth_message, run_cursor_login,
 };
-use crate::providers::cursor::client::CursorHttpClient;
+use crate::providers::cursor::client::{CursorError, CursorHttpClient};
 use crate::providers::cursor::exec_results::PendingCursorExec;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
@@ -75,6 +75,115 @@ fn shared_cursor_http_client() -> CursorHttpClient {
     *guard = Some(fresh.clone());
     fresh
 }
+
+enum LiveResumeOutcome {
+    Resumed(Response),
+    TerminalError(String),
+    MissingTools(Vec<String>),
+    ResumeError(CursorError),
+    Conflict,
+    Free,
+}
+
+/// Wait for an in-flight BiDi run to expose pending tools (and resume), finish,
+/// or fail — instead of immediately 409'ing concurrent same-session POSTs.
+async fn await_live_run_resume(
+    session_id: &str,
+    body: &MessagesRequest,
+    message_id: String,
+    wire_model: String,
+    estimated_input: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+) -> LiveResumeOutcome {
+    let has_tool_results = request_has_any_tool_result(body);
+    // Tool-result resumes: wait for pending tools to appear (race with expose).
+    // Nested turns without tool_results: queue until the live run frees up.
+    let wait_ms = if has_tool_results {
+        env_u64_millis("CCP_CURSOR_LIVE_RESUME_WAIT_MS", 30_000)
+    } else {
+        env_u64_millis("CCP_CURSOR_LIVE_NESTED_WAIT_MS", 15_000)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+    let mut last_missing: Option<Vec<String>> = None;
+
+    while tokio::time::Instant::now() < deadline {
+        if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
+            return LiveResumeOutcome::TerminalError(error);
+        }
+        let Some(run) = LiveRunRegistry::get(session_id) else {
+            return LiveResumeOutcome::Free;
+        };
+        let pending = run.pending_tools();
+        if !pending.is_empty() {
+            match collect_live_tool_results(body, &pending) {
+                Ok(tool_results) => match run.resume_batch(tool_results).await {
+                    Ok(events) => {
+                        return LiveResumeOutcome::Resumed(live_sse_response(
+                            events,
+                            message_id,
+                            wire_model,
+                            estimated_input,
+                            monitor,
+                        ));
+                    }
+                    Err(error) => return LiveResumeOutcome::ResumeError(error),
+                },
+                Err(missing) => {
+                    last_missing = Some(missing);
+                    if !has_tool_results {
+                        // Another agent's tool turn owns the pending set — keep
+                        // queuing until those results land and the run frees.
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    // Partial/mismatched tool_results: brief grace then 400.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+            }
+        }
+        // Still generating with empty pending — wait for tools or completion.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
+        return LiveResumeOutcome::TerminalError(error);
+    }
+    let Some(run) = LiveRunRegistry::get(session_id) else {
+        return LiveResumeOutcome::Free;
+    };
+    let pending = run.pending_tools();
+    if !pending.is_empty() {
+        match collect_live_tool_results(body, &pending) {
+            Ok(tool_results) => match run.resume_batch(tool_results).await {
+                Ok(events) => {
+                    return LiveResumeOutcome::Resumed(live_sse_response(
+                        events,
+                        message_id,
+                        wire_model,
+                        estimated_input,
+                        monitor,
+                    ));
+                }
+                Err(error) => return LiveResumeOutcome::ResumeError(error),
+            },
+            Err(missing) => return LiveResumeOutcome::MissingTools(missing),
+        }
+    }
+    if let Some(missing) = last_missing {
+        return LiveResumeOutcome::MissingTools(missing);
+    }
+    LiveResumeOutcome::Conflict
+}
+
+fn env_u64_millis(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 
 fn collect_live_tool_results(
     body: &MessagesRequest,
@@ -188,7 +297,7 @@ impl Provider for CursorProvider {
             if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
                 return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
             }
-            if let Some(run) = LiveRunRegistry::get(session_id) {
+            if LiveRunRegistry::get(session_id).is_some() {
                 if !want_stream {
                     return json_error(
                         StatusCode::BAD_REQUEST,
@@ -196,66 +305,44 @@ impl Provider for CursorProvider {
                         "Cursor live-run continuation requires stream=true",
                     );
                 }
-                let pending = run.pending_tools();
-                if !pending.is_empty() {
-                    match collect_live_tool_results(&body, &pending) {
-                        Ok(tool_results) => match run.resume_batch(tool_results).await {
-                            Ok(events) => {
-                                return live_sse_response(
-                                    events,
-                                    message_id,
-                                    wire_model.clone(),
-                                    estimate_request_input_tokens(&body),
-                                );
-                            }
-                            Err(error) => return map_cursor_error_to_response(&error),
-                        },
-                        Err(missing) => {
-                            return json_error(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_request_error",
-                                format!(
-                                    "Missing tool_result blocks for pending tools: {}",
-                                    missing.join(", ")
-                                ),
-                            );
-                        }
+                let estimated_input = estimate_request_input_tokens(&body);
+                let monitor = ctx.monitor.clone().map(|handle| (handle, ctx.req_id.clone()));
+                match await_live_run_resume(
+                    session_id,
+                    &body,
+                    message_id.clone(),
+                    wire_model.clone(),
+                    estimated_input,
+                    monitor.clone(),
+                )
+                .await
+                {
+                    LiveResumeOutcome::Resumed(response) => return response,
+                    LiveResumeOutcome::TerminalError(error) => {
+                        return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
                     }
-                }
-                // Race: Claude may POST tool_result a moment before pending_shared
-                // is visible, or while the previous segment is still finalizing.
-                if request_has_any_tool_result(&body) {
-                    // Brief race window: pending_shared may lag the HTTP POST by
-                    // a few ms. Keep this short — 500ms of sleeps felt like lag.
-                    for _ in 0..12 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        let pending = run.pending_tools();
-                        if pending.is_empty() {
-                            continue;
-                        }
-                        if let Ok(tool_results) = collect_live_tool_results(&body, &pending) {
-                            match run.resume_batch(tool_results).await {
-                                Ok(events) => {
-                                    return live_sse_response(
-                                        events,
-                                        message_id,
-                                        wire_model.clone(),
-                                        estimate_request_input_tokens(&body),
-                                    );
-                                }
-                                Err(error) => return map_cursor_error_to_response(&error),
-                            }
-                        }
+                    LiveResumeOutcome::MissingTools(missing) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            format!(
+                                "Missing tool_result blocks for pending tools: {}",
+                                missing.join(", ")
+                            ),
+                        );
                     }
+                    LiveResumeOutcome::Conflict => {
+                        return json_error(
+                            StatusCode::CONFLICT,
+                            "invalid_request_error",
+                            "A Cursor live run is already generating for this session",
+                        );
+                    }
+                    LiveResumeOutcome::ResumeError(error) => {
+                        return map_cursor_error_to_response(&error);
+                    }
+                    LiveResumeOutcome::Free => {}
                 }
-                // An empty pending snapshot means this same live Run is still in
-                // its model-generation/resume phase. Starting another Run here
-                // would replace the registry entry and cancel the in-flight one.
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "invalid_request_error",
-                    "A Cursor live run is already generating for this session",
-                );
             }
         }
 
@@ -387,6 +474,7 @@ impl Provider for CursorProvider {
                         message_id,
                         wire_model,
                         estimate_request_input_tokens(&body),
+                        ctx.monitor.clone().map(|handle| (handle, ctx.req_id.clone())),
                     );
                 }
                 Err(error) => {
