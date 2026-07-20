@@ -3,15 +3,9 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
-## v0.1.22 (2026-07-20)
+## v0.1.23 (2026-07-20)
 
-- Rename public identity to **claude-cursor-proxy** (one-way proxy: Claude Code → proxy → Cursor).
-- GitHub repo renamed in place (`YeautyYE/claude-cursor-proxy`); old URL redirects.
-- Config/state dirs move to `claude-cursor-proxy`; auth still falls back to `claude-cursor-bridge` and `claude-code-proxy`.
-- Installer accepts prior env aliases and creates optional symlinks for old binary names.
-
-## Unreleased
-
+- Fix Claude Code `Stream idle timeout` → 409 cascade on long BiDi turns: detect Anthropic SSE disconnect immediately (even under Cursor heartbeat flood), cancel/supersede zombie live runs instead of waiting then 409, keep Anthropic `ping` spacing with `MissedTickBehavior::Delay`.
 - Live BiDi: recover Claude-local `<tool_use>` XML (`Workflow`/`Skill`/…) into Anthropic tool_use, end the Cursor run so Claude Code can fulfill locally, then continue on the next turn with `tool_result` history.
 - Buffered tool bridge: map unknown XML tools (including `Workflow`) to `Generic` so resume does not drop pending state.
 - Confirm scrubber keeps user `<system-reminder>` (CLAUDE.md / rules); document `ENABLE_TOOL_SEARCH` / `enableWorkflows` / optional embed-system env.
@@ -21,6 +15,13 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 - Cheaper TTFT seeding: zero-copy Connect decode for uncompressed frames; estimate tools JSON size without re-serializing the full schema dump on every request.
 - SSE hot path: throttle + `try_lock` monitor progress publishes so TUI snapshot cloning cannot stall token emission; Bytes-clone classify path (no per-frame `to_vec`).
 - Emulate Anthropic hosted `web_search_20250305` (DuckDuckGo HTML → `server_tool_use` / `web_search_tool_result` SSE) so Claude Code `WebSearch` and `/deep-research` nested searches work through the proxy.
+
+## v0.1.22 (2026-07-20)
+
+- Rename public identity to **claude-cursor-proxy** (one-way proxy: Claude Code → proxy → Cursor).
+- GitHub repo renamed in place (`YeautyYE/claude-cursor-proxy`); old URL redirects.
+- Config/state dirs move to `claude-cursor-proxy`; auth still falls back to `claude-cursor-bridge` and `claude-code-proxy`.
+- Installer accepts prior env aliases and creates optional symlinks for old binary names.
 
 ## v0.1.21 (2026-07-15)
 

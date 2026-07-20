@@ -533,6 +533,31 @@ impl LiveRunRegistry {
         })
     }
 
+    /// Drop any in-flight live run for `session_id` and signal Cancel so the
+    /// BiDi driver exits. Used when Claude Code disconnects/retries and the
+    /// old run would otherwise 409 as "already generating".
+    pub fn cancel(session_id: &str) -> bool {
+        let entry = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            runs.remove(session_id)
+        };
+        match entry {
+            Some(LiveRunEntry::Running(handle)) => {
+                handle.cancel();
+                true
+            }
+            Some(LiveRunEntry::Starting { .. }) => true,
+            None => false,
+        }
+    }
+
+    /// Cancel any occupant, then reserve. Returns None only if another starter
+    /// wins a race after our cancel (caller should 409 or retry once).
+    pub fn supersede(session_id: &str) -> Option<LiveRunReservation> {
+        Self::cancel(session_id);
+        Self::reserve(session_id)
+    }
+
     pub fn get(session_id: &str) -> Option<Arc<CursorLiveRunHandle>> {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
@@ -1185,6 +1210,19 @@ async fn drive_live_run(
     let mut reconnect_attempts: u32 = 0;
 
     'driver: loop {
+        // Check before select: Cursor InteractionUpdate.heartbeat / client
+        // heartbeats keep the biased upstream/heartbeat arms ready and would
+        // otherwise starve the 250ms closed-sink poll for minutes — leaving a
+        // zombie "already generating" run after Claude Code disconnects.
+        if sink.as_ref().is_some_and(mpsc::Sender::is_closed) {
+            // Keep BiDi only when Claude still owes us native tool_results.
+            // logical_tools_waiting alone must not pin the session: those are
+            // UI hints, not Anthropic-exposed pending tools.
+            if pending.is_empty() {
+                break 'driver;
+            }
+            sink = None;
+        }
         let batch_deadline = pending.collect_deadline();
         tokio::select! {
             biased;
@@ -1192,6 +1230,8 @@ async fn drive_live_run(
             command = command_rx.recv() => {
                 match command {
                     Some(RunCommand::Cancel) => {
+                        // Registry may already have removed us via supersede;
+                        // still mark completed so prune/get stay consistent.
                         report_terminal_error(
                             &mut sink,
                             &terminal_error,
@@ -1400,14 +1440,6 @@ async fn drive_live_run(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                if sink.as_ref().is_some_and(mpsc::Sender::is_closed) {
-                    // Downstream cancelled this Anthropic segment. If Cursor still
-                    // expects tool results, keep the BiDi run alive; otherwise stop.
-                    if pending.is_empty() && logical_tools_waiting.is_empty() {
-                        break 'driver;
-                    }
-                    sink = None;
-                }
                 // Agent/tool runs must wait for Cursor `turn_ended` (or a native
                 // exec). Fable often emits a short plan text then thinks quietly
                 // for many minutes — inventing End after a few minutes truncates
@@ -2253,10 +2285,13 @@ pub fn live_sse_response(
     // Claude Code: Math.max(CLAUDE_STREAM_IDLE_TIMEOUT_MS||0, 300000). Keep
     // well under that; Cursor BiDi heartbeats alone do not produce SSE bytes.
     let ping_secs = env_u64("CCP_ANTHROPIC_SSE_PING_SECS", 15).clamp(5, 120);
-    let ping = tokio::time::interval_at(
+    let mut ping = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(ping_secs),
         Duration::from_secs(ping_secs),
     );
+    // After a burst of thinking deltas, still space pings — Burst would emit a
+    // catch-up flood then go quiet again under Claude's idle watchdog.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let stream = futures_util::stream::unfold(
         State {
@@ -3242,6 +3277,114 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn cancel_removes_running_entry_so_reserve_succeeds() {
+        let session = format!("cancel-session-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "run-cancel".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+        });
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        if reservation.insert(Arc::clone(&handle)).is_err() {
+            panic!("insert running handle");
+        }
+        assert!(LiveRunRegistry::get(&session).is_some());
+
+        assert!(LiveRunRegistry::cancel(&session));
+        assert!(LiveRunRegistry::get(&session).is_none());
+        // Cancel command must be delivered so the driver can exit.
+        assert!(matches!(command_rx.try_recv(), Ok(RunCommand::Cancel)));
+        // Slot is free for a new turn (Claude Code retry after idle timeout).
+        assert!(LiveRunRegistry::reserve(&session).is_some());
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn supersede_replaces_occupant_with_fresh_reservation() {
+        let session = format!("supersede-session-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "old-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+        });
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        if reservation.insert(handle).is_err() {
+            panic!("insert running handle");
+        }
+
+        let next = LiveRunRegistry::supersede(&session).expect("supersede");
+        // Committed insert of a new handle would succeed; dropping frees Starting.
+        drop(next);
+        assert!(LiveRunRegistry::get(&session).is_none());
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    async fn live_driver_terminates_on_disconnect_even_with_heartbeat_flood() {
+        // Regression: Cursor InteractionUpdate.heartbeat used to keep the biased
+        // upstream arm ready forever, starving the closed-sink poll so retries
+        // hit 409 "already generating".
+        let (upstream_tx, upstream_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(8);
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (initial_sink, initial_events) = mpsc::channel(1);
+        drop(initial_events);
+        let completed = Arc::new(AtomicBool::new(false));
+        let terminal_error = Arc::new(Mutex::new(None));
+
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            initial_sink,
+            Arc::new(Mutex::new(Vec::new())),
+            terminal_error,
+            Arc::clone(&completed),
+            Some(BTreeSet::from(["Read".to_string()])),
+            "heartbeat-drop-session".into(),
+            "heartbeat-drop-run".into(),
+            HashMap::new(),
+            test_reconnect_context(),
+        ));
+
+        use super::super::proto::{AgentServerMessage, InteractionHeartbeat};
+        for _ in 0..8 {
+            let mut payload = Vec::new();
+            AgentServerMessage {
+                conversation_checkpoint_update: None,
+                interaction_update: Some(InteractionUpdate {
+                    heartbeat: Some(InteractionHeartbeat {}),
+                    ..Default::default()
+                }),
+                kv_server_message: None,
+                interaction_query: None,
+                exec_server_message: None,
+            }
+            .encode(&mut payload)
+            .unwrap();
+            upstream_tx
+                .send(Ok(Some(encode_connect_frame(payload, 0))))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver must exit despite heartbeat flood after SSE drop")
+            .unwrap();
+        assert!(completed.load(Ordering::Acquire));
     }
 
     #[tokio::test]

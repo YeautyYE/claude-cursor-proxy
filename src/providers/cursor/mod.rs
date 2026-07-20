@@ -97,11 +97,12 @@ async fn await_live_run_resume(
 ) -> LiveResumeOutcome {
     let has_tool_results = request_has_any_tool_result(body);
     // Tool-result resumes: wait for pending tools to appear (race with expose).
-    // Nested turns without tool_results: queue until the live run frees up.
+    // Nested turns without tool_results: brief queue, then supersede — a long
+    // wait (was 15s) just delayed Claude Code retries after idle disconnect.
     let wait_ms = if has_tool_results {
         env_u64_millis("CCP_CURSOR_LIVE_RESUME_WAIT_MS", 30_000)
     } else {
-        env_u64_millis("CCP_CURSOR_LIVE_NESTED_WAIT_MS", 15_000)
+        env_u64_millis("CCP_CURSOR_LIVE_NESTED_WAIT_MS", 1_500)
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
     let mut last_missing: Option<Vec<String>> = None;
@@ -334,11 +335,10 @@ impl Provider for CursorProvider {
                         );
                     }
                     LiveResumeOutcome::Conflict => {
-                        return json_error(
-                            StatusCode::CONFLICT,
-                            "invalid_request_error",
-                            "A Cursor live run is already generating for this session",
-                        );
+                        // Zombie / still-thinking BiDi after Claude Code idle
+                        // disconnect or a nested retry without matching tools.
+                        // Waiting then 409 cascaded retries; supersede instead.
+                        LiveRunRegistry::cancel(session_id);
                     }
                     LiveResumeOutcome::ResumeError(error) => {
                         return map_cursor_error_to_response(&error);
@@ -420,12 +420,20 @@ impl Provider for CursorProvider {
             want_stream && session_id.is_some_and(|s| !s.is_empty()) && client.live_bidi_enabled();
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
-            let Some(reservation) = LiveRunRegistry::reserve(sid) else {
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "invalid_request_error",
-                    "A Cursor live run is already active for this session",
-                );
+            // Prefer a clean reserve; if a zombie run still holds the slot
+            // (race with cancel above, or Starting stuck), supersede once.
+            let reservation = match LiveRunRegistry::reserve(sid) {
+                Some(reservation) => reservation,
+                None => match LiveRunRegistry::supersede(sid) {
+                    Some(reservation) => reservation,
+                    None => {
+                        return json_error(
+                            StatusCode::CONFLICT,
+                            "invalid_request_error",
+                            "A Cursor live run is already active for this session",
+                        );
+                    }
+                },
             };
             let allowed = advertised_tool_names(&body);
             let start = match client
