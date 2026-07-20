@@ -15,8 +15,11 @@ pub struct CursorSelectedImage {
 /// - Field 8 `custom_system_prompt` is **team-only** (else 502).
 /// - Embedding Claude Code's full system into `UserMessage` makes Fable treat it as
 ///   **prompt injection** and waste turns (live 2026-07). Default: **do not embed**.
-/// - Therefore CLAUDE.md / rules / skill *instructions* that live in Anthropic
-///   `system` are **not** sent to Cursor unless an env opt-in is set.
+/// - Anthropic top-level `system` is **not** sent to Cursor unless an env
+///   opt-in is set (Fable treats a pasted system as prompt injection).
+/// - CLAUDE.md / rules / skills that Claude Code injects as user
+///   `<system-reminder>` messages **are** forwarded (scrubber only strips
+///   packaging banners + assistant injection-defense monologues).
 /// - Agent tools still work via Anthropic tool schemas + native tool bridge.
 /// - Claude-local tools (`Workflow`, `Skill`, MCP names) stay in the `<tools>`
 ///   dump even when native schemas are omitted for the BiDi bridge.
@@ -25,6 +28,7 @@ pub struct CursorSelectedImage {
 /// - `CCP_CURSOR_USE_CUSTOM_SYSTEM=1` — field 8 (team only)
 /// - `CCP_CURSOR_EMBED_SYSTEM=1` — plain-text system prefix in user payload
 /// - `CCP_CURSOR_PACKAGED_SYSTEM=1` — legacy banners (strongly discouraged)
+/// - `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT=1` — dump every tool schema (large)
 #[derive(Debug, Clone)]
 pub struct CursorPromptParts {
     /// Only set when `CCP_CURSOR_USE_CUSTOM_SYSTEM=1` (team accounts).
@@ -119,7 +123,7 @@ fn is_cursor_native_tool_name(name: &str) -> bool {
 /// [`CURSOR_NATIVE_TOOL_NAMES`] stays visible when `omit_tools` drops the
 /// native schema dump — otherwise `/deep-research` and skills degrade to
 /// plain Bash agenting.
-fn is_claude_local_tool_name(name: &str) -> bool {
+pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
     !name.is_empty() && !is_cursor_native_tool_name(name)
 }
 
@@ -586,9 +590,14 @@ fn image_extension(media_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate process-wide CCP_CURSOR_* env flags.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn omit_tools_skips_native_schemas_but_keeps_claude_local() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
@@ -628,6 +637,7 @@ mod tests {
 
     #[test]
     fn delta_only_keeps_workflow_skill_without_history() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
         }
@@ -663,6 +673,7 @@ mod tests {
 
     #[test]
     fn default_omits_system_to_avoid_fable_injection_loops() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
             std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
@@ -687,6 +698,7 @@ mod tests {
 
     #[test]
     fn scrubs_injection_defense_monologues_from_assistant_history() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
             std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
@@ -709,7 +721,38 @@ mod tests {
     }
 
     #[test]
+    fn preserves_claude_md_system_reminder_in_user_messages() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
+            std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
+            std::env::remove_var("CCP_CURSOR_PACKAGED_SYSTEM");
+        }
+        let reminder = "<system-reminder>\nAs you answer, follow the project's CLAUDE.md:\n# Project Rules\nAlways use tabs.\n</system-reminder>";
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": reminder},
+                    {"type": "text", "text": "list files"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let parts = render_cursor_prompt_parts(&req);
+        assert!(
+            parts.user_text.contains("<system-reminder>"),
+            "CLAUDE.md system-reminders must reach Cursor; got: {}",
+            parts.user_text
+        );
+        assert!(parts.user_text.contains("Always use tabs."));
+        assert!(parts.user_text.contains("list files"));
+        assert!(!parts.user_text.contains("CLAUDE_CODE_SYSTEM"));
+    }
+
+    #[test]
     fn multi_turn_agent_history_includes_tool_use_and_result() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
             std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
@@ -759,6 +802,7 @@ mod tests {
 
     #[test]
     fn filters_billing_headers_from_system_when_embed_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
             std::env::set_var("CCP_CURSOR_EMBED_SYSTEM", "1");
@@ -790,6 +834,7 @@ mod tests {
 
     #[test]
     fn scrubs_assistant_injection_monologues() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
             std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
@@ -810,6 +855,7 @@ mod tests {
 
     #[test]
     fn team_opt_in_puts_system_in_field8() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CCP_CURSOR_USE_CUSTOM_SYSTEM", "1");
             std::env::remove_var("CCP_CURSOR_PACKAGED_SYSTEM");

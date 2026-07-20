@@ -26,8 +26,8 @@ use super::connect::{
     ConnectFrame, ConnectFrameDecoder, FLAG_END, encode_connect_frame, parse_connect_error,
 };
 use super::exec_results::{
-    PendingCursorExec, encode_control_close, encode_control_throw, encode_exec_heartbeat,
-    encode_tool_result_frames,
+    CursorExecKind, PendingCursorExec, encode_control_close, encode_control_throw,
+    encode_exec_heartbeat, encode_tool_result_frames,
 };
 use super::http1::{self, BidiAppendSession};
 use super::proto::{
@@ -38,9 +38,10 @@ use super::proto::{
     McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
-use super::request::CursorSelectedImage;
+use super::request::{CursorSelectedImage, is_claude_local_tool_name};
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
+use super::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
 
 /// Outbound client messages: BiDi request body stream, or HTTP/1 BidiAppend.
 #[derive(Clone)]
@@ -1134,6 +1135,7 @@ async fn drive_live_run(
     let mut logical_tools_waiting = LogicalToolTracker::default();
     let mut last_progress = Instant::now();
     let mut resume_grace_until: Option<Instant> = None;
+    let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
     let run_started = Instant::now();
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
@@ -1293,6 +1295,7 @@ async fn drive_live_run(
                                 &mut logical_tools_waiting,
                                 &mut last_progress,
                                 tool_batch_quiet,
+                                &mut xml_parser,
                             ).await {
                                 break 'driver;
                             }
@@ -1504,6 +1507,7 @@ async fn process_live_frame(
     logical_tools_waiting: &mut LogicalToolTracker,
     last_progress: &mut Instant,
     tool_batch_quiet: Duration,
+    xml_parser: &mut CursorToolUseXmlParser,
 ) -> bool {
     if frame.flags & FLAG_END != 0 {
         if !pending.is_empty() {
@@ -1665,17 +1669,59 @@ async fn process_live_frame(
         if let Some(text) = update.text_delta
             && !text.text.is_empty()
         {
-            *saw_text = true;
             *useful = true;
             *last_progress = Instant::now();
-            if !emit_cursor_or_defer(
-                sink,
-                deferred,
-                CursorStreamEvent::TextDelta { text: text.text },
-            )
-            .await
-            {
-                return false;
+            let recovered = xml_parser.push(&text.text);
+            for evt in recovered {
+                match evt {
+                    RecoveredCursorEvent::Text(t) if !t.is_empty() => {
+                        *saw_text = true;
+                        if !emit_cursor_or_defer(
+                            sink,
+                            deferred,
+                            CursorStreamEvent::TextDelta { text: t },
+                        )
+                        .await
+                        {
+                            return false;
+                        }
+                    }
+                    RecoveredCursorEvent::Text(_) => {}
+                    RecoveredCursorEvent::ToolUse(tool_use) => {
+                        // Claude-local tools (Workflow/Skill/…) appear as XML in
+                        // Fable text when advertised via `<tools>`. Native
+                        // Read/Bash still come through ExecServerMessage.
+                        let allowed = allowed_tool_names
+                            .map(|set| set.contains(&tool_use.name))
+                            .unwrap_or(true);
+                        if allowed && is_claude_local_tool_name(&tool_use.name) {
+                            let exec = client_only_pending_exec(&tool_use);
+                            // Expose immediately — Cursor may turn_ended right
+                            // after the XML; a quiet window would race into
+                            // "pending native tools" errors.
+                            pending.queue(exec, Duration::ZERO);
+                        } else if !tool_use.name.is_empty() {
+                            // Unknown / native-shaped XML: keep visible as text
+                            // so we do not invent a fake Claude tool_use.
+                            let input_json = serde_json::to_string(&tool_use.input)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            let visible = format!(
+                                "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
+                                tool_use.id, tool_use.name
+                            );
+                            *saw_text = true;
+                            if !emit_cursor_or_defer(
+                                sink,
+                                deferred,
+                                CursorStreamEvent::TextDelta { text: visible },
+                            )
+                            .await
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(tokens) = update.token_delta
@@ -1759,6 +1805,9 @@ async fn expose_collected_tools(
     if exposed.is_empty() {
         return true;
     }
+    let client_only = exposed
+        .iter()
+        .any(|exec| matches!(exec.kind, CursorExecKind::ClientOnly));
     let tools = exposed
         .iter()
         .map(|exec| LiveNativeTool {
@@ -1772,10 +1821,34 @@ async fn expose_collected_tools(
     if !send_live_event(sink, Ok(LiveRunEvent::NativeToolBatch(tools))).await {
         return false;
     }
-    // Closing this sender ends exactly one downstream Anthropic HTTP segment;
-    // the upstream Cursor request body and response stream remain alive.
+    // Closing this sender ends exactly one downstream Anthropic HTTP segment.
     *sink = None;
-    true
+    // Client-only tools (Workflow/Skill/…) are fulfilled by Claude Code locally.
+    // End this BiDi run so the next Anthropic turn starts fresh with tool_result
+    // history — Cursor has no exec protocol for these tools.
+    !client_only
+}
+
+fn client_only_pending_exec(
+    tool_use: &crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse,
+) -> PendingCursorExec {
+    // Synthetic exec id: must be unique within the pending set; Cursor never
+    // assigned a real exec frame for these XML tool_uses.
+    let id = {
+        let mut hash: u32 = 0;
+        for b in tool_use.id.as_bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(u32::from(*b));
+        }
+        hash.max(1)
+    };
+    PendingCursorExec {
+        id,
+        exec_id: Some(format!("client_only_{}", tool_use.id)),
+        tool_use_id: tool_use.id.clone(),
+        claude_name: tool_use.name.clone(),
+        claude_input: serde_json::Value::Object(tool_use.input.clone()),
+        kind: CursorExecKind::ClientOnly,
+    }
 }
 
 fn record_segment_progress(
@@ -2609,6 +2682,7 @@ mod tests {
         let mut useful = false;
         let mut logical = LogicalToolTracker::default();
         let mut last_progress = Instant::now() - Duration::from_secs(600);
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
         let cont = process_live_frame(
             frames.into_iter().next().unwrap(),
             &outbound,
@@ -2624,6 +2698,7 @@ mod tests {
             &mut logical,
             &mut last_progress,
             Duration::from_millis(50),
+            &mut xml_parser,
         )
         .await;
         assert!(cont);

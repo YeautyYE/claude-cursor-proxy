@@ -960,6 +960,10 @@ fn claude_write_content(input: &serde_json::Map<String, serde_json::Value>) -> S
 }
 
 /// Create a `PendingCursorTool` from a recovered XML tool_use event.
+///
+/// Claude-local tools (`Workflow`, `Skill`, `mcp__*`, …) map to
+/// [`PendingCursorTool::Generic`] so Claude Code can fulfill them and the
+/// bridge can resume without inventing a Cursor exec protocol result.
 fn pending_from_recovered_tool(
     tool_use: &crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse,
 ) -> Option<PendingCursorTool> {
@@ -980,7 +984,7 @@ fn pending_from_recovered_tool(
                 content,
             })
         }
-        "Bash" => {
+        "Bash" | "Shell" => {
             let command = tool_use
                 .input
                 .get("command")
@@ -1000,6 +1004,11 @@ fn pending_from_recovered_tool(
                 timeout_ms,
             })
         }
+        name if !name.is_empty() => Some(PendingCursorTool::Generic {
+            tool_use_id: tool_use.id.clone(),
+            name: tool_use.name.clone(),
+            input: serde_json::Value::Object(tool_use.input.clone()),
+        }),
         _ => None,
     }
 }
@@ -1487,23 +1496,25 @@ mod tests {
     }
 
     #[test]
-    fn pending_write_accepts_cursor_style_path_aliases_from_xml() {
+    fn pending_workflow_xml_maps_to_generic_for_claude_local_fulfillment() {
         let tool = RecoveredCursorToolUse {
-            id: "call_1".into(),
-            original_id: None,
-            name: "Write".into(),
+            id: "call_wf_1".into(),
+            original_id: Some("wf1".into()),
+            name: "Workflow".into(),
             input: serde_json::json!({
-                "path": "/tmp/alias.txt",
-                "file_text": "via alias"
+                "name": "deep-research",
+                "args": "what is rust async"
             })
             .as_object()
             .cloned()
             .unwrap(),
         };
         let pending = pending_from_recovered_tool(&tool).unwrap();
-        assert_eq!(pending.name(), "Write");
+        assert_eq!(pending.name(), "Workflow");
+        assert_eq!(pending.tool_use_id(), "call_wf_1");
         let json = pending.input_json();
-        assert_eq!(json["file_path"], "/tmp/alias.txt");
-        assert_eq!(json["content"], "via alias");
+        assert_eq!(json["name"], "deep-research");
+        assert_eq!(json["args"], "what is rust async");
+        assert!(matches!(pending, PendingCursorTool::Generic { .. }));
     }
 }

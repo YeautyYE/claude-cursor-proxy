@@ -169,8 +169,24 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | on | Disable with `0` / `false` |
+| `CCP_CURSOR_EMBED_SYSTEM` | off | Forward Anthropic `system` into Cursor user text (can trigger Fable injection loops) |
+| `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | off | Dump **all** tool schemas (large); BiDi already keeps Claude-local tools (`Workflow`/`Skill`/…) |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `15` | SSE keep-alive interval |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | unset | Debug |
+
+### Claude Code (client) env / settings
+
+These are Claude Code knobs (not proxy config). Useful when `/deep-research` or ToolSearch misbehaves through a custom `ANTHROPIC_BASE_URL`:
+
+| Variable / setting | Purpose |
+| --- | --- |
+| `enableWorkflows: true` (settings) | Force Workflows on if your plan defaults them off |
+| `ENABLE_TOOL_SEARCH=true` | Re-enable ToolSearch when BASE_URL is not `api.anthropic.com` |
+| `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` | Treat proxy BASE_URL as first-party for some gates (use only if you know you need it) |
+
+**Rules / skills:** Claude Code injects `CLAUDE.md` and skill text into `/v1/messages` locally (often as user `<system-reminder>`). The proxy forwards those messages; it does **not** strip them. Top-level Anthropic `system` stays omitted by default (opt in with `CCP_CURSOR_EMBED_SYSTEM=1`).
+
+**Verify `/deep-research`:** transcript should show a `Workflow` tool_use (`name: deep-research`), not only Bash `curl`/`mkdir`.
 
 ```json
 {
@@ -201,6 +217,7 @@ claude-cursor-proxy cursor auth status
 | Auth / 401 | `claude-cursor-proxy cursor auth login` |
 | Background 400 | Set `ANTHROPIC_SMALL_FAST_MODEL` to a known full model id |
 | Duplicated tools | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
+| `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 
 ---

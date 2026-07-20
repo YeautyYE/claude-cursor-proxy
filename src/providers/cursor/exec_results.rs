@@ -32,6 +32,10 @@ pub enum CursorExecKind {
         working_directory: String,
         streaming: bool,
     },
+    /// Claude Code client-local tool (`Workflow`, `Skill`, …) recovered from
+    /// model XML. No Cursor exec protocol — Claude Code fulfills it, then the
+    /// next Anthropic turn starts a fresh Cursor run with `tool_result` history.
+    ClientOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +337,10 @@ pub fn encode_tool_result_frames(
                     }),
                 )?]
             }
+        }
+        CursorExecKind::ClientOnly => {
+            // No Cursor exec protocol — Claude Code already ran the tool.
+            return Ok(Vec::new());
         }
     };
 
