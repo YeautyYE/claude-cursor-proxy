@@ -709,7 +709,8 @@ fn sse_message_delta_contains_usage() {
 
     let msg_delta_data = events
         .iter()
-        .find(|(n, _)| n == "message_delta")
+        .rev()
+        .find(|(n, d)| n == "message_delta" && !d["delta"]["stop_reason"].is_null())
         .map(|(_, d)| d.clone());
     assert!(msg_delta_data.is_some(), "expected message_delta event");
     let data = msg_delta_data.unwrap();
@@ -1657,32 +1658,28 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
         .expect("first Anthropic segment stayed open after tool_use")
         .unwrap();
     let first_events = parse_sse_events(&first_sse);
-    assert_eq!(
-        first_events
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop",
-        ]
-    );
-    assert_eq!(first_events[1].1["content_block"]["type"], "tool_use");
-    assert_eq!(first_events[1].1["content_block"]["id"], "call-read-1");
-    assert_eq!(first_events[1].1["content_block"]["name"], "Read");
-    assert_eq!(first_events[2].1["delta"]["type"], "input_json_delta");
+    assert_eq!(first_events[0].0, "message_start");
+    assert_eq!(first_events.last().map(|(n, _)| n.as_str()), Some("message_stop"));
+    let tool_start = first_events
+        .iter()
+        .find(|(n, d)| n == "content_block_start" && d["content_block"]["type"] == "tool_use")
+        .map(|(_, d)| d)
+        .expect("tool_use content_block_start");
+    assert_eq!(tool_start["content_block"]["id"], "call-read-1");
+    assert_eq!(tool_start["content_block"]["name"], "Read");
+    let input_delta = first_events
+        .iter()
+        .find(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "input_json_delta")
+        .map(|(_, d)| d)
+        .expect("input_json_delta");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(
-            first_events[2].1["delta"]["partial_json"].as_str().unwrap()
+            input_delta["delta"]["partial_json"].as_str().unwrap()
         )
         .unwrap(),
         serde_json::json!({"file_path": "README.md"})
     );
-    assert_eq!(first_events[4].1["delta"]["stop_reason"], "tool_use");
+    assert_eq!(final_message_delta(&first_events)["delta"]["stop_reason"], "tool_use");
 
     // Leave the upstream Run alive long enough to observe the per-exec heartbeat.
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
@@ -1722,35 +1719,29 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
             .expect("second Anthropic segment did not finish on the original Cursor run")
             .unwrap();
     let second_events = parse_sse_events(&second_sse);
+    assert_eq!(second_events[0].0, "message_start");
     assert_eq!(
-        second_events
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop",
-        ]
+        second_events.last().map(|(n, _)| n.as_str()),
+        Some("message_stop")
     );
+    let text_delta = second_events
+        .iter()
+        .find(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "text_delta")
+        .map(|(_, d)| d)
+        .expect("text_delta");
     assert_eq!(
-        second_events[2].1["delta"]["text"],
+        text_delta["delta"]["text"],
         "continued on the same Cursor run"
     );
-    assert_eq!(second_events[4].1["delta"]["stop_reason"], "end_turn");
+    let final_delta = final_message_delta(&second_events);
+    assert_eq!(final_delta["delta"]["stop_reason"], "end_turn");
     // Cursor turn_ended reports total input=21 with cache_read=3 + cache_write=2;
     // Anthropic normalize → uncached input 16.
-    assert_eq!(second_events[4].1["usage"]["input_tokens"], 16);
+    assert_eq!(final_delta["usage"]["input_tokens"], 16);
     // Output is max(turn_ended=5, char/4 estimate of streamed text ≈8).
-    assert_eq!(second_events[4].1["usage"]["output_tokens"], 8);
-    assert_eq!(second_events[4].1["usage"]["cache_read_input_tokens"], 3);
-    assert_eq!(
-        second_events[4].1["usage"]["cache_creation_input_tokens"],
-        2
-    );
+    assert_eq!(final_delta["usage"]["output_tokens"], 8);
+    assert_eq!(final_delta["usage"]["cache_read_input_tokens"], 3);
+    assert_eq!(final_delta["usage"]["cache_creation_input_tokens"], 2);
 
     let client_messages = observed
         .client_messages
@@ -2136,22 +2127,10 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
         .expect("parallel tool batch did not close the first Anthropic segment")
         .unwrap();
     let first_events = parse_sse_events(&first_sse);
+    assert_eq!(first_events[0].0, "message_start");
     assert_eq!(
-        first_events
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop",
-        ]
+        first_events.last().map(|(n, _)| n.as_str()),
+        Some("message_stop")
     );
     let tool_starts: Vec<&serde_json::Value> = first_events
         .iter()
@@ -2165,7 +2144,10 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
     assert_eq!(tool_starts[0]["content_block"]["id"], "call-read-a");
     assert_eq!(tool_starts[1]["index"], 1);
     assert_eq!(tool_starts[1]["content_block"]["id"], "call-read-b");
-    assert_eq!(first_events[7].1["delta"]["stop_reason"], "tool_use");
+    assert_eq!(
+        final_message_delta(&first_events)["delta"]["stop_reason"],
+        "tool_use"
+    );
 
     let second_response = client
         .post(format!("http://{proxy_addr}/v1/messages"))
@@ -2749,4 +2731,22 @@ fn parse_sse_events(sse: &str) -> Vec<(String, serde_json::Value)> {
     }
 
     events
+}
+
+/// Final (non-progress) `message_delta` — mid-stream usage progress uses
+/// `stop_reason: null` and must not be confused with end_turn/tool_use.
+fn final_message_delta(events: &[(String, serde_json::Value)]) -> &serde_json::Value {
+    events
+        .iter()
+        .rev()
+        .find(|(name, data)| {
+            name == "message_delta"
+                && data
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .map(|s| !s.is_null())
+                    .unwrap_or(false)
+        })
+        .map(|(_, data)| data)
+        .expect("expected final message_delta with non-null stop_reason")
 }

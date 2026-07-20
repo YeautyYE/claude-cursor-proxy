@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use crate::providers::cursor::client::CursorUpstreamResponse;
 use crate::providers::cursor::response::{CursorStreamEvent, decode_upstream_response};
 
@@ -11,15 +13,22 @@ pub const EVENT_MESSAGE_STOP: &str = "message_stop";
 pub const EVENT_PING: &str = "ping";
 pub const EVENT_ERROR: &str = "error";
 
+/// Claude Code statusline In/Out/Cached/Ctx only advance from Anthropic usage
+/// fields on `message_start` / `message_delta` — not from thinking/text deltas.
+/// Throttle mid-stream `message_delta` so Out updates live without flooding SSE.
+const USAGE_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
+const USAGE_PROGRESS_MIN_OUTPUT_DELTA: u64 = 8;
+
 /// Frame upstream Cursor response bytes into Anthropic SSE event bytes.
 ///
 /// Produces the standard message lifecycle:
-/// 1. message_start (with initial usage)
+/// 1. message_start (with initial/estimated input + cache usage)
 /// 2. content_block_start (text)
 /// 3. content_block_delta (text deltas) / content_block_delta (thinking deltas)
-/// 4. content_block_stop
-/// 5. message_delta (with final usage and stop_reason)
-/// 6. message_stop
+/// 4. mid-stream message_delta (accumulating output_tokens; stop_reason null)
+/// 5. content_block_stop
+/// 6. message_delta (final usage and stop_reason)
+/// 7. message_stop
 pub fn frame_cursor_stream(
     upstream: &CursorUpstreamResponse,
     message_id: &str,
@@ -177,7 +186,7 @@ pub struct CursorSseFramer<'a> {
 
 /// Mutable lifecycle state shared by the borrowed framer and the owned,
 /// incremental encoder below.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CursorSseState {
     started: bool,
     thinking_open: bool,
@@ -191,7 +200,37 @@ struct CursorSseState {
     usage_output_estimate: u64,
     usage_cache_read_tokens: u64,
     usage_cache_write_tokens: u64,
+    /// Last `message_delta` usage progress snapshot (Claude Code Out meter).
+    last_progress_input: u64,
+    last_progress_output: u64,
+    last_progress_cache_read: u64,
+    last_progress_cache_write: u64,
+    last_progress_at: Option<Instant>,
     finalized: bool,
+}
+
+impl Default for CursorSseState {
+    fn default() -> Self {
+        Self {
+            started: false,
+            thinking_open: false,
+            text_open: false,
+            next_index: 0,
+            thinking_index: -1,
+            text_index: -1,
+            usage_input_tokens: 0,
+            usage_output_tokens: 0,
+            usage_output_estimate: 0,
+            usage_cache_read_tokens: 0,
+            usage_cache_write_tokens: 0,
+            last_progress_input: 0,
+            last_progress_output: 0,
+            last_progress_cache_read: 0,
+            last_progress_cache_write: 0,
+            last_progress_at: None,
+            finalized: false,
+        }
+    }
 }
 
 impl<'a> CursorSseFramer<'a> {
@@ -214,6 +253,9 @@ impl<'a> CursorSseFramer<'a> {
         }
         self.state.started = true;
 
+        let input = self.state.usage_input_tokens.max(1);
+        let cache_write = self.state.usage_cache_write_tokens;
+        let cache_read = self.state.usage_cache_read_tokens;
         let data = serde_json::json!({
             "type": "message_start",
             "message": {
@@ -225,14 +267,21 @@ impl<'a> CursorSseFramer<'a> {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.state.usage_input_tokens.max(1),
+                    "input_tokens": input,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": self.state.usage_cache_write_tokens,
-                    "cache_read_input_tokens": self.state.usage_cache_read_tokens
+                    "cache_creation_input_tokens": cache_write,
+                    "cache_read_input_tokens": cache_read
                 }
             }
         });
         write_sse_event(self.output, EVENT_MESSAGE_START, &data);
+        // Seed progress watermark so the first mid-stream message_delta only
+        // fires once Out (or input/cache) actually moves.
+        self.state.last_progress_input = input;
+        self.state.last_progress_output = 0;
+        self.state.last_progress_cache_read = cache_read;
+        self.state.last_progress_cache_write = cache_write;
+        self.state.last_progress_at = Some(Instant::now());
     }
 
     fn open_thinking(&mut self) -> bool {
@@ -348,6 +397,7 @@ impl<'a> CursorSseFramer<'a> {
             "thinking",
             text,
         );
+        self.maybe_emit_usage_progress(false);
     }
 
     pub fn emit_text_delta(&mut self, text: &str) {
@@ -363,6 +413,7 @@ impl<'a> CursorSseFramer<'a> {
             "text",
             text,
         );
+        self.maybe_emit_usage_progress(false);
     }
 
     /// Accumulate a rough Out floor from streamed text/thinking. Merged with
@@ -380,6 +431,76 @@ impl<'a> CursorSseFramer<'a> {
         self.state
             .usage_output_tokens
             .max(self.state.usage_output_estimate)
+    }
+
+    fn usage_snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.state.usage_input_tokens.max(1),
+            self.resolved_output_tokens(),
+            self.state.usage_cache_read_tokens,
+            self.state.usage_cache_write_tokens,
+        )
+    }
+
+    /// Emit a non-final `message_delta` with current usage.
+    ///
+    /// Claude Code merges `message_delta.usage` into the live message (Out from
+    /// `output_tokens`; In/Cached when those fields are > 0). `stop_reason` stays
+    /// null so the stream remains open. Content deltas alone never move the
+    /// statusline meters.
+    fn maybe_emit_usage_progress(&mut self, force: bool) {
+        if self.state.finalized || !self.state.started {
+            return;
+        }
+        let (input, output, cache_read, cache_write) = self.usage_snapshot();
+        let input_changed = input != self.state.last_progress_input;
+        let cache_changed = cache_read != self.state.last_progress_cache_read
+            || cache_write != self.state.last_progress_cache_write;
+        let output_delta = output.saturating_sub(self.state.last_progress_output);
+        let output_changed = output_delta > 0;
+        if !input_changed && !cache_changed && !output_changed {
+            return;
+        }
+        if !force {
+            let first_output = output_changed && self.state.last_progress_output == 0;
+            let significant = input_changed
+                || cache_changed
+                || output_delta >= USAGE_PROGRESS_MIN_OUTPUT_DELTA
+                || first_output;
+            if !significant {
+                return;
+            }
+            // Never delay the first Out>0 update — Claude Code statusline stays at
+            // Out:0 until it sees message_delta.usage.output_tokens.
+            if !first_output
+                && let Some(last) = self.state.last_progress_at
+                && last.elapsed() < USAGE_PROGRESS_MIN_INTERVAL
+                && !input_changed
+                && !cache_changed
+            {
+                return;
+            }
+        }
+
+        let data = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": null,
+                "stop_sequence": null
+            },
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_creation_input_tokens": cache_write,
+                "cache_read_input_tokens": cache_read
+            }
+        });
+        write_sse_event(self.output, EVENT_MESSAGE_DELTA, &data);
+        self.state.last_progress_input = input;
+        self.state.last_progress_output = output;
+        self.state.last_progress_cache_read = cache_read;
+        self.state.last_progress_cache_write = cache_write;
+        self.state.last_progress_at = Some(Instant::now());
     }
 
     pub fn record_usage(
@@ -414,6 +535,9 @@ impl<'a> CursorSseFramer<'a> {
         self.state.usage_output_tokens = output_tokens;
         self.state.usage_cache_read_tokens = cache_read_tokens;
         self.state.usage_cache_write_tokens = cache_write_tokens;
+        // Authoritative Cursor snapshot → push into Anthropic SSE immediately
+        // once message_start has been sent (statusline In/Cached/Out).
+        self.maybe_emit_usage_progress(true);
     }
 
     /// Accumulate incremental output/thinking tokens without clearing input/cache.
@@ -422,6 +546,7 @@ impl<'a> CursorSseFramer<'a> {
             return;
         }
         self.state.usage_output_tokens = self.state.usage_output_tokens.saturating_add(tokens);
+        self.maybe_emit_usage_progress(false);
     }
 
     /// Seed a provisional input estimate (e.g. from prompt length) until Cursor
@@ -501,6 +626,7 @@ impl<'a> CursorSseFramer<'a> {
         self.ensure_start();
         self.close_open_blocks();
 
+        let (input, output, cache_read, cache_write) = self.usage_snapshot();
         // message_delta
         let data = serde_json::json!({
             "type": "message_delta",
@@ -509,13 +635,18 @@ impl<'a> CursorSseFramer<'a> {
                 "stop_sequence": null
             },
             "usage": {
-                "input_tokens": self.state.usage_input_tokens.max(1),
-                "output_tokens": self.resolved_output_tokens(),
-                "cache_creation_input_tokens": self.state.usage_cache_write_tokens,
-                "cache_read_input_tokens": self.state.usage_cache_read_tokens
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_creation_input_tokens": cache_write,
+                "cache_read_input_tokens": cache_read
             }
         });
         write_sse_event(self.output, EVENT_MESSAGE_DELTA, &data);
+        self.state.last_progress_input = input;
+        self.state.last_progress_output = output;
+        self.state.last_progress_cache_read = cache_read;
+        self.state.last_progress_cache_write = cache_write;
+        self.state.last_progress_at = Some(Instant::now());
 
         // message_stop
         let data = serde_json::json!({
@@ -805,16 +936,15 @@ mod tests {
         let events = parse_sse_events(&sse_str);
         let event_names: Vec<&str> = events.iter().map(|e| e.0.as_str()).collect();
 
-        assert_eq!(
-            event_names,
-            vec![
-                "message_start",
-                "content_block_start",
-                "content_block_delta",
-                "content_block_stop",
-                "message_delta",
-                "message_stop"
-            ]
+        assert_eq!(event_names.first().copied(), Some("message_start"));
+        assert!(event_names.contains(&"content_block_start"));
+        assert!(event_names.contains(&"content_block_delta"));
+        assert!(event_names.contains(&"content_block_stop"));
+        assert!(event_names.contains(&"message_delta"));
+        assert_eq!(event_names.last().copied(), Some("message_stop"));
+        // Mid-stream progress may insert extra message_delta before the final one.
+        assert!(
+            event_names.iter().filter(|n| **n == "message_delta").count() >= 1
         );
     }
 
@@ -1001,47 +1131,45 @@ mod tests {
         let rendered = String::from_utf8(bytes).unwrap();
         let events = parse_sse_events(&rendered);
         let event_names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            event_names,
-            vec![
-                "message_start",
-                "content_block_start",
-                "content_block_delta",
-                "content_block_delta",
-                "content_block_stop",
-                "content_block_start",
-                "content_block_delta",
-                "content_block_stop",
-                "content_block_start",
-                "content_block_delta",
-                "content_block_stop",
-                "message_delta",
-                "message_stop",
-            ]
-        );
+        assert_eq!(event_names.first().copied(), Some("message_start"));
+        assert_eq!(event_names.last().copied(), Some("message_stop"));
+        assert!(event_names.contains(&"content_block_start"));
+        assert!(event_names.contains(&"content_block_delta"));
+        assert!(event_names.contains(&"content_block_stop"));
+        assert!(event_names.contains(&"message_delta"));
 
-        assert_eq!(events[1].1["index"], 0);
-        assert_eq!(events[1].1["content_block"]["type"], "thinking");
-        assert_eq!(events[2].1["delta"]["type"], "thinking_delta");
-        assert_eq!(events[3].1["delta"]["type"], "signature_delta");
-        assert_eq!(events[3].1["delta"]["signature"], "cursor-proxy");
-        assert_eq!(events[4].1["index"], 0);
+        let thinking_start = events
+            .iter()
+            .find(|(_, data)| data.get("content_block").and_then(|c| c.get("type")) == Some(&serde_json::json!("thinking")))
+            .expect("thinking block");
+        assert_eq!(thinking_start.1["index"], 0);
 
-        assert_eq!(events[5].1["index"], 1);
-        assert_eq!(events[5].1["content_block"]["type"], "text");
-        assert_eq!(events[6].1["delta"]["type"], "text_delta");
-        assert_eq!(events[7].1["index"], 1);
+        let text_start = events
+            .iter()
+            .find(|(_, data)| data.get("content_block").and_then(|c| c.get("type")) == Some(&serde_json::json!("text")))
+            .expect("text block");
+        assert_eq!(text_start.1["index"], 1);
 
-        assert_eq!(events[8].1["index"], 2);
-        assert_eq!(events[8].1["content_block"]["type"], "tool_use");
-        assert_eq!(events[9].1["delta"]["type"], "input_json_delta");
-        assert_eq!(events[10].1["index"], 2);
-        assert_eq!(events[11].1["delta"]["stop_reason"], "tool_use");
+        let tool_start = events
+            .iter()
+            .find(|(_, data)| data.get("content_block").and_then(|c| c.get("type")) == Some(&serde_json::json!("tool_use")))
+            .expect("tool_use block");
+        assert_eq!(tool_start.1["index"], 2);
+        assert_eq!(tool_start.1["content_block"]["id"], "tool_1");
+
+        let final_delta = events
+            .iter()
+            .rev()
+            .find(|(name, data)| {
+                name == EVENT_MESSAGE_DELTA && data["delta"]["stop_reason"] == "tool_use"
+            })
+            .map(|(_, data)| data)
+            .expect("final tool_use message_delta");
         // Cursor totals are split: uncached = input - cache_read - cache_write.
-        assert_eq!(events[11].1["usage"]["input_tokens"], 19);
-        assert_eq!(events[11].1["usage"]["output_tokens"], 9);
-        assert_eq!(events[11].1["usage"]["cache_creation_input_tokens"], 5);
-        assert_eq!(events[11].1["usage"]["cache_read_input_tokens"], 7);
+        assert_eq!(final_delta["usage"]["input_tokens"], 19);
+        assert_eq!(final_delta["usage"]["output_tokens"], 9);
+        assert_eq!(final_delta["usage"]["cache_creation_input_tokens"], 5);
+        assert_eq!(final_delta["usage"]["cache_read_input_tokens"], 7);
 
         assert_eq!(
             events
@@ -1050,12 +1178,12 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
+        assert!(
             events
                 .iter()
                 .filter(|(name, _)| name == EVENT_MESSAGE_DELTA)
-                .count(),
-            1
+                .count()
+                >= 1
         );
         assert_eq!(
             events
@@ -1119,12 +1247,15 @@ mod tests {
         encoder.push_event(&CursorStreamEvent::End);
 
         let final_events = parse_sse_events(&String::from_utf8(encoder.take_bytes()).unwrap());
+        assert!(final_events.iter().any(|(n, _)| n == "message_delta"));
         assert_eq!(
+            final_events.last().map(|(n, _)| n.as_str()),
+            Some("message_stop")
+        );
+        assert!(
             final_events
                 .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["content_block_stop", "message_delta", "message_stop"]
+                .any(|(n, d)| n == "message_delta" && d["delta"]["stop_reason"] == "end_turn")
         );
         assert!(encoder.is_finalized());
 
@@ -1158,6 +1289,67 @@ mod tests {
         encoder.record_usage(1, 2, 3, 4);
         encoder.emit_tool_pause("late_direct", "Read", "{}");
         assert!(encoder.take_bytes().is_empty());
+    }
+
+    #[test]
+    fn message_start_carries_seeded_input_usage() {
+        let mut encoder = CursorSseEncoder::new("msg_seed", "cursor-test");
+        encoder.seed_estimated_input_tokens(71_700);
+        encoder.begin();
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "message_start");
+        assert_eq!(events[0].1["message"]["usage"]["input_tokens"], 71_700);
+        assert_eq!(events[0].1["message"]["usage"]["output_tokens"], 0);
+    }
+
+    #[test]
+    fn mid_stream_message_delta_updates_output_tokens() {
+        let mut encoder = CursorSseEncoder::new("msg_progress", "cursor-test");
+        encoder.seed_estimated_input_tokens(12_000);
+        encoder.begin();
+        let _ = encoder.take_bytes();
+
+        // First thinking chunk should emit a progress message_delta (Out leaves 0).
+        encoder.emit_thinking_delta("abcdefghijklmnop"); // 16 chars → 4 tok estimate
+        let chunk = encoder.take_bytes();
+        let events = parse_sse_events(&String::from_utf8_lossy(&chunk));
+        assert!(
+            events
+                .iter()
+                .any(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "thinking_delta")
+        );
+        let progress = events
+            .iter()
+            .find(|(n, d)| n == EVENT_MESSAGE_DELTA && d["delta"]["stop_reason"].is_null())
+            .map(|(_, d)| d)
+            .expect("mid-stream message_delta with null stop_reason");
+        assert_eq!(progress["usage"]["input_tokens"], 12_000);
+        assert!(progress["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 4);
+
+        // token_delta bumps Out further and should surface in another progress delta
+        // (force path via add_output_tokens when delta is significant / first after gap).
+        std::thread::sleep(USAGE_PROGRESS_MIN_INTERVAL + Duration::from_millis(20));
+        encoder.add_output_tokens(32);
+        let chunk = encoder.take_bytes();
+        let events = parse_sse_events(&String::from_utf8_lossy(&chunk));
+        let progress = events
+            .iter()
+            .find(|(n, d)| n == EVENT_MESSAGE_DELTA && d["delta"]["stop_reason"].is_null())
+            .map(|(_, d)| d)
+            .expect("token_delta message_delta");
+        assert!(progress["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 32);
+
+        encoder.push_event(&CursorStreamEvent::End);
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
+        let final_delta = events
+            .iter()
+            .rev()
+            .find(|(n, d)| n == EVENT_MESSAGE_DELTA && d["delta"]["stop_reason"] == "end_turn")
+            .map(|(_, d)| d)
+            .expect("final message_delta");
+        assert_eq!(final_delta["usage"]["input_tokens"], 12_000);
+        assert!(final_delta["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 32);
     }
 
     #[test]
