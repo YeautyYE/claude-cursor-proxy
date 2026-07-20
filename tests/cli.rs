@@ -5,10 +5,10 @@ use tempfile::TempDir;
 
 #[test]
 fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Error>> {
-    let expected = format!("claude-cursor-bridge {}", env!("CARGO_PKG_VERSION"));
+    let expected = format!("claude-cursor-proxy {}", env!("CARGO_PKG_VERSION"));
 
     for arg in ["--version", "-v", "version"] {
-        let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+        let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
         cmd.arg(arg)
             .assert()
             .success()
@@ -19,14 +19,14 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
     assert!(out.contains("kimi:"));
     assert!(out.contains("cursor:"));
 
-    let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
     cmd.args(["models", "--full"]);
     cmd.output()?;
     Ok(())
@@ -34,7 +34,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn help_discovers_serverless_tui_demo() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("claude-cursor-bridge")?
+    Command::cargo_bin("claude-cursor-proxy")?
         .arg("--help")
         .assert()
         .success()
@@ -45,7 +45,7 @@ fn help_discovers_serverless_tui_demo() -> Result<(), Box<dyn std::error::Error>
 
 #[test]
 fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("claude-cursor-bridge")?
+    Command::cargo_bin("claude-cursor-proxy")?
         .arg("definitely-not-a-command")
         .assert()
         .failure()
@@ -55,7 +55,7 @@ fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
     cmd.args(["cursor", "auth", "device"]);
     let output = cmd.output()?;
     assert_eq!(output.status.code(), Some(2));
@@ -67,7 +67,7 @@ fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::erro
 #[test]
 fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
-    let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
     cmd.args(["kimi", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success();
@@ -76,7 +76,7 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
 
 #[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
     cmd.args(["models", "--full"]);
     let output = cmd.output()?;
     let out = String::from_utf8(output.stdout)?;
@@ -97,7 +97,7 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
         auth_dir.join("auth.json"),
         r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid","userId":"u"}"#,
     )?;
-    let mut cmd = Command::cargo_bin("claude-cursor-bridge")?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
     cmd.args(["kimi", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success().stdout(contains("User: u"));

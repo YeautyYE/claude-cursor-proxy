@@ -1,19 +1,19 @@
-# claude-cursor-bridge
+# claude-cursor-proxy
 
 **[English](README.md) | 中文**
 
-[![CI](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/ci.yml)
-[![Release](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/release.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/YeautyYE/claude-cursor-bridge?display_name=tag)](https://github.com/YeautyYE/claude-cursor-bridge/releases)
+[![CI](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/YeautyYE/claude-cursor-proxy?display_name=tag)](https://github.com/YeautyYE/claude-cursor-proxy/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](https://github.com/YeautyYE/claude-cursor-bridge/releases)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](https://github.com/YeautyYE/claude-cursor-proxy/releases)
 
-基于 [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) 改进。命令行工具名与仓库名均为 **`claude-cursor-bridge`**。
+基于 [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) 改进。本地 **单向代理**（Claude Code → 本代理 → Cursor）。命令行工具名与仓库名均为 **`claude-cursor-proxy`**。
 
 **让 Claude Code 稳定调用 Cursor 上的模型（推荐 Fable 5）。**
 
 ```
-Claude Code ──Anthropic /v1/messages──► claude-cursor-bridge (:18765)
+Claude Code ──Anthropic /v1/messages──► claude-cursor-proxy (:18765)
                                               │
                                               ├── Cursor (Fable 5)   ← 主路径
                                               ├── Codex             ← 额外后端
@@ -30,10 +30,10 @@ Claude Code ──Anthropic /v1/messages──► claude-cursor-bridge (:18765)
 Claude Code 只认 Anthropic 的接口（`/v1/messages` 等）。  
 Cursor 用的是自己的 Agent 协议，两边直接连不上。
 
-本工具在本机跑一个小服务（默认 `127.0.0.1:18765`），把两边接起来：
+本工具在本机跑一个单向代理（默认 `127.0.0.1:18765`）：
 
 1. Claude Code 照常发 Anthropic 请求
-2. 本工具转成 Cursor 能懂的请求，再发给 Cursor
+2. 代理转成 Cursor 能懂的请求，再发给 Cursor
 3. 把 Cursor 的流式回复转回 Anthropic 格式给 Claude Code  
    （会定期发 keep-alive，避免长时间思考被 Claude Code 当成卡住而断开）
 
@@ -52,7 +52,7 @@ Cursor 用的是自己的 Agent 协议，两边直接连不上。
 | **Fable 5** | 设 `ANTHROPIC_MODEL=claude-fable-5[1m]`（`ANTHROPIC_SMALL_FAST_MODEL` 写同样的即可） |
 | **用量 / 上下文** | 把 Cursor 的用量信息转成 Anthropic 的 `usage`，状态栏和上下文压缩更正常 |
 | **工具调用** | 尽量把 Cursor 侧工具接到 Claude Code 的工具循环里（尽力而为） |
-| **安装简单** | 预编译包带校验；macOS 会做 ad-hoc 签名；配置在 `~/.config/claude-cursor-bridge` |
+| **安装简单** | 预编译包带校验；macOS 会做 ad-hoc 签名；配置在 `~/.config/claude-cursor-proxy` |
 
 说明：这是兼容层，**不是**完整 Cursor IDE。边界见 [限制](#限制)。
 
@@ -63,19 +63,19 @@ Cursor 用的是自己的 Agent 协议，两边直接连不上。
 ### 1. 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-bridge/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/install.sh | bash
 ```
 
-支持 macOS / Linux。Windows 请从 [Releases](https://github.com/YeautyYE/claude-cursor-bridge/releases) 下载 `.zip`，或用 WSL。
+支持 macOS / Linux。Windows 请从 [Releases](https://github.com/YeautyYE/claude-cursor-proxy/releases) 下载 `.zip`，或用 WSL。
 
 <details>
 <summary>其他安装方式</summary>
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_BRIDGE_VERSION=v0.1.21 curl -fsSL …/install.sh \| bash` |
-| 安装到指定目录 | `CLAUDE_CURSOR_BRIDGE_INSTALL_DIR=/opt/bin bash install.sh` |
-| 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-bridge --locked` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.22 curl -fsSL …/install.sh \| bash` |
+| 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
+| 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
 
 </details>
@@ -83,13 +83,13 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-bridge/main/
 ### 2. 登录并启动服务
 
 ```bash
-claude-cursor-bridge cursor auth login
-claude-cursor-bridge serve                 # 默认 127.0.0.1:18765，带监控界面
-claude-cursor-bridge serve --no-monitor    # 只要日志，不要监控界面
-claude-cursor-bridge serve --port 11435    # 换端口
+claude-cursor-proxy cursor auth login
+claude-cursor-proxy serve                 # 默认 127.0.0.1:18765，带监控界面
+claude-cursor-proxy serve --no-monitor    # 只要日志，不要监控界面
+claude-cursor-proxy serve --port 11435    # 换端口
 ```
 
-### 3. 让 Claude Code 走本机桥接（Fable 5）
+### 3. 让 Claude Code 走本机代理（Fable 5）
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
@@ -110,13 +110,13 @@ claude
 <summary>改用 Codex / Kimi / Grok（额外后端）</summary>
 
 ```bash
-claude-cursor-bridge codex auth login
+claude-cursor-proxy codex auth login
 ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused \
   ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
-claude-cursor-bridge kimi auth login   # 或：grok auth login
+claude-cursor-proxy kimi auth login   # 或：grok auth login
 ```
 
 </details>
@@ -133,8 +133,8 @@ claude-cursor-bridge kimi auth login   # 或：grok auth login
 
 ```bash
 # 看内置模型列表
-claude-cursor-bridge models
-claude-cursor-bridge models --full
+claude-cursor-proxy models
+claude-cursor-proxy models --full
 
 # 服务已启动时：按 Anthropic 兼容接口列模型
 #（已登录 Cursor 时，会合并 Cursor 可用模型列表）
@@ -160,11 +160,11 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 
 | 平台 | 配置文件路径 |
 | --- | --- |
-| macOS / Linux | `~/.config/claude-cursor-bridge/config.json` |
-| Windows | `%APPDATA%\claude-cursor-bridge\config.json` |
+| macOS / Linux | `~/.config/claude-cursor-proxy/config.json` |
+| Windows | `%APPDATA%\claude-cursor-proxy\config.json` |
 
 可用 `CCP_CONFIG_DIR` 改配置目录。环境变量前缀仍是 **`CCP_*`**。  
-若你以前用过旧项目名，`~/.config/claude-code-proxy/` 下的登录文件仍会作为迁移回退读取。
+若你以前用过旧项目名，`~/.config/claude-cursor-bridge/` 与 `~/.config/claude-code-proxy/` 下的登录文件仍会作为迁移回退读取。
 
 | 变量 | 默认 | 作用 |
 | --- | --- |
@@ -189,7 +189,7 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 检查 Cursor 登录状态：
 
 ```bash
-claude-cursor-bridge cursor auth status
+claude-cursor-proxy cursor auth status
 ```
 
 ---
@@ -198,18 +198,18 @@ claude-cursor-bridge cursor auth status
 
 | 现象 | 怎么处理 |
 | --- | --- |
-| macOS 报 `Killed: 9` | `codesign --force -s - "$(command -v claude-cursor-bridge)"` |
-| 鉴权失败 / 401 | 重新执行 `claude-cursor-bridge cursor auth login` |
+| macOS 报 `Killed: 9` | `codesign --force -s - "$(command -v claude-cursor-proxy)"` |
+| 鉴权失败 / 401 | 重新执行 `claude-cursor-proxy cursor auth login` |
 | 后台小请求 400 | 把 `ANTHROPIC_SMALL_FAST_MODEL` 设成已知的完整模型 id（可与主模型相同） |
 | 工具调用重复 | 加上 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
-| 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-bridge/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 
 ---
 
 ## 限制
 
 - **非官方。** 各平台服务条款与账号风险自负。
-- **桥接本身不做访问控制。** 默认只监听本机；若绑到公网，务必放在防火墙或带鉴权的反向代理后面。
+- **代理本身不做访问控制。** 默认只监听本机；若绑到公网，务必放在防火墙或带鉴权的反向代理后面。
 - **限流** 跟你的上游账号走。
 - **兼容是尽力而为。** 文本、工具、思考、流式在支持路径上可用；部分边界情况会近似或省略。
 - **不是完整 Cursor IDE。** 超出 Claude Code 工具循环的 workspace / 回调能力不完整。

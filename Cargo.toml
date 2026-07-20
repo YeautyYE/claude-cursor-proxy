@@ -1,16 +1,16 @@
 [package]
-name = "claude-cursor-bridge"
-version = "0.1.21"
-description = "Stable Cursor reverse-proxy bridge so Claude Code can run Cursor models (Fable 5 and more)"
+name = "claude-cursor-proxy"
+version = "0.1.22"
+description = "Local Anthropic-compatible proxy so Claude Code can use Cursor (Fable 5) and other providers"
 edition = "2024"
 rust-version = "1.85"
-authors = ["YeautyYE", "claude-cursor-bridge contributors"]
+authors = ["YeautyYE", "claude-cursor-proxy contributors"]
 license = "MIT"
 publish = false
-repository = "https://github.com/YeautyYE/claude-cursor-bridge"
-homepage = "https://github.com/YeautyYE/claude-cursor-bridge"
+repository = "https://github.com/YeautyYE/claude-cursor-proxy"
+homepage = "https://github.com/YeautyYE/claude-cursor-proxy"
 readme = "README.md"
-keywords = ["claude-code", "cursor", "proxy", "bridge", "anthropic"]
+keywords = ["claude-code", "cursor", "proxy", "anthropic", "fable"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]

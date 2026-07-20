@@ -1315,7 +1315,7 @@ mod tests {
             json!({
                 "type": "response.function_call_arguments.done",
                 "output_index": 0,
-                "arguments": "{\"query\":\"claude-cursor-bridge github\"}"
+                "arguments": "{\"query\":\"claude-cursor-proxy github\"}"
             }),
             json!({
                 "type": "response.output_item.done",
@@ -1324,7 +1324,7 @@ mod tests {
                     "type":"function_call",
                     "call_id":"call_1",
                     "name":"WebSearch",
-                    "arguments":"{\"query\":\"claude-cursor-bridge github\"}"
+                    "arguments":"{\"query\":\"claude-cursor-proxy github\"}"
                 }
             }),
         ] {

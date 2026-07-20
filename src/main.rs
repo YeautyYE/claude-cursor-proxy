@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
-use claude_cursor_bridge::{
+use claude_cursor_proxy::{
     config, logging,
     monitor::MonitorHandle,
     paths,
@@ -14,9 +14,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "claude-cursor-bridge",
+    name = "claude-cursor-proxy",
     version = VERSION,
-    about = "Anthropic-compatible proxy for Claude Code provider backends",
+    about = "Local Anthropic-compatible proxy: Claude Code to Cursor (Fable) and other providers",
     disable_version_flag = true
 )]
 struct Cli {
@@ -64,7 +64,7 @@ enum Commands {
 enum ProviderGroup {
     Auth {
         #[command(subcommand)]
-        command: claude_cursor_bridge::provider::AuthCommand,
+        command: claude_cursor_proxy::provider::AuthCommand,
     },
 }
 
@@ -72,7 +72,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.version_flag {
-        println!("claude-cursor-bridge {}", VERSION);
+        println!("claude-cursor-proxy {}", VERSION);
         return Ok(());
     }
 
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
 
     match commands {
         Commands::Version => {
-            println!("claude-cursor-bridge {}", VERSION);
+            println!("claude-cursor-proxy {}", VERSION);
             Ok(())
         }
         Commands::Serve { port, no_monitor } => {
@@ -182,21 +182,21 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     let handlers = provider.cli();
     match command {
         ProviderGroup::Auth { command } => match command {
-            claude_cursor_bridge::provider::AuthCommand::Login => {
+            claude_cursor_proxy::provider::AuthCommand::Login => {
                 if let Err(err) = handlers.login() {
                     eprintln!("{err}");
                     std::process::exit(2);
                 }
                 Ok(())
             }
-            claude_cursor_bridge::provider::AuthCommand::Device => {
+            claude_cursor_proxy::provider::AuthCommand::Device => {
                 if let Err(err) = handlers.device() {
                     eprintln!("{err}");
                     std::process::exit(2);
                 }
                 Ok(())
             }
-            claude_cursor_bridge::provider::AuthCommand::Status => {
+            claude_cursor_proxy::provider::AuthCommand::Status => {
                 if let Err(err) = handlers.status() {
                     println!("{err}");
                     if err.to_string() == "Not authenticated" {
@@ -206,7 +206,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
                 }
                 Ok(())
             }
-            claude_cursor_bridge::provider::AuthCommand::Logout => {
+            claude_cursor_proxy::provider::AuthCommand::Logout => {
                 handlers.logout()?;
                 Ok(())
             }
@@ -247,7 +247,7 @@ fn compact_cursor_list(models: &[String]) -> String {
     if !dynamic.is_empty() {
         out.push_str(", example: cursor:gpt-5.5");
     }
-    out.push_str(" run `claude-cursor-bridge models --full` for all aliases");
+    out.push_str(" run `claude-cursor-proxy models --full` for all aliases");
     out
 }
 
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn demo_command_parses_without_server_options() {
-        let cli = Cli::try_parse_from(["claude-cursor-bridge", "demo"]).unwrap();
+        let cli = Cli::try_parse_from(["claude-cursor-proxy", "demo"]).unwrap();
 
         assert!(matches!(cli.command, Some(Commands::Demo)));
     }

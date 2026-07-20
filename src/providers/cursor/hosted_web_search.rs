@@ -129,7 +129,7 @@ pub async fn search_web(query: &str) -> Result<Vec<WebSearchHit>, String> {
         return Err("empty web search query".into());
     }
     let client = reqwest::Client::builder()
-        .user_agent("claude-cursor-bridge/web-search (compatible; +https://github.com/YeautyYE/claude-cursor-bridge)")
+        .user_agent("claude-cursor-proxy/web-search (compatible; +https://github.com/YeautyYE/claude-cursor-proxy)")
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| format!("web search client: {e}"))?;

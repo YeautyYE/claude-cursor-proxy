@@ -1,13 +1,19 @@
 # Changelog
 
-Project renamed to **claude-cursor-bridge** — public repo [YeautyYE/claude-cursor-bridge](https://github.com/YeautyYE/claude-cursor-bridge).
+Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
+
+## v0.1.22 (2026-07-20)
+
+- Rename public identity to **claude-cursor-proxy** (one-way proxy: Claude Code → proxy → Cursor).
+- GitHub repo renamed in place (`YeautyYE/claude-cursor-proxy`); old URL redirects.
+- Config/state dirs move to `claude-cursor-proxy`; auth still falls back to `claude-cursor-bridge` and `claude-code-proxy`.
+- Installer accepts prior env aliases and creates optional symlinks for old binary names.
 
 ## Unreleased
 
-- Renamed crate/binary to `claude-cursor-bridge`; config/state dirs to `claude-cursor-bridge` (legacy `claude-code-proxy` auth paths still read as fallback). Env prefix remains `CCP_*`.
 - Cursor live path latency: cheaper `message_start` token seeding (no full prompt re-render), shorter tool-batch quiet window (25ms), non-blocking text-delta fan-out, tighter SSE coalesce cap.
-- Emulate Anthropic hosted `web_search_20250305` (DuckDuckGo HTML → `server_tool_use` / `web_search_tool_result` SSE) so Claude Code `WebSearch` and `/deep-research` nested searches work through the bridge.
+- Emulate Anthropic hosted `web_search_20250305` (DuckDuckGo HTML → `server_tool_use` / `web_search_tool_result` SSE) so Claude Code `WebSearch` and `/deep-research` nested searches work through the proxy.
 
 ## v0.1.21 (2026-07-15)
 

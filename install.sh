@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
 #
-# claude-cursor-bridge installer
+# claude-cursor-proxy installer
 #
 # One-liner (macOS / Linux):
-#   curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-bridge/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/install.sh | bash
 #
 # Environment variables:
-#   GITHUB_REPO                         - Override owner/repo (default: YeautyYE/claude-cursor-bridge)
-#   CLAUDE_CURSOR_BRIDGE_VERSION        - Pin a release tag (e.g. v0.1.21 or 0.1.21)
-#   CLAUDE_CURSOR_BRIDGE_INSTALL_DIR    - Install directory (default: ~/.local/bin, or /usr/local/bin if writable)
-#   CLAUDE_CURSOR_BRIDGE_INSECURE_SKIP_CHECKSUM=1 - Skip checksum verify (not recommended)
+#   GITHUB_REPO                         - Override owner/repo (default: YeautyYE/claude-cursor-proxy)
+#   CLAUDE_CURSOR_PROXY_VERSION         - Pin a release tag (e.g. v0.1.22 or 0.1.22)
+#   CLAUDE_CURSOR_PROXY_INSTALL_DIR     - Install directory (default: ~/.local/bin, or /usr/local/bin if writable)
+#   CLAUDE_CURSOR_PROXY_INSECURE_SKIP_CHECKSUM=1 - Skip checksum verify (not recommended)
 #
-# Legacy aliases (still accepted): CLAUDE_CODE_PROXY_VERSION, CLAUDE_CODE_PROXY_INSTALL_DIR,
-# CLAUDE_CODE_PROXY_INSECURE_SKIP_CHECKSUM
+# Legacy aliases (still accepted): CLAUDE_CURSOR_BRIDGE_*, CLAUDE_CODE_PROXY_*
 #
 set -euo pipefail
 
-BIN_NAME="claude-cursor-bridge"
-REPO="${GITHUB_REPO:-YeautyYE/claude-cursor-bridge}"
+BIN_NAME="claude-cursor-proxy"
+REPO="${GITHUB_REPO:-YeautyYE/claude-cursor-proxy}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,8 +93,10 @@ normalize_tag() {
 }
 
 pinned_version() {
-	# Prefer new env; accept legacy CLAUDE_CODE_PROXY_VERSION.
-	if [ -n "${CLAUDE_CURSOR_BRIDGE_VERSION:-}" ]; then
+	# Prefer new env; accept legacy BRIDGE / CODE_PROXY aliases.
+	if [ -n "${CLAUDE_CURSOR_PROXY_VERSION:-}" ]; then
+		echo "${CLAUDE_CURSOR_PROXY_VERSION}"
+	elif [ -n "${CLAUDE_CURSOR_BRIDGE_VERSION:-}" ]; then
 		echo "${CLAUDE_CURSOR_BRIDGE_VERSION}"
 	elif [ -n "${CLAUDE_CODE_PROXY_VERSION:-}" ]; then
 		echo "${CLAUDE_CODE_PROXY_VERSION}"
@@ -119,7 +120,7 @@ resolve_version() {
 	if ! download "$latest_url" "$tmp"; then
 		rm -f "$tmp"
 		log_error "Failed to query GitHub Releases"
-		echo "Set a version explicitly: CLAUDE_CURSOR_BRIDGE_VERSION=v0.1.21 bash install.sh"
+		echo "Set a version explicitly: CLAUDE_CURSOR_PROXY_VERSION=v0.1.22 bash install.sh"
 		exit 1
 	fi
 	# Prefer python/jq if present; fall back to sed
@@ -135,14 +136,15 @@ resolve_version() {
 
 	if [ -z "$version" ] || [ "$version" = "null" ]; then
 		log_error "No GitHub release found for ${REPO}"
-		echo "Create a release (tag vX.Y.Z) first, or pin CLAUDE_CURSOR_BRIDGE_VERSION."
+		echo "Create a release (tag vX.Y.Z) first, or pin CLAUDE_CURSOR_PROXY_VERSION."
 		exit 1
 	fi
 	normalize_tag "$version"
 }
 
 skip_checksum() {
-	[ "${CLAUDE_CURSOR_BRIDGE_INSECURE_SKIP_CHECKSUM:-}" = "1" ] \
+	[ "${CLAUDE_CURSOR_PROXY_INSECURE_SKIP_CHECKSUM:-}" = "1" ] \
+		|| [ "${CLAUDE_CURSOR_BRIDGE_INSECURE_SKIP_CHECKSUM:-}" = "1" ] \
 		|| [ "${CLAUDE_CODE_PROXY_INSECURE_SKIP_CHECKSUM:-}" = "1" ]
 }
 
@@ -158,7 +160,7 @@ verify_checksum() {
 		shasum -a 256 -c "$checksum_file" >/dev/null
 	else
 		log_error "Neither sha256sum nor shasum found; cannot verify download"
-		echo "Install coreutils/shasum, or set CLAUDE_CURSOR_BRIDGE_INSECURE_SKIP_CHECKSUM=1 (not recommended)."
+		echo "Install coreutils/shasum, or set CLAUDE_CURSOR_PROXY_INSECURE_SKIP_CHECKSUM=1 (not recommended)."
 		exit 1
 	fi
 }
@@ -240,7 +242,7 @@ install_from_release() {
 	fi
 	chmod +x "${BIN_NAME}"
 
-	local install_dir="${CLAUDE_CURSOR_BRIDGE_INSTALL_DIR:-${CLAUDE_CODE_PROXY_INSTALL_DIR:-}}"
+	local install_dir="${CLAUDE_CURSOR_PROXY_INSTALL_DIR:-${CLAUDE_CURSOR_BRIDGE_INSTALL_DIR:-${CLAUDE_CODE_PROXY_INSTALL_DIR:-}}}"
 	if [ -z "$install_dir" ]; then
 		if [ -w /usr/local/bin ] 2>/dev/null; then
 			install_dir="/usr/local/bin"
@@ -278,6 +280,20 @@ install_from_release() {
 	ad_hoc_codesign "$dest"
 
 	log_success "${BIN_NAME} installed to ${dest}"
+
+	# Optional compatibility symlinks for previous binary names
+	for old_name in claude-cursor-bridge claude-code-proxy; do
+		link="${install_dir}/${old_name}"
+		if [ -e "$link" ] && [ ! -L "$link" ]; then
+			log_warning "Skipping symlink ${link} (exists and is not a symlink)"
+			continue
+		fi
+		if [ -w "$install_dir" ]; then
+			ln -sfn "${BIN_NAME}" "$link" 2>/dev/null || true
+		elif command -v sudo >/dev/null 2>&1; then
+			sudo ln -sfn "${BIN_NAME}" "$link" 2>/dev/null || true
+		fi
+	done
 
 	if [[ ":${PATH}:" != *":${install_dir}:"* ]]; then
 		log_warning "${install_dir} is not in your PATH"

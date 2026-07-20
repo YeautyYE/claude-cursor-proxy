@@ -10,7 +10,7 @@ Please **do not** open a public GitHub issue for security-sensitive reports.
 
 Prefer one of:
 
-1. **GitHub Security Advisories** — [Report a vulnerability](https://github.com/YeautyYE/claude-cursor-bridge/security/advisories/new) on this repository (once the repo is public and advisories are enabled).
+1. **GitHub Security Advisories** — [Report a vulnerability](https://github.com/YeautyYE/claude-cursor-proxy/security/advisories/new) on this repository (once the repo is public and advisories are enabled).
 2. **Private contact** — open a draft advisory or contact the maintainer via GitHub (@YeautyYE) with a short description and reproduction steps.
 
 Please include:

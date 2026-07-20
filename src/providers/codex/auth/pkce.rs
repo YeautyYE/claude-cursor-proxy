@@ -163,7 +163,7 @@ mod tests {
         assert!(url.contains("scope=openid+profile+email+offline_access"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
-        assert!(url.contains("originator=claude-cursor-bridge"));
+        assert!(url.contains("originator=claude-cursor-proxy"));
         assert!(url.contains("state=state"));
     }
 

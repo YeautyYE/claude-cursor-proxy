@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
 use crate::{config, paths};
 
-pub const KEYCHAIN_SERVICE: &str = "claude-cursor-bridge.cursor";
+pub const KEYCHAIN_SERVICE: &str = "claude-cursor-proxy.cursor";
 pub const KEYCHAIN_ACCOUNT: &str = "auth";
 
 /// Refresh when access JWT is within this window of expiry (align with Codex 5min).
@@ -103,7 +103,7 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
                 // Refresh rejected — only hard-fail if already expired.
                 if expires <= now_ms() {
                     anyhow::bail!(
-                        "Cursor access token expired and refresh failed. Run `claude-cursor-bridge cursor auth login`."
+                        "Cursor access token expired and refresh failed. Run `claude-cursor-proxy cursor auth login`."
                     );
                 }
                 Ok(Some(auth))
@@ -130,7 +130,7 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
         let auth = enrich(stored.clone(), self.auth_path());
         let Some(refresh_token) = auth.refresh_token.as_deref() else {
             anyhow::bail!(
-                "No Cursor refresh token available (env tokens cannot auto-renew). Run `claude-cursor-bridge cursor auth login`."
+                "No Cursor refresh token available (env tokens cannot auto-renew). Run `claude-cursor-proxy cursor auth login`."
             );
         };
         let refreshed = refresh_cursor_auth(refresh_token)?
@@ -343,7 +343,7 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 pub fn force_refresh_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
     if env_cursor_token().is_some() {
         anyhow::bail!(
-            "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-bridge cursor auth login`, or supply a fresh token."
+            "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-proxy cursor auth login`, or supply a fresh token."
         );
     }
     file_store().force_refresh()
@@ -372,7 +372,7 @@ pub fn cursor_auth_location() -> String {
 pub fn missing_auth_message() -> String {
     [
         "Cursor authentication was not found.",
-        "Run `claude-cursor-bridge cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
+        "Run `claude-cursor-proxy cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
         "On macOS the proxy also falls back to Cursor Agent Keychain (cursor-access-token) when CCP_CURSOR_CLI_KEYCHAIN_FALLBACK is on (default).",
         "On Linux/Windows it also reads ~/.config/cursor/auth.json when that fallback is enabled.",
     ]
@@ -385,7 +385,7 @@ pub fn expired_auth_message(auth: &CursorAuth) -> String {
         .map(format_unix_ms)
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "Cursor access token from {} is expired or near expiry ({}). Run `claude-cursor-bridge cursor auth login` again or set CCP_CURSOR_AUTH_TOKEN.",
+        "Cursor access token from {} is expired or near expiry ({}). Run `claude-cursor-proxy cursor auth login` again or set CCP_CURSOR_AUTH_TOKEN.",
         auth.source, expires
     )
 }

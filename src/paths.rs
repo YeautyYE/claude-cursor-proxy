@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Public app directory name (config / state).
-pub const APP_DIR: &str = "claude-cursor-bridge";
+pub const APP_DIR: &str = "claude-cursor-proxy";
 
 /// Previous install identity — used as a read fallback for auth/config migration.
-pub const LEGACY_APP_DIR: &str = "claude-code-proxy";
+pub const LEGACY_APP_DIR: &str = "claude-cursor-bridge";
+
+/// Older fork identity — secondary auth/config read fallback.
+pub const OLDER_LEGACY_APP_DIR: &str = "claude-code-proxy";
 
 #[derive(Debug, Clone)]
 pub struct DirResolverEnv {
@@ -109,7 +112,13 @@ pub fn provider_auth_file(provider: &str) -> PathBuf {
 
 pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     let deps = DirResolverEnv::default();
-    legacy_config_dir(&deps).join(provider).join("auth.json")
+    let bridge = legacy_config_dir(&deps).join(provider).join("auth.json");
+    if bridge.exists() {
+        return bridge;
+    }
+    join_with_sep(&deps.home, &[".config", OLDER_LEGACY_APP_DIR], false)
+        .join(provider)
+        .join("auth.json")
 }
 
 fn join_with_sep(base: &str, parts: &[&str], win32: bool) -> PathBuf {

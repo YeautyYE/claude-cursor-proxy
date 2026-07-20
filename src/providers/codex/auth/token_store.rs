@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
 use crate::paths;
 
-pub const KEYCHAIN_SERVICE: &str = "claude-cursor-bridge.codex";
+pub const KEYCHAIN_SERVICE: &str = "claude-cursor-proxy.codex";
 pub const KEYCHAIN_ACCOUNT: &str = "auth";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

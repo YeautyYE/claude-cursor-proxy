@@ -1967,7 +1967,7 @@ fn encode_interaction_auto_response(
         response.mcp_auth_request_response = Some(McpAuthRequestResponse {
             approved: None,
             rejected: Some(InteractionRejected {
-                reason: "claude-cursor-bridge cannot complete Cursor MCP auth UI".into(),
+                reason: "claude-cursor-proxy cannot complete Cursor MCP auth UI".into(),
             }),
         });
         matched = true;
@@ -1985,7 +1985,7 @@ fn encode_interaction_auto_response(
         response.ask_question_interaction_response = Some(AskQuestionInteractionResponse {
             result: Some(AskQuestionResult {
                 rejected: Some(AskQuestionRejected {
-                    reason: "claude-cursor-bridge has no interactive AskQuestion UI; answer via Claude tools instead".into(),
+                    reason: "claude-cursor-proxy has no interactive AskQuestion UI; answer via Claude tools instead".into(),
                 }),
             }),
         });

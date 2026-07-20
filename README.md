@@ -1,19 +1,19 @@
-# claude-cursor-bridge
+# claude-cursor-proxy
 
 **[中文](README.zh-CN.md) | English**
 
-[![CI](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/ci.yml)
-[![Release](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-bridge/actions/workflows/release.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/YeautyYE/claude-cursor-bridge?display_name=tag)](https://github.com/YeautyYE/claude-cursor-bridge/releases)
+[![CI](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/YeautyYE/claude-cursor-proxy/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/YeautyYE/claude-cursor-proxy?display_name=tag)](https://github.com/YeautyYE/claude-cursor-proxy/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](https://github.com/YeautyYE/claude-cursor-bridge/releases)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](https://github.com/YeautyYE/claude-cursor-proxy/releases)
 
-Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). This project is a **Cursor-first** Anthropic-compatible bridge for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). This project is a **Cursor-first** Anthropic-compatible **proxy** for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
 **Run Cursor models (Fable 5) from Claude Code — stably.**
 
 ```
-Claude Code ──Anthropic /v1/messages──► claude-cursor-bridge (:18765)
+Claude Code ──Anthropic /v1/messages──► claude-cursor-proxy (:18765)
                                               │
                                               ├── Cursor (Fable 5)   ← primary
                                               ├── Codex             ← additional
@@ -30,10 +30,10 @@ Claude Code ──Anthropic /v1/messages──► claude-cursor-bridge (:18765)
 Claude Code only speaks Anthropic’s API (`/v1/messages`, etc.).  
 Cursor uses its own Agent protocol. They do not talk to each other directly.
 
-This tool runs a local bridge (default `127.0.0.1:18765`) that connects them:
+This tool runs a local one-way proxy (default `127.0.0.1:18765`):
 
-1. Claude Code sends normal Anthropic requests
-2. The bridge translates them for Cursor and forwards upstream
+1. Claude Code sends normal Anthropic requests to the proxy
+2. The proxy translates them for Cursor and forwards upstream
 3. It streams Anthropic-shaped SSE back — with keep-alive so long thinking turns are not killed by Claude Code’s idle watchdog
 
 Primary upstream: **Cursor (Fable 5)** via `ANTHROPIC_MODEL=claude-fable-5[1m]`. Additional backends in the same process: Codex, Kimi, Grok.
@@ -49,8 +49,8 @@ Primary upstream: **Cursor (Fable 5)** via `ANTHROPIC_MODEL=claude-fable-5[1m]`.
 | **Stable sessions** | HTTP/2 BiDi upstream + Anthropic `ping` SSE keep-alive downstream |
 | **Fable 5** | Set `ANTHROPIC_MODEL=claude-fable-5[1m]` (and the same for `ANTHROPIC_SMALL_FAST_MODEL`) |
 | **Usage / ctx** | Cursor turn usage mapped onto Anthropic `usage` for status lines and compaction |
-| **Tools** | Cursor exec / native tools bridged into Claude Code’s tool loop (best-effort) |
-| **Simple install** | Checksummed binaries; macOS ad-hoc codesign; config under `~/.config/claude-cursor-bridge` |
+| **Tools** | Cursor exec / native tools proxied into Claude Code’s tool loop (best-effort) |
+| **Simple install** | Checksummed binaries; macOS ad-hoc codesign; config under `~/.config/claude-cursor-proxy` |
 
 Honest scope: best-effort compatibility — **not** a full Cursor IDE mirror. See [Limitations](#limitations).
 
@@ -61,19 +61,19 @@ Honest scope: best-effort compatibility — **not** a full Cursor IDE mirror. Se
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-bridge/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/install.sh | bash
 ```
 
-macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/YeautyYE/claude-cursor-bridge/releases) (or use WSL).
+macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/YeautyYE/claude-cursor-proxy/releases) (or use WSL).
 
 <details>
 <summary>Other install options</summary>
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_BRIDGE_VERSION=v0.1.21 curl -fsSL …/install.sh \| bash` |
-| Custom dir | `CLAUDE_CURSOR_BRIDGE_INSTALL_DIR=/opt/bin bash install.sh` |
-| From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-bridge --locked` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.22 curl -fsSL …/install.sh \| bash` |
+| Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
+| From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
 
 </details>
@@ -81,13 +81,13 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 ### Log in + serve
 
 ```bash
-claude-cursor-bridge cursor auth login
-claude-cursor-bridge serve                 # 127.0.0.1:18765 + monitor TUI
-claude-cursor-bridge serve --no-monitor    # logs only
-claude-cursor-bridge serve --port 11435    # custom port
+claude-cursor-proxy cursor auth login
+claude-cursor-proxy serve                 # 127.0.0.1:18765 + monitor TUI
+claude-cursor-proxy serve --no-monitor    # logs only
+claude-cursor-proxy serve --port 11435    # custom port
 ```
 
-### Point Claude Code at the bridge (Fable 5)
+### Point Claude Code at the proxy (Fable 5)
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
@@ -107,13 +107,13 @@ Always set `ANTHROPIC_SMALL_FAST_MODEL` to a full model id (same as `ANTHROPIC_M
 <summary>Codex / Kimi / Grok</summary>
 
 ```bash
-claude-cursor-bridge codex auth login
+claude-cursor-proxy codex auth login
 ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused \
   ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
-claude-cursor-bridge kimi auth login   # or: grok auth login
+claude-cursor-proxy kimi auth login   # or: grok auth login
 ```
 
 </details>
@@ -130,8 +130,8 @@ Other backends use their own full ids (for example `gpt-5.6-sol[1m]`, `kimi-for-
 
 ```bash
 # Built-in registry
-claude-cursor-bridge models
-claude-cursor-bridge models --full
+claude-cursor-proxy models
+claude-cursor-proxy models --full
 
 # While serve is running — Anthropic-compatible list
 # (merges Cursor GetUsableModels when logged in + registry)
@@ -146,7 +146,7 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 - Cursor Agent Connect (BiDi `Run`); optional HTTP/1 via `CCP_CURSOR_HTTP1=1`
 - SSE keep-alive (`ping`) so quiet thinking does not look stalled
 - Model routing by `ANTHROPIC_MODEL`
-- Auth stored by the bridge; Cursor can fall back to Cursor Agent Keychain / `auth.json`
+- Auth stored by the proxy; Cursor can fall back to Cursor Agent Keychain / `auth.json`
 - Monitor TUI when stdout is a TTY (`demo` for a simulated UI)
 
 ---
@@ -157,10 +157,10 @@ Precedence: **env > `config.json` > defaults**.
 
 | Platform | Path |
 | --- | --- |
-| macOS / Linux | `~/.config/claude-cursor-bridge/config.json` |
-| Windows | `%APPDATA%\claude-cursor-bridge\config.json` |
+| macOS / Linux | `~/.config/claude-cursor-proxy/config.json` |
+| Windows | `%APPDATA%\claude-cursor-proxy\config.json` |
 
-Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from earlier builds). Provider auth files under the old `~/.config/claude-code-proxy/` path are still read as a migration fallback.
+Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from earlier builds). Provider auth files under previous paths (`~/.config/claude-cursor-bridge/`, `~/.config/claude-code-proxy/`) are still read as a migration fallback.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -181,7 +181,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 ```
 
 ```bash
-claude-cursor-bridge cursor auth status
+claude-cursor-proxy cursor auth status
 ```
 
 ---
@@ -189,7 +189,7 @@ claude-cursor-bridge cursor auth status
 ## Limitations
 
 - **Not official.** Provider ToS and account risk are yours.
-- **No client auth on the bridge.** Loopback by default; non-loopback only behind a firewall or authenticating reverse proxy.
+- **No client auth on the proxy.** Loopback by default; non-loopback only behind a firewall or authenticating reverse proxy.
 - **Rate limits** follow the upstream account.
 - **Parity is best-effort.** Text, tools, thinking, and streaming work for supported paths; some edge cases are approximated or omitted.
 - **Not a full Cursor IDE.** Workspace/tool callbacks beyond Claude Code’s tool loop are incomplete.
@@ -197,11 +197,11 @@ claude-cursor-bridge cursor auth status
 
 | Symptom | Fix |
 | --- | --- |
-| macOS `Killed: 9` | `codesign --force -s - "$(command -v claude-cursor-bridge)"` |
-| Auth / 401 | `claude-cursor-bridge cursor auth login` |
+| macOS `Killed: 9` | `codesign --force -s - "$(command -v claude-cursor-proxy)"` |
+| Auth / 401 | `claude-cursor-proxy cursor auth login` |
 | Background 400 | Set `ANTHROPIC_SMALL_FAST_MODEL` to a known full model id |
 | Duplicated tools | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
-| Hung SSE | Check `~/.local/state/claude-cursor-bridge/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 
 ---
 

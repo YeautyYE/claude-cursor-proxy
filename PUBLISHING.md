@@ -1,59 +1,41 @@
 # Publishing notes (local)
 
-Maintainer checklist for the **new** public GitHub repo. Safe to delete after the first successful release.
+Maintainer checklist for GitHub releases.
 
 ## Naming decision (2026-07-20)
 
-**Chosen public identity: `claude-cursor-bridge`**
+**Chosen public identity: `claude-cursor-proxy`**
 
 | Candidate | Verdict |
 | --- | --- |
-| `claude-cursor-bridge` | **Chosen** — Claude Code + Cursor + bridge; searchable; not trademark-adjacent; matches binary & repo slug |
+| `claude-cursor-proxy` | **Chosen** — one-way proxy (Claude Code → proxy → Cursor); searchable; matches binary & repo slug |
+| `claude-cursor-bridge` | Previous name (v0.1.21); GitHub rename redirects; install keeps binary symlinks |
 | `cursor-claude-proxy` | Clear, but “proxy for Claude” can sound official / Cursor-owned |
 | `claude-code-proxy` | Upstream / old fork name; no longer matches Cursor-first product truth |
-| `ccp-cursor` | Opaque acronym; weak brand |
-| `fable-bridge` | Dates when the hero model changes |
-| `cursor-for-claude` | Trademark-adjacent; sounds official |
 
-Binary, crate, and default GitHub slug are all **`claude-cursor-bridge`**. Env prefix stays **`CCP_*`** for continuity.
+Binary, crate, and default GitHub slug are all **`claude-cursor-proxy`**. Env prefix stays **`CCP_*`** for continuity.
 
-## Create the empty GitHub repo
+## Release
 
-Do **not** push until the local tree is ready. Suggested steps:
+Tag a release to trigger `.github/workflows/release.yml` (example: `v0.1.22`), then push the tag.
 
-```bash
-# 1. Create empty public repo under YeautyYE (no README/license — local tree already has them)
-gh repo create YeautyYE/claude-cursor-bridge --public --description "Stable Cursor reverse-proxy bridge for Claude Code (Fable 5)"
-
-# 2. Point this checkout at the new remote (example)
-git remote rename origin old-origin   # if needed
-git remote add origin git@github.com:YeautyYE/claude-cursor-bridge.git
-
-# 3. Push main (or your release branch)
-git push -u origin HEAD
-
-# 4. Tag a release to trigger .github/workflows/release.yml
-git tag v0.1.21   # or next version
-git push origin v0.1.21
-```
-
-Install one-liner after `main` + release exist:
+Install one-liner:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-bridge/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/install.sh | bash
 ```
 
 ## Identity map
 
 | Item | Value |
 | --- | --- |
-| GitHub | `YeautyYE/claude-cursor-bridge` |
-| Binary / crate | `claude-cursor-bridge` |
-| Config dir | `~/.config/claude-cursor-bridge` (override: `CCP_CONFIG_DIR`) |
-| State / logs | `~/.local/state/claude-cursor-bridge` |
+| GitHub | `YeautyYE/claude-cursor-proxy` |
+| Binary / crate | `claude-cursor-proxy` |
+| Config dir | `~/.config/claude-cursor-proxy` (override: `CCP_CONFIG_DIR`) |
+| State / logs | `~/.local/state/claude-cursor-proxy` |
 | Env prefix | `CCP_*` (kept) |
-| Install pin | `CLAUDE_CURSOR_BRIDGE_VERSION` (legacy alias: `CLAUDE_CODE_PROXY_VERSION`) |
-| Legacy config | `~/.config/claude-code-proxy` still used as auth/config read fallback |
+| Install pin | `CLAUDE_CURSOR_PROXY_VERSION` (legacy: `CLAUDE_CURSOR_BRIDGE_*`, `CLAUDE_CODE_PROXY_*`) |
+| Legacy config | `~/.config/claude-cursor-bridge` and `~/.config/claude-code-proxy` still used as auth read fallback |
 
 ## Docs
 
@@ -63,8 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-bridge/main/
 
 ## Intentionally not done
 
-- No git commit / push / GitHub repo creation from this checklist alone
 - No Homebrew tap
 - No musl static Linux builds (gnu targets only)
 - No Apple Developer ID / notarization (install.sh ad-hoc codesign covers Gatekeeper `Killed: 9`)
-- No second binary alias named `claude-code-proxy` (document migration; one public binary)
+- Compatibility symlinks: `claude-cursor-bridge` / `claude-code-proxy` → `claude-cursor-proxy` (install.sh)

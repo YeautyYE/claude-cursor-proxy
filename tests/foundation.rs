@@ -1,14 +1,14 @@
-use claude_cursor_bridge::anthropic::{
+use claude_cursor_proxy::anthropic::{
     encode_sse_event, parse_sse_events, parse_sse_events_with_stats, schema::MessagesRequest,
 };
-use claude_cursor_bridge::auth::{AuthStorage, InMemoryAuthStore};
-use claude_cursor_bridge::config::{AliasProvider, load_config};
-use claude_cursor_bridge::logging::{create_logger, redact_value};
-use claude_cursor_bridge::paths::{self, DirResolverEnv};
-use claude_cursor_bridge::retry::{
+use claude_cursor_proxy::auth::{AuthStorage, InMemoryAuthStore};
+use claude_cursor_proxy::config::{AliasProvider, load_config};
+use claude_cursor_proxy::logging::{create_logger, redact_value};
+use claude_cursor_proxy::paths::{self, DirResolverEnv};
+use claude_cursor_proxy::retry::{
     RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay,
 };
-use claude_cursor_bridge::traffic::{
+use claude_cursor_proxy::traffic::{
     MAX_SSE_CAPTURE_BYTES, TrafficCaptureOptions, create_traffic_capture, redact_traffic,
     sanitize_path_part, traffic_capture_enabled_for_env,
 };
@@ -73,7 +73,7 @@ fn path_resolvers_cover_platform_rules() {
     };
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/home/u/.config/claude-cursor-bridge"
+        "/home/u/.config/claude-cursor-proxy"
     );
 
     let deps = DirResolverEnv {
@@ -83,7 +83,7 @@ fn path_resolvers_cover_platform_rules() {
     };
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/x/claude-cursor-bridge"
+        "/x/claude-cursor-proxy"
     );
 
     let deps = DirResolverEnv {
@@ -93,7 +93,7 @@ fn path_resolvers_cover_platform_rules() {
     };
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
-        "C:/Users/u/AppData/Roaming/claude-cursor-bridge"
+        "C:/Users/u/AppData/Roaming/claude-cursor-proxy"
     );
 }
 
