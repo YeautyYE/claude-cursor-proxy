@@ -470,6 +470,10 @@ pub struct ToolCallCompleted {
 }
 
 /// ToolCall oneof (CLI 2026.07) — tools we map to Claude Code.
+///
+/// Unmapped CLI siblings (intentionally omitted): `PiWriteToolCall`,
+/// `PiEditToolCall`, `ApplyAgentDiffToolCall`. Interaction updates are
+/// transcript-only in live BiDi; FS mutations use [`ExecServerMessage`].
 #[derive(Clone, PartialEq, Message)]
 pub struct ToolCall {
     #[prost(message, optional, tag = "1")]
@@ -669,6 +673,12 @@ pub struct EditToolCall {
     pub args: Option<EditArgs>,
 }
 
+/// Cursor Edit interaction args (full-file overwrite via streamed content).
+///
+/// Only `path` + `stream_content` (tag 6) are modeled. CLI may also emit
+/// `EditToolCallDelta` / intermediate tags 2–5; until `stream_content` is set
+/// we treat the edit as incomplete (`map_tool_call` returns `None`). Live FS
+/// writes go through [`ExecServerMessage::write_args`], not this path.
 #[derive(Clone, PartialEq, Message)]
 pub struct EditArgs {
     #[prost(string, tag = "1")]
@@ -777,6 +787,11 @@ pub struct TurnEnded {
 }
 
 /// Server → client tool/exec request (AgentServerMessage tag 2).
+///
+/// Decoded payloads: shell / write / delete / grep / read / ls / request_context /
+/// shell_stream. CLI also defines `PiWriteExecArgs` and `ApplyAgentDiff*` (and
+/// matching ToolCall oneofs); those are intentionally unmapped — unknown exec
+/// soft-fails via control throw rather than inventing a Claude Write.
 #[derive(Clone, PartialEq, Message)]
 pub struct ExecServerMessage {
     #[prost(uint32, tag = "1")]

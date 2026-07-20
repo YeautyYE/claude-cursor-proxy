@@ -1587,8 +1587,12 @@ async fn process_live_frame(
 
         let Some(mut native) = PendingCursorExec::from_server(&exec) else {
             logical_tools_waiting.resolve_server_exec_hint(&exec);
-            if let Ok(frames) = encode_control_throw(exec.id, "Unsupported Cursor exec tool".into())
-            {
+            // Soft-fail: PiWriteExec / ApplyAgentDiff / unknown tags are not
+            // decoded — throw instead of inventing a Claude Write.
+            if let Ok(frames) = encode_control_throw(
+                exec.id,
+                "Unsupported Cursor exec tool (mapped: shell/write/delete/grep/read/ls; not PiWrite/ApplyAgentDiff)".into(),
+            ) {
                 for frame in frames {
                     if !outbound.send_connect_frame(frame).await {
                         return false;

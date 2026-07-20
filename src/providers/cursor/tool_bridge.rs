@@ -421,16 +421,21 @@ pub fn build_write_result_from_native(
             }
         })
     } else {
-        let lines = if result.content.is_empty() {
-            0
-        } else {
-            result.content.lines().count()
-        };
+        // Prefer written file bytes from exec args — tool_result text is a
+        // status string and would skew linesCreated/fileSize (prost path in
+        // exec_results.rs already uses file content).
+        let file = exec
+            .args
+            .get("content")
+            .or_else(|| exec.args.get("file_text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lines = if file.is_empty() { 0 } else { file.lines().count() };
         serde_json::json!({
             "success": {
                 "path": path,
                 "linesCreated": lines,
-                "fileSize": result.content.len()
+                "fileSize": file.len()
             }
         })
     };
@@ -1144,16 +1149,18 @@ mod tests {
         let exec = CursorExec {
             id: Some(2),
             exec_id: None,
-            args: serde_json::json!({"file_path": "/tmp/b", "content": "hi"}),
+            args: serde_json::json!({"file_path": "/tmp/b", "content": "hi\nthere\n"}),
         };
         let result = CursorNativeToolResult {
-            content: "success".into(),
+            // Status text must not drive linesCreated/fileSize.
+            content: "Wrote contents to /tmp/b".into(),
             is_error: false,
         };
         let msg = build_write_result_from_native(&exec, &result);
         assert_eq!(msg["id"], 2);
         assert_eq!(msg["writeResult"]["success"]["path"], "/tmp/b");
-        assert_eq!(msg["writeResult"]["success"]["linesCreated"], 1);
+        assert_eq!(msg["writeResult"]["success"]["linesCreated"], 2);
+        assert_eq!(msg["writeResult"]["success"]["fileSize"], 9);
     }
 
     #[test]
