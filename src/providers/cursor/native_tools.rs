@@ -119,15 +119,12 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
     }
     if let Some(ref edit) = tc.edit_tool_call {
         let args = edit.args.as_ref()?;
-        // Cursor edit streams content; map to Write when we have content, else Edit-like Write.
+        // Cursor Edit is a full-file overwrite (stream_content), not Claude's
+        // old_string/new_string Edit. Map to Write when content has arrived.
         let content = args.stream_content.clone().unwrap_or_default();
         if content.is_empty() {
-            // Incomplete edit — still expose as Write with empty content so agent can recover.
-            return Some(MappedClaudeTool {
-                tool_use_id: call_id,
-                name: "Read".into(),
-                input: serde_json::json!({ "file_path": args.path }),
-            });
+            // Incomplete stream — do not invent a Read/Write; wait for content.
+            return None;
         }
         return Some(MappedClaudeTool {
             tool_use_id: call_id,
@@ -395,7 +392,9 @@ fn shell_single_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::cursor::proto::{ReadToolArgs, ReadToolCall, ShellToolCall};
+    use crate::providers::cursor::proto::{
+        ExecServerMessage, ReadToolArgs, ReadToolCall, ShellToolCall, ToolCall, ToolCallStarted,
+    };
 
     #[test]
     fn maps_shell_to_bash() {
@@ -530,5 +529,66 @@ mod tests {
         let m = map_tool_call_started(&started).unwrap();
         assert_eq!(m.name, "mcp__plugin__search");
         assert_eq!(m.input["query"], "hello");
+    }
+
+    #[test]
+    fn maps_exec_write_args_to_claude_write_schema() {
+        let exec = ExecServerMessage {
+            id: 9,
+            exec_id: Some("exec-w".into()),
+            write_args: Some(crate::providers::cursor::proto::WriteArgs {
+                path: "/tmp/out.md".into(),
+                file_text: "# hello\n".into(),
+            }),
+            ..Default::default()
+        };
+        let m = map_exec_server_message(&exec).unwrap();
+        assert_eq!(m.name, "Write");
+        assert_eq!(m.input["file_path"], "/tmp/out.md");
+        assert_eq!(m.input["content"], "# hello\n");
+        assert!(m.input.get("path").is_none());
+        assert!(m.input.get("file_text").is_none());
+        assert!(m.input.get("contents").is_none());
+    }
+
+    #[test]
+    fn maps_cursor_edit_with_content_to_write_not_edit() {
+        let started = ToolCallStarted {
+            call_id: "e1".into(),
+            tool_call: Some(ToolCall {
+                edit_tool_call: Some(crate::providers::cursor::proto::EditToolCall {
+                    args: Some(crate::providers::cursor::proto::EditArgs {
+                        path: "/tmp/a.rs".into(),
+                        stream_content: Some("fn main() {}".into()),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.name, "Write");
+        assert_eq!(m.input["file_path"], "/tmp/a.rs");
+        assert_eq!(m.input["content"], "fn main() {}");
+        assert!(m.input.get("old_string").is_none());
+        assert!(m.input.get("new_string").is_none());
+    }
+
+    #[test]
+    fn incomplete_cursor_edit_is_not_mapped_to_read() {
+        let started = ToolCallStarted {
+            call_id: "e2".into(),
+            tool_call: Some(ToolCall {
+                edit_tool_call: Some(crate::providers::cursor::proto::EditToolCall {
+                    args: Some(crate::providers::cursor::proto::EditArgs {
+                        path: "/tmp/a.rs".into(),
+                        stream_content: None,
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        assert!(map_tool_call_started(&started).is_none());
     }
 }

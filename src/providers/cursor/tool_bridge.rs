@@ -896,7 +896,9 @@ fn resolve_advertised_name(
     let fallbacks: &[&str] = match mapped_name {
         "Bash" => &["Bash", "Shell", "bash"],
         "Read" => &["Read", "read_file", "ReadFile"],
-        "Write" => &["Write", "write_file", "WriteFile", "Edit"],
+        // Never fall back to Edit: Claude Edit requires old_string/new_string,
+        // while Cursor Write/Edit overwrite maps to {file_path, content}.
+        "Write" => &["Write", "write_file", "WriteFile"],
         "Grep" => &["Grep", "grep", "Search"],
         "Glob" => &["Glob", "glob", "Find"],
         "WebSearch" => &["WebSearch", "web_search"],
@@ -931,36 +933,42 @@ fn resolve_advertised_name(
     None
 }
 
+/// Claude Code Read/Write use `file_path` / `content`; tolerate Cursor-ish aliases
+/// that sometimes appear in XML tool_use JSON.
+fn claude_file_path(input: &serde_json::Map<String, serde_json::Value>) -> String {
+    input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn claude_write_content(input: &serde_json::Map<String, serde_json::Value>) -> String {
+    input
+        .get("content")
+        .or_else(|| input.get("contents"))
+        .or_else(|| input.get("file_text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Create a `PendingCursorTool` from a recovered XML tool_use event.
 fn pending_from_recovered_tool(
     tool_use: &crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse,
 ) -> Option<PendingCursorTool> {
     match tool_use.name.as_str() {
         "Read" => {
-            let file_path = tool_use
-                .input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let file_path = claude_file_path(&tool_use.input);
             Some(PendingCursorTool::Read {
                 tool_use_id: tool_use.id.clone(),
                 path: file_path,
             })
         }
         "Write" => {
-            let file_path = tool_use
-                .input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let content = tool_use
-                .input
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let file_path = claude_file_path(&tool_use.input);
+            let content = claude_write_content(&tool_use.input);
             Some(PendingCursorTool::Write {
                 tool_use_id: tool_use.id.clone(),
                 path: file_path,
@@ -999,6 +1007,7 @@ fn pending_from_recovered_tool(
 mod tests {
     use super::*;
     use crate::anthropic::schema::MessagesRequest;
+    use crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse;
     use std::sync::Mutex;
 
     /// Serialize tests that share the global bridge registry.
@@ -1450,5 +1459,44 @@ mod tests {
 
         let result = serde_json::json!({"type": "tool_result"});
         assert!(!tool_result_is_error(&result));
+    }
+
+    #[test]
+    fn write_is_not_remapped_to_edit_when_only_edit_is_advertised() {
+        let allowed: BTreeSet<String> = ["Edit".into()].into_iter().collect();
+        assert!(
+            resolve_advertised_name("Write", Some(&allowed)).is_none(),
+            "Write→Edit remaps Claude Edit schema (old_string/new_string) incorrectly"
+        );
+    }
+
+    #[test]
+    fn write_prefers_write_over_edit_aliases() {
+        let allowed: BTreeSet<String> = ["Edit".into(), "Write".into()].into_iter().collect();
+        assert_eq!(
+            resolve_advertised_name("Write", Some(&allowed)).as_deref(),
+            Some("Write")
+        );
+    }
+
+    #[test]
+    fn pending_write_accepts_cursor_style_path_aliases_from_xml() {
+        let tool = RecoveredCursorToolUse {
+            id: "call_1".into(),
+            original_id: None,
+            name: "Write".into(),
+            input: serde_json::json!({
+                "path": "/tmp/alias.txt",
+                "file_text": "via alias"
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        };
+        let pending = pending_from_recovered_tool(&tool).unwrap();
+        assert_eq!(pending.name(), "Write");
+        let json = pending.input_json();
+        assert_eq!(json["file_path"], "/tmp/alias.txt");
+        assert_eq!(json["content"], "via alias");
     }
 }

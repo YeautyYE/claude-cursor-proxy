@@ -1885,7 +1885,9 @@ fn resolve_advertised_name(
     let fallbacks: &[&str] = match mapped_name {
         "Bash" => &["Bash", "Shell", "bash"],
         "Read" => &["Read", "read_file", "ReadFile"],
-        "Write" => &["Write", "write_file", "WriteFile", "Edit"],
+        // Never fall back to Edit: Claude Edit requires old_string/new_string,
+        // while Cursor Write/Edit overwrite maps to {file_path, content}.
+        "Write" => &["Write", "write_file", "WriteFile"],
         "Grep" => &["Grep", "grep", "Search"],
         "Glob" => &["Glob", "glob", "Find"],
         "WebSearch" => &["WebSearch", "web_search"],
