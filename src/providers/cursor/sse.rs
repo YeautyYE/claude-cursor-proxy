@@ -1160,6 +1160,26 @@ mod tests {
         assert!(encoder.take_bytes().is_empty());
     }
 
+    #[test]
+    fn content_delta_encode_is_fast_enough_for_streaming() {
+        // Mental budget: ~11 tok/s would be ~90ms/token. Encoding a short
+        // Anthropic content_block_delta must be orders of magnitude cheaper.
+        let mut encoder = CursorSseEncoder::new("msg_bench", "cursor-test");
+        encoder.begin();
+        let _ = encoder.take_bytes();
+        let started = std::time::Instant::now();
+        for i in 0..2_000 {
+            encoder.emit_text_delta(&format!("t{i}"));
+            let _ = encoder.take_bytes();
+        }
+        let elapsed = started.elapsed();
+        let per = elapsed / 2_000;
+        assert!(
+            per.as_micros() < 500,
+            "SSE text delta encode too slow: {per:?}/delta ({elapsed:?} for 2000)"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // SSE parser helper for tests
     // -----------------------------------------------------------------------

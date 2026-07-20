@@ -184,7 +184,6 @@ fn env_u64_millis(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-
 fn collect_live_tool_results(
     body: &MessagesRequest,
     pending: &[PendingCursorExec],
@@ -306,7 +305,10 @@ impl Provider for CursorProvider {
                     );
                 }
                 let estimated_input = estimate_request_input_tokens(&body);
-                let monitor = ctx.monitor.clone().map(|handle| (handle, ctx.req_id.clone()));
+                let monitor = ctx
+                    .monitor
+                    .clone()
+                    .map(|handle| (handle, ctx.req_id.clone()));
                 match await_live_run_resume(
                     session_id,
                     &body,
@@ -474,7 +476,9 @@ impl Provider for CursorProvider {
                         message_id,
                         wire_model,
                         estimate_request_input_tokens(&body),
-                        ctx.monitor.clone().map(|handle| (handle, ctx.req_id.clone())),
+                        ctx.monitor
+                            .clone()
+                            .map(|handle| (handle, ctx.req_id.clone())),
                     );
                 }
                 Err(error) => {

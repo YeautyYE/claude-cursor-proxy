@@ -272,10 +272,43 @@ pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
         };
     }
     if let Some(tools) = req.extra.get("tools") {
-        // Schema dump dominates Ctx; approximate without full serialize.
-        chars = chars.saturating_add(tools.to_string().len());
+        // Schema dump dominates Ctx. Walk the Value tree for a size estimate —
+        // `tools.to_string()` re-serializes the full tools array (often 100KB+)
+        // on every request and only delayed TTFT / burned CPU before first byte.
+        chars = chars.saturating_add(json_size_estimate(tools));
     }
     (chars / 4).max(1) as u64
+}
+
+/// Approximate serialized JSON size without allocating the full string.
+fn json_size_estimate(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(true) => 4,
+        serde_json::Value::Bool(false) => 5,
+        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::String(s) => s.len().saturating_add(2),
+        serde_json::Value::Array(items) => {
+            let inner: usize = items.iter().map(json_size_estimate).sum();
+            // brackets + commas
+            inner
+                .saturating_add(2)
+                .saturating_add(items.len().saturating_sub(1))
+        }
+        serde_json::Value::Object(map) => {
+            let inner: usize = map
+                .iter()
+                .map(|(k, v)| {
+                    k.len()
+                        .saturating_add(3)
+                        .saturating_add(json_size_estimate(v))
+                })
+                .sum();
+            inner
+                .saturating_add(2)
+                .saturating_add(map.len().saturating_sub(1))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -284,7 +317,7 @@ mod tests {
     use crate::providers::cursor::connect::encode_connect_frame;
     use crate::providers::cursor::proto::*;
     use crate::providers::cursor::test_frames;
-    use prost::Message;
+    use prost::Message as ProstMessage;
 
     #[test]
     fn decodes_text_and_usage_events() {
@@ -420,5 +453,46 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn estimate_request_input_tokens_avoids_tools_tostring_blowup() {
+        // Large tools schema must not require a full JSON re-serialize of the
+        // tools array (previously `tools.to_string().len()` on every request).
+        let tools = serde_json::json!([
+            {
+                "name": "Read",
+                "description": "x".repeat(8_000),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "y".repeat(8_000) }
+                    }
+                }
+            }
+        ]);
+        let mut extra = serde_json::Map::new();
+        extra.insert("tools".into(), tools);
+        let req = MessagesRequest {
+            model: Some("claude-fable-5".into()),
+            messages: vec![crate::anthropic::schema::Message {
+                role: "user".into(),
+                content: serde_json::json!("hi"),
+            }],
+            max_tokens: Some(16),
+            stream: true,
+            extra,
+        };
+        let started = std::time::Instant::now();
+        let tokens = estimate_request_input_tokens(&req);
+        let elapsed = started.elapsed();
+        assert!(
+            tokens > 1_000,
+            "expected large tools to dominate estimate, got {tokens}"
+        );
+        assert!(
+            elapsed.as_millis() < 50,
+            "tools size estimate too slow: {elapsed:?}"
+        );
     }
 }

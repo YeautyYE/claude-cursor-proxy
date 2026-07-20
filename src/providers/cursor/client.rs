@@ -1379,14 +1379,15 @@ pub fn decode_upstream_frames(body: &[u8]) -> Result<Vec<ConnectFrame>, CursorEr
 pub fn decode_frame_payload(
     frame: &ConnectFrame,
 ) -> Result<proto::AgentServerMessage, CursorError> {
-    let payload = if frame.flags & FLAG_GZIP != 0 {
-        super::connect::decode_gzip_frame(&frame.payload)
-            .map_err(|e| CursorError::internal(format!("gzip decompress: {e}")))?
-    } else {
-        frame.payload.to_vec()
-    };
-
-    proto::AgentServerMessage::decode(&payload[..])
+    // Hot path: every token delta hits this. Uncompressed frames are already
+    // `Bytes` — decode in place instead of copying into a fresh `Vec` each time.
+    if frame.flags & FLAG_GZIP != 0 {
+        let payload = super::connect::decode_gzip_frame(&frame.payload)
+            .map_err(|e| CursorError::internal(format!("gzip decompress: {e}")))?;
+        return proto::AgentServerMessage::decode(payload.as_slice())
+            .map_err(|e| CursorError::internal(format!("prost decode: {e}")));
+    }
+    proto::AgentServerMessage::decode(frame.payload.as_ref())
         .map_err(|e| CursorError::internal(format!("prost decode: {e}")))
 }
 

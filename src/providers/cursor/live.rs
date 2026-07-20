@@ -57,13 +57,13 @@ impl ClientOutbound {
         }
     }
 
-    /// Best-effort send for keepalives — never block the BiDi body channel.
+    /// Best-effort send for keepalives — never block the BiDi read loop.
     /// Full queues drop this heartbeat tick; the next interval still fires.
+    /// HTTP/1 BidiAppend is spawned so a slow append cannot stall upstream reads
+    /// (CLI's duplex heartbeats never serialize behind unary append RTTs).
     fn try_send_heartbeat_frame(&self, frame: Bytes) -> bool {
         match self {
             Self::Bidi(tx) => matches!(tx.try_send(Ok(frame)), Ok(())),
-            // Http1 append is async; spawn so the heartbeat task never awaits
-            // a slow BidiAppend under load.
             Self::Http1(session) => {
                 let session = session.clone();
                 tokio::spawn(async move {
@@ -74,6 +74,10 @@ impl ClientOutbound {
         }
     }
 }
+
+/// Fan-out from the BiDi driver to Anthropic SSE. Sized for Fable max-effort
+/// thinking bursts so we rarely block the upstream read loop.
+const LIVE_EVENT_CHANNEL_CAP: usize = 512;
 
 #[derive(Debug, Clone)]
 pub enum LiveRunEvent {
@@ -178,7 +182,9 @@ impl CursorLiveRunHandle {
         let pending = self.pending_tools();
         validate_tool_result_batch(&pending, &tool_results)
             .map_err(|message| CursorError::new(400, message, None))?;
-        let (sink, events) = mpsc::channel(64);
+        // Match start_live_agent capacity — post-tool thinking bursts must not
+        // trip the old 64-slot ceiling (silent drop under try_send timeout).
+        let (sink, events) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
         let (ack, ready) = oneshot::channel();
         self.command_tx
             .send(RunCommand::ResumeBatch {
@@ -535,9 +541,7 @@ impl LiveRunRegistry {
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
                 Some(Arc::clone(handle))
             }
-            Some(LiveRunEntry::Running(_))
-            | Some(LiveRunEntry::Starting { .. })
-            | None => None,
+            Some(LiveRunEntry::Running(_)) | Some(LiveRunEntry::Starting { .. }) | None => None,
         }
     }
 
@@ -650,8 +654,8 @@ impl CursorHttpClient {
             .await?;
 
         // Larger fan-out so token deltas don't block the BiDi read loop under
-        // Claude Code backpressure (coalescing in live_sse_response + try_send).
-        let (event_tx, events) = mpsc::channel(512);
+        // Claude Code backpressure (coalescing in live_sse_response).
+        let (event_tx, events) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
         let (command_tx, command_rx) = mpsc::channel(8);
         let pending = Arc::new(Mutex::new(Vec::new()));
         let terminal_error = Arc::new(Mutex::new(None));
@@ -676,7 +680,10 @@ impl CursorHttpClient {
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
         };
-        let (upstream_tx, upstream_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(64);
+        // Match event fan-out: a tiny upstream queue stalls the reqwest body
+        // pump (and Cursor's TCP window) during thinking bursts.
+        let (upstream_tx, upstream_rx) =
+            mpsc::channel::<Result<Option<Bytes>, String>>(LIVE_EVENT_CHANNEL_CAP);
         spawn_upstream_pump(response.bytes_stream(), upstream_tx.clone());
         tokio::spawn(drive_live_run(
             upstream_rx,
@@ -1130,7 +1137,10 @@ async fn drive_live_run(
     let run_started = Instant::now();
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
-    let tool_batch_quiet = Duration::from_millis(env_u64("CCP_CURSOR_TOOL_BATCH_MS", 25));
+    // 0 is allowed (expose on next select tick). This does NOT gate thinking/
+    // text deltas — those forward immediately while the SSE sink is live.
+    let tool_batch_quiet =
+        Duration::from_millis(env_u64_allow_zero("CCP_CURSOR_TOOL_BATCH_MS", 25));
     let resume_grace = Duration::from_secs(env_u64("CCP_CURSOR_RESUME_GRACE_SECS", 120));
     let mut exec_heartbeat = tokio::time::interval(Duration::from_secs(env_u64(
         "CCP_CURSOR_EXEC_HEARTBEAT_SECS",
@@ -1252,21 +1262,9 @@ async fn drive_live_run(
                     }
                 }
             }
-            _ = exec_heartbeat.tick(), if !pending.is_empty() => {
-                let ids: Vec<u32> = pending.all().map(|current| current.id).collect();
-                for id in ids {
-                    if let Ok(frame) = encode_exec_heartbeat(id)
-                        && !outbound.send_connect_frame(frame).await
-                    {
-                        break 'driver;
-                    }
-                }
-            }
-            _ = client_heartbeat.tick() => {
-                if let Some(ref frame) = client_hb_frame {
-                    let _ = outbound.try_send_heartbeat_frame(frame.clone());
-                }
-            }
+            // Prefer draining Cursor InteractionUpdates (thinking/text) over
+            // keepalive ticks whenever both are ready — max-effort thinking
+            // should not wait behind a heartbeat interval edge.
             item = upstream.recv() => {
                 match item {
                     Some(Ok(Some(chunk))) => {
@@ -1298,6 +1296,17 @@ async fn drive_live_run(
                             ).await {
                                 break 'driver;
                             }
+                        }
+                        // Quiet window already elapsed (incl. TOOL_BATCH_MS=0):
+                        // expose in this iteration so we do not wait for the
+                        // next select pass behind heartbeats / idle sleep.
+                        if pending
+                            .collect_deadline()
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                            && !expose_collected_tools(&mut pending, &pending_shared, &mut sink)
+                                .await
+                        {
+                            break 'driver;
                         }
                     }
                     Some(Ok(None)) | None => {
@@ -1356,6 +1365,22 @@ async fn drive_live_run(
                         report_terminal_error(&mut sink, &terminal_error, message).await;
                         break 'driver;
                     }
+                }
+            }
+            _ = exec_heartbeat.tick(), if !pending.is_empty() => {
+                // Never await append/send here — even with upstream preferred in
+                // biased select, a blocking BidiAppend freezes this task for a
+                // full RTT while Cursor keeps sending deltas (CLI does not).
+                let ids: Vec<u32> = pending.all().map(|current| current.id).collect();
+                for id in ids {
+                    if let Ok(frame) = encode_exec_heartbeat(id) {
+                        let _ = outbound.try_send_heartbeat_frame(frame);
+                    }
+                }
+            }
+            _ = client_heartbeat.tick() => {
+                if let Some(ref frame) = client_hb_frame {
+                    let _ = outbound.try_send_heartbeat_frame(frame.clone());
                 }
             }
             // With biased selection, drain a response chunk that is already
@@ -1801,9 +1826,9 @@ async fn send_live_event(
     let Some(tx) = sink.as_ref() else {
         return false;
     };
-    // Text/thinking deltas: never block the BiDi read loop on Claude Code
-    // backpressure. Prefer try_send; briefly block only as a last resort so
-    // Cursor heartbeats / tool frames are not stalled behind SSE consumers.
+    // Text/thinking deltas: prefer try_send so a slow Claude Code consumer does
+    // not stall Cursor BiDi heartbeats on the hot path. Never drop tokens —
+    // yield once for the SSE unfold to drain, then await send.
     let is_delta = matches!(
         &event,
         Ok(LiveRunEvent::Cursor(
@@ -1814,15 +1839,36 @@ async fn send_live_event(
         match tx.try_send(event) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(event)) => {
-                tokio::time::timeout(Duration::from_millis(5), tx.send(event))
-                    .await
-                    .map(|r| r.is_ok())
-                    .unwrap_or(true)
+                tokio::task::yield_now().await;
+                match tx.try_send(event) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Full(event)) => tx.send(event).await.is_ok(),
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     } else {
         tx.send(event).await.is_ok()
+    }
+}
+
+fn apply_live_run_event(encoder: &mut CursorSseEncoder, event: LiveRunEvent) {
+    match event {
+        LiveRunEvent::Cursor(event) => encoder.push_event(&event),
+        LiveRunEvent::NativeToolBatch(tools) => {
+            let encoded: Vec<(String, String, String)> = tools
+                .into_iter()
+                .map(|tool| {
+                    let input =
+                        serde_json::to_string(&tool.input).unwrap_or_else(|_| "{}".to_string());
+                    (tool.tool_use_id, tool.name, input)
+                })
+                .collect();
+            encoder.emit_tool_batch(encoded.iter().map(|(tool_use_id, name, input)| {
+                (tool_use_id.as_str(), name.as_str(), input.as_str())
+            }));
+        }
     }
 }
 
@@ -2043,23 +2089,53 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Like [`env_u64`] but allows an explicit `0` (e.g. disable tool-batch quiet).
+fn env_u64_allow_zero(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Minimum gap between monitor progress publishes on the SSE hot path.
+/// TUI polls ~4Hz; publishing every thinking delta only contends on the lock.
+const MONITOR_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
 fn publish_live_usage(
     monitor: &Option<(crate::monitor::MonitorHandle, String)>,
     encoder: &CursorSseEncoder,
     bytes: usize,
     chunks: u64,
+    pending_bytes: &mut u64,
+    pending_chunks: &mut u64,
+    last_publish: &mut Instant,
+    force: bool,
 ) {
+    *pending_bytes = pending_bytes.saturating_add(bytes as u64);
+    *pending_chunks = pending_chunks.saturating_add(chunks);
     let Some((handle, req_id)) = monitor else {
+        *pending_bytes = 0;
+        *pending_chunks = 0;
         return;
     };
+    if !force && last_publish.elapsed() < MONITOR_PROGRESS_MIN_INTERVAL {
+        return;
+    }
     let (input_tokens, output_tokens) = encoder.current_usage();
-    handle.stream_progress(
-        req_id,
-        bytes as u64,
-        chunks,
-        Some(input_tokens).filter(|v| *v > 0),
-        Some(output_tokens).filter(|v| *v > 0),
-    );
+    let input = Some(input_tokens).filter(|v| *v > 0);
+    let output = Some(output_tokens).filter(|v| *v > 0);
+    let published = if force {
+        handle.stream_progress(req_id, *pending_bytes, *pending_chunks, input, output);
+        true
+    } else {
+        // try_lock: never stall token emission behind TUI snapshot cloning.
+        handle.try_stream_progress(req_id, *pending_bytes, *pending_chunks, input, output)
+    };
+    if published {
+        *pending_bytes = 0;
+        *pending_chunks = 0;
+        *last_publish = Instant::now();
+    }
 }
 
 pub fn live_sse_response(
@@ -2075,6 +2151,9 @@ pub fn live_sse_response(
         began: bool,
         done: bool,
         monitor: Option<(crate::monitor::MonitorHandle, String)>,
+        pending_monitor_bytes: u64,
+        pending_monitor_chunks: u64,
+        last_monitor_publish: Instant,
         /// Periodic Anthropic `ping` so Claude Code's stream idle watchdog
         /// (≥300s by default) does not abort during quiet Cursor thinking.
         ping: tokio::time::Interval,
@@ -2106,6 +2185,11 @@ pub fn live_sse_response(
             began: false,
             done: false,
             monitor,
+            pending_monitor_bytes: 0,
+            pending_monitor_chunks: 0,
+            last_monitor_publish: Instant::now()
+                .checked_sub(MONITOR_PROGRESS_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now),
             ping,
         },
         |mut state| async move {
@@ -2123,6 +2207,10 @@ pub fn live_sse_response(
                             &state.encoder,
                             bytes.len(),
                             1,
+                            &mut state.pending_monitor_bytes,
+                            &mut state.pending_monitor_chunks,
+                            &mut state.last_monitor_publish,
+                            true,
                         );
                         return Some((Ok::<Bytes, Infallible>(Bytes::from(bytes)), state));
                     }
@@ -2132,154 +2220,26 @@ pub fn live_sse_response(
                     maybe = state.events.recv() => {
                         match maybe {
                             Some(Ok(event)) => {
-                                // Coalesce consecutive text/thinking deltas while
-                                // the channel has more ready events — fewer SSE
-                                // frames under bursty Cursor token streams.
-                                // Cap aggressively so TTFT / inter-token cadence
-                                // stays close to native CLI (was 32).
-                                let mut batch = vec![event];
-                                while let Ok(next) = state.events.try_recv() {
-                                    match next {
-                                        Ok(ev) => {
-                                            let can_coalesce = matches!(
-                                                (&batch.last(), &ev),
-                                                (
-                                                    Some(LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::TextDelta { .. }
-                                                    )),
-                                                    LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::TextDelta { .. }
-                                                    )
-                                                ) | (
-                                                    Some(LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::ThinkingDelta { .. }
-                                                    )),
-                                                    LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::ThinkingDelta { .. }
-                                                    )
-                                                )
-                                            );
-                                            if can_coalesce
-                                                && let (
-                                                    Some(LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::TextDelta { text: a },
-                                                    )),
-                                                    LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::TextDelta { text: b },
-                                                    ),
-                                                ) = (batch.last_mut(), &ev)
-                                            {
-                                                a.push_str(b);
-                                                continue;
-                                            }
-                                            if can_coalesce
-                                                && let (
-                                                    Some(LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::ThinkingDelta { text: a },
-                                                    )),
-                                                    LiveRunEvent::Cursor(
-                                                        CursorStreamEvent::ThinkingDelta { text: b },
-                                                    ),
-                                                ) = (batch.last_mut(), &ev)
-                                            {
-                                                a.push_str(b);
-                                                continue;
-                                            }
-                                            batch.push(ev);
-                                            if batch.len() >= 8 {
-                                                break;
-                                            }
-                                        }
-                                        Err(error) => {
-                                            // Process buffered events first, then error.
-                                            for event in batch {
-                                                match event {
-                                                    LiveRunEvent::Cursor(event) => {
-                                                        state.encoder.push_event(&event)
-                                                    }
-                                                    LiveRunEvent::NativeToolBatch(tools) => {
-                                                        let encoded: Vec<(String, String, String)> =
-                                                            tools
-                                                                .into_iter()
-                                                                .map(|tool| {
-                                                                    let input =
-                                                                        serde_json::to_string(
-                                                                            &tool.input,
-                                                                        )
-                                                                        .unwrap_or_else(|_| {
-                                                                            "{}".to_string()
-                                                                        });
-                                                                    (
-                                                                        tool.tool_use_id,
-                                                                        tool.name,
-                                                                        input,
-                                                                    )
-                                                                })
-                                                                .collect();
-                                                        state.encoder.emit_tool_batch(
-                                                            encoded.iter().map(
-                                                                |(tool_use_id, name, input)| {
-                                                                    (
-                                                                        tool_use_id.as_str(),
-                                                                        name.as_str(),
-                                                                        input.as_str(),
-                                                                    )
-                                                                },
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            state.done = true;
-                                            let data = serde_json::json!({
-                                                "type": "error",
-                                                "error": {"type": "api_error", "message": error}
-                                            });
-                                            return Some((
-                                                Ok(Bytes::from(format_sse_event_bytes(
-                                                    EVENT_ERROR,
-                                                    &data,
-                                                ))),
-                                                state,
-                                            ));
-                                        }
-                                    }
-                                }
-                                for event in batch {
-                                    match event {
-                                        LiveRunEvent::Cursor(event) => {
-                                            state.encoder.push_event(&event)
-                                        }
-                                        LiveRunEvent::NativeToolBatch(tools) => {
-                                            let encoded: Vec<(String, String, String)> = tools
-                                                .into_iter()
-                                                .map(|tool| {
-                                                    let input = serde_json::to_string(&tool.input)
-                                                        .unwrap_or_else(|_| "{}".to_string());
-                                                    (tool.tool_use_id, tool.name, input)
-                                                })
-                                                .collect();
-                                            state.encoder.emit_tool_batch(encoded.iter().map(
-                                                |(tool_use_id, name, input)| {
-                                                    (
-                                                        tool_use_id.as_str(),
-                                                        name.as_str(),
-                                                        input.as_str(),
-                                                    )
-                                                },
-                                            ));
-                                        }
-                                    }
-                                }
+                                // One LiveRunEvent → one HTTP chunk. Do not
+                                // coalesce text/thinking deltas: Claude Code's
+                                // streaming UX expects near-realtime cadence,
+                                // and opportunistic try_recv merges made tokens
+                                // arrive in bursts after channel backlog.
+                                apply_live_run_event(&mut state.encoder, event);
                                 let bytes = state.encoder.take_bytes();
                                 if !bytes.is_empty() {
+                                    let force = state.encoder.is_finalized();
                                     publish_live_usage(
                                         &state.monitor,
                                         &state.encoder,
                                         bytes.len(),
                                         1,
+                                        &mut state.pending_monitor_bytes,
+                                        &mut state.pending_monitor_chunks,
+                                        &mut state.last_monitor_publish,
+                                        force,
                                     );
-                                    if state.encoder.is_finalized() {
+                                    if force {
                                         state.done = true;
                                         let (input_tokens, output_tokens) =
                                             state.encoder.current_usage();
@@ -2309,12 +2269,16 @@ pub fn live_sse_response(
                                 state.encoder.finalize();
                                 state.done = true;
                                 let bytes = state.encoder.take_bytes();
-                                if !bytes.is_empty() {
+                                if !bytes.is_empty() || state.pending_monitor_bytes > 0 {
                                     publish_live_usage(
                                         &state.monitor,
                                         &state.encoder,
                                         bytes.len(),
-                                        1,
+                                        if bytes.is_empty() { 0 } else { 1 },
+                                        &mut state.pending_monitor_bytes,
+                                        &mut state.pending_monitor_chunks,
+                                        &mut state.last_monitor_publish,
+                                        true,
                                     );
                                 }
                                 let (input_tokens, output_tokens) = state.encoder.current_usage();
@@ -2715,12 +2679,61 @@ mod tests {
         assert!(event.is_err());
     }
 
+    #[tokio::test]
+    async fn thinking_deltas_are_not_dropped_when_sse_channel_is_full() {
+        // Capacity 1: first fill, second must await rather than the old 5ms-drop path.
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sink = Some(tx);
+        assert!(
+            send_live_event(
+                &mut sink,
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                    text: "first".into(),
+                })),
+            )
+            .await
+        );
+
+        let send = tokio::spawn(async move {
+            send_live_event(
+                &mut sink,
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                    text: "second-must-not-drop".into(),
+                })),
+            )
+            .await
+        });
+
+        // Give the spawned send a chance to block on the full channel.
+        tokio::task::yield_now().await;
+        let first = rx.recv().await.expect("first delta");
+        match first {
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta { text })) => {
+                assert_eq!(text, "first");
+            }
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        assert!(send.await.expect("join"), "second send must succeed");
+        let second = rx.recv().await.expect("second delta");
+        match second {
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta { text })) => {
+                assert_eq!(text, "second-must-not-drop");
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
     #[test]
     fn live_encoder_seed_and_token_delta_reach_monitor() {
         use crate::monitor::{EndpointKind, MonitorHandle};
 
         let monitor = MonitorHandle::new(16);
-        monitor.request_started("req-live", Some("sess".into()), None, EndpointKind::Messages);
+        monitor.request_started(
+            "req-live",
+            Some("sess".into()),
+            None,
+            EndpointKind::Messages,
+        );
         monitor.upstream_started("req-live");
 
         let mut encoder = CursorSseEncoder::new("msg_test", "claude-fable-5");
