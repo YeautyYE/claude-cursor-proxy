@@ -128,7 +128,9 @@ async fn healthz() -> Json<serde_json::Value> {
 /// Cursor fable-family ids are rewritten through [`anthropic_list_model_id`] so
 /// Claude Code sees a `[1m]` marker (1M context) on this surface.
 async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    use crate::providers::cursor::model::{anthropic_list_model_id, cursor_anthropic_surface_models};
+    use crate::providers::cursor::model::{
+        anthropic_list_model_id, cursor_anthropic_surface_models,
+    };
 
     let mut seen = std::collections::BTreeSet::new();
     let mut data: Vec<Value> = Vec::new();

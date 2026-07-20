@@ -456,7 +456,10 @@ mod tests {
     #[test]
     fn anthropic_list_model_id_keeps_effort_tier_with_1m() {
         assert_eq!(anthropic_list_model_id("fable"), "claude-fable-5[1m]");
-        assert_eq!(anthropic_list_model_id("claude-fable-5"), "claude-fable-5[1m]");
+        assert_eq!(
+            anthropic_list_model_id("claude-fable-5"),
+            "claude-fable-5[1m]"
+        );
         assert_eq!(
             anthropic_list_model_id("claude-fable-5-thinking-max"),
             "claude-fable-5-thinking-max[1m]"

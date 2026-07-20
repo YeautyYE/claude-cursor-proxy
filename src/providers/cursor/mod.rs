@@ -3,6 +3,7 @@ pub mod client;
 pub mod connect;
 pub mod conversation;
 pub mod exec_results;
+pub mod hosted_web_search;
 pub mod http1;
 pub(crate) mod identity;
 pub mod live;
@@ -34,6 +35,10 @@ use crate::providers::cursor::auth::{
 };
 use crate::providers::cursor::client::CursorHttpClient;
 use crate::providers::cursor::exec_results::PendingCursorExec;
+use crate::providers::cursor::hosted_web_search::{
+    extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
+    is_hosted_web_search_request, search_web,
+};
 use crate::providers::cursor::live::{LiveRunRegistry, live_sse_response};
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
@@ -153,6 +158,28 @@ impl Provider for CursorProvider {
             );
         }
 
+        // Claude Code WebSearchTool /deep-research nests Anthropic hosted
+        // web_search_20250305. Cursor has no equivalent — emulate the SSE shape
+        // with a lightweight HTML search so research workflows can proceed.
+        if is_hosted_web_search_request(&body) {
+            let query = extract_web_search_query(&body).unwrap_or_default();
+            if query.trim().is_empty() {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "web_search requires a non-empty query",
+                );
+            }
+            let (hits, error) = match search_web(&query).await {
+                Ok(hits) => (hits, None),
+                Err(err) => (Vec::new(), Some(err)),
+            };
+            if want_stream {
+                return hosted_web_search_sse_response(message_id, wire_model, query, hits, error);
+            }
+            return hosted_web_search_json_response(message_id, wire_model, query, hits, error);
+        }
+
         // True Cursor BiDi continuation: the preceding Anthropic response ended
         // at tool_use, but the upstream AgentService/Run stream is still alive.
         // Route the matching tool_result back onto that exact request stream
@@ -198,8 +225,10 @@ impl Provider for CursorProvider {
                 // Race: Claude may POST tool_result a moment before pending_shared
                 // is visible, or while the previous segment is still finalizing.
                 if request_has_any_tool_result(&body) {
-                    for _ in 0..20 {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    // Brief race window: pending_shared may lag the HTTP POST by
+                    // a few ms. Keep this short — 500ms of sleeps felt like lag.
+                    for _ in 0..12 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         let pending = run.pending_tools();
                         if pending.is_empty() {
                             continue;
@@ -297,9 +326,8 @@ impl Provider for CursorProvider {
         // Prefer long-lived BiDi/RunSSE whenever we have a session + streaming.
         // Tools are optional — tool-less turns still need live heartbeats, Anthropic
         // ping, and turn_ended (buffered run_agent truncates TTFT and long thinking).
-        let live_eligible = want_stream
-            && session_id.is_some_and(|s| !s.is_empty())
-            && client.live_bidi_enabled();
+        let live_eligible =
+            want_stream && session_id.is_some_and(|s| !s.is_empty()) && client.live_bidi_enabled();
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
             let Some(reservation) = LiveRunRegistry::reserve(sid) else {

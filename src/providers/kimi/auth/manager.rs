@@ -47,7 +47,9 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
                         auth
                     }
                     None => {
-                        anyhow::bail!("Not authenticated. Run: claude-cursor-bridge kimi auth login");
+                        anyhow::bail!(
+                            "Not authenticated. Run: claude-cursor-bridge kimi auth login"
+                        );
                     }
                 }
             }

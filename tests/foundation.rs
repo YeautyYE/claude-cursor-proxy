@@ -5,7 +5,9 @@ use claude_cursor_bridge::auth::{AuthStorage, InMemoryAuthStore};
 use claude_cursor_bridge::config::{AliasProvider, load_config};
 use claude_cursor_bridge::logging::{create_logger, redact_value};
 use claude_cursor_bridge::paths::{self, DirResolverEnv};
-use claude_cursor_bridge::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
+use claude_cursor_bridge::retry::{
+    RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay,
+};
 use claude_cursor_bridge::traffic::{
     MAX_SSE_CAPTURE_BYTES, TrafficCaptureOptions, create_traffic_capture, redact_traffic,
     sanitize_path_part, traffic_capture_enabled_for_env,

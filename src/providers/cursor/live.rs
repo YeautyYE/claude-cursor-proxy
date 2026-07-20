@@ -644,8 +644,8 @@ impl CursorHttpClient {
             .await?;
 
         // Larger fan-out so token deltas don't block the BiDi read loop under
-        // Claude Code backpressure (was 64; coalescing in live_sse_response helps).
-        let (event_tx, events) = mpsc::channel(256);
+        // Claude Code backpressure (coalescing in live_sse_response + try_send).
+        let (event_tx, events) = mpsc::channel(512);
         let (command_tx, command_rx) = mpsc::channel(8);
         let pending = Arc::new(Mutex::new(Vec::new()));
         let terminal_error = Arc::new(Mutex::new(None));
@@ -849,7 +849,11 @@ impl CursorHttpClient {
                 request = request.header("x-session-id", sid);
             }
         }
-        if let Some(cs) = identity.headers.iter().find(|(n, _)| n == "x-cursor-checksum") {
+        if let Some(cs) = identity
+            .headers
+            .iter()
+            .find(|(n, _)| n == "x-cursor-checksum")
+        {
             request = request.header("x-cursor-checksum", &cs.1);
         }
 
@@ -1118,17 +1122,17 @@ async fn drive_live_run(
     let mut last_progress = Instant::now();
     let mut resume_grace_until: Option<Instant> = None;
     let run_started = Instant::now();
-    let tool_batch_quiet = Duration::from_millis(env_u64("CCP_CURSOR_TOOL_BATCH_MS", 100));
+    // Keep the quiet window short: Claude Code cannot start tools until we
+    // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
+    let tool_batch_quiet = Duration::from_millis(env_u64("CCP_CURSOR_TOOL_BATCH_MS", 25));
     let resume_grace = Duration::from_secs(env_u64("CCP_CURSOR_RESUME_GRACE_SECS", 120));
     let mut exec_heartbeat = tokio::time::interval(Duration::from_secs(env_u64(
         "CCP_CURSOR_EXEC_HEARTBEAT_SECS",
         3,
     )));
     exec_heartbeat.tick().await;
-    let mut client_heartbeat = tokio::time::interval(Duration::from_secs(env_u64(
-        "CCP_CURSOR_HEARTBEAT_SECS",
-        5,
-    )));
+    let mut client_heartbeat =
+        tokio::time::interval(Duration::from_secs(env_u64("CCP_CURSOR_HEARTBEAT_SECS", 5)));
     client_heartbeat.tick().await;
     let client_hb_frame = {
         let message = AgentClientMessage {
@@ -1785,7 +1789,29 @@ async fn send_live_event(
     let Some(tx) = sink.as_ref() else {
         return false;
     };
-    tx.send(event).await.is_ok()
+    // Text/thinking deltas: never block the BiDi read loop on Claude Code
+    // backpressure. Prefer try_send; briefly block only as a last resort so
+    // Cursor heartbeats / tool frames are not stalled behind SSE consumers.
+    let is_delta = matches!(
+        &event,
+        Ok(LiveRunEvent::Cursor(
+            CursorStreamEvent::TextDelta { .. } | CursorStreamEvent::ThinkingDelta { .. }
+        ))
+    );
+    if is_delta {
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                tokio::time::timeout(Duration::from_millis(5), tx.send(event))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(true)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    } else {
+        tx.send(event).await.is_ok()
+    }
 }
 
 fn resolve_advertised_name(
@@ -1971,8 +1997,9 @@ fn encode_interaction_auto_response(
         response.ask_question_interaction_response = Some(AskQuestionInteractionResponse {
             result: Some(AskQuestionResult {
                 rejected: Some(AskQuestionRejected {
-                    reason: "claude-code-proxy: unsupported InteractionQuery; cannot present Cursor UI"
-                        .into(),
+                    reason:
+                        "claude-code-proxy: unsupported InteractionQuery; cannot present Cursor UI"
+                            .into(),
                 }),
             }),
         });
@@ -2060,6 +2087,8 @@ pub fn live_sse_response(
                                 // Coalesce consecutive text/thinking deltas while
                                 // the channel has more ready events — fewer SSE
                                 // frames under bursty Cursor token streams.
+                                // Cap aggressively so TTFT / inter-token cadence
+                                // stays close to native CLI (was 32).
                                 let mut batch = vec![event];
                                 while let Ok(next) = state.events.try_recv() {
                                     match next {
@@ -2109,8 +2138,7 @@ pub fn live_sse_response(
                                                 continue;
                                             }
                                             batch.push(ev);
-                                            // Cap batch so we still flush promptly.
-                                            if batch.len() >= 32 {
+                                            if batch.len() >= 8 {
                                                 break;
                                             }
                                         }

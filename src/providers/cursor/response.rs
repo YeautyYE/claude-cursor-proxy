@@ -236,11 +236,46 @@ fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEv
     }
 }
 
-/// Extract an estimate of input tokens from a MessagesRequest for usage
-/// reporting. This is a rough heuristic based on JSON string length.
+/// Cheap input-token estimate for `message_start` seeding.
+///
+/// Avoids re-running [`super::request::render_cursor_prompt`] (full history +
+/// tools JSON), which can cost tens–hundreds of ms on large Claude Code turns
+/// and delays TTFT. `turn_ended` usage replaces this seed when available.
 pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
-    let prompt = super::request::render_cursor_prompt(req);
-    (prompt.len() / 4).max(1) as u64
+    let mut chars = 0usize;
+    for message in &req.messages {
+        chars += match &message.content {
+            serde_json::Value::String(s) => s.len(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .map(|block| match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map_or(0, str::len),
+                    Some("thinking") => block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .map_or(0, str::len),
+                    Some("tool_result") => match block.get("content") {
+                        Some(serde_json::Value::String(s)) => s.len(),
+                        Some(serde_json::Value::Array(parts)) => parts
+                            .iter()
+                            .map(|p| p.get("text").and_then(|t| t.as_str()).map_or(0, str::len))
+                            .sum(),
+                        _ => 64,
+                    },
+                    _ => 64,
+                })
+                .sum(),
+            _ => 0,
+        };
+    }
+    if let Some(tools) = req.extra.get("tools") {
+        // Schema dump dominates Ctx; approximate without full serialize.
+        chars = chars.saturating_add(tools.to_string().len());
+    }
+    (chars / 4).max(1) as u64
 }
 
 #[cfg(test)]
