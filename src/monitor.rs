@@ -601,35 +601,40 @@ impl MonitorStore {
                 let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.status = RequestStatus::Streaming;
-                    if active.generation_started_instant.is_none() {
-                        active.generation_started_at = Some(SystemTime::now());
-                        active.generation_started_instant = Some(Instant::now());
-                        active.generation_initial_output_tokens =
-                            output_tokens.or(active.output_tokens).unwrap_or(0);
-                    } else {
-                        active.generation_finished_at = Some(SystemTime::now());
-                        active.generation_duration = active
-                            .generation_started_instant
-                            .map(|started| started.elapsed());
-                    }
                     active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
                     active.stream_chunks = active.stream_chunks.saturating_add(chunks);
                     active.input_tokens = input_tokens.or(active.input_tokens);
                     active.output_tokens = output_tokens.or(active.output_tokens);
+                    note_throughput_progress(
+                        &mut active.generation_started_at,
+                        &mut active.generation_started_instant,
+                        &mut active.generation_initial_output_tokens,
+                        &mut active.output_throughput_clock,
+                        &mut active.generation_finished_at,
+                        &mut active.generation_duration,
+                        active.output_tokens,
+                        bytes,
+                    );
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
                     let previous_output_tokens = completed.output_tokens.unwrap_or(0);
-                    if let Some(started) = completed.generation_started_instant {
-                        completed.generation_finished_at = Some(SystemTime::now());
-                        completed.generation_duration = Some(started.elapsed());
-                    }
                     completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
                     completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
                     completed.input_tokens = input_tokens.or(completed.input_tokens);
                     completed.output_tokens = output_tokens.or(completed.output_tokens);
+                    note_throughput_progress(
+                        &mut completed.generation_started_at,
+                        &mut completed.generation_started_instant,
+                        &mut completed.generation_initial_output_tokens,
+                        &mut completed.output_throughput_clock,
+                        &mut completed.generation_finished_at,
+                        &mut completed.generation_duration,
+                        completed.output_tokens,
+                        bytes,
+                    );
                     let added_tokens = completed
                         .output_tokens
                         .unwrap_or(0)
@@ -655,28 +660,36 @@ impl MonitorStore {
             } => {
                 let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
-                    if output_tokens.is_some()
-                        && let Some(started) = active.generation_started_instant
-                    {
-                        active.generation_finished_at = Some(SystemTime::now());
-                        active.generation_duration = Some(started.elapsed());
-                    }
                     active.input_tokens = input_tokens.or(active.input_tokens);
                     active.output_tokens = output_tokens.or(active.output_tokens);
+                    note_throughput_progress(
+                        &mut active.generation_started_at,
+                        &mut active.generation_started_instant,
+                        &mut active.generation_initial_output_tokens,
+                        &mut active.output_throughput_clock,
+                        &mut active.generation_finished_at,
+                        &mut active.generation_duration,
+                        active.output_tokens,
+                        0,
+                    );
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
                     let previous_output_tokens = completed.output_tokens.unwrap_or(0);
-                    if output_tokens.is_some()
-                        && let Some(started) = completed.generation_started_instant
-                    {
-                        completed.generation_finished_at = Some(SystemTime::now());
-                        completed.generation_duration = Some(started.elapsed());
-                    }
                     completed.input_tokens = input_tokens.or(completed.input_tokens);
                     completed.output_tokens = output_tokens.or(completed.output_tokens);
+                    note_throughput_progress(
+                        &mut completed.generation_started_at,
+                        &mut completed.generation_started_instant,
+                        &mut completed.generation_initial_output_tokens,
+                        &mut completed.output_throughput_clock,
+                        &mut completed.generation_finished_at,
+                        &mut completed.generation_duration,
+                        completed.output_tokens,
+                        0,
+                    );
                     let added_tokens = completed
                         .output_tokens
                         .unwrap_or(0)
@@ -795,9 +808,7 @@ impl MonitorStore {
                 error: None,
                 traffic_capture_path: None,
             });
-        if output_tokens.is_some()
-            && let Some(started) = active.generation_started_instant
-        {
+        if let Some(started) = active.generation_started_instant {
             active.generation_finished_at = Some(SystemTime::now());
             active.generation_duration = Some(started.elapsed());
         }
@@ -911,15 +922,17 @@ fn session_summaries(
         entry.output_tokens = entry
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
-        if let (Some(tokens), Some(duration)) = (
-            request
-                .output_tokens
-                .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
-                .filter(|tokens| *tokens > 0),
-            request
-                .generation_duration
-                .filter(|duration| !duration.is_zero()),
-        ) {
+        if request.output_throughput_clock
+            && let (Some(tokens), Some(duration)) = (
+                request
+                    .output_tokens
+                    .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
+                    .filter(|tokens| *tokens > 0),
+                request
+                    .generation_duration
+                    .filter(|duration| !duration.is_zero()),
+            )
+        {
             entry.rate_output_tokens = entry.rate_output_tokens.saturating_add(tokens);
             entry.generation_duration = entry.generation_duration.saturating_add(duration);
         }
@@ -959,15 +972,18 @@ fn session_summaries(
         entry.output_tokens = entry
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
-        if let (Some(tokens), Some(duration)) = (
-            request
-                .output_tokens
-                .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
-                .filter(|tokens| *tokens > 0),
-            request
-                .generation_duration
-                .filter(|duration| !duration.is_zero()),
-        ) {
+        if request.output_throughput_clock
+            && let (Some(tokens), Some(duration)) = (
+                request
+                    .output_tokens
+                    .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
+                    .filter(|tokens| *tokens > 0),
+                request
+                    .generation_started_instant
+                    .map(|started| started.elapsed())
+                    .filter(|duration| !duration.is_zero()),
+            )
+        {
             entry.rate_output_tokens = entry.rate_output_tokens.saturating_add(tokens);
             entry.generation_duration = entry.generation_duration.saturating_add(duration);
         }
@@ -1005,6 +1021,61 @@ fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
         right
     } else {
         left
+    }
+}
+
+/// Anchor / advance the throughput clock.
+///
+/// - First positive `output_tokens` starts (or restarts) the tok/s clock.
+/// - Pre-token stream bytes only arm a byte/event fallback clock, which is
+///   discarded once real Out arrives so thinking silence does not dilute Rate.
+fn note_throughput_progress(
+    generation_started_at: &mut Option<SystemTime>,
+    generation_started_instant: &mut Option<Instant>,
+    generation_initial_output_tokens: &mut u64,
+    output_throughput_clock: &mut bool,
+    generation_finished_at: &mut Option<SystemTime>,
+    generation_duration: &mut Option<Duration>,
+    output_tokens: Option<u64>,
+    streamed_bytes_this_event: u64,
+) {
+    let output = output_tokens.unwrap_or(0);
+    if output > 0 {
+        if !*output_throughput_clock {
+            *generation_started_at = Some(SystemTime::now());
+            *generation_started_instant = Some(Instant::now());
+            *generation_initial_output_tokens = 0;
+            *output_throughput_clock = true;
+            *generation_finished_at = None;
+            *generation_duration = None;
+        } else if let Some(started) = *generation_started_instant {
+            *generation_finished_at = Some(SystemTime::now());
+            *generation_duration = Some(started.elapsed());
+        }
+        return;
+    }
+
+    if *output_throughput_clock {
+        return;
+    }
+
+    let allow_byte_fallback = streamed_bytes_this_event > 0;
+    if generation_started_instant.is_none() {
+        if allow_byte_fallback {
+            *generation_started_at = Some(SystemTime::now());
+            *generation_started_instant = Some(Instant::now());
+            *generation_initial_output_tokens = 0;
+            *generation_finished_at = None;
+            *generation_duration = None;
+        }
+        return;
+    }
+
+    if allow_byte_fallback
+        && let Some(started) = *generation_started_instant
+    {
+        *generation_finished_at = Some(SystemTime::now());
+        *generation_duration = Some(started.elapsed());
     }
 }
 
