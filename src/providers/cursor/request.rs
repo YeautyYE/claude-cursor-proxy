@@ -22,7 +22,8 @@ pub struct CursorSelectedImage {
 ///   packaging banners + assistant injection-defense monologues).
 /// - Agent tools still work via Anthropic tool schemas + native tool bridge.
 /// - Claude-local tools (`Workflow`, `Skill`, MCP names) stay in the `<tools>`
-///   dump even when native schemas are omitted for the BiDi bridge.
+///   dump even when native schemas are omitted for the BiDi bridge, **and** are
+///   also advertised as `RunRequest.mcp_tools` so Fable can invoke them.
 ///
 /// Env:
 /// - `CCP_CURSOR_USE_CUSTOM_SYSTEM=1` — field 8 (team only)
@@ -125,6 +126,43 @@ fn is_cursor_native_tool_name(name: &str) -> bool {
 /// plain Bash agenting.
 pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
     !name.is_empty() && !is_cursor_native_tool_name(name)
+}
+
+/// Claude-local tools advertised as Cursor `RunRequest.mcp_tools`.
+///
+/// Prompt `<tools>` text alone is not enough: Fable's agent loop invokes MCP
+/// tools via `InteractionUpdate.tool_call_started` / MCP args. Without this
+/// field, Workflow/Skill are never called and turns end empty after thinking.
+pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
+    let tools = req.extra.get("tools")?.as_array()?;
+    let mapped: Vec<super::proto::McpTool> = tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?.to_string();
+            if !is_claude_local_tool_name(&name) {
+                return None;
+            }
+            let description = tool
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input_schema = tool
+                .get("input_schema")
+                .map(|schema| schema.to_string())
+                .unwrap_or_else(|| "{}".to_string());
+            Some(super::proto::McpTool {
+                name,
+                description,
+                input_schema,
+            })
+        })
+        .collect();
+    if mapped.is_empty() {
+        None
+    } else {
+        Some(super::proto::McpTools { tools: mapped })
+    }
 }
 
 /// Split Anthropic MessagesRequest into Cursor system vs user payloads.
@@ -602,6 +640,29 @@ mod tests {
 
     /// Serialize tests that mutate process-wide CCP_CURSOR_* env flags.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn claude_local_mcp_tools_includes_workflow_skill_not_read() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "Workflow", "description": "run workflow", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}},
+                {"name": "Skill", "description": "skill", "input_schema": {"type": "object"}},
+                {"name": "mcp__x__y", "description": "mcp", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect("mcp tools");
+        let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Workflow"));
+        assert!(names.contains(&"Skill"));
+        assert!(names.contains(&"mcp__x__y"));
+        assert!(!names.contains(&"Read"));
+        let workflow = mcp.tools.iter().find(|t| t.name == "Workflow").unwrap();
+        assert!(workflow.input_schema.contains("name"));
+    }
 
     #[test]
     fn omit_tools_skips_native_schemas_but_keeps_claude_local() {

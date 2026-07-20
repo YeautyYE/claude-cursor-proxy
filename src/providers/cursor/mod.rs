@@ -42,7 +42,8 @@ use crate::providers::cursor::hosted_web_search::{
 use crate::providers::cursor::live::{LiveRunRegistry, live_sse_response};
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
-    CursorPromptOptions, render_cursor_prompt, render_cursor_prompt_parts_with,
+    CursorPromptOptions, claude_local_mcp_tools, render_cursor_prompt,
+    render_cursor_prompt_parts_with,
 };
 use crate::providers::cursor::response::{
     CursorDecodeError, decode_cursor_upstream, decode_upstream_response,
@@ -421,6 +422,7 @@ impl Provider for CursorProvider {
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
             let allowed = advertised_tool_names(&body);
+            let mcp_tools = claude_local_mcp_tools(&body);
             let estimated_input = estimate_request_input_tokens(&body);
             let monitor = ctx
                 .monitor
@@ -449,6 +451,7 @@ impl Provider for CursorProvider {
                         custom_system,
                         sid,
                         allowed.clone(),
+                        mcp_tools.clone(),
                     )
                     .await
                 {
@@ -466,6 +469,7 @@ impl Provider for CursorProvider {
                                         custom_system,
                                         sid,
                                         allowed.clone(),
+                                        mcp_tools.clone(),
                                     )
                                     .await
                             }

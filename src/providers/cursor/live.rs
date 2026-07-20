@@ -38,6 +38,7 @@ use super::proto::{
     McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
+use super::native_tools::map_tool_call_started;
 use super::request::{CursorSelectedImage, is_claude_local_tool_name};
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
@@ -382,10 +383,16 @@ impl PendingExecState {
 struct LogicalToolTracker {
     named: HashSet<String>,
     anonymous_by_model: HashMap<String, usize>,
+    /// Wall clock of the oldest outstanding UI tool_call_started. Heartbeats
+    /// must not refresh this — otherwise we never clear stalled UI-only starts.
+    oldest_since: Option<Instant>,
 }
 
 impl LogicalToolTracker {
     fn started(&mut self, call_id: &str, model_call_id: &str) {
+        if self.is_empty() {
+            self.oldest_since = Some(Instant::now());
+        }
         if !call_id.is_empty() {
             self.named.insert(call_id.to_string());
         } else {
@@ -399,25 +406,34 @@ impl LogicalToolTracker {
     fn completed(&mut self, call_id: &str, model_call_id: &str) {
         if !call_id.is_empty() {
             self.named.remove(call_id);
-            return;
+        } else {
+            let mut remove_model = false;
+            if let Some(count) = self.anonymous_by_model.get_mut(model_call_id) {
+                *count = count.saturating_sub(1);
+                remove_model = *count == 0;
+            }
+            if remove_model {
+                self.anonymous_by_model.remove(model_call_id);
+            }
         }
-        let mut remove_model = false;
-        if let Some(count) = self.anonymous_by_model.get_mut(model_call_id) {
-            *count = count.saturating_sub(1);
-            remove_model = *count == 0;
-        }
-        if remove_model {
-            self.anonymous_by_model.remove(model_call_id);
+        if self.is_empty() {
+            self.oldest_since = None;
         }
     }
 
     fn resolve_exec(&mut self, exec: &PendingCursorExec) {
         if self.named.remove(&exec.tool_use_id) {
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
             return;
         }
         if let Some(exec_id) = exec.exec_id.as_deref()
             && self.named.remove(exec_id)
         {
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
             return;
         }
         self.resolve_only_outstanding();
@@ -431,11 +447,17 @@ impl LogicalToolTracker {
             .filter(|value| !value.is_empty())
             && self.named.remove(tool_call_id)
         {
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
             return;
         }
         if let Some(exec_id) = exec.exec_id.as_deref()
             && self.named.remove(exec_id)
         {
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
             return;
         }
         self.resolve_only_outstanding();
@@ -458,6 +480,11 @@ impl LogicalToolTracker {
     fn clear(&mut self) {
         self.named.clear();
         self.anonymous_by_model.clear();
+        self.oldest_since = None;
+    }
+
+    fn oldest_since(&self) -> Option<Instant> {
+        self.oldest_since
     }
 }
 
@@ -647,6 +674,7 @@ impl CursorHttpClient {
         custom_system_prompt: Option<&str>,
         session_id: &str,
         allowed_tool_names: Option<BTreeSet<String>>,
+        mcp_tools: Option<super::proto::McpTools>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -666,7 +694,7 @@ impl CursorHttpClient {
             &request_id,
             custom_system_prompt,
             &continuation,
-            None,
+            mcp_tools,
         );
         let first_message = AgentClientMessage {
             run_request: Some(run_request),
@@ -1481,7 +1509,12 @@ async fn drive_live_run(
                 } else if !logical_tools_waiting.is_empty() {
                     // A UI tool_call_started is not executable by itself. Wait for the
                     // authoritative ExecServerMessage instead of falsely ending the turn.
-                    if last_progress.elapsed() >= stream_idle {
+                    // Use oldest_since (ignores heartbeats) — last_progress used to stall
+                    // forever under InteractionUpdate.heartbeat floods (~1–2m empty turns).
+                    if logical_tools_waiting
+                        .oldest_since()
+                        .is_some_and(|since| since.elapsed() >= stream_idle)
+                    {
                         logical_tools_waiting.clear();
                     }
                 } else if !wait_for_turn_ended
@@ -1699,8 +1732,27 @@ async fn process_live_frame(
 
     if let Some(update) = message.interaction_update {
         if let Some(started) = update.tool_call_started {
-            // UI transcript only. Execution is driven exclusively by
-            // ExecServerMessage, otherwise tool_call_started + exec duplicates.
+            // Claude-local tools advertised via RunRequest.mcp_tools arrive as
+            // MCP tool_call_started (not ExecServerMessage). Expose immediately
+            // so Claude Code can fulfill Workflow/Skill locally.
+            if let Some(mapped) = map_tool_call_started(&started) {
+                let allowed = allowed_tool_names
+                    .map(|set| set.contains(&mapped.name))
+                    .unwrap_or(true);
+                if allowed && is_claude_local_tool_name(&mapped.name) {
+                    if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
+                        eprintln!(
+                            "[ccp-cursor] mcp tool_call_started → ClientOnly {}",
+                            mapped.name
+                        );
+                    }
+                    let exec = mcp_client_only_pending_exec(&mapped);
+                    pending.queue(exec, Duration::ZERO);
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
+            }
+            // Native UI transcript only. Execution is driven by ExecServerMessage,
+            // otherwise tool_call_started + exec duplicates.
             logical_tools_waiting.started(&started.call_id, &started.model_call_id);
             *useful = true;
             *last_progress = Instant::now();
@@ -1836,6 +1888,31 @@ async fn process_live_frame(
                 .await;
                 return false;
             }
+            // Heartbeat-only "thinking" with no text/tools yields a contentless
+            // Anthropic 200 (Out:0) — Claude Code looks hung then idle. Surface a
+            // short visible note so the agent can recover / call Workflow.
+            if !*saw_text && sink.is_some() {
+                let note = if allowed_tool_names
+                    .is_some_and(|set| set.iter().any(|n| is_claude_local_tool_name(n)))
+                {
+                    "Cursor finished this turn without text or tool calls. If the user asked for /deep-research or /workflows, call the Workflow tool (for example Workflow with name \"deep-research\") instead of ending silently."
+                } else {
+                    "Cursor finished this turn without text or tool calls."
+                };
+                *saw_text = true;
+                *useful = true;
+                if !emit_cursor_or_defer(
+                    sink,
+                    deferred,
+                    CursorStreamEvent::TextDelta {
+                        text: note.to_string(),
+                    },
+                )
+                .await
+                {
+                    return false;
+                }
+            }
             if !emit_cursor_or_defer(
                 sink,
                 deferred,
@@ -1846,7 +1923,8 @@ async fn process_live_frame(
                     output_tokens: turn
                         .output_tokens
                         .unwrap_or(0)
-                        .saturating_add(turn.reasoning_tokens.unwrap_or(0)),
+                        .saturating_add(turn.reasoning_tokens.unwrap_or(0))
+                        .max(if *saw_text { 1 } else { 0 }),
                     cache_read_tokens: turn.cache_read_tokens.unwrap_or(0),
                     cache_write_tokens: turn.cache_write_tokens.unwrap_or(0),
                 },
@@ -1999,6 +2077,26 @@ fn client_only_pending_exec(
         tool_use_id: tool_use.id.clone(),
         claude_name: tool_use.name.clone(),
         claude_input: serde_json::Value::Object(tool_use.input.clone()),
+        kind: CursorExecKind::ClientOnly,
+    }
+}
+
+fn mcp_client_only_pending_exec(
+    mapped: &super::native_tools::MappedClaudeTool,
+) -> PendingCursorExec {
+    let id = {
+        let mut hash: u32 = 0;
+        for b in mapped.tool_use_id.as_bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(u32::from(*b));
+        }
+        hash.max(1)
+    };
+    PendingCursorExec {
+        id,
+        exec_id: Some(format!("mcp_{}", mapped.tool_use_id)),
+        tool_use_id: mapped.tool_use_id.clone(),
+        claude_name: mapped.name.clone(),
+        claude_input: mapped.input.clone(),
         kind: CursorExecKind::ClientOnly,
     }
 }
@@ -2863,6 +2961,110 @@ mod tests {
             last_progress.elapsed() < Duration::from_secs(1),
             "server InteractionUpdate.heartbeat must refresh idle timer"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_workflow_tool_call_started_exposes_client_only() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "mcp-wf-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "Workflow".into(),
+                                tool_name: "Workflow".into(),
+                                tool_call_id: "mcp-wf-1".into(),
+                                provider_identifier: "claude-local".into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert(
+                                        "name".into(),
+                                        br#""deep-research""#.to_vec(),
+                                    );
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+        )
+        .await;
+        assert!(!cont, "MCP Workflow must end BiDi segment");
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Workflow");
+                assert_eq!(
+                    tools[0].input.get("name").and_then(|v| v.as_str()),
+                    Some("deep-research")
+                );
+            }
+            other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

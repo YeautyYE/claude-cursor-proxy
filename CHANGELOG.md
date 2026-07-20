@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.25 (2026-07-21)
+
+- Advertise Claude-local tools (`Workflow`, `Skill`, `mcp__*`) via Cursor `RunRequest.mcp_tools` so Fable can actually invoke them (prompt `<tools>` text alone was ignored → empty Out=0 turns after ~1m heartbeat-only thinking).
+- Expose MCP `tool_call_started` for Claude-local names as Anthropic `tool_use` and end the BiDi segment (same ClientOnly path as XML recovery).
+- Clear stalled UI-only `tool_call_started` using a heartbeat-immune timer; surface a short note instead of contentless `end_turn` when Cursor finishes with no text/tools.
+
 ## v0.1.24 (2026-07-20)
 
 - Fix Workflow/`turn_ended` race: expose Claude-local `<tool_use>` XML (Workflow/Skill) immediately — including when Cursor ends the turn in the same chunk — so Anthropic gets `Workflow(name: "deep-research")` instead of empty Out=0 completions.
