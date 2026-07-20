@@ -2122,20 +2122,18 @@ fn publish_live_usage(
         return;
     }
     let (input_tokens, output_tokens) = encoder.current_usage();
-    let input = Some(input_tokens).filter(|v| *v > 0);
-    let output = Some(output_tokens).filter(|v| *v > 0);
-    let published = if force {
-        handle.stream_progress(req_id, *pending_bytes, *pending_chunks, input, output);
-        true
-    } else {
-        // try_lock: never stall token emission behind TUI snapshot cloning.
-        handle.try_stream_progress(req_id, *pending_bytes, *pending_chunks, input, output)
-    };
-    if published {
-        *pending_bytes = 0;
-        *pending_chunks = 0;
-        *last_publish = Instant::now();
-    }
+    // Interval-gated (or forced). Safe to take the monitor lock briefly — this
+    // is not on the unthrottled per-delta path.
+    handle.stream_progress(
+        req_id,
+        *pending_bytes,
+        *pending_chunks,
+        Some(input_tokens).filter(|v| *v > 0),
+        Some(output_tokens).filter(|v| *v > 0),
+    );
+    *pending_bytes = 0;
+    *pending_chunks = 0;
+    *last_publish = Instant::now();
 }
 
 pub fn live_sse_response(
@@ -2747,6 +2745,44 @@ mod tests {
         let active = &monitor.snapshot().active[0];
         assert_eq!(active.input_tokens, Some(1_200));
         assert_eq!(active.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn consecutive_text_deltas_flush_as_separate_sse_chunks() {
+        // Mirrors live_sse_response: one LiveRunEvent → take_bytes() → one HTTP
+        // chunk. Coalescing consecutive deltas would merge "A"+"B" into a single
+        // content_block_delta and make Claude Code paint in bursts.
+        let mut encoder = CursorSseEncoder::new("msg_rt", "claude-fable-5");
+        encoder.begin();
+        let _ = encoder.take_bytes();
+
+        apply_live_run_event(
+            &mut encoder,
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                text: "A".into(),
+            }),
+        );
+        let first = String::from_utf8(encoder.take_bytes()).unwrap();
+        assert!(
+            first.contains("content_block_delta") && first.contains("\"text\":\"A\""),
+            "first chunk missing A: {first}"
+        );
+
+        apply_live_run_event(
+            &mut encoder,
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                text: "B".into(),
+            }),
+        );
+        let second = String::from_utf8(encoder.take_bytes()).unwrap();
+        assert!(
+            second.contains("content_block_delta") && second.contains("\"text\":\"B\""),
+            "second chunk missing B: {second}"
+        );
+        assert!(
+            !second.contains("\"text\":\"AB\"") && !second.contains("\"text\":\"A\""),
+            "deltas must not be coalesced across flushes: {second}"
+        );
     }
 
     #[test]
