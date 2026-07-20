@@ -360,6 +360,16 @@ impl PendingExecState {
         self.awaiting.is_empty() && self.collecting.is_empty()
     }
 
+    /// True when every pending exec is Claude-local (Workflow/Skill/…) — Cursor
+    /// often emits `turn_ended` in the same chunk as the XML, so we must expose
+    /// these before treating pending as a hard failure.
+    fn all_client_only(&self) -> bool {
+        !self.is_empty()
+            && self
+                .all()
+                .all(|exec| matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly))
+    }
+
     fn oldest_since(&self) -> Option<Instant> {
         match (self.awaiting_since, self.collecting_since) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -1326,6 +1336,7 @@ async fn drive_live_run(
                                 &mut sink,
                                 &mut deferred,
                                 &mut pending,
+                                &pending_shared,
                                 &mut kv_blobs,
                                 &mut latest_checkpoint,
                                 &terminal_error,
@@ -1336,7 +1347,9 @@ async fn drive_live_run(
                                 &mut last_progress,
                                 tool_batch_quiet,
                                 &mut xml_parser,
-                            ).await {
+                            )
+                            .await
+                            {
                                 break 'driver;
                             }
                         }
@@ -1530,6 +1543,7 @@ async fn process_live_frame(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
     pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     latest_checkpoint: &mut Option<Vec<u8>>,
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
@@ -1542,7 +1556,26 @@ async fn process_live_frame(
     xml_parser: &mut CursorToolUseXmlParser,
 ) -> bool {
     if frame.flags & FLAG_END != 0 {
+        // Trailing Workflow/Skill XML may still be buffered when Connect END arrives.
+        if !flush_xml_tool_uses(
+            xml_parser,
+            pending,
+            pending_shared,
+            sink,
+            deferred,
+            allowed_tool_names,
+            saw_text,
+            useful,
+            last_progress,
+        )
+        .await
+        {
+            return false;
+        }
         if !pending.is_empty() {
+            if pending.all_client_only() {
+                return expose_collected_tools(pending, pending_shared, sink).await;
+            }
             let message = parse_connect_error(&frame.payload)
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "Cursor upstream ended with pending native tools".to_string());
@@ -1729,9 +1762,12 @@ async fn process_live_frame(
                         if allowed && is_claude_local_tool_name(&tool_use.name) {
                             let exec = client_only_pending_exec(&tool_use);
                             // Expose immediately — Cursor may turn_ended right
-                            // after the XML; a quiet window would race into
-                            // "pending native tools" errors.
+                            // after the XML in the same chunk; waiting for the
+                            // outer select would race into "pending native tools".
                             pending.queue(exec, Duration::ZERO);
+                            if !expose_collected_tools(pending, pending_shared, sink).await {
+                                return false;
+                            }
                         } else if !tool_use.name.is_empty() {
                             // Unknown / native-shaped XML: keep visible as text
                             // so we do not invent a fake Claude tool_use.
@@ -1770,7 +1806,28 @@ async fn process_live_frame(
             return false;
         }
         if let Some(turn) = update.turn_ended {
+            // Flush trailing `<tool_use>` still in the XML buffer — Fable often
+            // closes the turn in the same InteractionUpdate as Workflow XML.
+            if !flush_xml_tool_uses(
+                xml_parser,
+                pending,
+                pending_shared,
+                sink,
+                deferred,
+                allowed_tool_names,
+                saw_text,
+                useful,
+                last_progress,
+            )
+            .await
+            {
+                return false;
+            }
             if !pending.is_empty() {
+                if pending.all_client_only() {
+                    // Workflow/Skill: expose Anthropic tool_use and end BiDi.
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
                 report_terminal_error(
                     sink,
                     terminal_error,
@@ -1859,6 +1916,69 @@ async fn expose_collected_tools(
     // End this BiDi run so the next Anthropic turn starts fresh with tool_result
     // history — Cursor has no exec protocol for these tools.
     !client_only
+}
+
+/// Drain buffered XML `<tool_use>` on turn/stream end and expose Claude-local
+/// tools immediately when recovered.
+async fn flush_xml_tool_uses(
+    xml_parser: &mut CursorToolUseXmlParser,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    saw_text: &mut bool,
+    useful: &mut bool,
+    last_progress: &mut Instant,
+) -> bool {
+    let mut exposed_client_only = false;
+    for evt in xml_parser.flush() {
+        match evt {
+            RecoveredCursorEvent::Text(t) if !t.is_empty() => {
+                *saw_text = true;
+                *useful = true;
+                *last_progress = Instant::now();
+                if !emit_cursor_or_defer(sink, deferred, CursorStreamEvent::TextDelta { text: t })
+                    .await
+                {
+                    return false;
+                }
+            }
+            RecoveredCursorEvent::Text(_) => {}
+            RecoveredCursorEvent::ToolUse(tool_use) => {
+                let allowed = allowed_tool_names
+                    .map(|set| set.contains(&tool_use.name))
+                    .unwrap_or(true);
+                if allowed && is_claude_local_tool_name(&tool_use.name) {
+                    pending.queue(client_only_pending_exec(&tool_use), Duration::ZERO);
+                    exposed_client_only = true;
+                } else if !tool_use.name.is_empty() {
+                    let input_json = serde_json::to_string(&tool_use.input)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let visible = format!(
+                        "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
+                        tool_use.id, tool_use.name
+                    );
+                    *saw_text = true;
+                    *useful = true;
+                    *last_progress = Instant::now();
+                    if !emit_cursor_or_defer(
+                        sink,
+                        deferred,
+                        CursorStreamEvent::TextDelta { text: visible },
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    if exposed_client_only {
+        return expose_collected_tools(pending, pending_shared, sink).await;
+    }
+    true
 }
 
 fn client_only_pending_exec(
@@ -2710,6 +2830,7 @@ mod tests {
         let mut sink = None;
         let mut deferred = VecDeque::new();
         let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
         let mut latest_checkpoint = None;
         let terminal_error = Arc::new(Mutex::new(None));
@@ -2724,6 +2845,7 @@ mod tests {
             &mut sink,
             &mut deferred,
             &mut pending,
+            &pending_shared,
             &mut kv_blobs,
             &mut latest_checkpoint,
             &terminal_error,
@@ -2741,6 +2863,109 @@ mod tests {
             last_progress.elapsed() < Duration::from_secs(1),
             "server InteractionUpdate.heartbeat must refresh idle timer"
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_xml_with_same_chunk_turn_ended_exposes_tool_use() {
+        // Regression: Fable often emits Workflow `<tool_use>` XML and turn_ended
+        // in one InteractionUpdate. Queuing without exposing raced into
+        // "pending native tools" and dropped the Anthropic tool_use (Out=0 hang).
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{AgentServerMessage, InteractionUpdate, TextDelta, TurnEnded};
+        use prost::Message;
+
+        let xml = r#"<tool_use id="wf-1" name="Workflow">{"name":"deep-research"}</tool_use>"#;
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: Some(TextDelta {
+                    text: xml.to_string(),
+                }),
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: Some(TurnEnded {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                }),
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Workflow".to_string(), "Read".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+        )
+        .await;
+        // Client-only expose ends the BiDi segment (return false).
+        assert!(!cont, "Workflow expose must end the live segment");
+        assert!(
+            terminal_error.lock().unwrap().is_none(),
+            "must not treat Workflow+turn_ended as pending-native failure"
+        );
+        assert!(sink.is_none(), "Anthropic segment closes after tool_use");
+
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Workflow");
+                assert_eq!(
+                    tools[0].input.get("name").and_then(|v| v.as_str()),
+                    Some("deep-research")
+                );
+            }
+            other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+        let shared = pending_shared.lock().unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].claude_name, "Workflow");
     }
 
     #[test]

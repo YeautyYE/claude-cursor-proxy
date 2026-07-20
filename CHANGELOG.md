@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.24 (2026-07-20)
+
+- Fix Workflow/`turn_ended` race: expose Claude-local `<tool_use>` XML (Workflow/Skill) immediately — including when Cursor ends the turn in the same chunk — so Anthropic gets `Workflow(name: "deep-research")` instead of empty Out=0 completions.
+- Eliminate remaining 409 `already active` races: retry supersede+start on Starting→Running steal instead of failing the client.
+- Prefer Claude-local tools in BiDi `<tools>` dumps so Fable does not reinvent `/deep-research` with Bash.
+
 ## v0.1.23 (2026-07-20)
 
 - Fix Claude Code `Stream idle timeout` → 409 cascade on long BiDi turns: detect Anthropic SSE disconnect immediately (even under Cursor heartbeat flood), cancel/supersede zombie live runs instead of waiting then 409, keep Anthropic `ping` spacing with `MissedTickBehavior::Delay`.

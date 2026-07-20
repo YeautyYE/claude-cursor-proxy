@@ -339,7 +339,15 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
         None
     } else {
         // Same shape as pre-split proxy (no extra prose — tools field only).
-        Some(format!("<tools>\n{}\n</tools>", tool_lines.join("\n")))
+        // Claude-local-only dumps get a one-line preference so Fable does not
+        // reinvent /deep-research with Bash when Workflow is advertised.
+        let body = tool_lines.join("\n");
+        let preface = if mode == ToolDumpMode::ClaudeLocalOnly {
+            "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Do not replace them with Bash/curl.\n"
+        } else {
+            ""
+        };
+        Some(format!("<tools>\n{preface}{body}\n</tools>"))
     }
 }
 
@@ -629,6 +637,10 @@ mod tests {
         assert!(parts.user_text.contains("\"name\":\"Workflow\""));
         assert!(parts.user_text.contains("\"name\":\"Skill\""));
         assert!(parts.user_text.contains("mcp__plugin__search"));
+        assert!(
+            parts.user_text.contains("Prefer these Claude Code client tools"),
+            "claude-local dump should nudge Workflow over Bash"
+        );
         assert!(
             !parts.user_text.contains("\"name\":\"Read\""),
             "native Read schema should stay omitted when bridging"

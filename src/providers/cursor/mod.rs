@@ -420,84 +420,98 @@ impl Provider for CursorProvider {
             want_stream && session_id.is_some_and(|s| !s.is_empty()) && client.live_bidi_enabled();
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
-            // Prefer a clean reserve; if a zombie run still holds the slot
-            // (race with cancel above, or Starting stuck), supersede once.
-            let reservation = match LiveRunRegistry::reserve(sid) {
-                Some(reservation) => reservation,
-                None => match LiveRunRegistry::supersede(sid) {
-                    Some(reservation) => reservation,
-                    None => {
-                        return json_error(
-                            StatusCode::CONFLICT,
-                            "invalid_request_error",
-                            "A Cursor live run is already active for this session",
-                        );
-                    }
-                },
-            };
             let allowed = advertised_tool_names(&body);
-            let start = match client
-                .start_live_agent(
-                    &token,
-                    user_text,
-                    model,
-                    &images,
-                    custom_system,
-                    sid,
-                    allowed.clone(),
-                )
-                .await
-            {
-                Ok(start) => Ok(start),
-                Err(error) if error.status == 401 && auth.refresh_token.is_some() => {
-                    match force_refresh_cursor_auth() {
-                        Ok(Some(refreshed)) => {
-                            token = refreshed.access_token;
-                            client
-                                .start_live_agent(
-                                    &token,
-                                    user_text,
-                                    model,
-                                    &images,
-                                    custom_system,
-                                    sid,
-                                    allowed,
-                                )
-                                .await
+            let estimated_input = estimate_request_input_tokens(&body);
+            let monitor = ctx
+                .monitor
+                .clone()
+                .map(|handle| (handle, ctx.req_id.clone()));
+
+            // Concurrent same-session POSTs (Claude Code retry after idle / 409)
+            // race on Starting→Running. Retry supersede+start instead of 409.
+            let mut start_error: Option<CursorError> = None;
+            for attempt in 0..3_u8 {
+                let Some(reservation) = (if attempt == 0 {
+                    LiveRunRegistry::reserve(sid).or_else(|| LiveRunRegistry::supersede(sid))
+                } else {
+                    LiveRunRegistry::supersede(sid)
+                }) else {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                };
+
+                let start = match client
+                    .start_live_agent(
+                        &token,
+                        user_text,
+                        model,
+                        &images,
+                        custom_system,
+                        sid,
+                        allowed.clone(),
+                    )
+                    .await
+                {
+                    Ok(start) => Ok(start),
+                    Err(error) if error.status == 401 && auth.refresh_token.is_some() => {
+                        match force_refresh_cursor_auth() {
+                            Ok(Some(refreshed)) => {
+                                token = refreshed.access_token;
+                                client
+                                    .start_live_agent(
+                                        &token,
+                                        user_text,
+                                        model,
+                                        &images,
+                                        custom_system,
+                                        sid,
+                                        allowed.clone(),
+                                    )
+                                    .await
+                            }
+                            _ => Err(error),
                         }
-                        _ => Err(error),
                     }
-                }
-                Err(error) => Err(error),
-            };
-            match start {
-                Ok(start) => {
-                    if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
-                        orphaned.cancel();
-                        return json_error(
-                            StatusCode::CONFLICT,
-                            "invalid_request_error",
-                            "A Cursor live run is already active for this session",
+                    Err(error) => Err(error),
+                };
+
+                match start {
+                    Ok(start) => {
+                        if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
+                            // Another request stole the slot during upstream open.
+                            orphaned.cancel();
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            continue;
+                        }
+                        return live_sse_response(
+                            start.events,
+                            message_id,
+                            wire_model,
+                            estimated_input,
+                            monitor,
                         );
                     }
-                    return live_sse_response(
-                        start.events,
-                        message_id,
-                        wire_model,
-                        estimate_request_input_tokens(&body),
-                        ctx.monitor
-                            .clone()
-                            .map(|handle| (handle, ctx.req_id.clone())),
-                    );
-                }
-                Err(error) => {
-                    drop(reservation);
-                    // Transport open failed — fall through to buffered run_agent
-                    // only when tools were not advertised (bridge path must stay live).
-                    if bridge_eligible {
-                        return map_cursor_error_to_response(&error);
+                    Err(error) => {
+                        drop(reservation);
+                        start_error = Some(error);
+                        break;
                     }
                 }
+            }
+
+            if let Some(error) = start_error {
+                // Transport open failed — fall through to buffered run_agent
+                // only when tools were not advertised (bridge path must stay live).
+                if bridge_eligible {
+                    return map_cursor_error_to_response(&error);
+                }
+            } else if bridge_eligible {
+                // Exhausted takeover retries while tools require the live path.
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "invalid_request_error",
+                    "A Cursor live run is already active for this session",
+                );
             }
         }
 
