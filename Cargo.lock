@@ -316,7 +316,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-cursor-proxy"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -337,6 +337,7 @@ dependencies = [
  "once_cell",
  "predicates",
  "prost",
+ "prost-types",
  "rand 0.8.6",
  "ratatui",
  "regex-lite",
@@ -1420,6 +1421,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "prost-types"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+dependencies = [
+ "prost",
 ]
 
 [[package]]

@@ -687,6 +687,17 @@ impl CursorHttpClient {
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
         let request_id = uuid::Uuid::new_v4().to_string();
         let continuation = super::conversation::continuation_for(Some(session_id));
+        if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
+            let names: Vec<&str> = mcp_tools
+                .as_ref()
+                .map(|m| m.tools.iter().map(|t| t.name.as_str()).collect())
+                .unwrap_or_default();
+            eprintln!(
+                "[ccp-cursor] start_live_agent session={session_id} mcp_tools={:?} count={}",
+                names,
+                names.len()
+            );
+        }
         let run_request = build_run_request_with_continuation(
             prompt,
             &resolved,
@@ -1414,16 +1425,53 @@ async fn drive_live_run(
                         {
                             continue 'driver;
                         }
-                        if pending.is_empty() {
-                            let _ = emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End).await;
-                        } else {
-                            report_terminal_error(
-                                &mut sink,
-                                &terminal_error,
-                                "Cursor upstream ended with pending native tools".into(),
-                            )
-                            .await;
+                        // Same empty-turn recovery as FLAG_END: flush trailing
+                        // Workflow XML, then surface a note instead of Out:0.
+                        if !flush_xml_tool_uses(
+                            &mut xml_parser,
+                            &mut pending,
+                            &pending_shared,
+                            &mut sink,
+                            &mut deferred,
+                            allowed_tool_names.as_ref(),
+                            &mut saw_text,
+                            &mut useful,
+                            &mut last_progress,
+                        )
+                        .await
+                        {
+                            break 'driver;
                         }
+                        if !pending.is_empty() {
+                            if pending.all_client_only() {
+                                let _ =
+                                    expose_collected_tools(&mut pending, &pending_shared, &mut sink)
+                                        .await;
+                            } else {
+                                report_terminal_error(
+                                    &mut sink,
+                                    &terminal_error,
+                                    "Cursor upstream ended with pending native tools".into(),
+                                )
+                                .await;
+                            }
+                            break 'driver;
+                        }
+                        if !emit_empty_turn_note_if_needed(
+                            &mut saw_text,
+                            &mut useful,
+                            &mut sink,
+                            &mut deferred,
+                            allowed_tool_names.as_ref(),
+                            "eof",
+                        )
+                        .await
+                        {
+                            break 'driver;
+                        }
+                        let _ =
+                            emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End)
+                                .await;
                         break 'driver;
                     }
                     Some(Err(error)) => {
@@ -1618,6 +1666,20 @@ async fn process_live_frame(
         if let Some(error) = parse_connect_error(&frame.payload) {
             let _ = emit_or_defer(sink, deferred, Err(error.to_string())).await;
         } else {
+            // Connect END without turn_ended used to emit bare End → silent
+            // Anthropic Out:0. Mirror the turn_ended empty-note recovery.
+            if !emit_empty_turn_note_if_needed(
+                saw_text,
+                useful,
+                sink,
+                deferred,
+                allowed_tool_names,
+                "flag_end",
+            )
+            .await
+            {
+                return false;
+            }
             let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
         }
         return false;
@@ -1891,27 +1953,17 @@ async fn process_live_frame(
             // Heartbeat-only "thinking" with no text/tools yields a contentless
             // Anthropic 200 (Out:0) — Claude Code looks hung then idle. Surface a
             // short visible note so the agent can recover / call Workflow.
-            if !*saw_text && sink.is_some() {
-                let note = if allowed_tool_names
-                    .is_some_and(|set| set.iter().any(|n| is_claude_local_tool_name(n)))
-                {
-                    "Cursor finished this turn without text or tool calls. If the user asked for /deep-research or /workflows, call the Workflow tool (for example Workflow with name \"deep-research\") instead of ending silently."
-                } else {
-                    "Cursor finished this turn without text or tool calls."
-                };
-                *saw_text = true;
-                *useful = true;
-                if !emit_cursor_or_defer(
-                    sink,
-                    deferred,
-                    CursorStreamEvent::TextDelta {
-                        text: note.to_string(),
-                    },
-                )
-                .await
-                {
-                    return false;
-                }
+            if !emit_empty_turn_note_if_needed(
+                saw_text,
+                useful,
+                sink,
+                deferred,
+                allowed_tool_names,
+                "turn_ended",
+            )
+            .await
+            {
+                return false;
             }
             if !emit_cursor_or_defer(
                 sink,
@@ -1938,6 +1990,56 @@ async fn process_live_frame(
         }
     }
     true
+}
+
+/// Emit a short visible note when Cursor closes with no text/tools.
+///
+/// Used from `turn_ended`, clean Connect `FLAG_END`, and exhausted EOF — all
+/// three previously could produce silent Anthropic Out:0 completions.
+async fn emit_empty_turn_note_if_needed(
+    saw_text: &mut bool,
+    useful: &mut bool,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    reason: &str,
+) -> bool {
+    if *saw_text || sink.is_none() {
+        return true;
+    }
+    let note = if allowed_tool_names
+        .is_some_and(|set| set.iter().any(|n| is_claude_local_tool_name(n)))
+    {
+        "Cursor finished this turn without text or tool calls. If the user asked for /deep-research or /workflows, call the Workflow tool (for example Workflow with name \"deep-research\") instead of ending silently."
+    } else {
+        "Cursor finished this turn without text or tool calls."
+    };
+    *saw_text = true;
+    *useful = true;
+    // Always leave a structured breadcrumb — empty turns are otherwise invisible
+    // in proxy.log (no InteractionUpdate dump unless CCP_CURSOR_DEBUG=1).
+    {
+        let mut fields = serde_json::Map::new();
+        fields.insert("reason".into(), serde_json::json!(reason));
+        fields.insert(
+            "claude_local_tools".into(),
+            serde_json::json!(allowed_tool_names.is_some_and(|set| {
+                set.iter().any(|n| is_claude_local_tool_name(n))
+            })),
+        );
+        crate::logging::create_logger("cursor").info("empty_turn_note", Some(fields));
+    }
+    if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
+        eprintln!("[ccp-cursor] empty_turn_note reason={reason}");
+    }
+    emit_cursor_or_defer(
+        sink,
+        deferred,
+        CursorStreamEvent::TextDelta {
+            text: note.to_string(),
+        },
+    )
+    .await
 }
 
 async fn report_terminal_error(
@@ -3168,6 +3270,75 @@ mod tests {
         let shared = pending_shared.lock().unwrap();
         assert_eq!(shared.len(), 1);
         assert_eq!(shared[0].claude_name, "Workflow");
+    }
+
+    #[tokio::test]
+    async fn flag_end_without_text_emits_empty_turn_note() {
+        // Regression: Connect FLAG_END used to emit bare End → Anthropic Out:0
+        // even when Workflow was advertised. Empty-note must fire before End.
+        use super::super::connect::{FLAG_END, encode_connect_frame};
+
+        let framed = encode_connect_frame(b"", FLAG_END);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+        )
+        .await;
+        assert!(!cont, "FLAG_END must end the live segment");
+        assert!(saw_text, "empty-note must mark saw_text");
+        assert!(useful);
+
+        let note = event_rx.try_recv().expect("empty-note TextDelta");
+        match note {
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                assert!(
+                    text.contains("without text or tool calls"),
+                    "unexpected note: {text}"
+                );
+                assert!(text.contains("Workflow"));
+            }
+            other => panic!("expected TextDelta note, got {other:?}"),
+        }
+        let end = event_rx.try_recv().expect("End after note");
+        assert!(matches!(
+            end,
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::End))
+        ));
     }
 
     #[test]

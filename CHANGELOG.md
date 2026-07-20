@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.26 (2026-07-21)
+
+- Fix `RunRequest.mcp_tools` wire shape to match Cursor CLI `McpToolDefinition`: `input_schema` as `google.protobuf.Struct` (not JSON string), plus `provider_identifier` / `tool_name` (`claude-local`). v0.1.25 advertised tools with the wrong encoding so Fable could still ignore Workflow.
+- Emit the empty-turn recovery note on Connect `FLAG_END` and exhausted EOF (not only `turn_ended`), so silent Anthropic Out:0 after ~1m heartbeat-only runs cannot happen.
+- Log `empty_turn_note` to `proxy.log` always; richer `CCP_CURSOR_DEBUG` start_live_agent mcp_tools listing.
+
 ## v0.1.25 (2026-07-21)
 
 - Advertise Claude-local tools (`Workflow`, `Skill`, `mcp__*`) via Cursor `RunRequest.mcp_tools` so Fable can actually invoke them (prompt `<tools>` text alone was ignored → empty Out=0 turns after ~1m heartbeat-only thinking).

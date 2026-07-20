@@ -128,11 +128,21 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
     !name.is_empty() && !is_cursor_native_tool_name(name)
 }
 
+/// Stable provider id for Claude Code client-local tools advertised as MCP.
+///
+/// Official Cursor CLI always sets `providerIdentifier` + `toolName` on each
+/// `McpToolDefinition`. Without those fields Fable may ignore the tool list.
+pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
+
 /// Claude-local tools advertised as Cursor `RunRequest.mcp_tools`.
 ///
 /// Prompt `<tools>` text alone is not enough: Fable's agent loop invokes MCP
 /// tools via `InteractionUpdate.tool_call_started` / MCP args. Without this
 /// field, Workflow/Skill are never called and turns end empty after thinking.
+///
+/// Wire shape must match `agent.v1.McpToolDefinition`: `input_schema` is a
+/// `google.protobuf.Struct` (not a JSON string), plus `provider_identifier` /
+/// `tool_name`.
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
     let tools = req.extra.get("tools")?.as_array()?;
     let mapped: Vec<super::proto::McpTool> = tools
@@ -149,9 +159,11 @@ pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::Mcp
                 .to_string();
             let input_schema = tool
                 .get("input_schema")
-                .map(|schema| schema.to_string())
-                .unwrap_or_else(|| "{}".to_string());
+                .and_then(json_to_prost_struct)
+                .or_else(|| json_to_prost_struct(&serde_json::json!({})));
             Some(super::proto::McpTool {
+                tool_name: name.clone(),
+                provider_identifier: CLAUDE_LOCAL_MCP_PROVIDER.to_string(),
                 name,
                 description,
                 input_schema,
@@ -163,6 +175,39 @@ pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::Mcp
     } else {
         Some(super::proto::McpTools { tools: mapped })
     }
+}
+
+/// Convert a JSON object into `google.protobuf.Struct` for MCP tool schemas.
+fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct> {
+    let serde_json::Value::Object(map) = value else {
+        return None;
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    for (key, val) in map {
+        fields.insert(key.clone(), json_to_prost_value(val));
+    }
+    Some(prost_types::Struct { fields })
+}
+
+fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(b) => Kind::BoolValue(*b),
+        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Kind::StringValue(s.clone()),
+        serde_json::Value::Array(items) => Kind::ListValue(prost_types::ListValue {
+            values: items.iter().map(json_to_prost_value).collect(),
+        }),
+        serde_json::Value::Object(map) => {
+            let mut fields = std::collections::BTreeMap::new();
+            for (k, v) in map {
+                fields.insert(k.clone(), json_to_prost_value(v));
+            }
+            Kind::StructValue(prost_types::Struct { fields })
+        }
+    };
+    prost_types::Value { kind: Some(kind) }
 }
 
 /// Split Anthropic MessagesRequest into Cursor system vs user payloads.
@@ -661,7 +706,49 @@ mod tests {
         assert!(names.contains(&"mcp__x__y"));
         assert!(!names.contains(&"Read"));
         let workflow = mcp.tools.iter().find(|t| t.name == "Workflow").unwrap();
-        assert!(workflow.input_schema.contains("name"));
+        assert_eq!(workflow.tool_name, "Workflow");
+        assert_eq!(workflow.provider_identifier, CLAUDE_LOCAL_MCP_PROVIDER);
+        let schema = workflow.input_schema.as_ref().expect("struct schema");
+        assert!(
+            schema.fields.contains_key("type") || schema.fields.contains_key("properties"),
+            "input_schema must be a protobuf Struct, not a JSON string"
+        );
+        assert!(schema.fields.contains_key("properties"));
+    }
+
+    #[test]
+    fn claude_local_mcp_tools_encodes_struct_not_json_string() {
+        use prost::Message;
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "Workflow", "description": "run workflow", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}}
+            ]
+        }))
+        .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect("mcp tools");
+        let mut bytes = Vec::new();
+        mcp.encode(&mut bytes).unwrap();
+        // Tag 3 must be a length-delimited *message* (Struct). A JSON string
+        // would also be length-delimited, but round-tripping through decode
+        // must recover Struct fields — not a string field.
+        let decoded = super::super::proto::McpTools::decode(&bytes[..]).unwrap();
+        let tool = &decoded.tools[0];
+        assert!(tool.input_schema.is_some());
+        assert!(!tool.provider_identifier.is_empty());
+        assert_eq!(tool.tool_name, "Workflow");
+        let props = tool
+            .input_schema
+            .as_ref()
+            .unwrap()
+            .fields
+            .get("properties")
+            .expect("properties field");
+        assert!(matches!(
+            props.kind,
+            Some(prost_types::value::Kind::StructValue(_))
+        ));
     }
 
     #[test]

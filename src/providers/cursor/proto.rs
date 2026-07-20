@@ -121,18 +121,27 @@ pub struct SelectedContext {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct McpTools {
+    /// Official CLI field name is `mcp_tools`; tag 1 repeated Definition.
     #[prost(message, repeated, tag = "1")]
     pub tools: Vec<McpTool>,
 }
 
+/// Maps to `agent.v1.McpToolDefinition` (Cursor CLI 2026.07).
+///
+/// Tag 3 is a `google.protobuf.Struct` (JSON object), not a JSON string.
+/// Tags 4/5 identify the MCP provider + tool name for routing.
 #[derive(Clone, PartialEq, Message)]
 pub struct McpTool {
     #[prost(string, tag = "1")]
     pub name: String,
     #[prost(string, tag = "2")]
     pub description: String,
-    #[prost(string, tag = "3")]
-    pub input_schema: String,
+    #[prost(message, optional, tag = "3")]
+    pub input_schema: Option<prost_types::Struct>,
+    #[prost(string, tag = "4")]
+    pub provider_identifier: String,
+    #[prost(string, tag = "5")]
+    pub tool_name: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
