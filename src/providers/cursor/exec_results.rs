@@ -76,14 +76,13 @@ impl PendingCursorExec {
                 working_directory: args.working_directory.clone(),
                 streaming: true,
             }
-        } else if let Some(args) = exec.shell_args.as_ref() {
+        } else {
+            let args = exec.shell_args.as_ref()?;
             CursorExecKind::Shell {
                 command: args.command.clone(),
                 working_directory: args.working_directory.clone(),
                 streaming: false,
             }
-        } else {
-            return None;
         };
 
         Some(Self {

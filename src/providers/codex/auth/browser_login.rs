@@ -116,10 +116,7 @@ pub fn run_browser_login_with_config(
 
         match listener.accept() {
             Ok((mut stream, _)) => {
-                match handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state) {
-                    Ok(tokens) => return Ok(tokens),
-                    Err(e) => return Err(e),
-                }
+                return handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));

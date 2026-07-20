@@ -198,7 +198,7 @@ pub fn parse_duckduckgo_html(html: &str) -> Vec<WebSearchHit> {
     hits
 }
 
-fn extract_attr<'a>(s: &'a str, name: &str) -> Option<String> {
+fn extract_attr(s: &str, name: &str) -> Option<String> {
     let key = format!("{name}=\"");
     let start = s.find(&key)? + key.len();
     let end = s[start..].find('"')? + start;
