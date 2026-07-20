@@ -107,6 +107,7 @@ fn mock_state_for_tick(
     streaming.streamed_bytes = 18_432_u64.saturating_add(tick.saturating_mul(384));
     streaming.stream_chunks = 96_u64.saturating_add(tick.saturating_mul(3));
     streaming.generation_duration = Some(Duration::from_secs(4));
+    streaming.output_throughput_clock = true;
     streaming.generation_initial_output_tokens = streaming
         .output_tokens
         .unwrap_or(0)
@@ -198,6 +199,7 @@ fn mock_state_for_tick(
     success.stream_chunks = 142;
     success.input_tokens = Some(125_600);
     success.output_tokens = Some(832);
+    success.output_throughput_clock = true;
     success.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-cursor-proxy-demo/traffic/req-complete-codex",
     ));
@@ -537,6 +539,7 @@ fn simulated_active_request(
         request.generation_started_instant = Some(instant_now - generation_duration);
         request.generation_finished_at = Some(now);
         request.generation_duration = Some(generation_duration);
+        request.output_throughput_clock = true;
         request.streamed_bytes = output_tokens.saturating_mul(24);
         request.stream_chunks = generation_ticks.saturating_mul(3);
         request.input_tokens = Some(1_800 + cycle.saturating_mul(137));
@@ -579,6 +582,7 @@ fn simulated_completed_request(
         request.error = Some("simulated upstream overload after streaming began".to_string());
     } else {
         request.generation_duration = Some(Duration::from_millis(2_750));
+        request.output_throughput_clock = true;
         request.stream_chunks = 33 + cycle % 9;
         request.output_tokens = Some(128 + cycle.saturating_mul(11));
         request.streamed_bytes = request.output_tokens.unwrap_or(0).saturating_mul(24);

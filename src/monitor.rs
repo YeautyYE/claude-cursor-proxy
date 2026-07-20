@@ -577,14 +577,10 @@ impl MonitorStore {
                     active.status = RequestStatus::Upstream;
                 }
             }
-            MonitorEvent::GenerationStarted { request_id } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.generation_started_at = Some(SystemTime::now());
-                    active.generation_started_instant = Some(Instant::now());
-                    active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
-                    active.generation_finished_at = None;
-                    active.generation_duration = None;
-                }
+            MonitorEvent::GenerationStarted { request_id: _ } => {
+                // Thinking silence must not dilute Rate: do not start the throughput clock
+                // here. The clock starts on first positive output_tokens via
+                // note_throughput_progress.
             }
             MonitorEvent::TrafficCapturePath { request_id, path } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
@@ -1177,15 +1173,25 @@ mod tests {
     }
 
     #[test]
-    fn generation_baseline_pairs_total_usage_with_the_full_observed_interval() {
+    fn generation_started_does_not_anchor_token_rate_before_output() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
         monitor.generation_started("r1");
+
+        let after_started = monitor.snapshot();
+        assert!(!after_started.active[0].output_throughput_clock);
+        assert!(after_started.active[0].generation_started_instant.is_none());
+        assert_eq!(after_started.active[0].rate(), Throughput::None);
+
+        std::thread::sleep(Duration::from_millis(20));
         monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
+        std::thread::sleep(Duration::from_millis(20));
+        monitor.stream_progress("r1", 50, 1, Some(1_225), Some(200));
         monitor.request_completed("r1", 200, None, None);
 
         let request = &monitor.snapshot().recent[0];
-
+        assert!(request.output_throughput_clock);
+        assert_eq!(request.generation_initial_output_tokens, 0);
         assert!(
             request
                 .generation_duration
@@ -1195,23 +1201,54 @@ mod tests {
     }
 
     #[test]
-    fn first_stream_progress_has_no_rate_without_an_interval() {
+    fn first_stream_progress_with_output_counts_tokens_from_zero_baseline() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
         monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
 
+        let after_first = monitor.snapshot();
+        assert_eq!(after_first.active.len(), 1);
+        assert!(after_first.active[0].output_throughput_clock);
+        assert_eq!(after_first.active[0].generation_initial_output_tokens, 0);
+
+        std::thread::sleep(Duration::from_millis(20));
+        monitor.stream_progress("r1", 50, 1, Some(1_225), Some(200));
+
         let state = monitor.snapshot();
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.active[0].rate(), Throughput::None);
+        assert_eq!(state.active[0].generation_initial_output_tokens, 0);
+        assert!(matches!(state.active[0].rate(), Throughput::TokensPerSecond(_)));
+    }
+
+    #[test]
+    fn first_positive_output_restarts_clock_after_pre_token_bytes() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.stream_progress("r1", 100, 1, None, None);
+
+        let after_bytes = monitor.snapshot();
+        assert!(!after_bytes.active[0].output_throughput_clock);
+        assert!(after_bytes.active[0].generation_started_instant.is_some());
+        let byte_started = after_bytes.active[0].generation_started_instant;
+
+        std::thread::sleep(Duration::from_millis(20));
+        monitor.stream_progress("r1", 50, 1, Some(1_225), Some(10));
+
+        let after_out = monitor.snapshot();
+        assert!(after_out.active[0].output_throughput_clock);
+        assert_eq!(after_out.active[0].generation_initial_output_tokens, 0);
+        assert!(after_out.active[0].generation_duration.is_none());
+        assert_ne!(after_out.active[0].generation_started_instant, byte_started);
     }
 
     #[test]
     fn late_stream_progress_extends_stream_timing_without_extending_request_latency() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
-        monitor.stream_progress("r1", 100, 1, Some(0), Some(0));
+        monitor.stream_progress("r1", 100, 1, Some(0), Some(10));
+        std::thread::sleep(Duration::from_millis(20));
         monitor.request_completed("r1", 200, None, None);
         let completed = monitor.snapshot().recent[0].clone();
+        std::thread::sleep(Duration::from_millis(20));
         monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
 
         let state = monitor.snapshot();
@@ -1354,7 +1391,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             generation_started_at: generation_duration.map(|_| SystemTime::UNIX_EPOCH),
             generation_started_instant: None,
             generation_initial_output_tokens: 0,
-            output_throughput_clock: false,
+            output_throughput_clock: generation_duration.is_some() && output_tokens > 0,
             generation_finished_at: generation_duration
                 .map(|duration| SystemTime::UNIX_EPOCH + duration),
             generation_duration,
