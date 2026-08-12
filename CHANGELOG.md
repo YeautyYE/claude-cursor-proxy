@@ -3,12 +3,28 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.28 (WIP)
+
+- Session fallback: when `X-Claude-Code-Session-Id` is missing, derive a stable id from `metadata.user_id` + project cwd so live BiDi still starts (logged as `session_id_fallback`). Claude Code 2.1.193 and 2.1.211 use the same header; nested agents keep that session id and add `x-claude-code-agent-id` / `x-claude-code-parent-agent-id` (plumbed into the Cursor live start path). `x-app` is logged (`cli` / `cli-bg`), not used for routing.
+- `/v1/messages/count_tokens` seeds from the session's last Cursor `turn_ended.input_tokens` when available; otherwise char/4 of the rendered Cursor prompt.
+
+### In progress (other agents)
+
+- RequestContext cwd/git population
+- Nested live-run keying on agent-id headers (no synthetic session UUID)
+- Synthetic Workflow
+- SSE coalesce
+- AskQuestion
+- Prompt shrink
+
 ## v0.1.27 (2026-08-13)
 
 - Fix ClientOnly (Workflow/Skill/mcp__*) continuation: after BiDi teardown, a tool_result-only POST is forwarded into the next Cursor Run instead of being skipped as a native exec resume. Clear the in-flight MCP checkpoint so the next turn is not a zombie resume.
 - Treat Cursor qualified MCP names (`claude-local/Workflow`, `claude-local:Workflow`) as ClientOnly and emit Anthropic `tool_use.name` `Workflow` so `/deep-research` reaches Claude Code.
 - Stop stuffing Cursor `provider_identifier` into Anthropic Workflow/MCP tool input (`additionalProperties: false`).
 - Mixed native+ClientOnly batches expose Workflow/Skill without flushing still-collecting Read/Bash into the same Anthropic pause. Starting live-run reservations count as occupied; ResumeAction reconnect keeps `mcp_tools`.
+- Stop mid-stream Anthropic `message_delta` while a thinking block is open so Claude Code's thinking OTPS meter keeps counting.
+- Emulate nested Anthropic hosted `web_fetch` for `/deep-research` Workflow agents.
 
 ## v0.1.26 (2026-07-21)
 

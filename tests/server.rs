@@ -302,6 +302,101 @@ async fn monitor_records_successful_request_events() {
 }
 
 #[tokio::test]
+async fn missing_session_header_derives_stable_fallback_id() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let body = r##"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"metadata":{"user_id":"user-fallback"},"system":[{"type":"text","text":"\nYou are an interactive agent.\n\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /projects/example\n - Is a git repository: true"}]}"##;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let state = monitor.snapshot();
+    let session_id = state.recent[0]
+        .session_id
+        .as_deref()
+        .expect("fallback session id must be present so live BiDi can start");
+    assert!(
+        session_id.starts_with("ccp-fb-"),
+        "expected derived fallback id, got {session_id}"
+    );
+
+    let monitor2 = MonitorHandle::new(10);
+    let app2 = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor2.clone()),
+    );
+    let response2 = app2
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response2.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        monitor2.snapshot().recent[0].session_id.as_deref(),
+        Some(session_id),
+        "same user and cwd must reuse the derived session"
+    );
+}
+
+#[tokio::test]
+async fn nested_agent_headers_keep_claude_session_id() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("X-Claude-Code-Session-Id", "parent-session")
+                .header("x-claude-code-agent-id", "agent%2Fchild")
+                .header("x-claude-code-parent-agent-id", "agent%2Fparent")
+                .header("x-app", "cli-bg")
+                .body(body_string(
+                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        monitor.snapshot().recent[0].session_id.as_deref(),
+        Some("parent-session"),
+        "nested agent POSTs must keep X-Claude-Code-Session-Id"
+    );
+}
+
+#[tokio::test]
 async fn monitor_records_invalid_json_failure() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(

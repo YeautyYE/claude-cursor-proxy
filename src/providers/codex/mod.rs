@@ -1013,6 +1013,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: Some(monitor.clone()),
+            claude_code: Default::default(),
         };
         let chunk = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":48}}\n\n";
 

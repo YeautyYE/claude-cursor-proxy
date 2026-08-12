@@ -22,11 +22,14 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
+use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::cursor::auth::{
@@ -39,14 +42,16 @@ use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
-use crate::providers::cursor::live::{LiveRunRegistry, live_sse_response};
+use crate::providers::cursor::live::{
+    LiveEventResult, LiveRunEvent, LiveRunIdentity, LiveRunRegistry, live_sse_response,
+};
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
     CursorPromptOptions, claude_local_mcp_tools, latest_user_is_only_tool_results,
     render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
-    CursorDecodeError, decode_cursor_upstream, decode_upstream_response,
+    CursorDecodeError, CursorStreamEvent, decode_cursor_upstream, decode_upstream_response,
     estimate_request_input_tokens,
 };
 use crate::providers::cursor::tool_bridge::{
@@ -77,6 +82,166 @@ fn shared_cursor_http_client() -> CursorHttpClient {
     fresh
 }
 
+const MAX_SESSION_USAGE: usize = 10_000;
+const LIVE_USAGE_TAP_CAP: usize = 512;
+
+struct SessionUsageStore {
+    map: HashMap<String, u64>,
+    order: VecDeque<String>,
+}
+
+static SESSION_USAGE: LazyLock<Mutex<SessionUsageStore>> = LazyLock::new(|| {
+    Mutex::new(SessionUsageStore {
+        map: HashMap::new(),
+        order: VecDeque::new(),
+    })
+});
+
+fn record_session_input_tokens(session_id: &str, input_tokens: u64) {
+    if session_id.is_empty() || input_tokens == 0 {
+        return;
+    }
+    let mut store = SESSION_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if store
+        .map
+        .insert(session_id.to_string(), input_tokens)
+        .is_none()
+    {
+        store.order.push_back(session_id.to_string());
+    } else {
+        store.order.retain(|item| item != session_id);
+        store.order.push_back(session_id.to_string());
+    }
+    while store.order.len() > MAX_SESSION_USAGE {
+        if let Some(evict) = store.order.pop_front() {
+            store.map.remove(&evict);
+        } else {
+            break;
+        }
+    }
+}
+
+fn last_session_input_tokens(session_id: &str) -> Option<u64> {
+    let store = SESSION_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+    store
+        .map
+        .get(session_id)
+        .copied()
+        .filter(|tokens| *tokens > 0)
+}
+
+fn count_tokens_for_request(session_id: Option<&str>, body: &MessagesRequest) -> u64 {
+    if let Some(session_id) = session_id.filter(|id| !id.is_empty())
+        && let Some(last) = last_session_input_tokens(session_id)
+    {
+        return last;
+    }
+    (render_cursor_prompt(body).len() / 4).max(1) as u64
+}
+
+fn remember_input_tokens(session_id: Option<&str>, input_tokens: Option<u64>) {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let Some(input_tokens) = input_tokens.filter(|tokens| *tokens > 0) else {
+        return;
+    };
+    record_session_input_tokens(session_id, input_tokens);
+}
+
+/// Mirror live `turn_ended` usage into the session store without editing live.rs.
+fn tap_session_usage(
+    session_id: String,
+    mut events: mpsc::Receiver<LiveEventResult>,
+) -> mpsc::Receiver<LiveEventResult> {
+    let (tx, rx) = mpsc::channel(LIVE_USAGE_TAP_CAP);
+    tokio::spawn(async move {
+        while let Some(item) = events.recv().await {
+            if let Ok(LiveRunEvent::Cursor(CursorStreamEvent::Usage { input_tokens, .. })) = &item
+                && *input_tokens > 0
+            {
+                record_session_input_tokens(&session_id, *input_tokens);
+            }
+            if tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn live_sse_recording_usage(
+    session_id: &str,
+    events: mpsc::Receiver<LiveEventResult>,
+    message_id: String,
+    wire_model: String,
+    estimated_input: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+) -> Response {
+    live_sse_response(
+        tap_session_usage(session_id.to_string(), events),
+        message_id,
+        wire_model,
+        estimated_input,
+        monitor,
+    )
+}
+
+#[cfg(test)]
+fn reset_session_usage_for_test() {
+    let mut store = SESSION_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+    store.map.clear();
+    store.order.clear();
+}
+
+#[cfg(test)]
+static SESSION_USAGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn log_live_start_claude_headers(ctx: &RequestContext, session_id: &str) {
+    if ctx.claude_code.agent_id.is_none()
+        && ctx.claude_code.parent_agent_id.is_none()
+        && ctx.claude_code.app.is_none()
+    {
+        return;
+    }
+    create_logger("cursor").info(
+        "live_start_nested_headers",
+        Some(serde_json::Map::from_iter([
+            ("sessionId".to_string(), serde_json::json!(session_id)),
+            (
+                "agentId".to_string(),
+                serde_json::json!(&ctx.claude_code.agent_id),
+            ),
+            (
+                "parentAgentId".to_string(),
+                serde_json::json!(&ctx.claude_code.parent_agent_id),
+            ),
+            ("app".to_string(), serde_json::json!(&ctx.claude_code.app)),
+        ])),
+    );
+}
+
+fn claude_agent_id(ctx: &RequestContext) -> Option<&str> {
+    ctx.claude_code
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRunIdentity<'a> {
+    LiveRunIdentity {
+        session_id,
+        agent_id: claude_agent_id(ctx),
+        parent_agent_id: ctx
+            .claude_code
+            .parent_agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty()),
+    }
+}
+
 enum LiveResumeOutcome {
     Resumed(Response),
     TerminalError(String),
@@ -90,6 +255,7 @@ enum LiveResumeOutcome {
 /// or fail — instead of immediately 409'ing concurrent same-session POSTs.
 async fn await_live_run_resume(
     session_id: &str,
+    agent_id: Option<&str>,
     body: &MessagesRequest,
     message_id: String,
     wire_model: String,
@@ -109,11 +275,11 @@ async fn await_live_run_resume(
     let mut last_missing: Option<Vec<String>> = None;
 
     while tokio::time::Instant::now() < deadline {
-        if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
+        if let Some(error) = LiveRunRegistry::take_terminal_error_run(session_id, agent_id) {
             return LiveResumeOutcome::TerminalError(error);
         }
-        let Some(run) = LiveRunRegistry::get(session_id) else {
-            if LiveRunRegistry::is_occupied(session_id) {
+        let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
+            if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
                 // Starting reservation: wait for Running instead of treating
                 // the session as free (which opened a second Cursor run).
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -126,7 +292,8 @@ async fn await_live_run_resume(
             match collect_live_tool_results(body, &pending) {
                 Ok(tool_results) => match run.resume_batch(tool_results).await {
                     Ok(events) => {
-                        return LiveResumeOutcome::Resumed(live_sse_response(
+                        return LiveResumeOutcome::Resumed(live_sse_recording_usage(
+                            session_id,
                             events,
                             message_id,
                             wire_model,
@@ -154,11 +321,11 @@ async fn await_live_run_resume(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
+    if let Some(error) = LiveRunRegistry::take_terminal_error_run(session_id, agent_id) {
         return LiveResumeOutcome::TerminalError(error);
     }
-    let Some(run) = LiveRunRegistry::get(session_id) else {
-        if LiveRunRegistry::is_occupied(session_id) {
+    let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
+        if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
             return LiveResumeOutcome::Conflict;
         }
         return LiveResumeOutcome::Free;
@@ -168,7 +335,8 @@ async fn await_live_run_resume(
         match collect_live_tool_results(body, &pending) {
             Ok(tool_results) => match run.resume_batch(tool_results).await {
                 Ok(events) => {
-                    return LiveResumeOutcome::Resumed(live_sse_response(
+                    return LiveResumeOutcome::Resumed(live_sse_recording_usage(
+                        session_id,
                         events,
                         message_id,
                         wire_model,
@@ -309,10 +477,11 @@ impl Provider for CursorProvider {
         // Route the matching tool_result back onto that exact request stream
         // instead of replaying the whole conversation as a fresh Cursor run.
         if let Some(session_id) = ctx.session_id.as_deref() {
-            if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
+            let agent_id = claude_agent_id(&ctx);
+            if let Some(error) = LiveRunRegistry::take_terminal_error_run(session_id, agent_id) {
                 return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
             }
-            if LiveRunRegistry::is_occupied(session_id) {
+            if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
                 if !want_stream {
                     return json_error(
                         StatusCode::BAD_REQUEST,
@@ -327,6 +496,7 @@ impl Provider for CursorProvider {
                     .map(|handle| (handle, ctx.req_id.clone()));
                 match await_live_run_resume(
                     session_id,
+                    agent_id,
                     &body,
                     message_id.clone(),
                     wire_model.clone(),
@@ -353,7 +523,7 @@ impl Provider for CursorProvider {
                         // Zombie / still-thinking BiDi after Claude Code idle
                         // disconnect or a nested retry without matching tools.
                         // Waiting then 409 cascaded retries; supersede instead.
-                        LiveRunRegistry::cancel(session_id);
+                        LiveRunRegistry::cancel_run(session_id, agent_id);
                     }
                     LiveResumeOutcome::ResumeError(error) => {
                         return map_cursor_error_to_response(&error);
@@ -440,6 +610,8 @@ impl Provider for CursorProvider {
             want_stream && session_id.is_some_and(|s| !s.is_empty()) && client.live_bidi_enabled();
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
+            let identity = live_run_identity(sid, &ctx);
+            log_live_start_claude_headers(&ctx, sid);
             let allowed = advertised_tool_names(&body);
             let mcp_tools = claude_local_mcp_tools(&body);
             let estimated_input = estimate_request_input_tokens(&body);
@@ -450,25 +622,28 @@ impl Provider for CursorProvider {
 
             // Concurrent same-session POSTs (Claude Code retry after idle / 409)
             // race on Starting→Running. Retry supersede+start instead of 409.
+            // Nested agents reserve `(session, agent_id)` so they do not steal
+            // the parent that shares X-Claude-Code-Session-Id.
             let mut start_error: Option<CursorError> = None;
             for attempt in 0..3_u8 {
                 let Some(reservation) = (if attempt == 0 {
-                    LiveRunRegistry::reserve(sid).or_else(|| LiveRunRegistry::supersede(sid))
+                    LiveRunRegistry::reserve_run(sid, identity.agent_id)
+                        .or_else(|| LiveRunRegistry::supersede_run(sid, identity.agent_id))
                 } else {
-                    LiveRunRegistry::supersede(sid)
+                    LiveRunRegistry::supersede_run(sid, identity.agent_id)
                 }) else {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                     continue;
                 };
 
                 let start = match client
-                    .start_live_agent(
+                    .start_live_agent_with_identity(
                         &token,
                         user_text,
                         model,
                         &images,
                         custom_system,
-                        sid,
+                        identity,
                         allowed.clone(),
                         mcp_tools.clone(),
                     )
@@ -480,13 +655,13 @@ impl Provider for CursorProvider {
                             Ok(Some(refreshed)) => {
                                 token = refreshed.access_token;
                                 client
-                                    .start_live_agent(
+                                    .start_live_agent_with_identity(
                                         &token,
                                         user_text,
                                         model,
                                         &images,
                                         custom_system,
-                                        sid,
+                                        identity,
                                         allowed.clone(),
                                         mcp_tools.clone(),
                                     )
@@ -506,7 +681,8 @@ impl Provider for CursorProvider {
                             tokio::time::sleep(Duration::from_millis(25)).await;
                             continue;
                         }
-                        return live_sse_response(
+                        return live_sse_recording_usage(
+                            sid,
                             start.events,
                             message_id,
                             wire_model,
@@ -593,6 +769,7 @@ impl Provider for CursorProvider {
                 );
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+                    remember_input_tokens(session_id, input_tokens);
                     monitor.stream_progress(
                         &ctx.req_id,
                         sse_bytes.len() as u64,
@@ -600,6 +777,9 @@ impl Provider for CursorProvider {
                         input_tokens,
                         output_tokens,
                     );
+                } else {
+                    let (input_tokens, _) = usage_from_anthropic_sse(&sse_bytes);
+                    remember_input_tokens(session_id, input_tokens);
                 }
 
                 let headers = [
@@ -612,6 +792,7 @@ impl Provider for CursorProvider {
                 let sse_bytes = sse::frame_cursor_stream(&upstream, &message_id, &wire_model);
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+                    remember_input_tokens(session_id, input_tokens);
                     monitor.stream_progress(
                         &ctx.req_id,
                         sse_bytes.len() as u64,
@@ -619,6 +800,9 @@ impl Provider for CursorProvider {
                         input_tokens,
                         output_tokens,
                     );
+                } else {
+                    let (input_tokens, _) = usage_from_anthropic_sse(&sse_bytes);
+                    remember_input_tokens(session_id, input_tokens);
                 }
                 let headers = [
                     (http::header::CONTENT_TYPE, "text/event-stream"),
@@ -630,10 +814,12 @@ impl Provider for CursorProvider {
         } else {
             match decode_cursor_upstream(&upstream, &message_id, &wire_model) {
                 Ok(json) => {
+                    let input_tokens = json.pointer("/usage/input_tokens").and_then(|v| v.as_u64());
+                    remember_input_tokens(session_id, input_tokens);
                     if let Some(monitor) = ctx.monitor.as_ref() {
                         monitor.usage_updated(
                             &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                            input_tokens,
                             json.pointer("/usage/output_tokens")
                                 .and_then(|v| v.as_u64()),
                         );
@@ -646,8 +832,7 @@ impl Provider for CursorProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let prompt = render_cursor_prompt(&body);
-        let tokens = (prompt.len() / 4) as u64; // rough estimate
+        let tokens = count_tokens_for_request(ctx.session_id.as_deref(), &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
         }
@@ -861,5 +1046,79 @@ mod tests {
     fn cursor_cli_handler_is_available_without_touching_real_credentials() {
         let handler: &dyn CliHandlers = &CURSOR_CLI;
         let _ = handler;
+    }
+
+    fn hello_body() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "cursor",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn count_tokens_uses_last_turn_ended_input_tokens_for_session() {
+        let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
+        reset_session_usage_for_test();
+        record_session_input_tokens("sess-count-last", 53_037);
+        let tokens = count_tokens_for_request(Some("sess-count-last"), &hello_body());
+        assert_eq!(tokens, 53_037);
+    }
+
+    #[test]
+    fn count_tokens_estimates_rendered_prompt_when_session_has_no_usage() {
+        let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
+        reset_session_usage_for_test();
+        let body = hello_body();
+        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        let tokens = count_tokens_for_request(Some("sess-count-fresh"), &body);
+        assert_eq!(tokens, expected);
+        assert!(tokens >= 1);
+    }
+
+    #[test]
+    fn count_tokens_does_not_leak_usage_across_sessions() {
+        let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
+        reset_session_usage_for_test();
+        record_session_input_tokens("sess-other", 99_000);
+        let body = hello_body();
+        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        assert_eq!(
+            count_tokens_for_request(Some("sess-count-isolated"), &body),
+            expected
+        );
+    }
+
+    #[test]
+    fn nested_agent_headers_keep_parent_session_id_for_live_start() {
+        let ctx = RequestContext {
+            req_id: "req".into(),
+            session_id: Some("parent-session".into()),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders {
+                agent_id: Some("agent%2Fchild".into()),
+                parent_agent_id: Some("agent%2Fparent".into()),
+                app: Some("cli-bg".into()),
+            },
+        };
+        let identity = live_run_identity("parent-session", &ctx);
+        assert_eq!(identity.session_id, "parent-session");
+        assert_eq!(identity.agent_id, Some("agent%2Fchild"));
+        assert_eq!(identity.parent_agent_id, Some("agent%2Fparent"));
+        assert!(identity.is_nested());
+    }
+
+    #[test]
+    fn count_tokens_ignores_zero_recorded_usage() {
+        let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
+        reset_session_usage_for_test();
+        record_session_input_tokens("sess-zero", 0);
+        let body = hello_body();
+        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        assert_eq!(count_tokens_for_request(Some("sess-zero"), &body), expected);
     }
 }

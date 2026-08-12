@@ -1,9 +1,10 @@
 use crate::{
     anthropic::json_error,
+    anthropic::schema::MessagesRequest,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     project,
-    provider::RequestContext,
+    provider::{ClaudeCodeAgentHeaders, RequestContext},
     registry::{Registry, normalize_incoming_model},
     session::{self},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
@@ -20,6 +21,7 @@ use axum::{
 use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::Write;
@@ -231,19 +233,36 @@ async fn dispatch_request(
             ("query".to_string(), json!(&query)),
         ])),
     );
-    let session_id = req
-        .headers()
-        .get("x-claude-code-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(std::string::ToString::to_string);
-    if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(&req_id, session_id.clone(), None, endpoint);
+    let header_session_id = session_id_from_headers(&headers);
+    let claude_code = claude_code_headers_from(&headers);
+    if claude_code.agent_id.is_some()
+        || claude_code.parent_agent_id.is_some()
+        || claude_code.app.is_some()
+    {
+        log.info(
+            "claude_code_headers",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("app".to_string(), json!(&claude_code.app)),
+                ("agentId".to_string(), json!(&claude_code.agent_id)),
+                (
+                    "parentAgentId".to_string(),
+                    json!(&claude_code.parent_agent_id),
+                ),
+            ])),
+        );
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
     let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(err) => {
+            start_request_monitor(
+                state.monitor.as_ref(),
+                &req_id,
+                header_session_id.clone(),
+                endpoint,
+            );
             let response = json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -285,9 +304,15 @@ async fn dispatch_request(
         }
     };
 
-    let mut body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
+    let mut body: MessagesRequest = match parse_json_body(&body_bytes) {
         Ok(body) => body,
         Err(response) => {
+            start_request_monitor(
+                state.monitor.as_ref(),
+                &req_id,
+                header_session_id.clone(),
+                endpoint,
+            );
             let status = response.status();
             log_request_completed(
                 &log,
@@ -324,6 +349,36 @@ async fn dispatch_request(
             return response;
         }
     };
+
+    let resolved_session = resolve_session_id(header_session_id, &body);
+    if resolved_session.fallback {
+        log.info(
+            "session_id_fallback",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("sessionId".to_string(), json!(&resolved_session.session_id)),
+                (
+                    "reason".to_string(),
+                    json!("missing X-Claude-Code-Session-Id"),
+                ),
+                (
+                    "hasUserId".to_string(),
+                    json!(metadata_user_id(&body).is_some()),
+                ),
+                (
+                    "hasCwd".to_string(),
+                    json!(working_directory_from_body(&body).is_some()),
+                ),
+            ])),
+        );
+    }
+    let session_id = Some(resolved_session.session_id);
+    start_request_monitor(
+        state.monitor.as_ref(),
+        &req_id,
+        session_id.clone(),
+        endpoint,
+    );
 
     if let Some(project) = project::name_from_request(
         body.extra.get("system"),
@@ -508,6 +563,7 @@ async fn dispatch_request(
         provider: provider.name().to_string(),
         traffic,
         monitor: state.monitor.clone(),
+        claude_code,
     };
 
     let response = if count_tokens {
@@ -815,6 +871,100 @@ fn monitor_failed(
     }
 }
 
+fn start_request_monitor(
+    monitor: Option<&MonitorHandle>,
+    req_id: &str,
+    session_id: Option<String>,
+    endpoint: EndpointKind,
+) {
+    if let Some(monitor) = monitor {
+        monitor.request_started(req_id, session_id, None, endpoint);
+    }
+}
+
+/// Claude Code 2.1.193 (`cli.js`) and installed 2.1.211 (`claude.exe`) both send
+/// `X-Claude-Code-Session-Id` on Anthropic requests. HTTP header names are
+/// case-insensitive (`x-claude-code-session-id` matches). Keep this list so a
+/// future rename can be accepted alongside the current name.
+const CLAUDE_SESSION_ID_HEADERS: &[&str] = &["x-claude-code-session-id"];
+
+struct ResolvedSessionId {
+    session_id: String,
+    fallback: bool,
+}
+
+fn session_id_from_headers(headers: &http::HeaderMap) -> Option<String> {
+    for name in CLAUDE_SESSION_ID_HEADERS {
+        if let Some(value) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_session_id(
+    header_session_id: Option<String>,
+    body: &MessagesRequest,
+) -> ResolvedSessionId {
+    if let Some(session_id) = header_session_id.filter(|id| !id.is_empty()) {
+        return ResolvedSessionId {
+            session_id,
+            fallback: false,
+        };
+    }
+    ResolvedSessionId {
+        session_id: derive_fallback_session_id(body),
+        fallback: true,
+    }
+}
+
+fn derive_fallback_session_id(body: &MessagesRequest) -> String {
+    let user_id = metadata_user_id(body).unwrap_or("");
+    let cwd = working_directory_from_body(body).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(user_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(cwd.as_bytes());
+    format!("ccp-fb-{:x}", hasher.finalize())
+}
+
+fn metadata_user_id(body: &MessagesRequest) -> Option<&str> {
+    let metadata = body.extra.get("metadata")?;
+    metadata
+        .get("user_id")
+        .or_else(|| metadata.get("userId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn working_directory_from_body(body: &MessagesRequest) -> Option<String> {
+    project::cwd_from_request(
+        body.extra.get("system"),
+        body.messages.iter().rev().map(|message| &message.content),
+    )
+}
+
+fn header_text(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn claude_code_headers_from(headers: &http::HeaderMap) -> ClaudeCodeAgentHeaders {
+    ClaudeCodeAgentHeaders {
+        agent_id: header_text(headers, "x-claude-code-agent-id"),
+        parent_agent_id: header_text(headers, "x-claude-code-parent-agent-id"),
+        app: header_text(headers, "x-app"),
+    }
+}
+
 fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
@@ -898,8 +1048,26 @@ fn set_mode(path: &Path, mode: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::enable_accepted_tcp_nodelay;
+    use super::{
+        claude_code_headers_from, derive_fallback_session_id, enable_accepted_tcp_nodelay,
+        resolve_session_id, session_id_from_headers,
+    };
+    use crate::anthropic::schema::MessagesRequest;
+    use serde_json::json;
     use tokio::net::TcpListener;
+
+    fn body_from(value: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn fallback_body(user_id: &str, cwd: &str, first_user: &str) -> MessagesRequest {
+        body_from(json!({
+            "model": "cursor",
+            "messages": [{"role": "user", "content": first_user}],
+            "metadata": {"user_id": user_id},
+            "system": format!("# Environment\n - Primary working directory: {cwd}\n - Is a git repository: true")
+        }))
+    }
 
     #[tokio::test]
     async fn accepted_connections_enable_tcp_nodelay() {
@@ -913,5 +1081,119 @@ mod tests {
             "Anthropic listen sockets must disable Nagle (TCP_NODELAY)"
         );
         client.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn session_id_reads_claude_code_header_canonical_and_http2_case() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("X-Claude-Code-Session-Id", "sess-from-cli".parse().unwrap());
+        assert_eq!(
+            session_id_from_headers(&headers).as_deref(),
+            Some("sess-from-cli")
+        );
+
+        let mut lower = http::HeaderMap::new();
+        lower.insert("x-claude-code-session-id", "sess-lower".parse().unwrap());
+        assert_eq!(
+            session_id_from_headers(&lower).as_deref(),
+            Some("sess-lower")
+        );
+    }
+
+    #[test]
+    fn session_id_header_wins_over_derived_fallback() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "header-session".parse().unwrap(),
+        );
+        let body = fallback_body("user-1", "/tmp/proj", "hello");
+        let resolved = resolve_session_id(session_id_from_headers(&headers), &body);
+        assert_eq!(resolved.session_id, "header-session");
+        assert!(!resolved.fallback);
+    }
+
+    #[test]
+    fn session_id_falls_back_when_header_absent() {
+        let body = fallback_body("user-1", "/tmp/proj", "hello");
+        let resolved = resolve_session_id(None, &body);
+        assert!(
+            resolved.fallback,
+            "missing header must log a derived fallback"
+        );
+        assert!(
+            resolved.session_id.starts_with("ccp-fb-"),
+            "derived id should be distinguishable from Claude UUIDs: {}",
+            resolved.session_id
+        );
+        assert_eq!(resolved.session_id.len(), "ccp-fb-".len() + 64);
+    }
+
+    #[test]
+    fn session_id_fallback_is_stable_across_later_turns() {
+        let first = fallback_body("user-1", "/tmp/proj", "hello");
+        let continued = body_from(json!({
+            "model": "cursor",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "continue"}
+            ],
+            "metadata": {"user_id": "user-1"},
+            "system": "# Environment\n - Primary working directory: /tmp/proj\n"
+        }));
+        let a = derive_fallback_session_id(&first);
+        let b = derive_fallback_session_id(&continued);
+        assert_eq!(a, b, "later turns must keep the same live BiDi session");
+    }
+
+    #[test]
+    fn session_id_fallback_changes_with_user_or_cwd_not_later_messages() {
+        let base = derive_fallback_session_id(&fallback_body("user-1", "/tmp/proj", "hello"));
+        let other_user = derive_fallback_session_id(&fallback_body("user-2", "/tmp/proj", "hello"));
+        let other_cwd = derive_fallback_session_id(&fallback_body("user-1", "/tmp/other", "hello"));
+        let other_msg = derive_fallback_session_id(&fallback_body("user-1", "/tmp/proj", "hola"));
+        assert_ne!(base, other_user);
+        assert_ne!(base, other_cwd);
+        assert_eq!(
+            base, other_msg,
+            "fallback is user_id + cwd; first-message text must not mint a new session"
+        );
+    }
+
+    #[test]
+    fn nested_agent_headers_do_not_replace_session_id() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "X-Claude-Code-Session-Id",
+            "parent-session".parse().unwrap(),
+        );
+        headers.insert("x-claude-code-agent-id", "agent%2Fchild".parse().unwrap());
+        headers.insert(
+            "x-claude-code-parent-agent-id",
+            "agent%2Fparent".parse().unwrap(),
+        );
+        headers.insert("x-app", "cli-bg".parse().unwrap());
+        let nested = claude_code_headers_from(&headers);
+        assert_eq!(nested.agent_id.as_deref(), Some("agent%2Fchild"));
+        assert_eq!(nested.parent_agent_id.as_deref(), Some("agent%2Fparent"));
+        assert_eq!(nested.app.as_deref(), Some("cli-bg"));
+        let resolved = resolve_session_id(
+            session_id_from_headers(&headers),
+            &fallback_body("u", "/tmp/p", "x"),
+        );
+        assert_eq!(resolved.session_id, "parent-session");
+        assert!(!resolved.fallback);
+    }
+
+    #[test]
+    fn session_id_fallback_never_returns_empty() {
+        let empty = body_from(json!({
+            "model": "cursor",
+            "messages": []
+        }));
+        let resolved = resolve_session_id(None, &empty);
+        assert!(resolved.fallback);
+        assert!(!resolved.session_id.is_empty());
     }
 }

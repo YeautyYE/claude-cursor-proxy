@@ -35,6 +35,16 @@ pub trait CliHandlers: Send + Sync {
     fn logout(&self) -> Result<()>;
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeCodeAgentHeaders {
+    /// `x-claude-code-agent-id` (URL-encoded). Nested agents only.
+    pub agent_id: Option<String>,
+    /// `x-claude-code-parent-agent-id` (URL-encoded). Nested agents only.
+    pub parent_agent_id: Option<String>,
+    /// `x-app` (`cli` / `cli-bg`). Logging only, not used for routing.
+    pub app: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub req_id: String,
@@ -43,4 +53,6 @@ pub struct RequestContext {
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,
     pub monitor: Option<MonitorHandle>,
+    /// Nested-agent headers from Claude Code. Same session id as the parent.
+    pub claude_code: ClaudeCodeAgentHeaders,
 }
