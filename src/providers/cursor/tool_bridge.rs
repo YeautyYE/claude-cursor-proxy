@@ -430,7 +430,11 @@ pub fn build_write_result_from_native(
             .or_else(|| exec.args.get("file_text"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let lines = if file.is_empty() { 0 } else { file.lines().count() };
+        let lines = if file.is_empty() {
+            0
+        } else {
+            file.lines().count()
+        };
         serde_json::json!({
             "success": {
                 "path": path,

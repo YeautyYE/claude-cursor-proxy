@@ -3,19 +3,19 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
-## v0.1.28 (WIP)
+## v0.1.28 (2026-08-13)
 
-- Session fallback: when `X-Claude-Code-Session-Id` is missing, derive a stable id from `metadata.user_id` + project cwd so live BiDi still starts (logged as `session_id_fallback`). Claude Code 2.1.193 and 2.1.211 use the same header; nested agents keep that session id and add `x-claude-code-agent-id` / `x-claude-code-parent-agent-id` (plumbed into the Cursor live start path). `x-app` is logged (`cli` / `cli-bg`), not used for routing.
+- Nested live runs are keyed by `(session_id, agent_id)` using plumbed `x-claude-code-agent-id` / `x-claude-code-parent-agent-id` (no synthetic session UUID). Nested Workflow POSTs share `X-Claude-Code-Session-Id` without superseding the parent BiDi.
+- Fill CLI `RequestContext` on the exec reply (`request_context_result`) with cwd/git from Claude system / `<system-reminder>` — not as a `RunRequest` field.
+- When `RunRequest.mcp_tools` is set, the prompt XML `<tools>` dump is names + one-line descriptions only (no duplicated JSON schemas), plus a Workflow/Skill nudge.
+- Empty turns synthesize a real Workflow `tool_use` from `Invoke: Workflow({ name: "deep-research", … })` (or the `"deep-research"` workflow line) instead of a text-only recovery note.
+- Mixed ClientOnly + native batches keep BiDi open so in-flight Read/Bash are not dropped when Workflow/Skill is exposed.
+- SSE delta coalesce only under channel backpressure (tokens otherwise stream at Cursor cadence).
+- Map Cursor `AskQuestion` to Claude Code `AskUserQuestion` and expose it as ClientOnly.
+- Session header fallback: when `X-Claude-Code-Session-Id` is missing, derive a stable `ccp-fb-` id from `metadata.user_id` + project cwd so live BiDi still starts (`session_id_fallback`). Nested agents keep that session id. `x-app` is logged (`cli` / `cli-bg`), not used for routing.
 - `/v1/messages/count_tokens` seeds from the session's last Cursor `turn_ended.input_tokens` when available; otherwise char/4 of the rendered Cursor prompt.
-
-### In progress (other agents)
-
-- RequestContext cwd/git population
-- Nested live-run keying on agent-id headers (no synthetic session UUID)
-- Synthetic Workflow
-- SSE coalesce
-- AskQuestion
-- Prompt shrink
+- Cursor CLI `ShellArgs.timeout` is milliseconds (same as Claude Bash); pass through without converting to seconds.
+- Anthropic listen sockets and Cursor upstream HTTP set `TCP_NODELAY` so Nagle does not delay SSE chunks.
 
 ## v0.1.27 (2026-08-13)
 

@@ -1067,9 +1067,7 @@ fn note_throughput_progress(
         return;
     }
 
-    if allow_byte_fallback
-        && let Some(started) = *generation_started_instant
-    {
+    if allow_byte_fallback && let Some(started) = *generation_started_instant {
         *generation_finished_at = Some(SystemTime::now());
         *generation_duration = Some(started.elapsed());
     }
@@ -1216,7 +1214,10 @@ mod tests {
 
         let state = monitor.snapshot();
         assert_eq!(state.active[0].generation_initial_output_tokens, 0);
-        assert!(matches!(state.active[0].rate(), Throughput::TokensPerSecond(_)));
+        assert!(matches!(
+            state.active[0].rate(),
+            Throughput::TokensPerSecond(_)
+        ));
     }
 
     #[test]
