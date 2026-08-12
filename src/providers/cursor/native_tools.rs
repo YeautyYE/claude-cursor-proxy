@@ -1,7 +1,9 @@
 //! Map Cursor Agent native tool calls (InteractionUpdate / ExecServerMessage)
 //! onto Claude Code Anthropic tool_use shapes.
 
-use crate::providers::cursor::proto::{ExecServerMessage, ShellArgs, ToolCall, ToolCallStarted};
+use crate::providers::cursor::proto::{
+    ExecServerMessage, FetchArgs, ShellArgs, ToolCall, ToolCallStarted,
+};
 
 /// A tool call ready for Anthropic `tool_use` emission.
 #[derive(Debug, Clone)]
@@ -181,7 +183,8 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
         });
     }
     if let Some(ref mcp) = tc.mcp_tool_call {
-        let args = mcp.args.as_ref()?;
+        let fallback = crate::providers::cursor::proto::McpArgs::default();
+        let args = mcp.args.as_ref().unwrap_or(&fallback);
         let name = if !args.tool_name.is_empty() {
             args.tool_name.clone()
         } else if !args.name.is_empty() {
@@ -272,16 +275,10 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
         });
     }
     if let Some(ref fetch) = tc.fetch_tool_call {
-        let args = fetch.args.as_ref()?;
-        return Some(MappedClaudeTool {
-            tool_use_id: if args.tool_call_id.is_empty() {
-                call_id
-            } else {
-                args.tool_call_id.clone()
-            },
-            name: "WebFetch".into(),
-            input: serde_json::json!({ "url": args.url }),
-        });
+        return map_fetch_args(fetch.args.as_ref()?, call_id);
+    }
+    if let Some(ref fetch) = tc.web_fetch_tool_call {
+        return map_fetch_args(fetch.args.as_ref()?, call_id);
     }
     if let Some(ref ask) = tc.ask_question_tool_call {
         let args = ask.args.as_ref()?;
@@ -305,6 +302,74 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
         });
     }
     None
+}
+
+fn map_fetch_args(args: &FetchArgs, call_id: String) -> Option<MappedClaudeTool> {
+    Some(MappedClaudeTool {
+        tool_use_id: if args.tool_call_id.is_empty() {
+            call_id
+        } else {
+            args.tool_call_id.clone()
+        },
+        name: "WebFetch".into(),
+        input: serde_json::json!({ "url": args.url }),
+    })
+}
+
+/// Fill empty/partial MCP tool input from `partial_tool_call.args_text_delta`.
+///
+/// Cursor documents that field as aggregated JSON text so far. Incomplete JSON
+/// is ignored so we never invent keys.
+pub fn merge_partial_args_json(mapped: &mut MappedClaudeTool, args_text: &str) -> bool {
+    let text = args_text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let empty = mapped.input.is_null()
+        || mapped
+            .input
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    match (&mut mapped.input, value) {
+        (serde_json::Value::Object(dst), serde_json::Value::Object(src)) => {
+            if dst.is_empty() {
+                *dst = src;
+                return true;
+            }
+            let mut changed = false;
+            for (key, val) in src {
+                dst.entry(key).or_insert_with(|| {
+                    changed = true;
+                    val
+                });
+            }
+            changed
+        }
+        (dst, src) if empty => {
+            *dst = src;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Snapshot-or-append `args_text_delta` chunks. JSON objects/arrays replace when
+/// they are at least as long as the buffer (aggregated snapshots); fragments append.
+pub fn accumulate_partial_args_text(dst: &mut String, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+    let trimmed = incoming.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if incoming.len() >= dst.len() || serde_json::from_str::<serde_json::Value>(dst).is_err() {
+            *dst = incoming.to_string();
+        }
+        return;
+    }
+    dst.push_str(incoming);
 }
 
 fn decode_mcp_arg_value(raw: &[u8]) -> serde_json::Value {
@@ -660,5 +725,53 @@ mod tests {
             model_call_id: String::new(),
         };
         assert!(map_tool_call_started(&started).is_none());
+    }
+
+    #[test]
+    fn maps_web_fetch_tool_call_tag_37_like_fetch() {
+        let started = ToolCallStarted {
+            call_id: "wf37".into(),
+            tool_call: Some(ToolCall {
+                web_fetch_tool_call: Some(crate::providers::cursor::proto::WebFetchToolCall {
+                    args: Some(crate::providers::cursor::proto::FetchArgs {
+                        url: "https://example.com/docs".into(),
+                        tool_call_id: "wf37".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.name, "WebFetch");
+        assert_eq!(m.input["url"], "https://example.com/docs");
+        assert_eq!(m.tool_use_id, "wf37");
+    }
+
+    #[test]
+    fn merge_partial_args_fills_empty_workflow_input() {
+        let mut mapped = MappedClaudeTool {
+            tool_use_id: "mcp-1".into(),
+            name: "Workflow".into(),
+            input: serde_json::json!({}),
+        };
+        assert!(merge_partial_args_json(
+            &mut mapped,
+            r#"{"name":"deep-research"}"#
+        ));
+        assert_eq!(mapped.input["name"], "deep-research");
+        assert!(!merge_partial_args_json(&mut mapped, "{incomplete"));
+    }
+
+    #[test]
+    fn accumulate_partial_args_prefers_json_snapshots() {
+        let mut buf = String::new();
+        accumulate_partial_args_text(&mut buf, r#"{"name":""#);
+        accumulate_partial_args_text(&mut buf, r#"{"name":"deep-research"}"#);
+        assert_eq!(buf, r#"{"name":"deep-research"}"#);
+        let mut frag = String::new();
+        accumulate_partial_args_text(&mut frag, r#"{"name":""#);
+        accumulate_partial_args_text(&mut frag, r#"deep-research"}"#);
+        assert_eq!(frag, r#"{"name":"deep-research"}"#);
     }
 }

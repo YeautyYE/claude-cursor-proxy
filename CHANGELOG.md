@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.29 (2026-08-13)
+
+- Decode Cursor `InteractionUpdate.partial_tool_call` (tag 7) and `tool_call_delta` (tag 15). Streamed MCP/Workflow JSON in `args_text_delta` is merged into ClientOnly `tool_use.input` so Fable cannot expose Workflow with an empty object.
+- Decode `ToolCall.web_fetch_tool_call` (tag 37, distinct from Fetch tag 24). Cursor-native WebFetch stays transcript/exec; nested Anthropic hosted `web_fetch` is still the emulator on `/v1/messages`.
+
 ## v0.1.28 (2026-08-13)
 
 - Nested live runs are keyed by `(session_id, agent_id)` using plumbed `x-claude-code-agent-id` / `x-claude-code-parent-agent-id` (no synthetic session UUID). Nested Workflow POSTs share `X-Claude-Code-Session-Id` without superseding the parent BiDi.

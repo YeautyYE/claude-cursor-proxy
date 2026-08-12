@@ -30,7 +30,9 @@ use super::exec_results::{
     encode_exec_heartbeat, encode_tool_result_frames,
 };
 use super::http1::{self, BidiAppendSession};
-use super::native_tools::map_tool_call_started;
+use super::native_tools::{
+    accumulate_partial_args_text, map_tool_call_started, merge_partial_args_json,
+};
 use super::proto::{
     self, AgentClientMessage, AskQuestionArgs, AskQuestionInteractionQuery,
     AskQuestionInteractionResponse, AskQuestionRejected, AskQuestionResult, ClientHeartbeat,
@@ -533,6 +535,8 @@ struct LogicalToolTracker {
     /// Wall clock of the oldest outstanding UI tool_call_started. Heartbeats
     /// must not refresh this — otherwise we never clear stalled UI-only starts.
     oldest_since: Option<Instant>,
+    /// Aggregated `partial_tool_call.args_text_delta` keyed by call_id.
+    partial_args: HashMap<String, String>,
 }
 
 impl LogicalToolTracker {
@@ -550,9 +554,37 @@ impl LogicalToolTracker {
         }
     }
 
+    fn remember_partial_args(&mut self, call_id: &str, model_call_id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let key = if !call_id.is_empty() {
+            call_id
+        } else if !model_call_id.is_empty() {
+            model_call_id
+        } else {
+            return;
+        };
+        let entry = self.partial_args.entry(key.to_string()).or_default();
+        accumulate_partial_args_text(entry, delta);
+    }
+
+    fn partial_args_for(&self, call_id: &str, model_call_id: &str) -> Option<&str> {
+        if !call_id.is_empty()
+            && let Some(text) = self.partial_args.get(call_id)
+        {
+            return Some(text.as_str());
+        }
+        if !model_call_id.is_empty() {
+            return self.partial_args.get(model_call_id).map(String::as_str);
+        }
+        None
+    }
+
     fn completed(&mut self, call_id: &str, model_call_id: &str) {
         if !call_id.is_empty() {
             self.named.remove(call_id);
+            self.partial_args.remove(call_id);
         } else {
             let mut remove_model = false;
             if let Some(count) = self.anonymous_by_model.get_mut(model_call_id) {
@@ -627,6 +659,7 @@ impl LogicalToolTracker {
     fn clear(&mut self) {
         self.named.clear();
         self.anonymous_by_model.clear();
+        self.partial_args.clear();
         self.oldest_since = None;
     }
 
@@ -2394,12 +2427,52 @@ async fn process_live_frame(
     }
 
     if let Some(update) = message.interaction_update {
+        if let Some(partial) = update.partial_tool_call {
+            logical_tools_waiting.remember_partial_args(
+                &partial.call_id,
+                &partial.model_call_id,
+                &partial.args_text_delta,
+            );
+            *last_progress = Instant::now();
+            *useful = true;
+        }
+        if let Some(delta) = update.tool_call_delta {
+            // Shell/edit/task stream only — MCP/Workflow args use partial_tool_call.
+            if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
+                eprintln!(
+                    "[ccp-cursor] tool_call_delta call_id={} (not MCP args)",
+                    delta.call_id
+                );
+            }
+            *last_progress = Instant::now();
+        }
         if let Some(started) = update.tool_call_started {
             // Claude-local tools advertised via RunRequest.mcp_tools arrive as
             // MCP tool_call_started (not ExecServerMessage). Expose immediately
             // so Claude Code can fulfill Workflow/Skill locally.
-            if let Some(mapped) = map_tool_call_started(&started) {
+            if let Some(mut mapped) = map_tool_call_started(&started) {
+                let streamed = logical_tools_waiting
+                    .partial_args_for(&started.call_id, &started.model_call_id)
+                    .map(str::to_owned);
+                if let Some(args_text) = streamed.as_deref() {
+                    merge_partial_args_json(&mut mapped, args_text);
+                }
                 let provider = mcp_provider_identifier(&started);
+                if started
+                    .tool_call
+                    .as_ref()
+                    .and_then(|tc| tc.web_fetch_tool_call.as_ref())
+                    .is_some()
+                {
+                    // Cursor-native WebFetch (ToolCall tag 37). Nested Anthropic
+                    // hosted web_fetch is emulated on the Messages path; this
+                    // frame is UI/exec transcript, not ClientOnly.
+                    if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
+                        eprintln!(
+                            "[ccp-cursor] web_fetch_tool_call ignored (hosted web_fetch emulator covers nested Anthropic)"
+                        );
+                    }
+                }
                 if let Some(emit_name) =
                     client_only_anthropic_name(&mapped.name, provider, allowed_tool_names)
                 {
@@ -4204,6 +4277,8 @@ mod tests {
                 thinking_delta: None,
                 thinking_completed: None,
                 token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
                 turn_ended: None,
             }),
             exec_server_message: None,
@@ -4331,6 +4406,8 @@ mod tests {
                 thinking_delta: None,
                 thinking_completed: None,
                 token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
                 turn_ended: None,
             }),
             exec_server_message: None,
@@ -4399,6 +4476,150 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn partial_tool_call_args_fill_empty_mcp_started_input() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, PartialToolCall, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        fn frame_for(msg: AgentServerMessage) -> super::super::connect::ConnectFrame {
+            let mut full = Vec::new();
+            msg.encode(&mut full).unwrap();
+            let framed = encode_connect_frame(full, 0);
+            let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+            decoder.push(&framed).unwrap().into_iter().next().unwrap()
+        }
+
+        async fn drive(
+            frame: super::super::connect::ConnectFrame,
+            outbound: &ClientOutbound,
+            sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+            pending: &mut PendingExecState,
+            pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+            logical: &mut LogicalToolTracker,
+            allowed: &BTreeSet<String>,
+        ) -> bool {
+            let mut deferred = VecDeque::new();
+            let mut kv_blobs = HashMap::new();
+            let mut latest_checkpoint = None;
+            let terminal_error = Arc::new(Mutex::new(None));
+            let mut saw_text = false;
+            let mut useful = false;
+            let mut last_progress = Instant::now();
+            let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+            process_live_frame(
+                frame,
+                outbound,
+                sink,
+                &mut deferred,
+                pending,
+                pending_shared,
+                &mut kv_blobs,
+                &mut latest_checkpoint,
+                &terminal_error,
+                Some(allowed),
+                &mut saw_text,
+                &mut useful,
+                logical,
+                &mut last_progress,
+                Duration::from_millis(50),
+                &mut xml_parser,
+                None,
+            )
+            .await
+        }
+
+        let mcp = |args: std::collections::HashMap<String, Vec<u8>>| McpToolCall {
+            args: Some(McpArgs {
+                name: "Workflow".into(),
+                tool_name: "Workflow".into(),
+                tool_call_id: "mcp-partial-1".into(),
+                provider_identifier: "claude-local".into(),
+                args,
+            }),
+        };
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut logical = LogicalToolTracker::default();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+
+        let cont = drive(
+            frame_for(AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    partial_tool_call: Some(PartialToolCall {
+                        call_id: "mcp-partial-1".into(),
+                        model_call_id: "model-1".into(),
+                        args_text_delta: r#"{"name":"deep-research"}"#.into(),
+                        tool_call: Some(ToolCall {
+                            mcp_tool_call: Some(mcp(Default::default())),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(cont, "partial_tool_call must not tear down BiDi");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must wait for tool_call_started"
+        );
+
+        let cont = drive(
+            frame_for(AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    tool_call_started: Some(ToolCallStarted {
+                        call_id: "mcp-partial-1".into(),
+                        model_call_id: "model-1".into(),
+                        tool_call: Some(ToolCall {
+                            mcp_tool_call: Some(mcp(Default::default())),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(!cont, "MCP Workflow must end BiDi segment");
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Workflow");
+                assert_eq!(
+                    tools[0].input.get("name").and_then(|v| v.as_str()),
+                    Some("deep-research"),
+                    "ClientOnly input must come from partial_tool_call args_text_delta"
+                );
+            }
+            other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+    }
+
     async fn client_only_tools_from_mcp_started(
         tool_name: &str,
         name: &str,
@@ -4440,6 +4661,8 @@ mod tests {
                 thinking_delta: None,
                 thinking_completed: None,
                 token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
                 turn_ended: None,
             }),
             exec_server_message: None,
@@ -4551,6 +4774,8 @@ mod tests {
                 thinking_delta: None,
                 thinking_completed: None,
                 token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
                 turn_ended: Some(TurnEnded {
                     input_tokens: Some(10),
                     output_tokens: Some(2),

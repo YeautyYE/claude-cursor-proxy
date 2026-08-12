@@ -208,6 +208,8 @@ fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEv
         // tool_call_started/completed belong to Cursor's UI transcript. Local
         // execution is requested separately by ExecServerMessage and only that
         // message carries the ids needed to return a native result.
+        // `partial_tool_call` / `tool_call_delta` are decoded on the prost
+        // struct; MCP arg accumulation for ClientOnly lives on the live BiDi path.
 
         // Token delta is an incremental output/thinking signal — never a full
         // usage snapshot. Mapping it to Usage{input:0,..} previously wiped the
@@ -453,6 +455,98 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn decodes_partial_tool_call_fixture_frame() {
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                partial_tool_call: Some(PartialToolCall {
+                    call_id: "mcp-1".into(),
+                    model_call_id: "model-1".into(),
+                    args_text_delta: r#"{"name":"deep-research"}"#.into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "Workflow".into(),
+                                tool_name: "Workflow".into(),
+                                tool_call_id: "mcp-1".into(),
+                                provider_identifier: "claude-local".into(),
+                                args: Default::default(),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        assert_eq!(
+            payload[0], 0x0a,
+            "AgentServerMessage.interaction_update is tag 1"
+        );
+        let body = encode_connect_frame(&payload, 0).to_vec();
+        let events = decode_upstream_response(&body).unwrap();
+        assert!(
+            events.is_empty(),
+            "partial_tool_call is transcript/arg stream, not a buffered NativeTool: {events:?}"
+        );
+        let decoded = AgentServerMessage::decode(payload.as_slice()).unwrap();
+        let partial = decoded
+            .interaction_update
+            .unwrap()
+            .partial_tool_call
+            .unwrap();
+        assert_eq!(partial.call_id, "mcp-1");
+        assert_eq!(partial.args_text_delta, r#"{"name":"deep-research"}"#);
+    }
+
+    #[test]
+    fn decodes_tool_call_delta_fixture_frame() {
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                tool_call_delta: Some(ToolCallDeltaUpdate {
+                    call_id: "edit-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call_delta: Some(ToolCallDelta {
+                        edit_tool_call_delta: Some(EditToolCallDelta {
+                            stream_content_delta: "// code".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        assert!(
+            payload.contains(&0x7a),
+            "tool_call_delta tag 15 missing in {payload:?}"
+        );
+        let body = encode_connect_frame(&payload, 0).to_vec();
+        let events = decode_upstream_response(&body).unwrap();
+        assert!(events.is_empty(), "tool_call_delta is not a NativeTool");
+        let decoded = AgentServerMessage::decode(payload.as_slice()).unwrap();
+        assert_eq!(
+            decoded
+                .interaction_update
+                .unwrap()
+                .tool_call_delta
+                .unwrap()
+                .call_id,
+            "edit-1"
+        );
     }
 
     #[test]

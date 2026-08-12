@@ -442,9 +442,10 @@ pub struct KvError {
     pub message: String,
 }
 
-/// InteractionUpdate oneof fields (CLI 2026.07):
+/// InteractionUpdate oneof fields (CLI 2026.07 / IDE 3.12 `agent.v1`):
 /// 1=text_delta, 2=tool_call_started, 3=tool_call_completed, 4=thinking_delta,
-/// 5=thinking_completed, 8=token_delta, 13=heartbeat, 14=turn_ended, …
+/// 5=thinking_completed, 7=partial_tool_call, 8=token_delta, 13=heartbeat,
+/// 14=turn_ended, 15=tool_call_delta, …
 #[derive(Clone, PartialEq, Message)]
 pub struct InteractionUpdate {
     #[prost(message, optional, tag = "1")]
@@ -458,6 +459,9 @@ pub struct InteractionUpdate {
     /// Empty marker that reasoning finished (CLI tag 5).
     #[prost(message, optional, tag = "5")]
     pub thinking_completed: Option<ThinkingCompleted>,
+    /// Streaming tool args before `tool_call_started` (CLI `PartialToolCallUpdate`).
+    #[prost(message, optional, tag = "7")]
+    pub partial_tool_call: Option<PartialToolCall>,
     #[prost(message, optional, tag = "8")]
     pub token_delta: Option<TokenDelta>,
     /// Server keep-alive during long thinking (CLI tag 13). Must refresh our
@@ -466,6 +470,10 @@ pub struct InteractionUpdate {
     pub heartbeat: Option<InteractionHeartbeat>,
     #[prost(message, optional, tag = "14")]
     pub turn_ended: Option<TurnEnded>,
+    /// Shell/edit/task stream deltas (CLI `ToolCallDeltaUpdate`). MCP/Workflow
+    /// args stream on `partial_tool_call`, not here.
+    #[prost(message, optional, tag = "15")]
+    pub tool_call_delta: Option<ToolCallDeltaUpdate>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -489,6 +497,61 @@ pub struct ToolCallCompleted {
     pub tool_call: Option<ToolCall>,
     #[prost(string, tag = "3")]
     pub model_call_id: String,
+}
+
+/// CLI `PartialToolCallUpdate` (InteractionUpdate tag 7).
+/// `args_text_delta` is aggregated JSON text so far (may be incomplete).
+#[derive(Clone, PartialEq, Message)]
+pub struct PartialToolCall {
+    #[prost(string, tag = "1")]
+    pub call_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub tool_call: Option<ToolCall>,
+    #[prost(string, tag = "3")]
+    pub args_text_delta: String,
+    #[prost(string, tag = "4")]
+    pub model_call_id: String,
+}
+
+/// CLI `ToolCallDeltaUpdate` (InteractionUpdate tag 15).
+#[derive(Clone, PartialEq, Message)]
+pub struct ToolCallDeltaUpdate {
+    #[prost(string, tag = "1")]
+    pub call_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub tool_call_delta: Option<ToolCallDelta>,
+    #[prost(string, tag = "3")]
+    pub model_call_id: String,
+}
+
+/// Inner oneof for [`ToolCallDeltaUpdate`]. Task (tag 2) nests another
+/// InteractionUpdate and is left undecoded.
+#[derive(Clone, PartialEq, Message)]
+pub struct ToolCallDelta {
+    #[prost(message, optional, tag = "1")]
+    pub shell_tool_call_delta: Option<ShellToolCallDelta>,
+    #[prost(message, optional, tag = "3")]
+    pub edit_tool_call_delta: Option<EditToolCallDelta>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShellToolCallDelta {
+    #[prost(message, optional, tag = "1")]
+    pub stdout: Option<ShellStreamTextDelta>,
+    #[prost(message, optional, tag = "2")]
+    pub stderr: Option<ShellStreamTextDelta>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShellStreamTextDelta {
+    #[prost(string, tag = "1")]
+    pub content: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EditToolCallDelta {
+    #[prost(string, tag = "1")]
+    pub stream_content_delta: String,
 }
 
 /// ToolCall oneof (CLI 2026.07) — tools we map to Claude Code.
@@ -526,6 +589,9 @@ pub struct ToolCall {
     pub ask_question_tool_call: Option<AskQuestionToolCall>,
     #[prost(message, optional, tag = "24")]
     pub fetch_tool_call: Option<FetchToolCall>,
+    /// Distinct from `fetch_tool_call` (24). Cursor.app + 0xlane `agent_v1.proto`.
+    #[prost(message, optional, tag = "37")]
+    pub web_fetch_tool_call: Option<WebFetchToolCall>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -622,6 +688,13 @@ pub struct WebSearchArgs {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct FetchToolCall {
+    #[prost(message, optional, tag = "1")]
+    pub args: Option<FetchArgs>,
+}
+
+/// ToolCall tag 37. Args match `WebFetchArgs` (url=1, tool_call_id=2).
+#[derive(Clone, PartialEq, Message)]
+pub struct WebFetchToolCall {
     #[prost(message, optional, tag = "1")]
     pub args: Option<FetchArgs>,
 }
@@ -1411,5 +1484,106 @@ mod tests {
         );
         let decoded = RequestContextEnv::decode(&buf[..]).unwrap();
         assert_eq!(decoded.process_working_directory, "/tmp/cwd");
+    }
+
+    #[test]
+    fn interaction_update_partial_tool_call_uses_tag_7() {
+        let update = InteractionUpdate {
+            partial_tool_call: Some(PartialToolCall {
+                call_id: "mcp-1".into(),
+                model_call_id: "model-1".into(),
+                args_text_delta: r#"{"name":"deep-research"}"#.into(),
+                tool_call: Some(ToolCall {
+                    mcp_tool_call: Some(McpToolCall {
+                        args: Some(McpArgs {
+                            name: "Workflow".into(),
+                            tool_name: "Workflow".into(),
+                            tool_call_id: "mcp-1".into(),
+                            provider_identifier: "claude-local".into(),
+                            args: Default::default(),
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        update.encode(&mut buf).unwrap();
+        // Field 7, wire type 2 → tag 0x3a.
+        assert_eq!(buf[0], 0x3a, "partial_tool_call tag 7 missing in {buf:?}");
+        let decoded = InteractionUpdate::decode(&buf[..]).unwrap();
+        let partial = decoded.partial_tool_call.expect("partial_tool_call");
+        assert_eq!(partial.call_id, "mcp-1");
+        assert_eq!(partial.args_text_delta, r#"{"name":"deep-research"}"#);
+        assert_eq!(
+            partial
+                .tool_call
+                .unwrap()
+                .mcp_tool_call
+                .unwrap()
+                .args
+                .unwrap()
+                .tool_name,
+            "Workflow"
+        );
+    }
+
+    #[test]
+    fn interaction_update_tool_call_delta_uses_tag_15() {
+        let update = InteractionUpdate {
+            tool_call_delta: Some(ToolCallDeltaUpdate {
+                call_id: "edit-1".into(),
+                model_call_id: "model-1".into(),
+                tool_call_delta: Some(ToolCallDelta {
+                    edit_tool_call_delta: Some(EditToolCallDelta {
+                        stream_content_delta: "fn main() {}".into(),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        update.encode(&mut buf).unwrap();
+        // Field 15, wire type 2 → tag 0x7a.
+        assert_eq!(buf[0], 0x7a, "tool_call_delta tag 15 missing in {buf:?}");
+        let decoded = InteractionUpdate::decode(&buf[..]).unwrap();
+        let delta = decoded.tool_call_delta.expect("tool_call_delta");
+        assert_eq!(delta.call_id, "edit-1");
+        assert_eq!(
+            delta
+                .tool_call_delta
+                .unwrap()
+                .edit_tool_call_delta
+                .unwrap()
+                .stream_content_delta,
+            "fn main() {}"
+        );
+    }
+
+    #[test]
+    fn tool_call_web_fetch_uses_tag_37() {
+        let call = ToolCall {
+            web_fetch_tool_call: Some(WebFetchToolCall {
+                args: Some(FetchArgs {
+                    url: "https://example.com".into(),
+                    tool_call_id: "wf-1".into(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        call.encode(&mut buf).unwrap();
+        // Field 37, wire type 2 → tag 0xaa 0x02.
+        assert!(
+            buf.windows(2).any(|w| w == [0xaa, 0x02]),
+            "web_fetch_tool_call tag 37 missing in {buf:?}"
+        );
+        let decoded = ToolCall::decode(&buf[..]).unwrap();
+        let args = decoded.web_fetch_tool_call.unwrap().args.unwrap();
+        assert_eq!(args.url, "https://example.com");
+        assert_eq!(args.tool_call_id, "wf-1");
+        assert!(decoded.fetch_tool_call.is_none());
     }
 }
