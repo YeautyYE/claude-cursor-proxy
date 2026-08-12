@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.31 (2026-08-13)
+
+- Fix Cursor `Connect error 502: parse binary: invalid end group tag` on the first `/v1/messages` turn. `McpToolDefinition.input_schema` is now `google.protobuf.Value` (`struct_value`) with a minimal `{type:object}` schema; only Workflow / Skill / `mcp__*` are advertised. Encoding every Claude-local tool's full JSON Schema as a raw Struct made Cursor reject the Run. Empty `conversation_state` is omitted. RequestContext cwd is skipped when the path does not exist on this host (LAN/WSL). Connect END errors are logged and stored as terminal failures (TUI 200 was the SSE envelope; the real error is in the stream).
+
 ## v0.1.30 (2026-08-13)
 
 - Decode `ToolCallDelta.task` (tag 2): nested `TaskToolCallDelta.interaction_update` is boxed and processed one extra level so subagent `partial_tool_call` still fills ClientOnly MCP/Workflow args and nested text/`tool_use` is not dropped. Nested `turn_ended` does not end the parent Task.

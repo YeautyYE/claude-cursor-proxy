@@ -2218,7 +2218,13 @@ async fn process_live_frame(
             return false;
         }
         if let Some(error) = parse_connect_error(&frame.payload) {
-            let _ = emit_or_defer(sink, deferred, Err(error.to_string())).await;
+            let mut fields = serde_json::Map::new();
+            fields.insert("status".into(), serde_json::json!(error.status));
+            fields.insert("code".into(), serde_json::json!(error.code));
+            fields.insert("message".into(), serde_json::json!(error.message));
+            crate::logging::create_logger("cursor").warn("connect_end_error", Some(fields));
+            report_terminal_error(sink, terminal_error, error.to_string()).await;
+            return false;
         } else {
             // Connect END without turn_ended used to emit bare End → silent
             // Anthropic Out:0. Mirror the turn_ended empty-note recovery.

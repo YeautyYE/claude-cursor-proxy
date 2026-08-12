@@ -158,8 +158,10 @@ pub struct McpTools {
 
 /// Maps to `agent.v1.McpToolDefinition` (Cursor CLI 2026.07).
 ///
-/// Tag 3 is a `google.protobuf.Struct` (JSON object), not a JSON string.
-/// Tags 4/5 identify the MCP provider + tool name for routing.
+/// Tag 3 is `google.protobuf.Value` wrapping a Struct (`struct_value`).
+/// Encoding a raw Struct here makes Cursor see tag 1 as a length-delimited
+/// map entry where Value's tag 1 is `null_value` (varint) — live symptom
+/// `parse binary: invalid end group tag`. Tags 4/5 are MCP routing.
 #[derive(Clone, PartialEq, Message)]
 pub struct McpTool {
     #[prost(string, tag = "1")]
@@ -167,7 +169,7 @@ pub struct McpTool {
     #[prost(string, tag = "2")]
     pub description: String,
     #[prost(message, optional, tag = "3")]
-    pub input_schema: Option<prost_types::Struct>,
+    pub input_schema: Option<prost_types::Value>,
     #[prost(string, tag = "4")]
     pub provider_identifier: String,
     #[prost(string, tag = "5")]

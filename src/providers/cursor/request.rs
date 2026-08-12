@@ -134,6 +134,23 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
     !name.is_empty() && !is_cursor_native_tool_name(name)
 }
 
+/// Tools Cursor should see on `RunRequest.mcp_tools`. Broader Claude-local
+/// names still go in the prompt `<tools>` dump for XML recovery.
+fn advertise_as_cursor_mcp(name: &str) -> bool {
+    let bare = strip_mcp_provider_prefix(name);
+    bare.eq_ignore_ascii_case("Workflow")
+        || bare.eq_ignore_ascii_case("Skill")
+        || bare.starts_with("mcp__")
+}
+
+fn mcp_input_schema_value() -> prost_types::Value {
+    let schema = json_to_prost_struct(&serde_json::json!({ "type": "object" }))
+        .expect("minimal object schema");
+    prost_types::Value {
+        kind: Some(prost_types::value::Kind::StructValue(schema)),
+    }
+}
+
 /// Cursor may qualify MCP names as `provider/tool` or `provider:tool`
 /// (`claude-local/Workflow`). Anthropic `tools[].name` is the bare tool.
 pub(crate) fn strip_mcp_provider_prefix(name: &str) -> &str {
@@ -163,32 +180,33 @@ pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
 /// field, Workflow/Skill are never called and turns end empty after thinking.
 ///
 /// Wire shape must match `agent.v1.McpToolDefinition`: `input_schema` is a
-/// `google.protobuf.Struct` (not a JSON string), plus `provider_identifier` /
-/// `tool_name`.
+/// `google.protobuf.Value` (`struct_value`), plus `provider_identifier` /
+/// `tool_name`. Only Workflow / Skill / `mcp__*` are advertised — dumping
+/// every Claude-local tool (Task, AskUserQuestion, …) with full JSON Schema
+/// as a raw Struct made Cursor reject the Run with
+/// `parse binary: invalid end group tag`.
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
     let tools = req.extra.get("tools")?.as_array()?;
     let mapped: Vec<super::proto::McpTool> = tools
         .iter()
         .filter_map(|tool| {
             let name = tool.get("name")?.as_str()?.to_string();
-            if !is_claude_local_tool_name(&name) {
+            if !advertise_as_cursor_mcp(&name) {
                 return None;
             }
             let description = tool
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
-                .to_string();
-            let input_schema = tool
-                .get("input_schema")
-                .and_then(json_to_prost_struct)
-                .or_else(|| json_to_prost_struct(&serde_json::json!({})));
+                .chars()
+                .take(240)
+                .collect::<String>();
             Some(super::proto::McpTool {
                 tool_name: name.clone(),
                 provider_identifier: CLAUDE_LOCAL_MCP_PROVIDER.to_string(),
                 name,
                 description,
-                input_schema,
+                input_schema: Some(mcp_input_schema_value()),
             })
         })
         .collect();
@@ -271,7 +289,10 @@ fn request_context_from_cwd(
     cwd: Option<&str>,
     branch_hint: Option<&str>,
 ) -> super::proto::RequestContext {
-    let Some(cwd) = cwd.filter(|p| !p.is_empty()) else {
+    // Remote Claude Code (LAN/WSL) sends its own cwd in <system-reminder>.
+    // Filling RequestContext with a path that does not exist on this host is
+    // useless; skip rather than advertise a ghost workspace.
+    let Some(cwd) = cwd.filter(|p| !p.is_empty() && std::path::Path::new(p).exists()) else {
         return super::proto::RequestContext::default();
     };
     let git = git_identity(std::path::Path::new(cwd), branch_hint);
@@ -1014,12 +1035,39 @@ mod tests {
         let workflow = mcp.tools.iter().find(|t| t.name == "Workflow").unwrap();
         assert_eq!(workflow.tool_name, "Workflow");
         assert_eq!(workflow.provider_identifier, CLAUDE_LOCAL_MCP_PROVIDER);
-        let schema = workflow.input_schema.as_ref().expect("struct schema");
-        assert!(
-            schema.fields.contains_key("type") || schema.fields.contains_key("properties"),
-            "input_schema must be a protobuf Struct, not a JSON string"
-        );
-        assert!(schema.fields.contains_key("properties"));
+        match workflow.input_schema.as_ref().and_then(|v| v.kind.as_ref()) {
+            Some(prost_types::value::Kind::StructValue(schema)) => {
+                assert_eq!(
+                    schema.fields.get("type").and_then(|v| match &v.kind {
+                        Some(prost_types::value::Kind::StringValue(s)) => Some(s.as_str()),
+                        _ => None,
+                    }),
+                    Some("object")
+                );
+                assert!(
+                    !schema.fields.contains_key("properties"),
+                    "full JSON Schema must not be copied onto mcp_tools"
+                );
+            }
+            other => panic!("input_schema must be Value.struct_value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_local_mcp_tools_skips_task_and_ask_user_question() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "Task", "description": "task", "input_schema": {"type": "object"}},
+                {"name": "AskUserQuestion", "description": "ask", "input_schema": {"type": "object"}},
+                {"name": "Workflow", "description": "wf", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect("mcp tools");
+        let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Workflow"]);
     }
 
     #[test]
@@ -1036,25 +1084,20 @@ mod tests {
         let mcp = claude_local_mcp_tools(&req).expect("mcp tools");
         let mut bytes = Vec::new();
         mcp.encode(&mut bytes).unwrap();
-        // Tag 3 must be a length-delimited *message* (Struct). A JSON string
+        // Tag 3 must be a length-delimited *message* (Value). A JSON string
         // would also be length-delimited, but round-tripping through decode
-        // must recover Struct fields — not a string field.
+        // must recover struct_value — not a string field.
         let decoded = super::super::proto::McpTools::decode(&bytes[..]).unwrap();
         let tool = &decoded.tools[0];
         assert!(tool.input_schema.is_some());
         assert!(!tool.provider_identifier.is_empty());
         assert_eq!(tool.tool_name, "Workflow");
-        let props = tool
-            .input_schema
-            .as_ref()
-            .unwrap()
-            .fields
-            .get("properties")
-            .expect("properties field");
-        assert!(matches!(
-            props.kind,
-            Some(prost_types::value::Kind::StructValue(_))
-        ));
+        match tool.input_schema.as_ref().and_then(|v| v.kind.as_ref()) {
+            Some(prost_types::value::Kind::StructValue(schema)) => {
+                assert!(schema.fields.contains_key("type"));
+            }
+            other => panic!("expected Value.struct_value, got {other:?}"),
+        }
     }
 
     #[test]
