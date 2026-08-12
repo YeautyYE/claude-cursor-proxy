@@ -230,6 +230,11 @@ pub struct CursorModelResolution {
 /// Keeps the full catalog `model_id` (already validated live) and additionally
 /// sends `thinking` / `effort` / `context` when derivable, matching CLI
 /// `cli-config.json` selectedModel.parameters.
+///
+/// Anthropic Messages `thinking` / `max_tokens` / `tool_choice` are **not**
+/// inputs: AgentRunRequest has no such fields (see proto.rs). Overlaying
+/// `thinking.enabled` here would duplicate catalog-id effort (e.g.
+/// `claude-fable-5-thinking-max` already sets `thinking=true`, `effort=max`).
 pub fn requested_model_parameters(
     model_id: &str,
 ) -> Vec<crate::providers::cursor::proto::ModelParameter> {
@@ -373,6 +378,23 @@ mod tests {
         assert_eq!(map.get("thinking").map(String::as_str), Some("true"));
         assert_eq!(map.get("effort").map(String::as_str), Some("max"));
         assert_eq!(map.get("context").map(String::as_str), Some("1m"));
+    }
+
+    #[test]
+    fn non_thinking_catalog_id_does_not_invent_thinking_param() {
+        // Anthropic Messages `thinking` is not an input to this function.
+        // A catalog id without a thinking/effort suffix must not grow those
+        // parameters (do not duplicate Anthropic generation controls here).
+        let params = requested_model_parameters("composer-2.5");
+        let ids: Vec<&str> = params.iter().map(|p| p.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"thinking"),
+            "composer-2.5 must not get thinking=true from a fake Anthropic overlay: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"effort"),
+            "composer-2.5 must not get an invented effort param: {ids:?}"
+        );
     }
 
     #[test]

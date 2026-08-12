@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.30 (2026-08-13)
+
+- Decode `ToolCallDelta.task` (tag 2): nested `TaskToolCallDelta.interaction_update` is boxed and processed one extra level so subagent `partial_tool_call` still fills ClientOnly MCP/Workflow args and nested text/`tool_use` is not dropped. Nested `turn_ended` does not end the parent Task.
+
 ## v0.1.29 (2026-08-13)
 
 - Decode Cursor `InteractionUpdate.partial_tool_call` (tag 7) and `tool_call_delta` (tag 15). Streamed MCP/Workflow JSON in `args_text_delta` is merged into ClientOnly `tool_use.input` so Fable cannot expose Workflow with an empty object.

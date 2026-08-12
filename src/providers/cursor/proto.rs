@@ -53,9 +53,26 @@ pub struct RunRequest {
     // Tag 6 `mcp_file_system_options` and tag 7 `skill_options` exist on
     // `agent.v1.AgentRunRequest`. Official CLI live construction omits empty
     // `skill_options`; skills go on RequestContext.agent_skills (tag 29).
-    // Do not send empty SkillOptions. No thinking / max_tokens / tool_choice
-    // fields exist on AgentRunRequest — thinking/effort/context are
-    // RequestedModel.parameters (see model.rs).
+    // Do not send empty SkillOptions.
+    //
+    // Anthropic Messages `thinking` / `max_tokens` / `tool_choice` have **no**
+    // AgentRunRequest fields. Verified 2026-08:
+    // - Cursor.app `cursor-agent-exec` + `workbench.desktop.main.js`: tags 1–23
+    //   (conversation_state, action, model_details, mcp_tools, conversation_id,
+    //   mcp_file_system_options, skill_options, custom_system_prompt,
+    //   requested_model, suggest_next_prompt, subagent_type_name,
+    //   exclude_workspace_context, harness, selected_subagent_models,
+    //   selected_subagent_model_details, conversation_group_id,
+    //   pre_fetched_blobs, dev_raw_model_slug, client_supports_inline_images,
+    //   subagent_model_overrides, can_create_cloud_subagents,
+    //   suppress_subagent_progress_update_tool, client_supports_send_to_user).
+    // - 0xlane `docs/proto/agent_v1.proto`: tags 1–18, same names, no extras.
+    // - claudedocs/cursor-cli-reverse-2026-07.md §4.3 (CLI 2026.07 extract).
+    // `tool_choice` does not appear as a proto field name in cursor-agent-exec.
+    // `max_tokens` exists only on ConversationTokenDetails (usage window), not
+    // this message. Nested RequestedModel.parameters (`thinking`/`effort`/
+    // `context`) are catalog-id derived in model.rs — do not overlay Anthropic
+    // generation controls onto them.
     // RequestContext is NOT a RunRequest field; the server asks via
     // ExecServerMessage.request_context_args (tag 10) and the client replies
     // ExecClientMessage.request_context_result (tag 10).
@@ -471,7 +488,8 @@ pub struct InteractionUpdate {
     #[prost(message, optional, tag = "14")]
     pub turn_ended: Option<TurnEnded>,
     /// Shell/edit/task stream deltas (CLI `ToolCallDeltaUpdate`). MCP/Workflow
-    /// args stream on `partial_tool_call`, not here.
+    /// args usually stream on `partial_tool_call`; a Task delta (tag 2) may
+    /// nest another InteractionUpdate that itself carries `partial_tool_call`.
     #[prost(message, optional, tag = "15")]
     pub tool_call_delta: Option<ToolCallDeltaUpdate>,
 }
@@ -524,14 +542,47 @@ pub struct ToolCallDeltaUpdate {
     pub model_call_id: String,
 }
 
-/// Inner oneof for [`ToolCallDeltaUpdate`]. Task (tag 2) nests another
-/// InteractionUpdate and is left undecoded.
+/// Inner oneof for [`ToolCallDeltaUpdate`].
+///
+/// Cursor.app + 0xlane `agent_v1.proto`:
+/// `shell=1`, `task=2` (`TaskToolCallDelta` → nested `InteractionUpdate`),
+/// `edit=3`. Cursor.app also has `replace_env=4` (not decoded here).
+/// Nested `InteractionUpdate` is boxed so the type is finite; live/buffered
+/// processing applies [`MAX_TASK_DELTA_NEST`] extra level(s).
 #[derive(Clone, PartialEq, Message)]
 pub struct ToolCallDelta {
     #[prost(message, optional, tag = "1")]
     pub shell_tool_call_delta: Option<ShellToolCallDelta>,
+    #[prost(message, optional, tag = "2")]
+    pub task_tool_call_delta: Option<TaskToolCallDelta>,
     #[prost(message, optional, tag = "3")]
     pub edit_tool_call_delta: Option<EditToolCallDelta>,
+}
+
+/// `agent.v1.TaskToolCallDelta` — `interaction_update = 1`.
+#[derive(Clone, PartialEq, Message)]
+pub struct TaskToolCallDelta {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub interaction_update: Option<Box<InteractionUpdate>>,
+}
+
+/// Nested Task deltas recurse (`ToolCallDelta` → `TaskToolCallDelta` →
+/// `InteractionUpdate` → `ToolCallDelta`). Process one extra level only.
+pub const MAX_TASK_DELTA_NEST: u8 = 1;
+
+impl ToolCallDeltaUpdate {
+    pub fn into_nested_task_update(self) -> Option<Box<InteractionUpdate>> {
+        self.tool_call_delta
+            .and_then(|d| d.task_tool_call_delta)
+            .and_then(|t| t.interaction_update)
+    }
+
+    pub fn nested_task_update(&self) -> Option<&InteractionUpdate> {
+        self.tool_call_delta
+            .as_ref()
+            .and_then(|d| d.task_tool_call_delta.as_ref())
+            .and_then(|t| t.interaction_update.as_deref())
+    }
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1418,6 +1469,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_run_request_encodes_to_zero_bytes() {
+        // Cursor.app AgentRunRequest tags 1–23 have no thinking / max_tokens /
+        // tool_choice. Default must not invent those (or any) tags on the wire.
+        let req = RunRequest::default();
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        assert!(buf.is_empty(), "empty RunRequest must stay wire-empty");
+    }
+
+    #[test]
     fn populated_request_context_uses_cli_env_git_and_skill_tags() {
         let ctx = RequestContext {
             env: Some(RequestContextEnv {
@@ -1585,5 +1646,115 @@ mod tests {
         assert_eq!(args.url, "https://example.com");
         assert_eq!(args.tool_call_id, "wf-1");
         assert!(decoded.fetch_tool_call.is_none());
+    }
+
+    #[test]
+    fn tool_call_delta_task_nests_interaction_update_tag_2() {
+        let nested = InteractionUpdate {
+            partial_tool_call: Some(PartialToolCall {
+                call_id: "mcp-nested".into(),
+                model_call_id: "model-1".into(),
+                args_text_delta: r#"{"name":"deep-research"}"#.into(),
+                tool_call: None,
+            }),
+            text_delta: Some(TextDelta {
+                text: "subagent".into(),
+            }),
+            ..Default::default()
+        };
+        let delta = ToolCallDelta {
+            task_tool_call_delta: Some(TaskToolCallDelta {
+                interaction_update: Some(Box::new(nested)),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        delta.encode(&mut buf).unwrap();
+        // Field 2, wire type 2 → tag 0x12.
+        assert_eq!(
+            buf[0], 0x12,
+            "task_tool_call_delta tag 2 missing in {buf:?}"
+        );
+        let decoded = ToolCallDelta::decode(&buf[..]).unwrap();
+        assert!(decoded.shell_tool_call_delta.is_none());
+        assert!(decoded.edit_tool_call_delta.is_none());
+        let nested = decoded
+            .task_tool_call_delta
+            .expect("task_tool_call_delta")
+            .interaction_update
+            .expect("nested InteractionUpdate");
+        assert_eq!(
+            nested.partial_tool_call.unwrap().args_text_delta,
+            r#"{"name":"deep-research"}"#
+        );
+        assert_eq!(nested.text_delta.unwrap().text, "subagent");
+    }
+
+    #[test]
+    fn interaction_update_tool_call_delta_task_round_trips_nested_partial() {
+        let update = InteractionUpdate {
+            tool_call_delta: Some(ToolCallDeltaUpdate {
+                call_id: "task-1".into(),
+                model_call_id: "model-1".into(),
+                tool_call_delta: Some(ToolCallDelta {
+                    task_tool_call_delta: Some(TaskToolCallDelta {
+                        interaction_update: Some(Box::new(InteractionUpdate {
+                            partial_tool_call: Some(PartialToolCall {
+                                call_id: "mcp-nested".into(),
+                                model_call_id: "model-1".into(),
+                                args_text_delta: r#"{"name":"deep-research"}"#.into(),
+                                tool_call: None,
+                            }),
+                            ..Default::default()
+                        })),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        update.encode(&mut buf).unwrap();
+        assert_eq!(buf[0], 0x7a, "tool_call_delta tag 15 missing in {buf:?}");
+        let decoded = InteractionUpdate::decode(&buf[..]).unwrap();
+        let nested = decoded
+            .tool_call_delta
+            .as_ref()
+            .and_then(ToolCallDeltaUpdate::nested_task_update)
+            .expect("nested task InteractionUpdate");
+        assert_eq!(
+            nested.partial_tool_call.as_ref().unwrap().call_id,
+            "mcp-nested"
+        );
+        // A second nested Task delta still decodes (boxed) so the type is
+        // finite; live processing caps at MAX_TASK_DELTA_NEST.
+        let twice = InteractionUpdate {
+            tool_call_delta: Some(ToolCallDeltaUpdate {
+                call_id: "task-outer".into(),
+                model_call_id: "model-1".into(),
+                tool_call_delta: Some(ToolCallDelta {
+                    task_tool_call_delta: Some(TaskToolCallDelta {
+                        interaction_update: Some(Box::new(decoded)),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf2 = Vec::new();
+        twice.encode(&mut buf2).unwrap();
+        let round = InteractionUpdate::decode(&buf2[..]).unwrap();
+        let inner = round
+            .tool_call_delta
+            .as_ref()
+            .and_then(ToolCallDeltaUpdate::nested_task_update)
+            .and_then(|u| u.tool_call_delta.as_ref())
+            .and_then(ToolCallDeltaUpdate::nested_task_update)
+            .expect("second nested level present on wire");
+        assert_eq!(
+            inner.partial_tool_call.as_ref().unwrap().args_text_delta,
+            r#"{"name":"deep-research"}"#
+        );
+        assert_eq!(MAX_TASK_DELTA_NEST, 1);
     }
 }

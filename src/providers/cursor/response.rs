@@ -187,54 +187,74 @@ fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEv
     }
 
     if let Some(ref update) = msg.interaction_update {
-        // Thinking delta
-        if let Some(ref td) = update.thinking_delta
-            && !td.text.is_empty()
-        {
-            events.push(CursorStreamEvent::ThinkingDelta {
-                text: td.text.clone(),
-            });
-        }
+        push_interaction_stream_events(update, events, 0);
+    }
+}
 
-        // Text delta
-        if let Some(ref td) = update.text_delta
-            && !td.text.is_empty()
-        {
-            events.push(CursorStreamEvent::TextDelta {
-                text: td.text.clone(),
-            });
-        }
+fn push_interaction_stream_events(
+    update: &super::proto::InteractionUpdate,
+    events: &mut Vec<CursorStreamEvent>,
+    nest_depth: u8,
+) {
+    if let Some(ref td) = update.thinking_delta
+        && !td.text.is_empty()
+    {
+        events.push(CursorStreamEvent::ThinkingDelta {
+            text: td.text.clone(),
+        });
+    }
 
-        // tool_call_started/completed belong to Cursor's UI transcript. Local
-        // execution is requested separately by ExecServerMessage and only that
-        // message carries the ids needed to return a native result.
-        // `partial_tool_call` / `tool_call_delta` are decoded on the prost
-        // struct; MCP arg accumulation for ClientOnly lives on the live BiDi path.
+    if let Some(ref td) = update.text_delta
+        && !td.text.is_empty()
+    {
+        events.push(CursorStreamEvent::TextDelta {
+            text: td.text.clone(),
+        });
+    }
 
-        // Token delta is an incremental output/thinking signal — never a full
-        // usage snapshot. Mapping it to Usage{input:0,..} previously wiped the
-        // status bar down to In:1 Out:N.
-        if let Some(ref td) = update.token_delta
-            && td.tokens > 0
-        {
-            events.push(CursorStreamEvent::OutputTokenDelta {
-                tokens: td.tokens as u64,
-            });
-        }
+    // tool_call_started/completed belong to Cursor's UI transcript. Local
+    // execution is requested separately by ExecServerMessage and only that
+    // message carries the ids needed to return a native result.
+    // Nested Task deltas (tag 2) carry another InteractionUpdate — flatten
+    // one level so subagent text is not dropped. MCP arg accumulation for
+    // ClientOnly lives on the live BiDi path.
+    if nest_depth < super::proto::MAX_TASK_DELTA_NEST
+        && let Some(nested) = update
+            .tool_call_delta
+            .as_ref()
+            .and_then(super::proto::ToolCallDeltaUpdate::nested_task_update)
+    {
+        push_interaction_stream_events(nested, events, nest_depth + 1);
+    }
 
-        // Turn ended (usage + end) — fields are optional on wire
-        if let Some(ref te) = update.turn_ended {
-            events.push(CursorStreamEvent::Usage {
-                input_tokens: te.input_tokens.unwrap_or(0),
-                output_tokens: te
-                    .output_tokens
-                    .unwrap_or(0)
-                    .saturating_add(te.reasoning_tokens.unwrap_or(0)),
-                cache_read_tokens: te.cache_read_tokens.unwrap_or(0),
-                cache_write_tokens: te.cache_write_tokens.unwrap_or(0),
-            });
-            events.push(CursorStreamEvent::End);
-        }
+    if nest_depth > 0 {
+        // Nested turn_ended must not end the parent Task stream.
+        return;
+    }
+
+    // Token delta is an incremental output/thinking signal — never a full
+    // usage snapshot. Mapping it to Usage{input:0,..} previously wiped the
+    // status bar down to In:1 Out:N.
+    if let Some(ref td) = update.token_delta
+        && td.tokens > 0
+    {
+        events.push(CursorStreamEvent::OutputTokenDelta {
+            tokens: td.tokens as u64,
+        });
+    }
+
+    // Turn ended (usage + end) — fields are optional on wire
+    if let Some(ref te) = update.turn_ended {
+        events.push(CursorStreamEvent::Usage {
+            input_tokens: te.input_tokens.unwrap_or(0),
+            output_tokens: te
+                .output_tokens
+                .unwrap_or(0)
+                .saturating_add(te.reasoning_tokens.unwrap_or(0)),
+            cache_read_tokens: te.cache_read_tokens.unwrap_or(0),
+            cache_write_tokens: te.cache_write_tokens.unwrap_or(0),
+        });
+        events.push(CursorStreamEvent::End);
     }
 }
 
@@ -546,6 +566,117 @@ mod tests {
                 .unwrap()
                 .call_id,
             "edit-1"
+        );
+    }
+
+    #[test]
+    fn nested_task_delta_text_surfaces_without_ending_parent() {
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                tool_call_delta: Some(ToolCallDeltaUpdate {
+                    call_id: "task-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call_delta: Some(ToolCallDelta {
+                        task_tool_call_delta: Some(TaskToolCallDelta {
+                            interaction_update: Some(Box::new(InteractionUpdate {
+                                text_delta: Some(TextDelta {
+                                    text: "from subagent".into(),
+                                }),
+                                turn_ended: Some(TurnEnded {
+                                    output_tokens: Some(3),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            })),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let body = encode_connect_frame(&payload, 0).to_vec();
+        let events = decode_upstream_response(&body).unwrap();
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, ["from subagent"]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CursorStreamEvent::End | CursorStreamEvent::Usage { .. })),
+            "nested turn_ended must not end the parent: {events:?}"
+        );
+    }
+
+    #[test]
+    fn nested_task_delta_second_level_text_is_not_flattened() {
+        let inner = InteractionUpdate {
+            text_delta: Some(TextDelta {
+                text: "secret".into(),
+            }),
+            ..Default::default()
+        };
+        let mid = InteractionUpdate {
+            text_delta: Some(TextDelta {
+                text: "visible".into(),
+            }),
+            tool_call_delta: Some(ToolCallDeltaUpdate {
+                call_id: "task-inner".into(),
+                model_call_id: "model-1".into(),
+                tool_call_delta: Some(ToolCallDelta {
+                    task_tool_call_delta: Some(TaskToolCallDelta {
+                        interaction_update: Some(Box::new(inner)),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                tool_call_delta: Some(ToolCallDeltaUpdate {
+                    call_id: "task-outer".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call_delta: Some(ToolCallDelta {
+                        task_tool_call_delta: Some(TaskToolCallDelta {
+                            interaction_update: Some(Box::new(mid)),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let body = encode_connect_frame(&payload, 0).to_vec();
+        let events = decode_upstream_response(&body).unwrap();
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, ["visible"]);
+        assert!(
+            !text.iter().any(|t| t.contains("secret")),
+            "second nested Task level must stay capped: {events:?}"
         );
     }
 

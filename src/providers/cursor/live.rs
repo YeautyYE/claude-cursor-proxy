@@ -38,9 +38,9 @@ use super::proto::{
     AskQuestionInteractionResponse, AskQuestionRejected, AskQuestionResult, ClientHeartbeat,
     CreatePlanRequestResponse, CreatePlanResult, CreatePlanSuccess, ExecClientMessage,
     GetBlobResult, InteractionApproved, InteractionQuery, InteractionRejected, InteractionResponse,
-    KvClientMessage, KvServerMessage, McpAuthRequestResponse, RequestContext, RequestContextResult,
-    RequestContextSuccess, SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse,
-    WebSearchRequestResponse,
+    InteractionUpdate, KvClientMessage, KvServerMessage, MAX_TASK_DELTA_NEST,
+    McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
+    SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
 use super::request::{
     CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, cursor_request_context_from_text,
@@ -2427,286 +2427,355 @@ async fn process_live_frame(
     }
 
     if let Some(update) = message.interaction_update {
-        if let Some(partial) = update.partial_tool_call {
-            logical_tools_waiting.remember_partial_args(
-                &partial.call_id,
-                &partial.model_call_id,
-                &partial.args_text_delta,
+        return process_interaction_update(
+            update,
+            outbound,
+            sink,
+            deferred,
+            pending,
+            pending_shared,
+            terminal_error,
+            allowed_tool_names,
+            saw_text,
+            useful,
+            logical_tools_waiting,
+            last_progress,
+            xml_parser,
+            &mut turn_ctx,
+            0,
+        )
+        .await;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_interaction_update(
+    update: InteractionUpdate,
+    outbound: &ClientOutbound,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    saw_text: &mut bool,
+    useful: &mut bool,
+    logical_tools_waiting: &mut LogicalToolTracker,
+    last_progress: &mut Instant,
+    xml_parser: &mut CursorToolUseXmlParser,
+    turn_ctx: &mut Option<&mut LiveTurnCtx<'_>>,
+    task_nest_depth: u8,
+) -> bool {
+    if let Some(partial) = update.partial_tool_call {
+        logical_tools_waiting.remember_partial_args(
+            &partial.call_id,
+            &partial.model_call_id,
+            &partial.args_text_delta,
+        );
+        *last_progress = Instant::now();
+        *useful = true;
+    }
+    if let Some(delta) = update.tool_call_delta {
+        if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
+            eprintln!(
+                "[ccp-cursor] tool_call_delta call_id={} nested_task={}",
+                delta.call_id,
+                delta.nested_task_update().is_some()
             );
-            *last_progress = Instant::now();
-            *useful = true;
         }
-        if let Some(delta) = update.tool_call_delta {
-            // Shell/edit/task stream only — MCP/Workflow args use partial_tool_call.
-            if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
-                eprintln!(
-                    "[ccp-cursor] tool_call_delta call_id={} (not MCP args)",
-                    delta.call_id
-                );
-            }
-            *last_progress = Instant::now();
-        }
-        if let Some(started) = update.tool_call_started {
-            // Claude-local tools advertised via RunRequest.mcp_tools arrive as
-            // MCP tool_call_started (not ExecServerMessage). Expose immediately
-            // so Claude Code can fulfill Workflow/Skill locally.
-            if let Some(mut mapped) = map_tool_call_started(&started) {
-                let streamed = logical_tools_waiting
-                    .partial_args_for(&started.call_id, &started.model_call_id)
-                    .map(str::to_owned);
-                if let Some(args_text) = streamed.as_deref() {
-                    merge_partial_args_json(&mut mapped, args_text);
-                }
-                let provider = mcp_provider_identifier(&started);
-                if started
-                    .tool_call
-                    .as_ref()
-                    .and_then(|tc| tc.web_fetch_tool_call.as_ref())
-                    .is_some()
-                {
-                    // Cursor-native WebFetch (ToolCall tag 37). Nested Anthropic
-                    // hosted web_fetch is emulated on the Messages path; this
-                    // frame is UI/exec transcript, not ClientOnly.
-                    if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
-                        eprintln!(
-                            "[ccp-cursor] web_fetch_tool_call ignored (hosted web_fetch emulator covers nested Anthropic)"
-                        );
-                    }
-                }
-                if let Some(emit_name) =
-                    client_only_anthropic_name(&mapped.name, provider, allowed_tool_names)
-                {
-                    if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
-                        eprintln!(
-                            "[ccp-cursor] mcp tool_call_started → ClientOnly {} (wire={})",
-                            emit_name, mapped.name
-                        );
-                    }
-                    if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
-                        return false;
-                    }
-                    let mut exec = mcp_client_only_pending_exec(&mapped);
-                    exec.claude_name = emit_name;
-                    pending.queue(exec, Duration::ZERO);
-                    return expose_collected_tools(pending, pending_shared, sink).await;
-                }
-                if mapped.name == "AskUserQuestion"
-                    && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
-                {
-                    if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
-                        return false;
-                    }
-                    let mut exec = mcp_client_only_pending_exec(&mapped);
-                    exec.claude_name = emit_name;
-                    exec.claude_input = ask_user_question_input_from_mapped(&mapped.input);
-                    pending.queue(exec, Duration::ZERO);
-                    *useful = true;
-                    *last_progress = Instant::now();
-                    return expose_collected_tools(pending, pending_shared, sink).await;
-                }
-            }
-            // Native UI transcript only. Execution is driven by ExecServerMessage,
-            // otherwise tool_call_started + exec duplicates.
-            logical_tools_waiting.started(&started.call_id, &started.model_call_id);
-            *useful = true;
-            *last_progress = Instant::now();
-        }
-        if let Some(completed) = update.tool_call_completed {
-            logical_tools_waiting.completed(&completed.call_id, &completed.model_call_id);
-            *last_progress = Instant::now();
-        }
-        if let Some(thinking) = update.thinking_delta
-            && !thinking.text.is_empty()
+        *last_progress = Instant::now();
+        if task_nest_depth < MAX_TASK_DELTA_NEST
+            && let Some(nested) = delta.into_nested_task_update()
         {
             *useful = true;
-            *last_progress = Instant::now();
-            if !emit_live_delta(
+            if !Box::pin(process_interaction_update(
+                *nested,
+                outbound,
                 sink,
                 deferred,
-                CursorStreamEvent::ThinkingDelta {
-                    text: thinking.text,
-                },
-                turn_ctx.as_deref_mut(),
-            )
+                pending,
+                pending_shared,
+                terminal_error,
+                allowed_tool_names,
+                saw_text,
+                useful,
+                logical_tools_waiting,
+                last_progress,
+                xml_parser,
+                turn_ctx,
+                task_nest_depth + 1,
+            ))
             .await
             {
                 return false;
             }
         }
-        if update.heartbeat.is_some() {
-            // Server keep-alive during quiet thinking — refresh idle timers so
-            // we do not invent End / stall while BiDi is still healthy.
-            *last_progress = Instant::now();
+    }
+    if let Some(started) = update.tool_call_started {
+        // Claude-local tools advertised via RunRequest.mcp_tools arrive as
+        // MCP tool_call_started (not ExecServerMessage). Expose immediately
+        // so Claude Code can fulfill Workflow/Skill locally.
+        if let Some(mut mapped) = map_tool_call_started(&started) {
+            let streamed = logical_tools_waiting
+                .partial_args_for(&started.call_id, &started.model_call_id)
+                .map(str::to_owned);
+            if let Some(args_text) = streamed.as_deref() {
+                merge_partial_args_json(&mut mapped, args_text);
+            }
+            let provider = mcp_provider_identifier(&started);
+            if started
+                .tool_call
+                .as_ref()
+                .and_then(|tc| tc.web_fetch_tool_call.as_ref())
+                .is_some()
+            {
+                // Cursor-native WebFetch (ToolCall tag 37). Nested Anthropic
+                // hosted web_fetch is emulated on the Messages path; this
+                // frame is UI/exec transcript, not ClientOnly.
+                if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
+                    eprintln!(
+                        "[ccp-cursor] web_fetch_tool_call ignored (hosted web_fetch emulator covers nested Anthropic)"
+                    );
+                }
+            }
+            if let Some(emit_name) =
+                client_only_anthropic_name(&mapped.name, provider, allowed_tool_names)
+            {
+                if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
+                    eprintln!(
+                        "[ccp-cursor] mcp tool_call_started → ClientOnly {} (wire={})",
+                        emit_name, mapped.name
+                    );
+                }
+                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                    return false;
+                }
+                let mut exec = mcp_client_only_pending_exec(&mapped);
+                exec.claude_name = emit_name;
+                pending.queue(exec, Duration::ZERO);
+                return expose_collected_tools(pending, pending_shared, sink).await;
+            }
+            if mapped.name == "AskUserQuestion"
+                && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
+            {
+                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                    return false;
+                }
+                let mut exec = mcp_client_only_pending_exec(&mapped);
+                exec.claude_name = emit_name;
+                exec.claude_input = ask_user_question_input_from_mapped(&mapped.input);
+                pending.queue(exec, Duration::ZERO);
+                *useful = true;
+                *last_progress = Instant::now();
+                return expose_collected_tools(pending, pending_shared, sink).await;
+            }
         }
-        if let Some(text) = update.text_delta
-            && !text.text.is_empty()
+        // Native UI transcript only. Execution is driven by ExecServerMessage,
+        // otherwise tool_call_started + exec duplicates.
+        logical_tools_waiting.started(&started.call_id, &started.model_call_id);
+        *useful = true;
+        *last_progress = Instant::now();
+    }
+    if let Some(completed) = update.tool_call_completed {
+        logical_tools_waiting.completed(&completed.call_id, &completed.model_call_id);
+        *last_progress = Instant::now();
+    }
+    if let Some(thinking) = update.thinking_delta
+        && !thinking.text.is_empty()
+    {
+        *useful = true;
+        *last_progress = Instant::now();
+        if !emit_live_delta(
+            sink,
+            deferred,
+            CursorStreamEvent::ThinkingDelta {
+                text: thinking.text,
+            },
+            turn_ctx.as_deref_mut(),
+        )
+        .await
         {
-            *useful = true;
-            *last_progress = Instant::now();
-            let recovered = xml_parser.push(&text.text);
-            for evt in recovered {
-                match evt {
-                    RecoveredCursorEvent::Text(t) if !t.is_empty() => {
+            return false;
+        }
+    }
+    if update.heartbeat.is_some() {
+        // Server keep-alive during quiet thinking — refresh idle timers so
+        // we do not invent End / stall while BiDi is still healthy.
+        *last_progress = Instant::now();
+    }
+    if let Some(text) = update.text_delta
+        && !text.text.is_empty()
+    {
+        *useful = true;
+        *last_progress = Instant::now();
+        let recovered = xml_parser.push(&text.text);
+        for evt in recovered {
+            match evt {
+                RecoveredCursorEvent::Text(t) if !t.is_empty() => {
+                    *saw_text = true;
+                    if !emit_live_delta(
+                        sink,
+                        deferred,
+                        CursorStreamEvent::TextDelta { text: t },
+                        turn_ctx.as_deref_mut(),
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
+                RecoveredCursorEvent::Text(_) => {}
+                RecoveredCursorEvent::ToolUse(tool_use) => {
+                    // Claude-local tools (Workflow/Skill/…) appear as XML in
+                    // Fable text when advertised via `<tools>`. Native
+                    // Read/Bash still come through ExecServerMessage.
+                    if let Some(emit_name) =
+                        client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
+                    {
+                        let mut exec = client_only_pending_exec(&tool_use);
+                        exec.claude_name = emit_name;
+                        // Expose immediately — Cursor may turn_ended right
+                        // after the XML in the same chunk; waiting for the
+                        // outer select would race into "pending native tools".
+                        pending.queue(exec, Duration::ZERO);
+                        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                            return false;
+                        }
+                        if !expose_collected_tools(pending, pending_shared, sink).await {
+                            return false;
+                        }
+                    } else if !tool_use.name.is_empty() {
+                        // Unknown / native-shaped XML: keep visible as text
+                        // so we do not invent a fake Claude tool_use.
+                        let input_json = serde_json::to_string(&tool_use.input)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let visible = format!(
+                            "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
+                            tool_use.id, tool_use.name
+                        );
                         *saw_text = true;
-                        if !emit_live_delta(
+                        if !emit_cursor_or_defer(
                             sink,
                             deferred,
-                            CursorStreamEvent::TextDelta { text: t },
-                            turn_ctx.as_deref_mut(),
+                            CursorStreamEvent::TextDelta { text: visible },
                         )
                         .await
                         {
                             return false;
                         }
                     }
-                    RecoveredCursorEvent::Text(_) => {}
-                    RecoveredCursorEvent::ToolUse(tool_use) => {
-                        // Claude-local tools (Workflow/Skill/…) appear as XML in
-                        // Fable text when advertised via `<tools>`. Native
-                        // Read/Bash still come through ExecServerMessage.
-                        if let Some(emit_name) =
-                            client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
-                        {
-                            let mut exec = client_only_pending_exec(&tool_use);
-                            exec.claude_name = emit_name;
-                            // Expose immediately — Cursor may turn_ended right
-                            // after the XML in the same chunk; waiting for the
-                            // outer select would race into "pending native tools".
-                            pending.queue(exec, Duration::ZERO);
-                            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await
-                            {
-                                return false;
-                            }
-                            if !expose_collected_tools(pending, pending_shared, sink).await {
-                                return false;
-                            }
-                        } else if !tool_use.name.is_empty() {
-                            // Unknown / native-shaped XML: keep visible as text
-                            // so we do not invent a fake Claude tool_use.
-                            let input_json = serde_json::to_string(&tool_use.input)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            let visible = format!(
-                                "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
-                                tool_use.id, tool_use.name
-                            );
-                            *saw_text = true;
-                            if !emit_cursor_or_defer(
-                                sink,
-                                deferred,
-                                CursorStreamEvent::TextDelta { text: visible },
-                            )
-                            .await
-                            {
-                                return false;
-                            }
-                        }
-                    }
                 }
             }
         }
-        if let Some(tokens) = update.token_delta
-            && tokens.tokens > 0
-        {
-            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
-                return false;
-            }
-            if !emit_cursor_or_defer(
-                sink,
-                deferred,
-                CursorStreamEvent::OutputTokenDelta {
-                    tokens: tokens.tokens as u64,
-                },
-            )
-            .await
-            {
-                return false;
-            }
-        }
-        if let Some(turn) = update.turn_ended {
-            // Flush trailing `<tool_use>` still in the XML buffer — Fable often
-            // closes the turn in the same InteractionUpdate as Workflow XML.
-            if !flush_xml_tool_uses(
-                xml_parser,
-                pending,
-                pending_shared,
-                sink,
-                deferred,
-                allowed_tool_names,
-                saw_text,
-                useful,
-                last_progress,
-            )
-            .await
-            {
-                return false;
-            }
-            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
-                return false;
-            }
-            if !pending.is_empty() {
-                if pending.has_outstanding_native()
-                    && pending.all().any(|exec| {
-                        matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
-                    })
-                {
-                    if !control_close_natives(pending, outbound).await {
-                        return false;
-                    }
-                }
-                if pending.all_client_only() {
-                    // Workflow/Skill: expose Anthropic tool_use and end BiDi
-                    // unless native execs are still collecting (mixed keep-alive).
-                    return expose_collected_tools(pending, pending_shared, sink).await;
-                }
-                report_terminal_error(
-                    sink,
-                    terminal_error,
-                    "Cursor turn ended with pending native tools".into(),
-                )
-                .await;
-                return false;
-            }
-            // Heartbeat-only "thinking" with no text/tools yields a contentless
-            // Anthropic 200 (Out:0) — Claude Code looks hung then idle. Surface a
-            // short visible note so the agent can recover / call Workflow.
-            if !emit_empty_turn_note_if_needed(
-                saw_text,
-                useful,
-                sink,
-                deferred,
-                pending,
-                pending_shared,
-                allowed_tool_names,
-                turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
-                "turn_ended",
-            )
-            .await
-            {
-                return false;
-            }
-            if !emit_cursor_or_defer(
-                sink,
-                deferred,
-                CursorStreamEvent::Usage {
-                    input_tokens: turn.input_tokens.unwrap_or(0),
-                    // Fable thinking often lands in reasoning_tokens while
-                    // output_tokens stays 0 — Claude Code's Out meter needs both.
-                    output_tokens: turn
-                        .output_tokens
-                        .unwrap_or(0)
-                        .saturating_add(turn.reasoning_tokens.unwrap_or(0))
-                        .max(if *saw_text { 1 } else { 0 }),
-                    cache_read_tokens: turn.cache_read_tokens.unwrap_or(0),
-                    cache_write_tokens: turn.cache_write_tokens.unwrap_or(0),
-                },
-            )
-            .await
-            {
-                return false;
-            }
-            let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
+    }
+    if let Some(tokens) = update.token_delta
+        && tokens.tokens > 0
+    {
+        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
             return false;
         }
+        if !emit_cursor_or_defer(
+            sink,
+            deferred,
+            CursorStreamEvent::OutputTokenDelta {
+                tokens: tokens.tokens as u64,
+            },
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    if let Some(turn) = update.turn_ended {
+        if task_nest_depth > 0 {
+            // Subagent finished; the parent Task call is still in flight.
+            *last_progress = Instant::now();
+            return true;
+        }
+        // Flush trailing `<tool_use>` still in the XML buffer — Fable often
+        // closes the turn in the same InteractionUpdate as Workflow XML.
+        if !flush_xml_tool_uses(
+            xml_parser,
+            pending,
+            pending_shared,
+            sink,
+            deferred,
+            allowed_tool_names,
+            saw_text,
+            useful,
+            last_progress,
+        )
+        .await
+        {
+            return false;
+        }
+        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+            return false;
+        }
+        if !pending.is_empty() {
+            if pending.has_outstanding_native()
+                && pending.all().any(|exec| {
+                    matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
+                })
+            {
+                if !control_close_natives(pending, outbound).await {
+                    return false;
+                }
+            }
+            if pending.all_client_only() {
+                // Workflow/Skill: expose Anthropic tool_use and end BiDi
+                // unless native execs are still collecting (mixed keep-alive).
+                return expose_collected_tools(pending, pending_shared, sink).await;
+            }
+            report_terminal_error(
+                sink,
+                terminal_error,
+                "Cursor turn ended with pending native tools".into(),
+            )
+            .await;
+            return false;
+        }
+        // Heartbeat-only "thinking" with no text/tools yields a contentless
+        // Anthropic 200 (Out:0) — Claude Code looks hung then idle. Surface a
+        // short visible note so the agent can recover / call Workflow.
+        if !emit_empty_turn_note_if_needed(
+            saw_text,
+            useful,
+            sink,
+            deferred,
+            pending,
+            pending_shared,
+            allowed_tool_names,
+            turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
+            "turn_ended",
+        )
+        .await
+        {
+            return false;
+        }
+        if !emit_cursor_or_defer(
+            sink,
+            deferred,
+            CursorStreamEvent::Usage {
+                input_tokens: turn.input_tokens.unwrap_or(0),
+                // Fable thinking often lands in reasoning_tokens while
+                // output_tokens stays 0 — Claude Code's Out meter needs both.
+                output_tokens: turn
+                    .output_tokens
+                    .unwrap_or(0)
+                    .saturating_add(turn.reasoning_tokens.unwrap_or(0))
+                    .max(if *saw_text { 1 } else { 0 }),
+                cache_read_tokens: turn.cache_read_tokens.unwrap_or(0),
+                cache_write_tokens: turn.cache_write_tokens.unwrap_or(0),
+            },
+        )
+        .await
+        {
+            return false;
+        }
+        let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
+        return false;
     }
     true
 }
@@ -4618,6 +4687,298 @@ mod tests {
             }
             other => panic!("expected NativeToolBatch, got {other:?}"),
         }
+    }
+
+    fn task_nested_frame(nested: InteractionUpdate) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, TaskToolCallDelta, ToolCallDelta, ToolCallDeltaUpdate,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_delta: Some(ToolCallDeltaUpdate {
+                    call_id: "task-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call_delta: Some(ToolCallDelta {
+                        task_tool_call_delta: Some(TaskToolCallDelta {
+                            interaction_update: Some(Box::new(nested)),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    async fn drive_task_frame(
+        frame: super::super::connect::ConnectFrame,
+        outbound: &ClientOutbound,
+        sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+        pending: &mut PendingExecState,
+        pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+        logical: &mut LogicalToolTracker,
+        allowed: &BTreeSet<String>,
+    ) -> bool {
+        let mut deferred = VecDeque::new();
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        process_live_frame(
+            frame,
+            outbound,
+            sink,
+            &mut deferred,
+            pending,
+            pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(allowed),
+            &mut saw_text,
+            &mut useful,
+            logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_delta_nested_partial_args_fill_mcp_started() {
+        use super::super::proto::{
+            McpArgs, McpToolCall, PartialToolCall, ToolCall, ToolCallStarted,
+        };
+
+        let mcp = |args: std::collections::HashMap<String, Vec<u8>>| McpToolCall {
+            args: Some(McpArgs {
+                name: "Workflow".into(),
+                tool_name: "Workflow".into(),
+                tool_call_id: "mcp-nested-1".into(),
+                provider_identifier: "claude-local".into(),
+                args,
+            }),
+        };
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut logical = LogicalToolTracker::default();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+
+        let cont = drive_task_frame(
+            task_nested_frame(InteractionUpdate {
+                partial_tool_call: Some(PartialToolCall {
+                    call_id: "mcp-nested-1".into(),
+                    model_call_id: "model-1".into(),
+                    args_text_delta: r#"{"name":"deep-research"}"#.into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(mcp(Default::default())),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(cont, "nested partial_tool_call must not tear down BiDi");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must wait for nested tool_call_started"
+        );
+
+        let cont = drive_task_frame(
+            task_nested_frame(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "mcp-nested-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(mcp(Default::default())),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(!cont, "nested MCP Workflow must end BiDi segment");
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Workflow");
+                assert_eq!(
+                    tools[0].input.get("name").and_then(|v| v.as_str()),
+                    Some("deep-research"),
+                    "ClientOnly input must come from nested task partial_tool_call"
+                );
+            }
+            other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_delta_nested_text_surfaces() {
+        use super::super::proto::TextDelta;
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut logical = LogicalToolTracker::default();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+
+        let cont = drive_task_frame(
+            task_nested_frame(InteractionUpdate {
+                text_delta: Some(TextDelta {
+                    text: "from subagent".into(),
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(cont, "nested text must not tear down BiDi");
+        let event = event_rx.try_recv().expect("text delta");
+        match event {
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                assert_eq!(text, "from subagent");
+            }
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_delta_nested_turn_ended_does_not_end_parent() {
+        use super::super::proto::TurnEnded;
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut logical = LogicalToolTracker::default();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+
+        let cont = drive_task_frame(
+            task_nested_frame(InteractionUpdate {
+                turn_ended: Some(TurnEnded {
+                    output_tokens: Some(4),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(cont, "nested turn_ended must not end the parent Task");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "nested turn_ended must not emit parent End/Usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_delta_caps_second_nested_level() {
+        use super::super::proto::{
+            TaskToolCallDelta, TextDelta, ToolCallDelta, ToolCallDeltaUpdate,
+        };
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut logical = LogicalToolTracker::default();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+
+        let inner = InteractionUpdate {
+            text_delta: Some(TextDelta {
+                text: "secret".into(),
+            }),
+            ..Default::default()
+        };
+        let cont = drive_task_frame(
+            task_nested_frame(InteractionUpdate {
+                text_delta: Some(TextDelta {
+                    text: "visible".into(),
+                }),
+                tool_call_delta: Some(ToolCallDeltaUpdate {
+                    call_id: "task-inner".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call_delta: Some(ToolCallDelta {
+                        task_tool_call_delta: Some(TaskToolCallDelta {
+                            interaction_update: Some(Box::new(inner)),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(cont, "capped nest must keep parent BiDi");
+        let event = event_rx.try_recv().expect("visible text");
+        match event {
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                assert_eq!(text, "visible");
+            }
+            other => panic!("expected visible TextDelta, got {other:?}"),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "second nested Task level must not surface"
+        );
     }
 
     async fn client_only_tools_from_mcp_started(

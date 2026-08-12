@@ -36,6 +36,9 @@ pub struct CursorPromptOptions {
 ///   `RunRequest.mcp_tools`. When that field is populated, the XML `<tools>`
 ///   dump is names + one-line descriptions only (no duplicated JSON schemas),
 ///   plus a short Workflow/Skill nudge so Fable still sees they exist.
+/// - Anthropic `thinking` / `max_tokens` / `tool_choice` are **not** mapped
+///   onto AgentRunRequest (no such proto fields; see proto.rs). Catalog
+///   thinking/effort already go on `RequestedModel.parameters` via model.rs.
 ///
 /// Env:
 /// - `CCP_CURSOR_USE_CUSTOM_SYSTEM=1` — field 8 (team only)
