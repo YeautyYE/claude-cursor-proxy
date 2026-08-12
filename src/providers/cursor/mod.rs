@@ -3,7 +3,6 @@ pub mod client;
 pub mod connect;
 pub mod conversation;
 pub mod exec_results;
-pub mod hosted_web_fetch;
 pub mod hosted_web_search;
 pub mod http1;
 pub(crate) mod identity;
@@ -36,7 +35,6 @@ use crate::providers::cursor::auth::{
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient};
 use crate::providers::cursor::exec_results::PendingCursorExec;
-use crate::providers::cursor::hosted_web_fetch::maybe_handle_hosted_web_fetch;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
     is_hosted_web_search_request, search_web,
@@ -299,13 +297,6 @@ impl Provider for CursorProvider {
                 return hosted_web_search_sse_response(message_id, wire_model, query, hits, error);
             }
             return hosted_web_search_json_response(message_id, wire_model, query, hits, error);
-        }
-
-        // Nested Anthropic hosted web_fetch_* (Claude Code /deep-research).
-        if let Some(resp) =
-            maybe_handle_hosted_web_fetch(&body, &message_id, &wire_model).await
-        {
-            return resp;
         }
 
         // True Cursor BiDi continuation: the preceding Anthropic response ended
