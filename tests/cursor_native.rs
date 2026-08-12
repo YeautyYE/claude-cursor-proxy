@@ -724,6 +724,69 @@ fn sse_message_delta_contains_usage() {
     assert_eq!(data["delta"]["stop_reason"], "end_turn");
 }
 
+#[test]
+fn sse_thinking_has_no_progress_message_delta_but_keeps_final_usage() {
+    use claude_cursor_proxy::providers::cursor::connect::encode_connect_frame;
+    use claude_cursor_proxy::providers::cursor::proto::*;
+    use claude_cursor_proxy::providers::cursor::sse::frame_cursor_stream;
+    use prost::Message;
+
+    let mut body = Vec::new();
+    let msg = AgentServerMessage {
+        conversation_checkpoint_update: None,
+        interaction_update: Some(InteractionUpdate {
+            heartbeat: None,
+            tool_call_started: None,
+            tool_call_completed: None,
+            thinking_delta: Some(ThinkingDelta {
+                text: "abcdefghijklmnop".into(),
+            }),
+            thinking_completed: None,
+            text_delta: None,
+            token_delta: None,
+            turn_ended: Some(TurnEnded {
+                input_tokens: Some(12),
+                output_tokens: Some(4),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
+            }),
+        }),
+        kv_server_message: None,
+        interaction_query: None,
+        exec_server_message: None,
+    };
+    let mut payload = Vec::new();
+    msg.encode(&mut payload).unwrap();
+    body.extend_from_slice(&encode_connect_frame(&payload, 0));
+    body.extend_from_slice(&encode_connect_frame(b"", 2));
+
+    let upstream = claude_cursor_proxy::providers::cursor::client::CursorUpstreamResponse {
+        status: 200,
+        body,
+        error_detail: None,
+    };
+    let events = parse_sse_events(&String::from_utf8_lossy(&frame_cursor_stream(
+        &upstream,
+        "msg_think",
+        "cursor-test",
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "thinking_delta"),
+        "thinking_delta remains the live Claude Code signal"
+    );
+    assert!(
+        events.iter().all(|(n, d)| !is_progress_message_delta(n, d)),
+        "no mid-stream message_delta while thinking is open / before first text_delta; got {events:?}"
+    );
+    let final_delta = final_message_delta(&events);
+    assert_eq!(final_delta["delta"]["stop_reason"], "end_turn");
+    assert_eq!(final_delta["usage"]["input_tokens"].as_u64(), Some(12));
+    assert!(final_delta["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 4);
+}
+
 // ---------------------------------------------------------------------------
 // Registry integration
 // ---------------------------------------------------------------------------
@@ -1659,7 +1722,10 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
         .unwrap();
     let first_events = parse_sse_events(&first_sse);
     assert_eq!(first_events[0].0, "message_start");
-    assert_eq!(first_events.last().map(|(n, _)| n.as_str()), Some("message_stop"));
+    assert_eq!(
+        first_events.last().map(|(n, _)| n.as_str()),
+        Some("message_stop")
+    );
     let tool_start = first_events
         .iter()
         .find(|(n, d)| n == "content_block_start" && d["content_block"]["type"] == "tool_use")
@@ -1679,7 +1745,10 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
         .unwrap(),
         serde_json::json!({"file_path": "README.md"})
     );
-    assert_eq!(final_message_delta(&first_events)["delta"]["stop_reason"], "tool_use");
+    assert_eq!(
+        final_message_delta(&first_events)["delta"]["stop_reason"],
+        "tool_use"
+    );
 
     // Leave the upstream Run alive long enough to observe the per-exec heartbeat.
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
@@ -2181,11 +2250,27 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
             .expect("parallel tool results did not resume the original Cursor run")
             .unwrap();
     let second_events = parse_sse_events(&second_sse);
+    assert_eq!(second_events[0].0, "message_start");
     assert_eq!(
-        second_events
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
+        second_events.last().map(|(n, _)| n.as_str()),
+        Some("message_stop")
+    );
+    let text_delta = second_events
+        .iter()
+        .find(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "text_delta")
+        .map(|(_, d)| d)
+        .expect("text_delta");
+    assert_eq!(
+        text_delta["delta"]["text"],
+        "both parallel reads continued on one run"
+    );
+    let skeleton: Vec<&str> = second_events
+        .iter()
+        .filter(|(name, data)| !is_progress_message_delta(name, data))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        skeleton,
         vec![
             "message_start",
             "content_block_start",
@@ -2195,11 +2280,12 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
             "message_stop",
         ]
     );
-    assert_eq!(
-        second_events[2].1["delta"]["text"],
-        "both parallel reads continued on one run"
+    let final_delta = final_message_delta(&second_events);
+    assert_eq!(final_delta["delta"]["stop_reason"], "end_turn");
+    assert!(
+        !progress_message_delta_before_first_text(&second_events),
+        "no progress message_delta before first text_delta"
     );
-    assert_eq!(second_events[4].1["delta"]["stop_reason"], "end_turn");
 
     let client_messages = observed
         .client_messages
@@ -2315,15 +2401,14 @@ fn bridge_start_pauses_on_tool_use_xml() {
         "expected message_stop"
     );
 
-    let msg_delta = parsed
-        .iter()
-        .find(|(n, _)| n == "message_delta")
-        .map(|(_, d)| d.clone());
-    assert!(msg_delta.is_some(), "expected message_delta");
+    assert!(
+        parsed.iter().any(|(n, _)| n == "message_delta"),
+        "expected message_delta"
+    );
     assert_eq!(
-        msg_delta.unwrap()["delta"]["stop_reason"],
+        final_message_delta(&parsed)["delta"]["stop_reason"],
         "tool_use",
-        "stop_reason should be tool_use"
+        "final message_delta stop_reason should be tool_use"
     );
 
     // Clean up
@@ -2368,15 +2453,10 @@ fn bridge_start_passes_through_without_tool_use() {
     assert!(event_names.contains(&"message_delta"));
     assert!(event_names.contains(&"message_stop"));
 
-    // Verify stop_reason is end_turn
-    let msg_delta = parsed
-        .iter()
-        .find(|(n, _)| n == "message_delta")
-        .map(|(_, d)| d.clone());
     assert_eq!(
-        msg_delta.unwrap()["delta"]["stop_reason"],
+        final_message_delta(&parsed)["delta"]["stop_reason"],
         "end_turn",
-        "stop_reason should be end_turn without tool_use"
+        "final message_delta stop_reason should be end_turn without tool_use"
     );
 }
 
@@ -2540,14 +2620,9 @@ fn bridge_rejects_tool_not_in_allowed_list() {
 
     let sse_str = String::from_utf8_lossy(&sse);
     let parsed = parse_sse_events(&sse_str);
-    let _event_names: Vec<&str> = parsed.iter().map(|(n, _)| n.as_str()).collect();
 
-    let msg_delta = parsed
-        .iter()
-        .find(|(n, _)| n == "message_delta")
-        .map(|(_, d)| d.clone());
     assert_eq!(
-        msg_delta.unwrap()["delta"]["stop_reason"],
+        final_message_delta(&parsed)["delta"]["stop_reason"],
         "end_turn",
         "disallowed tool should not trigger tool_use"
     );
@@ -2749,4 +2824,21 @@ fn final_message_delta(events: &[(String, serde_json::Value)]) -> &serde_json::V
         })
         .map(|(_, data)| data)
         .expect("expected final message_delta with non-null stop_reason")
+}
+
+fn is_progress_message_delta(name: &str, data: &serde_json::Value) -> bool {
+    name == "message_delta" && data["delta"]["stop_reason"].is_null()
+}
+
+fn progress_message_delta_before_first_text(events: &[(String, serde_json::Value)]) -> bool {
+    let mut saw_text = false;
+    for (name, data) in events {
+        if name == "content_block_delta" && data["delta"]["type"] == "text_delta" {
+            saw_text = true;
+        }
+        if is_progress_message_delta(name, data) && !saw_text {
+            return true;
+        }
+    }
+    false
 }
