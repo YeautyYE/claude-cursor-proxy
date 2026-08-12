@@ -284,16 +284,23 @@ pub fn render_cursor_prompt_parts_with(
     }
 }
 
-/// Latest user text that is not solely tool_result blocks (new Claude turn).
+/// Latest user text that is not solely *older* tool_result blocks (new Claude turn).
+///
+/// Native exec results belong on the live BiDi stream, so historical
+/// tool_result-only messages are skipped when a newer user turn exists.
+/// After ClientOnly (Workflow/Skill/mcp__*) teardown there is no live run:
+/// the latest user message *is* those results and must be forwarded.
 fn render_latest_user_delta(req: &MessagesRequest) -> Option<String> {
+    let mut seen_user = false;
     for message in req.messages.iter().rev() {
         if message.role != "user" {
             continue;
         }
+        let is_latest_user = !seen_user;
+        seen_user = true;
         let content = render_message_content(message)?;
         let content = scrub_injection_noise("user", &content);
-        // Skip pure tool_result continuations — those belong on the live BiDi stream.
-        if content_is_only_tool_results(message) {
+        if !is_latest_user && content_is_only_tool_results(message) {
             continue;
         }
         if content.trim().is_empty() {
@@ -314,6 +321,70 @@ fn content_is_only_tool_results(message: &crate::anthropic::schema::Message) -> 
         }
         _ => false,
     }
+}
+
+/// True when the newest user message is only `tool_result` blocks.
+pub(crate) fn latest_user_is_only_tool_results(req: &MessagesRequest) -> bool {
+    req.messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .is_some_and(content_is_only_tool_results)
+}
+
+fn tool_result_ids(message: &crate::anthropic::schema::Message) -> Vec<String> {
+    match &message.content {
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .filter_map(|block| {
+                block
+                    .get("tool_use_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn assistant_tool_name_for_id<'a>(req: &'a MessagesRequest, tool_use_id: &str) -> Option<&'a str> {
+    for message in &req.messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        let serde_json::Value::Array(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            if block.get("id").and_then(|id| id.as_str()) == Some(tool_use_id) {
+                return block.get("name").and_then(|name| name.as_str());
+            }
+        }
+    }
+    None
+}
+
+/// True when the latest user message carries results for Claude-local tools
+/// (`Workflow` / `Skill` / `mcp__*`) that Cursor cannot resume on BiDi.
+pub(crate) fn request_has_client_only_tool_results(req: &MessagesRequest) -> bool {
+    let Some(user) = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return false;
+    };
+    let ids = tool_result_ids(user);
+    if ids.is_empty() {
+        return false;
+    }
+    ids.iter()
+        .any(|id| assistant_tool_name_for_id(req, id).is_some_and(is_claude_local_tool_name))
 }
 
 /// Strip packaging banners and Fable injection-defense monologues so multi-turn
@@ -786,7 +857,9 @@ mod tests {
         assert!(parts.user_text.contains("\"name\":\"Skill\""));
         assert!(parts.user_text.contains("mcp__plugin__search"));
         assert!(
-            parts.user_text.contains("Prefer these Claude Code client tools"),
+            parts
+                .user_text
+                .contains("Prefer these Claude Code client tools"),
             "claude-local dump should nudge Workflow over Bash"
         );
         assert!(
@@ -829,6 +902,140 @@ mod tests {
             "checkpoint delta must still advertise Workflow"
         );
         assert!(!parts.user_text.contains("\"name\":\"Read\""));
+    }
+
+    #[test]
+    fn delta_only_forwards_client_only_tool_result_continuation() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+            std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
+            std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "run /deep-research"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "wf1", "name": "Workflow", "input": {"name": "deep-research"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "wf1", "content": "Baked findings: the proxy maps MCP Workflow."}
+                ]}
+            ],
+            "tools": [
+                {"name": "Read", "description": "x", "input_schema": {"type": "object"}},
+                {"name": "Workflow", "description": "wf", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}}
+            ]
+        }))
+        .unwrap();
+        assert!(latest_user_is_only_tool_results(&req));
+        assert!(request_has_client_only_tool_results(&req));
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: true,
+            },
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("Baked findings: the proxy maps MCP Workflow."),
+            "ClientOnly tool_result must appear in the next RunRequest user text; got: {}",
+            parts.user_text
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("<tool_result tool_use_id=\"wf1\">")
+        );
+        assert!(
+            !parts.user_text.contains("run /deep-research"),
+            "delta_only should not replay the original user text: {}",
+            parts.user_text
+        );
+        assert!(
+            parts.user_text.contains("\"name\":\"Workflow\""),
+            "checkpoint delta must still advertise Workflow"
+        );
+    }
+
+    #[test]
+    fn client_only_full_history_includes_workflow_tool_result() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+            std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
+            std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "run /deep-research"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "wf1", "name": "Workflow", "input": {"name": "deep-research"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "wf1", "content": "Baked findings: the proxy maps MCP Workflow."}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: false,
+            },
+        );
+        assert!(parts.user_text.contains("run /deep-research"));
+        assert!(
+            parts
+                .user_text
+                .contains("<tool_use id=\"wf1\" name=\"Workflow\">")
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("Baked findings: the proxy maps MCP Workflow.")
+        );
+    }
+
+    #[test]
+    fn delta_only_skips_older_tool_results_when_new_user_text_exists() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "a.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}"}
+                ]},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "next question"}
+            ]
+        }))
+        .unwrap();
+        assert!(!latest_user_is_only_tool_results(&req));
+        assert!(!request_has_client_only_tool_results(&req));
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: true,
+            },
+        );
+        assert!(parts.user_text.contains("next question"));
+        assert!(!parts.user_text.contains("first"));
+        assert!(!parts.user_text.contains("fn main() {}"));
+        assert!(!parts.user_text.contains("<tool_result"));
     }
 
     #[test]

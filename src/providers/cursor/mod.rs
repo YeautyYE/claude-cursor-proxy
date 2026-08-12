@@ -3,6 +3,7 @@ pub mod client;
 pub mod connect;
 pub mod conversation;
 pub mod exec_results;
+pub mod hosted_web_fetch;
 pub mod hosted_web_search;
 pub mod http1;
 pub(crate) mod identity;
@@ -35,6 +36,7 @@ use crate::providers::cursor::auth::{
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient};
 use crate::providers::cursor::exec_results::PendingCursorExec;
+use crate::providers::cursor::hosted_web_fetch::maybe_handle_hosted_web_fetch;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
     is_hosted_web_search_request, search_web,
@@ -42,8 +44,8 @@ use crate::providers::cursor::hosted_web_search::{
 use crate::providers::cursor::live::{LiveRunRegistry, live_sse_response};
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
-    CursorPromptOptions, claude_local_mcp_tools, render_cursor_prompt,
-    render_cursor_prompt_parts_with,
+    CursorPromptOptions, claude_local_mcp_tools, latest_user_is_only_tool_results,
+    render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     CursorDecodeError, decode_cursor_upstream, decode_upstream_response,
@@ -113,6 +115,12 @@ async fn await_live_run_resume(
             return LiveResumeOutcome::TerminalError(error);
         }
         let Some(run) = LiveRunRegistry::get(session_id) else {
+            if LiveRunRegistry::is_occupied(session_id) {
+                // Starting reservation: wait for Running instead of treating
+                // the session as free (which opened a second Cursor run).
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
             return LiveResumeOutcome::Free;
         };
         let pending = run.pending_tools();
@@ -152,6 +160,9 @@ async fn await_live_run_resume(
         return LiveResumeOutcome::TerminalError(error);
     }
     let Some(run) = LiveRunRegistry::get(session_id) else {
+        if LiveRunRegistry::is_occupied(session_id) {
+            return LiveResumeOutcome::Conflict;
+        }
         return LiveResumeOutcome::Free;
     };
     let pending = run.pending_tools();
@@ -290,6 +301,13 @@ impl Provider for CursorProvider {
             return hosted_web_search_json_response(message_id, wire_model, query, hits, error);
         }
 
+        // Nested Anthropic hosted web_fetch_* (Claude Code /deep-research).
+        if let Some(resp) =
+            maybe_handle_hosted_web_fetch(&body, &message_id, &wire_model).await
+        {
+            return resp;
+        }
+
         // True Cursor BiDi continuation: the preceding Anthropic response ended
         // at tool_use, but the upstream AgentService/Run stream is still alive.
         // Route the matching tool_result back onto that exact request stream
@@ -298,7 +316,7 @@ impl Provider for CursorProvider {
             if let Some(error) = LiveRunRegistry::take_terminal_error(session_id) {
                 return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
             }
-            if LiveRunRegistry::get(session_id).is_some() {
+            if LiveRunRegistry::is_occupied(session_id) {
                 if !want_stream {
                     return json_error(
                         StatusCode::BAD_REQUEST,
@@ -395,13 +413,18 @@ impl Provider for CursorProvider {
         let session_id = ctx.session_id.as_deref();
         let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
         let continuation = crate::providers::cursor::conversation::continuation_for(session_id);
+        let client_only_continuation =
+            request_has_client_only_tool_results(&body) || latest_user_is_only_tool_results(&body);
         let parts = render_cursor_prompt_parts_with(
             &body,
             CursorPromptOptions {
                 // Native BiDi tools don't need Anthropic schemas in user text;
                 // Claude-local tools (Workflow/Skill/mcp__) are still forwarded.
                 omit_tools: bridge_eligible || continuation.has_checkpoint,
-                delta_only: continuation.has_checkpoint,
+                // ClientOnly (Workflow/Skill) results arrive after BiDi teardown.
+                // delta_only would skip tool_result-only messages and replay the
+                // original user text against a stale/zombie MCP checkpoint.
+                delta_only: continuation.has_checkpoint && !client_only_continuation,
             },
         );
         let images = request::cursor_selected_images(&body);

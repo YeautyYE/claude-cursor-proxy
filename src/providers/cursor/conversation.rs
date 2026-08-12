@@ -134,6 +134,21 @@ pub fn save_checkpoint(session_id: &str, checkpoint: Vec<u8>) {
     touch_and_evict(&mut store, session_id, now);
 }
 
+/// Drop a stored checkpoint while keeping `conversation_id` and KV blobs.
+///
+/// ClientOnly (Workflow/Skill) teardown must not resume an in-flight MCP exec
+/// on the next Anthropic turn. Native BiDi runs still call [`save_checkpoint`].
+pub fn clear_checkpoint(session_id: &str) {
+    let now = now_millis();
+    let mut store = STORE.lock().expect("cursor conversation lock");
+    let Some(entry) = store.map.get_mut(session_id) else {
+        return;
+    };
+    entry.checkpoint = None;
+    entry.last_seen = now;
+    touch_and_evict(&mut store, session_id, now);
+}
+
 /// Merge KV blobs into the conversation store (set_blob wins).
 pub fn merge_blobs(session_id: &str, blobs: &HashMap<Vec<u8>, Vec<u8>>) {
     if blobs.is_empty() {
@@ -216,6 +231,23 @@ mod tests {
         assert_eq!(cont.pre_fetched_blobs[0].0, vec![1, 2, 3]);
         assert_eq!(cont.pre_fetched_blobs[0].1, vec![9, 9]);
         assert!(cont.conversation_id.is_some());
+    }
+
+    #[test]
+    fn clear_checkpoint_drops_state_but_keeps_conversation_id() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let created = get_or_create("sess-clear");
+        save_checkpoint("sess-clear", vec![0x0a, 0x02, 0x01, 0x02]);
+        assert!(continuation_for(Some("sess-clear")).has_checkpoint);
+        clear_checkpoint("sess-clear");
+        let cont = continuation_for(Some("sess-clear"));
+        assert!(!cont.has_checkpoint);
+        assert!(cont.conversation_state.is_empty());
+        assert_eq!(
+            cont.conversation_id.as_deref(),
+            Some(created.conversation_id.as_str())
+        );
     }
 
     #[test]

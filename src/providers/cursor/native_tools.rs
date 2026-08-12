@@ -193,12 +193,8 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
         for (k, v) in &args.args {
             input.insert(k.clone(), decode_mcp_arg_value(v));
         }
-        if !args.provider_identifier.is_empty() {
-            input.insert(
-                "provider_identifier".to_string(),
-                serde_json::json!(args.provider_identifier),
-            );
-        }
+        // Cursor's provider_identifier is a wire field, not tool input.
+        // Workflow schema is `{name, args}` with additionalProperties: false.
         return Some(MappedClaudeTool {
             tool_use_id: if args.tool_call_id.is_empty() {
                 call_id
@@ -529,6 +525,38 @@ mod tests {
         let m = map_tool_call_started(&started).unwrap();
         assert_eq!(m.name, "mcp__plugin__search");
         assert_eq!(m.input["query"], "hello");
+        assert!(
+            m.input.get("provider_identifier").is_none(),
+            "provider_identifier is a Cursor wire field, not Anthropic tool input"
+        );
+    }
+
+    #[test]
+    fn maps_workflow_mcp_without_provider_identifier_in_input() {
+        let mut args_map = std::collections::HashMap::new();
+        args_map.insert("name".into(), br#""deep-research""#.to_vec());
+        let started = ToolCallStarted {
+            call_id: "wf1".into(),
+            tool_call: Some(ToolCall {
+                mcp_tool_call: Some(crate::providers::cursor::proto::McpToolCall {
+                    args: Some(crate::providers::cursor::proto::McpArgs {
+                        name: "Workflow".into(),
+                        args: args_map,
+                        tool_call_id: "wf1".into(),
+                        provider_identifier: "claude-local".into(),
+                        tool_name: "Workflow".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.name, "Workflow");
+        assert_eq!(m.input["name"], "deep-research");
+        assert_eq!(m.input.as_object().map(|o| o.len()), Some(1));
+        assert!(m.input.get("provider_identifier").is_none());
+        assert!(m.input.get("args").is_none());
     }
 
     #[test]

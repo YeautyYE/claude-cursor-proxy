@@ -1524,4 +1524,35 @@ mod tests {
         let ids = decode_usable_models_proto(&buf).unwrap();
         assert_eq!(ids, vec!["composer-2.5", "gpt-5.5"]);
     }
+
+    #[test]
+    fn resume_run_request_keeps_mcp_tools() {
+        let resolved = crate::providers::cursor::model::resolve_cursor_model("fable").unwrap();
+        let cont = super::super::conversation::RunContinuation {
+            conversation_id: Some("conv-1".into()),
+            conversation_state: vec![0x08, 0x01],
+            pre_fetched_blobs: vec![],
+            has_checkpoint: true,
+        };
+        let mcp_tools = Some(proto::McpTools {
+            tools: vec![proto::McpTool {
+                tool_name: "Workflow".into(),
+                provider_identifier: "claude-local".into(),
+                name: "Workflow".into(),
+                description: "wf".into(),
+                input_schema: None,
+            }],
+        });
+        let req = build_resume_run_request(&resolved, "req-1", &cont, mcp_tools.clone());
+        assert!(
+            req.action
+                .as_ref()
+                .and_then(|action| action.resume_action.as_ref())
+                .is_some()
+        );
+        let tools = req.mcp_tools.expect("resume must keep mcp_tools");
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.tools[0].name, "Workflow");
+        assert_eq!(tools.tools[0].provider_identifier, "claude-local");
+    }
 }

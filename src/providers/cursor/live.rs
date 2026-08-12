@@ -30,6 +30,7 @@ use super::exec_results::{
     encode_exec_heartbeat, encode_tool_result_frames,
 };
 use super::http1::{self, BidiAppendSession};
+use super::native_tools::map_tool_call_started;
 use super::proto::{
     self, AgentClientMessage, AskQuestionInteractionResponse, AskQuestionRejected,
     AskQuestionResult, ClientHeartbeat, CreatePlanRequestResponse, CreatePlanResult,
@@ -38,7 +39,6 @@ use super::proto::{
     McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
-use super::native_tools::map_tool_call_started;
 use super::request::{CursorSelectedImage, is_claude_local_tool_name};
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
@@ -332,6 +332,32 @@ impl PendingExecState {
         if !self.can_expose() {
             return Vec::new();
         }
+        let has_client_only = self
+            .collecting
+            .iter()
+            .any(|exec| matches!(exec.kind, CursorExecKind::ClientOnly));
+        let has_native = self
+            .collecting
+            .iter()
+            .any(|exec| !matches!(exec.kind, CursorExecKind::ClientOnly));
+        if has_client_only && has_native {
+            // Split mixed batches: expose Workflow/Skill immediately without
+            // flushing still-collecting Cursor Read/Bash into the same Anthropic
+            // tool_use pause (those native execs have no Claude-local handler).
+            let mut client_only = Vec::new();
+            let mut native = Vec::new();
+            for exec in self.collecting.drain(..) {
+                if matches!(exec.kind, CursorExecKind::ClientOnly) {
+                    client_only.push(exec);
+                } else {
+                    native.push(exec);
+                }
+            }
+            self.collecting = native;
+            self.awaiting = client_only;
+            self.awaiting_since = Some(Instant::now());
+            return self.awaiting.clone();
+        }
         self.awaiting = std::mem::take(&mut self.collecting);
         self.awaiting_since = self
             .collecting_since
@@ -608,6 +634,21 @@ impl LiveRunRegistry {
         }
     }
 
+    /// True while a reservation or live handle owns this session.
+    ///
+    /// [`Self::get`] returns `None` for `Starting` (no handle yet). Concurrent
+    /// POSTs must still treat that slot as occupied instead of opening a second
+    /// Cursor run.
+    pub fn is_occupied(session_id: &str) -> bool {
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.get(session_id) {
+            Some(LiveRunEntry::Starting { .. }) => true,
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
+            _ => false,
+        }
+    }
+
     pub fn take_terminal_error(session_id: &str) -> Option<String> {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
@@ -705,7 +746,7 @@ impl CursorHttpClient {
             &request_id,
             custom_system_prompt,
             &continuation,
-            mcp_tools,
+            mcp_tools.clone(),
         );
         let first_message = AgentClientMessage {
             run_request: Some(run_request),
@@ -754,6 +795,7 @@ impl CursorHttpClient {
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
+            mcp_tools: mcp_tools.clone(),
         };
         // Match event fan-out: a tiny upstream queue stalls the reqwest body
         // pump (and Cursor's TCP window) during thinking bursts.
@@ -1043,6 +1085,7 @@ struct LiveReconnectContext {
     model_id: String,
     conversation_id: Option<String>,
     force_http1: bool,
+    mcp_tools: Option<super::proto::McpTools>,
 }
 
 type LiveUpstream = mpsc::Receiver<Result<Option<Bytes>, String>>;
@@ -1135,7 +1178,8 @@ async fn try_live_reconnect(
         },
     };
     let request_id = uuid::Uuid::new_v4().to_string();
-    let run_request = build_resume_run_request(&resolved, &request_id, &cont, None);
+    let run_request =
+        build_resume_run_request(&resolved, &request_id, &cont, reconnect.mcp_tools.clone());
     let first_message = AgentClientMessage {
         run_request: Some(run_request),
         exec_client_message: None,
@@ -1598,7 +1642,16 @@ async fn drive_live_run(
 
     completed.store(true, Ordering::Release);
     // Persist checkpoint + KV blobs so the next Claude turn can resume Cursor state.
-    if let Some(checkpoint) = latest_checkpoint.take() {
+    // ClientOnly (Workflow/Skill) teardown must not keep an in-flight MCP
+    // checkpoint — the next POST is a fresh turn that includes tool_results.
+    let client_only_teardown = pending_shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|exec| matches!(exec.kind, CursorExecKind::ClientOnly));
+    if client_only_teardown {
+        super::conversation::clear_checkpoint(&session_id);
+    } else if let Some(checkpoint) = latest_checkpoint.take() {
         super::conversation::save_checkpoint(&session_id, checkpoint);
     }
     super::conversation::merge_blobs(&session_id, &kv_blobs);
@@ -2023,9 +2076,10 @@ async fn emit_empty_turn_note_if_needed(
         fields.insert("reason".into(), serde_json::json!(reason));
         fields.insert(
             "claude_local_tools".into(),
-            serde_json::json!(allowed_tool_names.is_some_and(|set| {
-                set.iter().any(|n| is_claude_local_tool_name(n))
-            })),
+            serde_json::json!(
+                allowed_tool_names
+                    .is_some_and(|set| { set.iter().any(|n| is_claude_local_tool_name(n)) })
+            ),
         );
         crate::logging::create_logger("cursor").info("empty_turn_note", Some(fields));
     }
@@ -2133,8 +2187,8 @@ async fn flush_xml_tool_uses(
                     pending.queue(client_only_pending_exec(&tool_use), Duration::ZERO);
                     exposed_client_only = true;
                 } else if !tool_use.name.is_empty() {
-                    let input_json = serde_json::to_string(&tool_use.input)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let input_json =
+                        serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
                     let visible = format!(
                         "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
                         tool_use.id, tool_use.name
@@ -2798,6 +2852,7 @@ mod tests {
             model_id: "composer-2.5".into(),
             conversation_id: Some("conv-test".into()),
             force_http1: false,
+            mcp_tools: None,
         }
     }
 
@@ -2959,6 +3014,86 @@ mod tests {
         assert_eq!(exposed[1].tool_use_id, "shared-id__cursor_2");
     }
 
+    fn pending_client_only(id: u32, tool_use_id: &str) -> PendingCursorExec {
+        PendingCursorExec {
+            id,
+            exec_id: Some(format!("client_only_{tool_use_id}")),
+            tool_use_id: tool_use_id.to_string(),
+            claude_name: "Workflow".into(),
+            claude_input: serde_json::json!({"name": "deep-research"}),
+            kind: CursorExecKind::ClientOnly,
+        }
+    }
+
+    #[test]
+    fn pending_exec_state_exposes_client_only_without_flushing_native() {
+        let mut state = PendingExecState::default();
+        assert!(state.queue(pending_exec(1, "read-1"), Duration::from_millis(50)));
+        assert!(state.queue(pending_client_only(2, "wf-1"), Duration::ZERO));
+        let exposed = state.expose();
+        assert_eq!(exposed.len(), 1);
+        assert_eq!(exposed[0].tool_use_id, "wf-1");
+        assert!(matches!(exposed[0].kind, CursorExecKind::ClientOnly));
+        assert_eq!(state.awaiting().len(), 1);
+        assert_eq!(state.awaiting()[0].tool_use_id, "wf-1");
+        assert!(
+            state.all().any(|exec| exec.tool_use_id == "read-1"),
+            "native Read must remain collecting"
+        );
+        assert!(
+            !state
+                .awaiting()
+                .iter()
+                .any(|exec| exec.tool_use_id == "read-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn expose_mixed_batch_emits_only_client_only_and_ends_bidi() {
+        let mut pending = PendingExecState::default();
+        pending.queue(pending_exec(1, "read-1"), Duration::from_millis(50));
+        pending.queue(pending_client_only(2, "wf-1"), Duration::ZERO);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let keep_bidi = expose_collected_tools(&mut pending, &pending_shared, &mut sink).await;
+        assert!(!keep_bidi, "ClientOnly expose must end BiDi");
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Workflow");
+                assert_eq!(tools[0].tool_use_id, "wf-1");
+            }
+            other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+        let shared = pending_shared.lock().unwrap();
+        assert!(
+            shared
+                .iter()
+                .all(|exec| matches!(exec.kind, CursorExecKind::ClientOnly))
+        );
+        assert!(pending.all().any(|exec| exec.tool_use_id == "read-1"));
+    }
+
+    #[test]
+    fn starting_reservation_is_occupied_without_a_handle() {
+        let session = format!("starting-session-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        assert!(
+            LiveRunRegistry::get(&session).is_none(),
+            "Starting has no runnable handle"
+        );
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "Starting must look occupied to concurrent POSTs"
+        );
+        drop(reservation);
+        assert!(!LiveRunRegistry::is_occupied(&session));
+        LiveRunRegistry::clear();
+    }
+
     #[test]
     fn tool_result_batch_requires_each_pending_id_exactly_once() {
         let pending = vec![pending_exec(1, "tool-1"), pending_exec(2, "tool-2")];
@@ -3091,10 +3226,7 @@ mod tests {
                                 provider_identifier: "claude-local".into(),
                                 args: {
                                     let mut m = std::collections::HashMap::new();
-                                    m.insert(
-                                        "name".into(),
-                                        br#""deep-research""#.to_vec(),
-                                    );
+                                    m.insert("name".into(), br#""deep-research""#.to_vec());
                                     m
                                 },
                             }),
@@ -3163,6 +3295,10 @@ mod tests {
                 assert_eq!(
                     tools[0].input.get("name").and_then(|v| v.as_str()),
                     Some("deep-research")
+                );
+                assert!(
+                    tools[0].input.get("provider_identifier").is_none(),
+                    "Workflow Anthropic input must not include provider_identifier"
                 );
             }
             other => panic!("expected NativeToolBatch, got {other:?}"),
@@ -3475,9 +3611,7 @@ mod tests {
 
         apply_live_run_event(
             &mut encoder,
-            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
-                text: "A".into(),
-            }),
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text: "A".into() }),
         );
         let first = String::from_utf8(encoder.take_bytes()).unwrap();
         assert!(
@@ -3487,9 +3621,7 @@ mod tests {
 
         apply_live_run_event(
             &mut encoder,
-            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
-                text: "B".into(),
-            }),
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text: "B".into() }),
         );
         let second = String::from_utf8(encoder.take_bytes()).unwrap();
         assert!(

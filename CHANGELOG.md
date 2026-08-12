@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.27 (2026-08-13)
+
+- Fix ClientOnly (Workflow/Skill/mcp__*) continuation: after BiDi teardown, a tool_result-only POST is forwarded into the next Cursor Run instead of being skipped as a native exec resume. Clear the in-flight MCP checkpoint so the next turn is not a zombie resume.
+- Stop stuffing Cursor `provider_identifier` into Anthropic Workflow/MCP tool input (`additionalProperties: false`).
+- Mixed native+ClientOnly batches expose Workflow/Skill without flushing still-collecting Read/Bash into the same Anthropic pause. Starting live-run reservations count as occupied; ResumeAction reconnect keeps `mcp_tools`.
+
 ## v0.1.26 (2026-07-21)
 
 - Fix `RunRequest.mcp_tools` wire shape to match Cursor CLI `McpToolDefinition`: `input_schema` as `google.protobuf.Struct` (not JSON string), plus `provider_identifier` / `tool_name` (`claude-local`). v0.1.25 advertised tools with the wrong encoding so Fable could still ignore Workflow.
