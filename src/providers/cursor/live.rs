@@ -32,16 +32,17 @@ use super::exec_results::{
 use super::http1::{self, BidiAppendSession};
 use super::native_tools::map_tool_call_started;
 use super::proto::{
-    self, AgentClientMessage, AskQuestionInteractionResponse, AskQuestionRejected,
-    AskQuestionResult, ClientHeartbeat, CreatePlanRequestResponse, CreatePlanResult,
-    CreatePlanSuccess, ExecClientMessage, GetBlobResult, InteractionApproved, InteractionQuery,
-    InteractionRejected, InteractionResponse, KvClientMessage, KvServerMessage,
-    McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
-    SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
+    self, AgentClientMessage, AskQuestionArgs, AskQuestionInteractionQuery,
+    AskQuestionInteractionResponse, AskQuestionRejected, AskQuestionResult, ClientHeartbeat,
+    CreatePlanRequestResponse, CreatePlanResult, CreatePlanSuccess, ExecClientMessage,
+    GetBlobResult, InteractionApproved, InteractionQuery, InteractionRejected, InteractionResponse,
+    KvClientMessage, KvServerMessage, McpAuthRequestResponse, RequestContext, RequestContextResult,
+    RequestContextSuccess, SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse,
+    WebSearchRequestResponse,
 };
 use super::request::{
-    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_tool_name,
-    strip_mcp_provider_prefix,
+    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, cursor_request_context_from_text,
+    is_claude_local_tool_name, strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
@@ -84,6 +85,77 @@ impl ClientOutbound {
 /// thinking bursts so we rarely block the upstream read loop.
 const LIVE_EVENT_CHANNEL_CAP: usize = 512;
 
+/// Merge consecutive thinking/text deltas only when the fan-out is at least
+/// half full. Healthy queues stay 1:1 so Claude Code paints at Cursor cadence.
+const COALESCE_WINDOW: Duration = Duration::from_millis(8);
+const COALESCE_MAX_CHARS: usize = 4096;
+const MAX_CONSECUTIVE_DECODE_FAILURES: u32 = 8;
+
+/// Claude Code 2.1.193 `AskUserQuestion` chip/tag max (`Qzi = 12`).
+const ASK_USER_QUESTION_HEADER_MAX: usize = 12;
+
+/// Nested Workflow POSTs share `X-Claude-Code-Session-Id` (`kt()` is not
+/// rotated). The nested difference is additive headers
+/// `x-claude-code-agent-id` + `x-claude-code-parent-agent-id`. Concurrent live
+/// runs are keyed by `(session_id, agent_id)` — never a new session UUID.
+const AGENT_RUN_MARK: &str = "::agent::";
+
+/// Identity for a Claude Code Messages POST that may be a nested agent.
+///
+/// `mod.rs` / `server.rs` should pass `x-claude-code-agent-id` and
+/// `x-claude-code-parent-agent-id` here. Absent `agent_id` keeps one run per
+/// session (legacy behavior).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LiveRunIdentity<'a> {
+    pub session_id: &'a str,
+    pub agent_id: Option<&'a str>,
+    pub parent_agent_id: Option<&'a str>,
+}
+
+impl<'a> LiveRunIdentity<'a> {
+    pub fn parent(session_id: &'a str) -> Self {
+        Self {
+            session_id,
+            agent_id: None,
+            parent_agent_id: None,
+        }
+    }
+
+    pub fn is_nested(&self) -> bool {
+        self.agent_id
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty())
+            && self
+                .parent_agent_id
+                .map(str::trim)
+                .is_some_and(|id| !id.is_empty())
+    }
+}
+
+/// Registry / Cursor-conversation key for a live run.
+///
+/// `None` / empty `agent_id` → `session_id` (one run per Claude session).
+/// Nested agent → `{session_id}::agent::{agent_id}` so it cannot supersede
+/// the parent that shares `X-Claude-Code-Session-Id`.
+pub fn live_run_key(session_id: &str, agent_id: Option<&str>) -> String {
+    match agent_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(agent) => format!("{session_id}{AGENT_RUN_MARK}{agent}"),
+        None => session_id.to_string(),
+    }
+}
+
+pub fn live_run_key_for(identity: LiveRunIdentity<'_>) -> String {
+    live_run_key(identity.session_id, identity.agent_id)
+}
+
+fn claude_session_of(run_key: &str) -> &str {
+    run_key.split(AGENT_RUN_MARK).next().unwrap_or(run_key)
+}
+
+fn channel_backpressured(remaining: usize, cap: usize) -> bool {
+    cap > 0 && remaining.saturating_mul(2) <= cap
+}
+
 #[derive(Debug, Clone)]
 pub enum LiveRunEvent {
     Cursor(CursorStreamEvent),
@@ -119,6 +191,7 @@ enum RunCommand {
     Cancel,
 }
 
+#[derive(Debug)]
 pub struct CursorLiveRunHandle {
     run_id: String,
     command_tx: mpsc::Sender<RunCommand>,
@@ -400,6 +473,51 @@ impl PendingExecState {
                 .all(|exec| matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly))
     }
 
+    fn has_outstanding_native(&self) -> bool {
+        self.all()
+            .any(|exec| !matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly))
+    }
+
+    #[allow(dead_code)]
+    fn has_client_only_awaiting(&self) -> bool {
+        self.awaiting
+            .iter()
+            .any(|exec| matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly))
+    }
+
+    /// Remove native execs (Read/Bash/…) so FLAG_END / turn_ended can
+    /// `control_close` them instead of dropping the TCP stream. ClientOnly
+    /// tools stay queued for Anthropic expose.
+    fn drain_natives(&mut self) -> Vec<PendingCursorExec> {
+        let mut natives = Vec::new();
+        let mut client_collecting = Vec::new();
+        for exec in self.collecting.drain(..) {
+            if matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly) {
+                client_collecting.push(exec);
+            } else {
+                natives.push(exec);
+            }
+        }
+        self.collecting = client_collecting;
+        if self.collecting.is_empty() {
+            self.collecting_since = None;
+            self.collect_deadline = None;
+        }
+        let mut client_awaiting = Vec::new();
+        for exec in self.awaiting.drain(..) {
+            if matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly) {
+                client_awaiting.push(exec);
+            } else {
+                natives.push(exec);
+            }
+        }
+        self.awaiting = client_awaiting;
+        if self.awaiting.is_empty() {
+            self.awaiting_since = None;
+        }
+        natives
+    }
+
     fn oldest_since(&self) -> Option<Instant> {
         match (self.awaiting_since, self.collecting_since) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -522,8 +640,59 @@ enum LiveRunEntry {
     Running(Arc<CursorLiveRunHandle>),
 }
 
-static LIVE_RUNS: LazyLock<Mutex<HashMap<String, LiveRunEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+struct LiveRunMap {
+    /// Registry key → entry. Key is the Claude session id, or
+    /// `{session}::agent::{agent_id}` for a nested Workflow/subagent run.
+    runs: HashMap<String, LiveRunEntry>,
+    /// Claude `X-Claude-Code-Session-Id` → all registry keys for that session.
+    by_session: HashMap<String, Vec<String>>,
+}
+
+impl LiveRunMap {
+    fn new() -> Self {
+        Self {
+            runs: HashMap::new(),
+            by_session: HashMap::new(),
+        }
+    }
+
+    fn insert_key(&mut self, key: String, entry: LiveRunEntry) {
+        let session = claude_session_of(&key).to_string();
+        self.runs.insert(key.clone(), entry);
+        let slots = self.by_session.entry(session).or_default();
+        if !slots.iter().any(|existing| existing == &key) {
+            slots.push(key);
+        }
+    }
+
+    fn remove_key(&mut self, key: &str) -> Option<LiveRunEntry> {
+        let entry = self.runs.remove(key)?;
+        let session = claude_session_of(key);
+        if let Some(slots) = self.by_session.get_mut(session) {
+            slots.retain(|existing| existing != key);
+            if slots.is_empty() {
+                self.by_session.remove(session);
+            }
+        }
+        Some(entry)
+    }
+
+    fn keys_for(&self, session_id: &str) -> Vec<String> {
+        self.by_session.get(session_id).cloned().unwrap_or_default()
+    }
+
+    fn session_occupied(&self, session_id: &str) -> bool {
+        self.keys_for(session_id)
+            .iter()
+            .any(|key| match self.runs.get(key) {
+                Some(LiveRunEntry::Starting { .. }) => true,
+                Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
+                _ => false,
+            })
+    }
+}
+
+static LIVE_RUNS: LazyLock<Mutex<LiveRunMap>> = LazyLock::new(|| Mutex::new(LiveRunMap::new()));
 
 /// Exclusive claim on a session id while its upstream BiDi request is being
 /// established. Dropping an uncommitted reservation makes the session
@@ -543,14 +712,14 @@ impl LiveRunReservation {
     ) -> Result<(), Arc<CursorLiveRunHandle>> {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         let owns_reservation = matches!(
-            runs.get(&self.session_id),
+            runs.runs.get(&self.session_id),
             Some(LiveRunEntry::Starting { reservation_id })
                 if reservation_id == &self.reservation_id
         );
         if !owns_reservation {
             return Err(handle);
         }
-        runs.insert(self.session_id.clone(), LiveRunEntry::Running(handle));
+        runs.insert_key(self.session_id.clone(), LiveRunEntry::Running(handle));
         self.committed = true;
         Ok(())
     }
@@ -563,12 +732,12 @@ impl Drop for LiveRunReservation {
         }
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         let owns_reservation = matches!(
-            runs.get(&self.session_id),
+            runs.runs.get(&self.session_id),
             Some(LiveRunEntry::Starting { reservation_id })
                 if reservation_id == &self.reservation_id
         );
         if owns_reservation {
-            runs.remove(&self.session_id);
+            runs.remove_key(&self.session_id);
         }
     }
 }
@@ -578,34 +747,59 @@ pub struct LiveRunRegistry;
 impl LiveRunRegistry {
     /// Claim a session before awaiting upstream startup. This closes the race
     /// where two initial requests both observed an empty registry and started
-    /// separate Cursor runs.
+    /// separate Cursor runs. `agent_id = None` is one run per Claude session.
     pub fn reserve(session_id: &str) -> Option<LiveRunReservation> {
+        Self::reserve_run(session_id, None)
+    }
+
+    pub fn reserve_run(session_id: &str, agent_id: Option<&str>) -> Option<LiveRunReservation> {
+        let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        if runs.contains_key(session_id) {
+        if Self::key_occupied(&runs, &key) {
+            return None;
+        }
+        Self::reserve_key(&mut runs, key)
+    }
+
+    fn reserve_key(runs: &mut LiveRunMap, key: String) -> Option<LiveRunReservation> {
+        if runs.runs.contains_key(&key) {
             return None;
         }
         let reservation_id = uuid::Uuid::new_v4().to_string();
-        runs.insert(
-            session_id.to_string(),
+        runs.insert_key(
+            key.clone(),
             LiveRunEntry::Starting {
                 reservation_id: reservation_id.clone(),
             },
         );
         Some(LiveRunReservation {
-            session_id: session_id.to_string(),
+            session_id: key,
             reservation_id,
             committed: false,
         })
     }
 
-    /// Drop any in-flight live run for `session_id` and signal Cancel so the
-    /// BiDi driver exits. Used when Claude Code disconnects/retries and the
-    /// old run would otherwise 409 as "already generating".
+    fn key_occupied(runs: &LiveRunMap, key: &str) -> bool {
+        match runs.runs.get(key) {
+            Some(LiveRunEntry::Starting { .. }) => true,
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
+            _ => false,
+        }
+    }
+
+    /// Drop the live run for this Claude session (primary / no agent_id).
     pub fn cancel(session_id: &str) -> bool {
+        Self::cancel_run(session_id, None)
+    }
+
+    /// Cancel only the `(session_id, agent_id)` slot. Nested agents must pass
+    /// their agent id so the parent run is left alone.
+    pub fn cancel_run(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
         let entry = {
             let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-            runs.remove(session_id)
+            runs.remove_key(&key)
         };
         match entry {
             Some(LiveRunEntry::Running(handle)) => {
@@ -617,80 +811,117 @@ impl LiveRunRegistry {
         }
     }
 
-    /// Cancel any occupant, then reserve. Returns None only if another starter
-    /// wins a race after our cancel (caller should 409 or retry once).
+    /// Cancel any occupant of this slot, then reserve. Nested callers must use
+    /// [`Self::supersede_run`] with `agent_id` so the parent is not stolen.
     pub fn supersede(session_id: &str) -> Option<LiveRunReservation> {
-        Self::cancel(session_id);
-        Self::reserve(session_id)
+        Self::supersede_run(session_id, None)
+    }
+
+    pub fn supersede_run(session_id: &str, agent_id: Option<&str>) -> Option<LiveRunReservation> {
+        Self::cancel_run(session_id, agent_id);
+        Self::reserve_run(session_id, agent_id)
     }
 
     pub fn get(session_id: &str) -> Option<Arc<CursorLiveRunHandle>> {
+        Self::get_run(session_id, None)
+    }
+
+    pub fn get_run(session_id: &str, agent_id: Option<&str>) -> Option<Arc<CursorLiveRunHandle>> {
+        let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        match runs.get(session_id) {
-            // Completed runs (incl. terminal failures awaiting take_terminal_error)
-            // must not look "still generating" to concurrent POSTs.
+        match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
                 Some(Arc::clone(handle))
             }
-            Some(LiveRunEntry::Running(_)) | Some(LiveRunEntry::Starting { .. }) | None => None,
+            _ => None,
         }
     }
 
-    /// True while a reservation or live handle owns this session.
-    ///
-    /// [`Self::get`] returns `None` for `Starting` (no handle yet). Concurrent
-    /// POSTs must still treat that slot as occupied instead of opening a second
-    /// Cursor run.
+    /// True while a reservation or live handle owns this Claude session slot
+    /// (no agent id). Nested occupancy is [`Self::is_occupied_run`].
     pub fn is_occupied(session_id: &str) -> bool {
+        Self::is_occupied_run(session_id, None)
+    }
+
+    pub fn is_occupied_run(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        match runs.get(session_id) {
-            Some(LiveRunEntry::Starting { .. }) => true,
-            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
-            _ => false,
-        }
+        Self::key_occupied(&runs, &key)
     }
 
     pub fn take_terminal_error(session_id: &str) -> Option<String> {
+        Self::take_terminal_error_run(session_id, None)
+    }
+
+    pub fn take_terminal_error_run(session_id: &str, agent_id: Option<&str>) -> Option<String> {
+        let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        let error = match runs.get(session_id) {
+        let error = match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(handle)) => handle.take_terminal_error(),
             Some(LiveRunEntry::Starting { .. }) | None => None,
         };
         if error.is_some() {
-            runs.remove(session_id);
+            runs.remove_key(&key);
         }
         error
     }
 
-    fn prune_finished(runs: &mut HashMap<String, LiveRunEntry>) {
-        runs.retain(|_, entry| match entry {
-            LiveRunEntry::Starting { .. } => true,
-            LiveRunEntry::Running(handle) => !handle.is_completed() || handle.has_terminal_error(),
-        });
+    fn prune_finished(runs: &mut LiveRunMap) {
+        let stale: Vec<String> = runs
+            .runs
+            .iter()
+            .filter_map(|(key, entry)| match entry {
+                LiveRunEntry::Starting { .. } => None,
+                LiveRunEntry::Running(handle)
+                    if !handle.is_completed() || handle.has_terminal_error() =>
+                {
+                    None
+                }
+                LiveRunEntry::Running(_) => Some(key.clone()),
+            })
+            .collect();
+        for key in stale {
+            runs.remove_key(&key);
+        }
     }
 
     fn remove_if(session_id: &str, run_id: &str) {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(
-            runs.get(session_id),
-            Some(LiveRunEntry::Running(handle)) if handle.run_id == run_id
-        ) {
-            runs.remove(session_id);
+        let keys = runs.keys_for(claude_session_of(session_id));
+        let mut extra = Vec::new();
+        if !keys.iter().any(|k| k == session_id) {
+            extra.push(session_id.to_string());
+        }
+        for key in keys.into_iter().chain(extra) {
+            if matches!(
+                runs.runs.get(&key),
+                Some(LiveRunEntry::Running(handle)) if handle.run_id == run_id
+            ) {
+                runs.remove_key(&key);
+                return;
+            }
         }
     }
 
     #[cfg(test)]
     pub fn clear() {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in runs.values() {
+        for entry in runs.runs.values() {
             if let LiveRunEntry::Running(handle) = entry {
                 handle.cancel();
             }
         }
-        runs.clear();
+        runs.runs.clear();
+        runs.by_session.clear();
+    }
+
+    #[cfg(test)]
+    fn slot_keys(session_id: &str) -> Vec<String> {
+        let runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        runs.keys_for(session_id)
     }
 }
 
@@ -720,6 +951,34 @@ impl CursorHttpClient {
         allowed_tool_names: Option<BTreeSet<String>>,
         mcp_tools: Option<super::proto::McpTools>,
     ) -> Result<LiveRunStart, CursorError> {
+        self.start_live_agent_with_identity(
+            token,
+            prompt,
+            model,
+            images,
+            custom_system_prompt,
+            LiveRunIdentity::parent(session_id),
+            allowed_tool_names,
+            mcp_tools,
+        )
+        .await
+    }
+
+    /// Start a BiDi run keyed by `(session_id, agent_id)`. Nested Workflow
+    /// agents must pass `x-claude-code-agent-id` so they do not steal the
+    /// parent's Cursor conversation / live slot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_live_agent_with_identity(
+        &self,
+        token: &str,
+        prompt: &str,
+        model: &str,
+        images: &[CursorSelectedImage],
+        custom_system_prompt: Option<&str>,
+        identity: LiveRunIdentity<'_>,
+        allowed_tool_names: Option<BTreeSet<String>>,
+        mcp_tools: Option<super::proto::McpTools>,
+    ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
                 "Cursor live agent is disabled for this transport",
@@ -730,14 +989,19 @@ impl CursorHttpClient {
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let continuation = super::conversation::continuation_for(Some(session_id));
+        let worker_session = live_run_key_for(identity);
+        let continuation = super::conversation::continuation_for(Some(&worker_session));
         if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
             let names: Vec<&str> = mcp_tools
                 .as_ref()
                 .map(|m| m.tools.iter().map(|t| t.name.as_str()).collect())
                 .unwrap_or_default();
             eprintln!(
-                "[ccp-cursor] start_live_agent session={session_id} mcp_tools={:?} count={}",
+                "[ccp-cursor] start_live_agent session={} agent={:?} parent_agent={:?} nested={} mcp_tools={:?} count={}",
+                identity.session_id,
+                identity.agent_id,
+                identity.parent_agent_id,
+                identity.is_nested(),
                 names,
                 names.len()
             );
@@ -760,13 +1024,13 @@ impl CursorHttpClient {
             client_heartbeat: None,
         };
 
-        let identity = LiveIdentityHeaders::build(token);
+        let cursor_identity = LiveIdentityHeaders::build(token);
         let (outbound, response) = self
             .open_live_transport(
                 token,
                 &request_id,
                 &first_message,
-                &identity,
+                &cursor_identity,
                 force_http1,
                 /*allow_h1_fallback=*/ !force_http1,
             )
@@ -788,13 +1052,12 @@ impl CursorHttpClient {
             completed: Arc::clone(&completed),
         });
 
-        let worker_session = session_id.to_string();
         let seeded_blobs: HashMap<Vec<u8>, Vec<u8>> =
             continuation.pre_fetched_blobs.into_iter().collect();
         let reconnect = LiveReconnectContext {
             http: self.clone(),
             token: token.to_string(),
-            identity,
+            identity: cursor_identity,
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
@@ -818,6 +1081,7 @@ impl CursorHttpClient {
             worker_session,
             run_id,
             seeded_blobs,
+            prompt.to_string(),
             reconnect,
         ));
 
@@ -1229,6 +1493,161 @@ async fn try_live_reconnect(
     }
 }
 
+#[derive(Debug, Default)]
+struct LiveDeltaCoalescer {
+    pending: Option<CursorStreamEvent>,
+    started: Option<tokio::time::Instant>,
+}
+
+impl LiveDeltaCoalescer {
+    fn ingest(&mut self, event: LiveEventResult, remaining: usize) -> Vec<LiveEventResult> {
+        let Ok(LiveRunEvent::Cursor(delta)) = &event else {
+            let mut out = Vec::new();
+            if let Some(flushed) = self.flush() {
+                out.push(flushed);
+            }
+            out.push(event);
+            return out;
+        };
+        let same_kind_merge = match (&self.pending, delta) {
+            (
+                Some(CursorStreamEvent::ThinkingDelta { .. }),
+                CursorStreamEvent::ThinkingDelta { .. },
+            )
+            | (Some(CursorStreamEvent::TextDelta { .. }), CursorStreamEvent::TextDelta { .. }) => {
+                true
+            }
+            _ => false,
+        };
+        if !channel_backpressured(remaining, LIVE_EVENT_CHANNEL_CAP) || !same_kind_merge {
+            let mut out = Vec::new();
+            if let Some(flushed) = self.flush() {
+                out.push(flushed);
+            }
+            if channel_backpressured(remaining, LIVE_EVENT_CHANNEL_CAP)
+                && matches!(
+                    delta,
+                    CursorStreamEvent::ThinkingDelta { .. } | CursorStreamEvent::TextDelta { .. }
+                )
+            {
+                self.pending = Some(delta.clone());
+                self.started = Some(tokio::time::Instant::now());
+                return out;
+            }
+            out.push(event);
+            return out;
+        }
+        match (&mut self.pending, delta) {
+            (
+                Some(CursorStreamEvent::ThinkingDelta { text }),
+                CursorStreamEvent::ThinkingDelta { text: more },
+            )
+            | (
+                Some(CursorStreamEvent::TextDelta { text }),
+                CursorStreamEvent::TextDelta { text: more },
+            ) => {
+                text.push_str(more);
+                if text.len() >= COALESCE_MAX_CHARS
+                    || self
+                        .started
+                        .is_some_and(|started| started.elapsed() >= COALESCE_WINDOW)
+                {
+                    return self.flush().into_iter().collect();
+                }
+                Vec::new()
+            }
+            _ => {
+                let mut out = Vec::new();
+                if let Some(flushed) = self.flush() {
+                    out.push(flushed);
+                }
+                out.push(event);
+                out
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Option<LiveEventResult> {
+        self.started = None;
+        self.pending
+            .take()
+            .map(|event| Ok(LiveRunEvent::Cursor(event)))
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        let started = self.started?;
+        self.pending.as_ref()?;
+        Some(started + COALESCE_WINDOW)
+    }
+}
+
+async fn flush_coalescer(
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    coalescer: &mut LiveDeltaCoalescer,
+) -> bool {
+    match coalescer.flush() {
+        Some(event) => emit_or_defer(sink, deferred, event).await,
+        None => true,
+    }
+}
+
+async fn flush_turn_coalescer(
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    turn_ctx: Option<&mut LiveTurnCtx<'_>>,
+) -> bool {
+    match turn_ctx {
+        Some(ctx) => flush_coalescer(sink, deferred, ctx.coalescer).await,
+        None => true,
+    }
+}
+
+async fn emit_live_delta(
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    event: CursorStreamEvent,
+    turn_ctx: Option<&mut LiveTurnCtx<'_>>,
+) -> bool {
+    let Some(ctx) = turn_ctx else {
+        return emit_cursor_or_defer(sink, deferred, event).await;
+    };
+    if sink.is_none() {
+        return emit_cursor_or_defer(sink, deferred, event).await;
+    }
+    let remaining = sink.as_ref().map(|tx| tx.capacity()).unwrap_or(0);
+    for item in ctx
+        .coalescer
+        .ingest(Ok(LiveRunEvent::Cursor(event)), remaining)
+    {
+        if !emit_or_defer(sink, deferred, item).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn control_close_natives(pending: &mut PendingExecState, outbound: &ClientOutbound) -> bool {
+    for exec in pending.drain_natives() {
+        match encode_control_close(exec.id) {
+            Ok(frame) => {
+                if !outbound.send_connect_frame(frame).await {
+                    return false;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    true
+}
+
+struct LiveTurnCtx<'a> {
+    user_prompt: &'a str,
+    request_context: &'a RequestContext,
+    decode_failures: &'a mut u32,
+    coalescer: &'a mut LiveDeltaCoalescer,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_run(
     mut upstream: LiveUpstream,
@@ -1243,6 +1662,7 @@ async fn drive_live_run(
     session_id: String,
     run_id: String,
     seeded_blobs: HashMap<Vec<u8>, Vec<u8>>,
+    user_prompt: String,
     reconnect: LiveReconnectContext,
 ) {
     let mut sink = Some(initial_sink);
@@ -1257,6 +1677,9 @@ async fn drive_live_run(
     let mut last_progress = Instant::now();
     let mut resume_grace_until: Option<Instant> = None;
     let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
+    let mut coalescer = LiveDeltaCoalescer::default();
+    let mut decode_failures: u32 = 0;
+    let request_context = cursor_request_context_from_text(&user_prompt);
     let run_started = Instant::now();
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
@@ -1320,6 +1743,7 @@ async fn drive_live_run(
             sink = None;
         }
         let batch_deadline = pending.collect_deadline();
+        let coalesce_deadline = coalescer.deadline();
         tokio::select! {
             biased;
 
@@ -1416,6 +1840,12 @@ async fn drive_live_run(
                             }
                         };
                         for frame in frames {
+                            let mut turn = LiveTurnCtx {
+                                user_prompt: &user_prompt,
+                                request_context: &request_context,
+                                decode_failures: &mut decode_failures,
+                                coalescer: &mut coalescer,
+                            };
                             if !process_live_frame(
                                 frame,
                                 &outbound,
@@ -1433,6 +1863,7 @@ async fn drive_live_run(
                                 &mut last_progress,
                                 tool_batch_quiet,
                                 &mut xml_parser,
+                                Some(&mut turn),
                             )
                             .await
                             {
@@ -1445,10 +1876,15 @@ async fn drive_live_run(
                         if pending
                             .collect_deadline()
                             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                            && !expose_collected_tools(&mut pending, &pending_shared, &mut sink)
-                                .await
                         {
-                            break 'driver;
+                            if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                                break 'driver;
+                            }
+                            if !expose_collected_tools(&mut pending, &pending_shared, &mut sink)
+                                .await
+                            {
+                                break 'driver;
+                            }
                         }
                     }
                     Some(Ok(None)) | None => {
@@ -1490,7 +1926,19 @@ async fn drive_live_run(
                             break 'driver;
                         }
                         if !pending.is_empty() {
+                            if pending.has_outstanding_native()
+                                && pending.all().any(|exec| {
+                                    matches!(
+                                        exec.kind,
+                                        super::exec_results::CursorExecKind::ClientOnly
+                                    )
+                                })
+                            {
+                                let _ = control_close_natives(&mut pending, &outbound).await;
+                            }
                             if pending.all_client_only() {
+                                let _ = flush_coalescer(&mut sink, &mut deferred, &mut coalescer)
+                                    .await;
                                 let _ =
                                     expose_collected_tools(&mut pending, &pending_shared, &mut sink)
                                         .await;
@@ -1504,12 +1952,18 @@ async fn drive_live_run(
                             }
                             break 'driver;
                         }
+                        if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                            break 'driver;
+                        }
                         if !emit_empty_turn_note_if_needed(
                             &mut saw_text,
                             &mut useful,
                             &mut sink,
                             &mut deferred,
+                            &mut pending,
+                            &pending_shared,
                             allowed_tool_names.as_ref(),
+                            &user_prompt,
                             "eof",
                         )
                         .await
@@ -1550,7 +2004,13 @@ async fn drive_live_run(
                 // Never await append/send here — even with upstream preferred in
                 // biased select, a blocking BidiAppend freezes this task for a
                 // full RTT while Cursor keeps sending deltas (CLI does not).
-                let ids: Vec<u32> = pending.all().map(|current| current.id).collect();
+                let ids: Vec<u32> = pending
+                    .all()
+                    .filter(|current| {
+                        !matches!(current.kind, super::exec_results::CursorExecKind::ClientOnly)
+                    })
+                    .map(|current| current.id)
+                    .collect();
                 for id in ids {
                     if let Ok(frame) = encode_exec_heartbeat(id) {
                         let _ = outbound.try_send_heartbeat_frame(frame);
@@ -1571,7 +2031,19 @@ async fn drive_live_run(
                     tokio::time::sleep_until(deadline).await;
                 }
             }, if batch_deadline.is_some() => {
+                if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                    break 'driver;
+                }
                 if !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await {
+                    break 'driver;
+                }
+            }
+            _ = async {
+                if let Some(deadline) = coalesce_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if coalesce_deadline.is_some() => {
+                if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
                     break 'driver;
                 }
             }
@@ -1691,6 +2163,7 @@ async fn process_live_frame(
     last_progress: &mut Instant,
     tool_batch_quiet: Duration,
     xml_parser: &mut CursorToolUseXmlParser,
+    mut turn_ctx: Option<&mut LiveTurnCtx<'_>>,
 ) -> bool {
     if frame.flags & FLAG_END != 0 {
         // Trailing Workflow/Skill XML may still be buffered when Connect END arrives.
@@ -1709,7 +2182,19 @@ async fn process_live_frame(
         {
             return false;
         }
+        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+            return false;
+        }
         if !pending.is_empty() {
+            if pending.has_outstanding_native()
+                && pending.all().any(|exec| {
+                    matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
+                })
+            {
+                if !control_close_natives(pending, outbound).await {
+                    return false;
+                }
+            }
             if pending.all_client_only() {
                 return expose_collected_tools(pending, pending_shared, sink).await;
             }
@@ -1729,7 +2214,10 @@ async fn process_live_frame(
                 useful,
                 sink,
                 deferred,
+                pending,
+                pending_shared,
                 allowed_tool_names,
+                turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
                 "flag_end",
             )
             .await
@@ -1741,8 +2229,43 @@ async fn process_live_frame(
         return false;
     }
     let message = match super::client::decode_frame_payload(&frame) {
-        Ok(message) => message,
-        Err(_) => return true,
+        Ok(message) => {
+            if let Some(ctx) = turn_ctx.as_mut() {
+                *ctx.decode_failures = 0;
+            }
+            message
+        }
+        Err(error) => {
+            let payload_len = frame.payload.len();
+            if let Some(ctx) = turn_ctx.as_mut() {
+                *ctx.decode_failures = ctx.decode_failures.saturating_add(1);
+                let mut fields = serde_json::Map::new();
+                fields.insert("payload_len".into(), serde_json::json!(payload_len));
+                fields.insert("error".into(), serde_json::json!(error.to_string()));
+                fields.insert(
+                    "consecutive".into(),
+                    serde_json::json!(*ctx.decode_failures),
+                );
+                crate::logging::create_logger("cursor").warn("live_frame_decode", Some(fields));
+                if *ctx.decode_failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                    report_terminal_error(
+                        sink,
+                        terminal_error,
+                        format!(
+                            "Cursor prost decode failed {MAX_CONSECUTIVE_DECODE_FAILURES} consecutive frames (last: {error}, {payload_len} bytes)"
+                        ),
+                    )
+                    .await;
+                    return false;
+                }
+            } else {
+                let mut fields = serde_json::Map::new();
+                fields.insert("payload_len".into(), serde_json::json!(payload_len));
+                fields.insert("error".into(), serde_json::json!(error.to_string()));
+                crate::logging::create_logger("cursor").warn("live_frame_decode", Some(fields));
+            }
+            return true;
+        }
     };
 
     if let Some(checkpoint) = message.conversation_checkpoint_update {
@@ -1771,6 +2294,23 @@ async fn process_live_frame(
     }
 
     if let Some(query) = message.interaction_query {
+        if let Some(ask) = query.ask_question_interaction_query.as_ref()
+            && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
+        {
+            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                return false;
+            }
+            pending.queue(
+                ask_user_question_pending_exec(query.id, ask, emit_name),
+                Duration::ZERO,
+            );
+            *last_progress = Instant::now();
+            *useful = true;
+            // Do not auto-reject: expose ClientOnly AskUserQuestion and tear
+            // down like Workflow. Cursor AskQuestionResult has no answer tags
+            // in proto.rs, so the Claude tool_result path is ClientOnly.
+            return expose_collected_tools(pending, pending_shared, sink).await;
+        }
         match encode_interaction_auto_response(&query) {
             Ok(Some(reply)) => {
                 if !outbound.send_connect_frame(reply).await {
@@ -1790,7 +2330,12 @@ async fn process_live_frame(
 
     if let Some(exec) = message.exec_server_message {
         if exec.request_context_args.is_some() {
-            match encode_request_context_reply(&exec) {
+            let context = turn_ctx
+                .as_ref()
+                .map(|ctx| ctx.request_context)
+                .cloned()
+                .unwrap_or_else(RequestContext::default);
+            match encode_request_context_reply(&exec, &context) {
                 Ok(reply) => {
                     if !outbound.send_connect_frame(reply).await {
                         return false;
@@ -1864,9 +2409,26 @@ async fn process_live_frame(
                             emit_name, mapped.name
                         );
                     }
+                    if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                        return false;
+                    }
                     let mut exec = mcp_client_only_pending_exec(&mapped);
                     exec.claude_name = emit_name;
                     pending.queue(exec, Duration::ZERO);
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
+                if mapped.name == "AskUserQuestion"
+                    && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
+                {
+                    if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                        return false;
+                    }
+                    let mut exec = mcp_client_only_pending_exec(&mapped);
+                    exec.claude_name = emit_name;
+                    exec.claude_input = ask_user_question_input_from_mapped(&mapped.input);
+                    pending.queue(exec, Duration::ZERO);
+                    *useful = true;
+                    *last_progress = Instant::now();
                     return expose_collected_tools(pending, pending_shared, sink).await;
                 }
             }
@@ -1885,12 +2447,13 @@ async fn process_live_frame(
         {
             *useful = true;
             *last_progress = Instant::now();
-            if !emit_cursor_or_defer(
+            if !emit_live_delta(
                 sink,
                 deferred,
                 CursorStreamEvent::ThinkingDelta {
                     text: thinking.text,
                 },
+                turn_ctx.as_deref_mut(),
             )
             .await
             {
@@ -1912,10 +2475,11 @@ async fn process_live_frame(
                 match evt {
                     RecoveredCursorEvent::Text(t) if !t.is_empty() => {
                         *saw_text = true;
-                        if !emit_cursor_or_defer(
+                        if !emit_live_delta(
                             sink,
                             deferred,
                             CursorStreamEvent::TextDelta { text: t },
+                            turn_ctx.as_deref_mut(),
                         )
                         .await
                         {
@@ -1936,6 +2500,10 @@ async fn process_live_frame(
                             // after the XML in the same chunk; waiting for the
                             // outer select would race into "pending native tools".
                             pending.queue(exec, Duration::ZERO);
+                            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await
+                            {
+                                return false;
+                            }
                             if !expose_collected_tools(pending, pending_shared, sink).await {
                                 return false;
                             }
@@ -1965,7 +2533,11 @@ async fn process_live_frame(
         }
         if let Some(tokens) = update.token_delta
             && tokens.tokens > 0
-            && !emit_cursor_or_defer(
+        {
+            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                return false;
+            }
+            if !emit_cursor_or_defer(
                 sink,
                 deferred,
                 CursorStreamEvent::OutputTokenDelta {
@@ -1973,8 +2545,9 @@ async fn process_live_frame(
                 },
             )
             .await
-        {
-            return false;
+            {
+                return false;
+            }
         }
         if let Some(turn) = update.turn_ended {
             // Flush trailing `<tool_use>` still in the XML buffer — Fable often
@@ -1994,9 +2567,22 @@ async fn process_live_frame(
             {
                 return false;
             }
+            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                return false;
+            }
             if !pending.is_empty() {
+                if pending.has_outstanding_native()
+                    && pending.all().any(|exec| {
+                        matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
+                    })
+                {
+                    if !control_close_natives(pending, outbound).await {
+                        return false;
+                    }
+                }
                 if pending.all_client_only() {
-                    // Workflow/Skill: expose Anthropic tool_use and end BiDi.
+                    // Workflow/Skill: expose Anthropic tool_use and end BiDi
+                    // unless native execs are still collecting (mixed keep-alive).
                     return expose_collected_tools(pending, pending_shared, sink).await;
                 }
                 report_terminal_error(
@@ -2015,7 +2601,10 @@ async fn process_live_frame(
                 useful,
                 sink,
                 deferred,
+                pending,
+                pending_shared,
                 allowed_tool_names,
+                turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
                 "turn_ended",
             )
             .await
@@ -2049,7 +2638,8 @@ async fn process_live_frame(
     true
 }
 
-/// Emit a short visible note when Cursor closes with no text/tools.
+/// Recover an empty Cursor turn: emit a real Anthropic `Workflow` tool_use when
+/// that tool was advertised, otherwise a short visible note.
 ///
 /// Used from `turn_ended`, clean Connect `FLAG_END`, and exhausted EOF — all
 /// three previously could produce silent Anthropic Out:0 completions.
@@ -2058,11 +2648,28 @@ async fn emit_empty_turn_note_if_needed(
     useful: &mut bool,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     allowed_tool_names: Option<&BTreeSet<String>>,
+    user_prompt: &str,
     reason: &str,
 ) -> bool {
     if *saw_text || sink.is_none() {
         return true;
+    }
+    if workflow_tool_advertised(allowed_tool_names) {
+        let (name, args) = synthetic_workflow_from_prompt(user_prompt);
+        pending.queue(
+            synthetic_workflow_pending_exec(&name, &args),
+            Duration::ZERO,
+        );
+        *saw_text = true;
+        *useful = true;
+        let mut fields = serde_json::Map::new();
+        fields.insert("reason".into(), serde_json::json!(reason));
+        fields.insert("workflow_name".into(), serde_json::json!(name));
+        crate::logging::create_logger("cursor").info("empty_turn_workflow", Some(fields));
+        return expose_collected_tools(pending, pending_shared, sink).await;
     }
     let note = if allowed_tool_names
         .is_some_and(|set| set.iter().any(|n| is_claude_local_tool_name(n)))
@@ -2150,9 +2757,12 @@ async fn expose_collected_tools(
     }
     // Closing this sender ends exactly one downstream Anthropic HTTP segment.
     *sink = None;
-    // Client-only tools (Workflow/Skill/…) are fulfilled by Claude Code locally.
-    // End this BiDi run so the next Anthropic turn starts fresh with tool_result
-    // history — Cursor has no exec protocol for these tools.
+    // Client-only tools (Workflow/Skill/AskUserQuestion) are fulfilled by Claude
+    // Code locally. End this BiDi run so the next Anthropic turn starts fresh
+    // with tool_result history — unless native Read/Bash are still in-flight.
+    if client_only && pending.has_outstanding_native() {
+        return true;
+    }
     !client_only
 }
 
@@ -2317,6 +2927,240 @@ fn mcp_client_only_pending_exec(
     }
 }
 
+fn advertised_ask_user_question(allowed: Option<&BTreeSet<String>>) -> Option<String> {
+    resolve_advertised_name("AskUserQuestion", allowed)
+}
+
+fn ask_user_question_pending_exec(
+    query_id: u32,
+    ask: &AskQuestionInteractionQuery,
+    emit_name: String,
+) -> PendingCursorExec {
+    let tool_use_id = if ask.tool_call_id.is_empty() {
+        format!("ask_question_{query_id}")
+    } else {
+        ask.tool_call_id.clone()
+    };
+    PendingCursorExec {
+        id: query_id.max(1),
+        exec_id: Some(format!("ask_{tool_use_id}")),
+        tool_use_id,
+        claude_name: emit_name,
+        claude_input: ask_user_question_input(ask.args.as_ref()),
+        kind: CursorExecKind::ClientOnly,
+    }
+}
+
+fn ask_user_question_input(args: Option<&AskQuestionArgs>) -> serde_json::Value {
+    let title = args.map(|a| a.title.as_str()).unwrap_or("");
+    let items: Vec<(String, Option<Vec<serde_json::Value>>)> = args
+        .map(|a| {
+            a.questions
+                .iter()
+                .map(|q| (q.prompt.clone(), None))
+                .collect()
+        })
+        .unwrap_or_default();
+    ask_user_question_input_from_parts(title, &items)
+}
+
+fn ask_user_question_input_from_mapped(input: &serde_json::Value) -> serde_json::Value {
+    let title = input.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let items: Vec<(String, Option<Vec<serde_json::Value>>)> = input
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|q| {
+                    let prompt = q
+                        .get("question")
+                        .or_else(|| q.get("prompt"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let options = q.get("options").and_then(|v| v.as_array()).cloned();
+                    (prompt, options)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ask_user_question_input_from_parts(title, &items)
+}
+
+/// Map Cursor `AskQuestionArgs` onto Claude Code 2.1.193 `AskUserQuestion`.
+///
+/// proto.rs `AskQuestionItem` only has `id` + `prompt` — no `options` /
+/// `allow_multiple`. Synthesize the required 2–4 options when missing.
+fn ask_user_question_input_from_parts(
+    title: &str,
+    items: &[(String, Option<Vec<serde_json::Value>>)],
+) -> serde_json::Value {
+    let header = truncate_ask_header(title);
+    let mut questions = Vec::new();
+    for (prompt, options) in items.iter().take(4) {
+        let mut question = prompt.trim().to_string();
+        if question.is_empty() {
+            question = title.trim().to_string();
+        }
+        if question.is_empty() {
+            question = "Continue?".to_string();
+        }
+        if !question.ends_with('?') {
+            question.push('?');
+        }
+        let header = if header.is_empty() {
+            truncate_ask_header(&question)
+        } else {
+            header.clone()
+        };
+        let options = match options {
+            Some(opts) if (2..=4).contains(&opts.len()) => opts.clone(),
+            _ => default_ask_options(),
+        };
+        questions.push(serde_json::json!({
+            "question": question,
+            "header": header,
+            "options": options,
+        }));
+    }
+    if questions.is_empty() {
+        let mut question = title.trim().to_string();
+        if question.is_empty() {
+            question = "Continue?".to_string();
+        } else if !question.ends_with('?') {
+            question.push('?');
+        }
+        questions.push(serde_json::json!({
+            "question": question,
+            "header": if header.is_empty() {
+                truncate_ask_header(&question)
+            } else {
+                header
+            },
+            "options": default_ask_options(),
+        }));
+    }
+    serde_json::json!({ "questions": questions })
+}
+
+fn default_ask_options() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "label": "Continue",
+            "description": "Accept this option and continue",
+        }),
+        serde_json::json!({
+            "label": "Skip",
+            "description": "Skip this question",
+        }),
+    ]
+}
+
+fn truncate_ask_header(text: &str) -> String {
+    text.trim()
+        .chars()
+        .take(ASK_USER_QUESTION_HEADER_MAX)
+        .collect()
+}
+
+fn workflow_tool_advertised(allowed: Option<&BTreeSet<String>>) -> bool {
+    allowed.is_some_and(|set| {
+        set.iter()
+            .any(|name| strip_mcp_provider_prefix(name).eq_ignore_ascii_case("Workflow"))
+    })
+}
+
+fn synthetic_workflow_from_prompt(prompt: &str) -> (String, String) {
+    if let Some(parsed) = parse_injected_workflow(prompt) {
+        return parsed;
+    }
+    ("deep-research".into(), String::new())
+}
+
+/// Parse Claude Code injected slash text:
+/// `Invoke: Workflow({ name: "deep-research", args: "..." })`
+/// or `Run the "deep-research" workflow.`
+fn parse_injected_workflow(prompt: &str) -> Option<(String, String)> {
+    if let Some(rest) = find_ignore_ascii_case(prompt, "Invoke: Workflow(") {
+        let name = jsonish_quoted_field(rest, "name")?;
+        let args = jsonish_quoted_field(rest, "args").unwrap_or_default();
+        return Some((name, args));
+    }
+    parse_run_the_workflow(prompt)
+}
+
+fn parse_run_the_workflow(prompt: &str) -> Option<(String, String)> {
+    let lower = prompt.to_ascii_lowercase();
+    let marker = "run the \"";
+    let start = lower.find(marker)?;
+    let name_start = start + marker.len();
+    let name_end = lower[name_start..].find('"')?;
+    let name = prompt[name_start..name_start + name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after = lower[name_start + name_end + 1..].trim_start();
+    if !after.starts_with("workflow") {
+        return None;
+    }
+    Some((name, String::new()))
+}
+
+fn find_ignore_ascii_case<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
+    let hay = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() || hay.len() < needle_bytes.len() {
+        return None;
+    }
+    for i in 0..=hay.len() - needle_bytes.len() {
+        if hay[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes) {
+            return Some(&haystack[i + needle_bytes.len()..]);
+        }
+    }
+    None
+}
+
+fn jsonish_quoted_field(source: &str, key: &str) -> Option<String> {
+    let mut search = 0;
+    while let Some(rel) = source[search..].find(key) {
+        let abs = search + rel;
+        let after_key = source[abs + key.len()..].trim_start();
+        if let Some(rest) = after_key.strip_prefix(':') {
+            let rest = rest.trim_start();
+            if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let body = &rest[quote.len_utf8()..];
+                if let Some(end) = body.find(quote) {
+                    return Some(body[..end].to_string());
+                }
+            }
+        }
+        search = abs + key.len();
+        if search >= source.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn synthetic_workflow_pending_exec(name: &str, args: &str) -> PendingCursorExec {
+    let tool_use_id = format!("empty_turn_workflow_{name}");
+    let id = {
+        let mut hash: u32 = 0;
+        for b in tool_use_id.as_bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(u32::from(*b));
+        }
+        hash.max(1)
+    };
+    PendingCursorExec {
+        id,
+        exec_id: Some(format!("client_only_{tool_use_id}")),
+        tool_use_id,
+        claude_name: "Workflow".into(),
+        claude_input: serde_json::json!({ "name": name, "args": args }),
+        kind: CursorExecKind::ClientOnly,
+    }
+}
+
 fn record_segment_progress(
     event: &LiveEventResult,
     saw_text: &mut bool,
@@ -2463,7 +3307,19 @@ fn resolve_advertised_name(
     None
 }
 
-fn encode_request_context_reply(exec: &proto::ExecServerMessage) -> Result<Bytes, CursorError> {
+fn encode_request_context_reply(
+    exec: &proto::ExecServerMessage,
+    context: &RequestContext,
+) -> Result<Bytes, CursorError> {
+    // CLI does not put RequestContext on RunRequest. The server sends
+    // ExecServerMessage.request_context_args (tag 10); we reply
+    // ExecClientMessage.request_context_result (tag 10).
+    //
+    // proto.rs already has env.process_working_directory (tag 21), git_repos
+    // (tag 11), and agent_skills (tag 29). cwd/git come from the request
+    // system-reminder via `cursor_request_context_from_text` — do not dump the
+    // full Claude system prompt. agent_skills stays empty here (no skill
+    // corpus on this path).
     let message = AgentClientMessage {
         run_request: None,
         exec_client_message: Some(ExecClientMessage {
@@ -2478,7 +3334,7 @@ fn encode_request_context_reply(exec: &proto::ExecServerMessage) -> Result<Bytes
             ls_result: None,
             request_context_result: Some(RequestContextResult {
                 success: Some(RequestContextSuccess {
-                    request_context: Some(RequestContext {}),
+                    request_context: Some(context.clone()),
                     served_from_disk_cache: Some(false),
                 }),
                 error: None,
@@ -2534,8 +3390,9 @@ fn encode_kv_reply(
 }
 
 /// Auto-approve / soft-reject InteractionQuery so HTTP/1 and BiDi agent runs
-/// do not stall waiting for IDE UI. AskQuestion is rejected with an explicit
-/// reason (Claude Code has no Cursor approval modal).
+/// do not stall waiting for IDE UI. Advertised AskUserQuestion is handled in
+/// `process_live_frame` (ClientOnly expose). Unadvertised AskQuestion is
+/// rejected with an explicit reason.
 fn encode_interaction_auto_response(
     query: &InteractionQuery,
 ) -> Result<Option<Bytes>, CursorError> {
@@ -2879,8 +3736,8 @@ pub fn live_sse_response(
 #[cfg(test)]
 mod tests {
     use super::super::proto::{
-        ExecReadArgs, ExecServerMessage, InteractionUpdate, RequestContextArgs, TextDelta,
-        TurnEnded,
+        ExecReadArgs, ExecServerMessage, GitRepoInfo, InteractionUpdate, RequestContextArgs,
+        RequestContextEnv, TextDelta, TurnEnded,
     };
     use super::*;
 
@@ -2993,17 +3850,43 @@ mod tests {
             request_context_args: Some(RequestContextArgs::default()),
             ..Default::default()
         };
-        let frames = encode_request_context_reply(&exec).unwrap();
+        let context = RequestContext {
+            env: Some(RequestContextEnv {
+                process_working_directory: "/tmp/work".into(),
+                project_folder: "/tmp/work".into(),
+                workspace_paths: vec!["/tmp/work".into()],
+                ..Default::default()
+            }),
+            git_repos: vec![GitRepoInfo {
+                path: "/tmp/work".into(),
+                branch_name: "main".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frames = encode_request_context_reply(&exec, &context).unwrap();
         let decoded = super::super::client::decode_upstream_frames(&frames).unwrap();
         assert_eq!(decoded.len(), 2);
 
         let result = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        let filled = result
+            .exec_client_message
+            .unwrap()
+            .request_context_result
+            .unwrap()
+            .success
+            .unwrap()
+            .request_context
+            .unwrap();
+        let env = filled.env.expect("env");
+        assert_eq!(env.process_working_directory, "/tmp/work");
+        assert_eq!(env.project_folder, "/tmp/work");
+        assert_eq!(env.workspace_paths, vec!["/tmp/work".to_string()]);
+        assert_eq!(filled.git_repos.len(), 1);
+        assert_eq!(filled.git_repos[0].branch_name, "main");
         assert!(
-            result
-                .exec_client_message
-                .unwrap()
-                .request_context_result
-                .is_some()
+            filled.agent_skills.is_empty(),
+            "do not invent agent_skills from the Claude system prompt"
         );
         let close = AgentClientMessage::decode(decoded[1].payload.as_ref()).unwrap();
         assert_eq!(
@@ -3085,6 +3968,17 @@ mod tests {
         }
     }
 
+    fn dummy_handle(run_id: &str) -> Arc<CursorLiveRunHandle> {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        Arc::new(CursorLiveRunHandle {
+            run_id: run_id.into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     #[test]
     fn pending_exec_state_exposes_client_only_without_flushing_native() {
         let mut state = PendingExecState::default();
@@ -3117,7 +4011,10 @@ mod tests {
         let mut sink = Some(event_tx);
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let keep_bidi = expose_collected_tools(&mut pending, &pending_shared, &mut sink).await;
-        assert!(!keep_bidi, "ClientOnly expose must end BiDi");
+        assert!(
+            keep_bidi,
+            "mixed ClientOnly+native must keep BiDi for in-flight Read/Bash"
+        );
         let event = event_rx.recv().await.expect("NativeToolBatch");
         match event {
             Ok(LiveRunEvent::NativeToolBatch(tools)) => {
@@ -3151,6 +4048,55 @@ mod tests {
         );
         drop(reservation);
         assert!(!LiveRunRegistry::is_occupied(&session));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn nested_agent_run_does_not_supersede_parent() {
+        LiveRunRegistry::clear();
+        let session = format!("nested-session-{}", uuid::Uuid::new_v4());
+        let parent_res = LiveRunRegistry::reserve(&session).expect("parent reserve");
+        let parent = dummy_handle("parent-run");
+        parent_res
+            .insert(Arc::clone(&parent))
+            .expect("insert parent");
+
+        let nested_res = LiveRunRegistry::reserve_run(&session, Some("agent-nested"))
+            .expect("nested slot must be free while parent is running");
+        assert!(
+            LiveRunRegistry::get(&session).is_some(),
+            "parent slot must stay occupied"
+        );
+        assert!(LiveRunRegistry::is_occupied_run(
+            &session,
+            Some("agent-nested")
+        ));
+        let nested = dummy_handle("nested-run");
+        nested_res
+            .insert(Arc::clone(&nested))
+            .expect("insert nested");
+
+        assert_eq!(LiveRunRegistry::get(&session).unwrap().run_id, "parent-run");
+        assert_eq!(
+            LiveRunRegistry::get_run(&session, Some("agent-nested"))
+                .unwrap()
+                .run_id,
+            "nested-run"
+        );
+        assert_eq!(
+            live_run_key(&session, Some("agent-nested")),
+            format!("{session}::agent::agent-nested")
+        );
+        assert!(
+            !live_run_key(&session, Some("agent-nested")).contains("::nested::"),
+            "must not invent a nested session UUID"
+        );
+
+        let _ = LiveRunRegistry::supersede(&session);
+        assert!(
+            LiveRunRegistry::get_run(&session, Some("agent-nested")).is_some(),
+            "supersede(session) must not cancel the nested agent slot"
+        );
         LiveRunRegistry::clear();
     }
 
@@ -3251,6 +4197,7 @@ mod tests {
             &mut last_progress,
             Duration::from_millis(50),
             &mut xml_parser,
+            None,
         )
         .await;
         assert!(cont);
@@ -3379,6 +4326,7 @@ mod tests {
             &mut last_progress,
             Duration::from_millis(50),
             &mut xml_parser,
+            None,
         )
         .await;
         assert!(!cont, "MCP Workflow must end BiDi segment");
@@ -3487,6 +4435,7 @@ mod tests {
             &mut last_progress,
             Duration::from_millis(50),
             &mut xml_parser,
+            None,
         )
         .await;
         assert!(
@@ -3604,6 +4553,7 @@ mod tests {
             &mut last_progress,
             Duration::from_millis(50),
             &mut xml_parser,
+            None,
         )
         .await;
         // Client-only expose ends the BiDi segment (return false).
@@ -3632,9 +4582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flag_end_without_text_emits_empty_turn_note() {
-        // Regression: Connect FLAG_END used to emit bare End → Anthropic Out:0
-        // even when Workflow was advertised. Empty-note must fire before End.
+    async fn flag_end_with_workflow_emits_tool_use() {
         use super::super::connect::{FLAG_END, encode_connect_frame};
 
         let framed = encode_connect_frame(b"", FLAG_END);
@@ -3658,6 +4606,16 @@ mod tests {
         let mut last_progress = Instant::now();
         let allowed = BTreeSet::from(["Workflow".to_string()]);
         let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        let prompt = r#"Invoke: Workflow({ name: "deep-research", args: "why rust?" })"#;
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            user_prompt: prompt,
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
 
         let cont = process_live_frame(
             frames.into_iter().next().unwrap(),
@@ -3676,11 +4634,76 @@ mod tests {
             &mut last_progress,
             Duration::from_millis(50),
             &mut xml_parser,
+            Some(&mut turn),
+        )
+        .await;
+        assert!(!cont, "Workflow tool_use ends the live segment");
+        let event = event_rx.try_recv().expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Workflow");
+                assert_eq!(
+                    tools[0].input.get("name").and_then(|v| v.as_str()),
+                    Some("deep-research")
+                );
+                assert_eq!(
+                    tools[0].input.get("args").and_then(|v| v.as_str()),
+                    Some("why rust?")
+                );
+            }
+            other => panic!("expected Workflow tool_use, got {other:?}"),
+        }
+        assert!(event_rx.try_recv().is_err(), "must not also emit End/note");
+    }
+
+    #[tokio::test]
+    async fn flag_end_without_workflow_emits_empty_turn_note() {
+        use super::super::connect::{FLAG_END, encode_connect_frame};
+
+        let framed = encode_connect_frame(b"", FLAG_END);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Read".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
         )
         .await;
         assert!(!cont, "FLAG_END must end the live segment");
         assert!(saw_text, "empty-note must mark saw_text");
-        assert!(useful);
 
         let note = event_rx.try_recv().expect("empty-note TextDelta");
         match note {
@@ -3689,7 +4712,10 @@ mod tests {
                     text.contains("without text or tool calls"),
                     "unexpected note: {text}"
                 );
-                assert!(text.contains("Workflow"));
+                assert!(
+                    !text.contains("Workflow"),
+                    "note-only when Workflow was not advertised"
+                );
             }
             other => panic!("expected TextDelta note, got {other:?}"),
         }
@@ -3698,6 +4724,338 @@ mod tests {
             end,
             Ok(LiveRunEvent::Cursor(CursorStreamEvent::End))
         ));
+    }
+
+    #[test]
+    fn parse_injected_workflow_invoke_and_run_the() {
+        let (name, args) = parse_injected_workflow(
+            r#"Invoke: Workflow({ name: "deep-research", args: "what is rust?" })"#,
+        )
+        .unwrap();
+        assert_eq!(name, "deep-research");
+        assert_eq!(args, "what is rust?");
+
+        let (name, args) = parse_injected_workflow(r#"Run the "deep-research" workflow."#).unwrap();
+        assert_eq!(name, "deep-research");
+        assert_eq!(args, "");
+    }
+
+    fn text_delta_event(text: &str) -> LiveEventResult {
+        Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: text.into(),
+        }))
+    }
+
+    #[test]
+    fn coalescer_passes_through_when_queue_healthy() {
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let out = coalescer.ingest(text_delta_event("a"), LIVE_EVENT_CHANNEL_CAP);
+        assert_eq!(out.len(), 1);
+        assert!(coalescer.flush().is_none());
+    }
+
+    #[test]
+    fn coalescer_merges_consecutive_text_under_backpressure() {
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let remaining = LIVE_EVENT_CHANNEL_CAP / 4;
+        assert!(
+            coalescer
+                .ingest(text_delta_event("hello"), remaining)
+                .is_empty()
+        );
+        assert!(
+            coalescer
+                .ingest(text_delta_event(" world"), remaining)
+                .is_empty()
+        );
+        match coalescer.flush() {
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }))) => {
+                assert_eq!(text, "hello world");
+            }
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalescer_does_not_merge_across_tool_batch() {
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let remaining = LIVE_EVENT_CHANNEL_CAP / 4;
+        assert!(
+            coalescer
+                .ingest(text_delta_event("hello"), remaining)
+                .is_empty()
+        );
+        let out = coalescer.ingest(Ok(LiveRunEvent::NativeToolBatch(Vec::new())), remaining);
+        assert_eq!(out.len(), 2, "flush text then pass the tool batch");
+        assert!(
+            coalescer
+                .ingest(text_delta_event("after"), remaining)
+                .is_empty()
+        );
+        match coalescer.flush() {
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }))) => {
+                assert_eq!(text, "after");
+            }
+            other => panic!("expected post-tool text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_advertised_exposes_client_only() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, AskQuestionArgs, AskQuestionInteractionQuery, AskQuestionItem,
+            InteractionQuery,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: Some(InteractionQuery {
+                id: 7,
+                ask_question_interaction_query: Some(AskQuestionInteractionQuery {
+                    args: Some(AskQuestionArgs {
+                        title: "Choose a path forward now".into(),
+                        questions: vec![AskQuestionItem {
+                            id: "q1".into(),
+                            prompt: "Which approach".into(),
+                        }],
+                    }),
+                    tool_call_id: "ask-1".into(),
+                }),
+                ..Default::default()
+            }),
+            exec_server_message: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["AskUserQuestion".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        assert!(!cont, "AskUserQuestion expose tears down like Workflow");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "must not auto-reject advertised AskUserQuestion"
+        );
+        let event = event_rx.try_recv().expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "AskUserQuestion");
+                let questions = tools[0]
+                    .input
+                    .get("questions")
+                    .and_then(|v| v.as_array())
+                    .expect("questions");
+                assert_eq!(questions.len(), 1);
+                assert_eq!(
+                    questions[0].get("question").and_then(|v| v.as_str()),
+                    Some("Which approach?")
+                );
+                let header = questions[0]
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert!(header.chars().count() <= ASK_USER_QUESTION_HEADER_MAX);
+                let options = questions[0]
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .expect("options");
+                assert!(
+                    (2..=4).contains(&options.len()),
+                    "AskUserQuestion options must be 2-4, got {}",
+                    options.len()
+                );
+            }
+            other => panic!("expected AskUserQuestion tool_use, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_question_unadvertised_is_rejected() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, AskQuestionArgs, AskQuestionInteractionQuery, AskQuestionItem,
+            InteractionQuery,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: Some(InteractionQuery {
+                id: 7,
+                ask_question_interaction_query: Some(AskQuestionInteractionQuery {
+                    args: Some(AskQuestionArgs {
+                        title: "Choose".into(),
+                        questions: vec![AskQuestionItem {
+                            id: "q1".into(),
+                            prompt: "Go?".into(),
+                        }],
+                    }),
+                    tool_call_id: "ask-2".into(),
+                }),
+                ..Default::default()
+            }),
+            exec_server_message: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Read".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        assert!(cont, "rejecting AskQuestion must keep BiDi");
+        assert!(event_rx.try_recv().is_err(), "must not expose tool_use");
+        let reply = request_rx.try_recv().expect("reject frame");
+        let decoded = super::super::client::decode_upstream_frames(&reply.unwrap()).unwrap();
+        let message = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        assert!(
+            message
+                .interaction_response
+                .as_ref()
+                .and_then(|r| r.ask_question_interaction_response.as_ref())
+                .and_then(|r| r.result.as_ref())
+                .and_then(|r| r.rejected.as_ref())
+                .is_some(),
+            "unadvertised AskQuestion must still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn prost_decode_failure_skips_frame_without_502() {
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
+        let prompt = "";
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            user_prompt: prompt,
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+        let frame = ConnectFrame {
+            flags: super::super::connect::FLAG_GZIP,
+            payload: Bytes::from_static(&[0xff, 0x00, 0x00]),
+        };
+        let cont = process_live_frame(
+            frame,
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            None,
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            Some(&mut turn),
+        )
+        .await;
+        assert!(cont, "a single prost decode error must skip, not 502");
+        assert_eq!(decode_failures, 1);
+        assert!(terminal_error.lock().unwrap().is_none());
     }
 
     #[test]
@@ -4021,6 +5379,7 @@ mod tests {
             "multi-test-session".into(),
             "multi-test-run".into(),
             HashMap::new(),
+            String::new(),
             test_reconnect_context(),
         ));
         let handle = CursorLiveRunHandle {
@@ -4309,6 +5668,7 @@ mod tests {
             "heartbeat-drop-session".into(),
             "heartbeat-drop-run".into(),
             HashMap::new(),
+            String::new(),
             test_reconnect_context(),
         ));
 
@@ -4362,6 +5722,7 @@ mod tests {
             "drop-test-session".into(),
             "drop-test-run".into(),
             HashMap::new(),
+            String::new(),
             test_reconnect_context(),
         ));
 
