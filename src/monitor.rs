@@ -1025,6 +1025,7 @@ fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
 /// - First positive `output_tokens` starts (or restarts) the tok/s clock.
 /// - Pre-token stream bytes only arm a byte/event fallback clock, which is
 ///   discarded once real Out arrives so thinking silence does not dilute Rate.
+#[allow(clippy::too_many_arguments)]
 fn note_throughput_progress(
     generation_started_at: &mut Option<SystemTime>,
     generation_started_instant: &mut Option<Instant>,

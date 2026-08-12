@@ -37,15 +37,16 @@
 
             installPhase = ''
               runHook preInstall
-              install -Dm755 target/release/claude-cursor-bridge "$out/bin/claude-cursor-bridge"
+              install -Dm755 target/release/claude-cursor-proxy "$out/bin/claude-cursor-proxy"
+              ln -s claude-cursor-proxy "$out/bin/claude-cursor-bridge"
               runHook postInstall
             '';
 
             meta = with pkgs.lib; {
               description = cargoToml.package.description;
-              homepage = "https://github.com/YeautyYE/claude-cursor-bridge";
+              homepage = "https://github.com/YeautyYE/claude-cursor-proxy";
               license = licenses.mit;
-              mainProgram = "claude-cursor-bridge";
+              mainProgram = "claude-cursor-proxy";
             };
           };
         }
@@ -54,7 +55,7 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/claude-cursor-bridge";
+          program = "${self.packages.${system}.default}/bin/claude-cursor-proxy";
         };
       });
 

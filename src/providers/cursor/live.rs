@@ -713,16 +713,6 @@ impl LiveRunMap {
     fn keys_for(&self, session_id: &str) -> Vec<String> {
         self.by_session.get(session_id).cloned().unwrap_or_default()
     }
-
-    fn session_occupied(&self, session_id: &str) -> bool {
-        self.keys_for(session_id)
-            .iter()
-            .any(|key| match self.runs.get(key) {
-                Some(LiveRunEntry::Starting { .. }) => true,
-                Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
-                _ => false,
-            })
-    }
 }
 
 static LIVE_RUNS: LazyLock<Mutex<LiveRunMap>> = LazyLock::new(|| Mutex::new(LiveRunMap::new()));
@@ -949,12 +939,6 @@ impl LiveRunRegistry {
         }
         runs.runs.clear();
         runs.by_session.clear();
-    }
-
-    #[cfg(test)]
-    fn slot_keys(session_id: &str) -> Vec<String> {
-        let runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        runs.keys_for(session_id)
     }
 }
 
@@ -1542,16 +1526,16 @@ impl LiveDeltaCoalescer {
             out.push(event);
             return out;
         };
-        let same_kind_merge = match (&self.pending, delta) {
+        let same_kind_merge = matches!(
+            (&self.pending, delta),
             (
                 Some(CursorStreamEvent::ThinkingDelta { .. }),
                 CursorStreamEvent::ThinkingDelta { .. },
+            ) | (
+                Some(CursorStreamEvent::TextDelta { .. }),
+                CursorStreamEvent::TextDelta { .. }
             )
-            | (Some(CursorStreamEvent::TextDelta { .. }), CursorStreamEvent::TextDelta { .. }) => {
-                true
-            }
-            _ => false,
-        };
+        );
         if !channel_backpressured(remaining, LIVE_EVENT_CHANNEL_CAP) || !same_kind_merge {
             let mut out = Vec::new();
             if let Some(flushed) = self.flush() {
@@ -1662,13 +1646,10 @@ async fn emit_live_delta(
 
 async fn control_close_natives(pending: &mut PendingExecState, outbound: &ClientOutbound) -> bool {
     for exec in pending.drain_natives() {
-        match encode_control_close(exec.id) {
-            Ok(frame) => {
-                if !outbound.send_connect_frame(frame).await {
-                    return false;
-                }
+        if let Ok(frame) = encode_control_close(exec.id) {
+            if !outbound.send_connect_frame(frame).await {
+                return false;
             }
-            Err(_) => {}
         }
     }
     true
@@ -2223,10 +2204,9 @@ async fn process_live_frame(
                 && pending.all().any(|exec| {
                     matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
                 })
+                && !control_close_natives(pending, outbound).await
             {
-                if !control_close_natives(pending, outbound).await {
-                    return false;
-                }
+                return false;
             }
             if pending.all_client_only() {
                 return expose_collected_tools(pending, pending_shared, sink).await;
@@ -2718,10 +2698,9 @@ async fn process_interaction_update(
                 && pending.all().any(|exec| {
                     matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
                 })
+                && !control_close_natives(pending, outbound).await
             {
-                if !control_close_natives(pending, outbound).await {
-                    return false;
-                }
+                return false;
             }
             if pending.all_client_only() {
                 // Workflow/Skill: expose Anthropic tool_use and end BiDi
@@ -2785,6 +2764,7 @@ async fn process_interaction_update(
 ///
 /// Used from `turn_ended`, clean Connect `FLAG_END`, and exhausted EOF — all
 /// three previously could produce silent Anthropic Out:0 completions.
+#[allow(clippy::too_many_arguments)]
 async fn emit_empty_turn_note_if_needed(
     saw_text: &mut bool,
     useful: &mut bool,
@@ -2910,6 +2890,7 @@ async fn expose_collected_tools(
 
 /// Drain buffered XML `<tool_use>` on turn/stream end and expose Claude-local
 /// tools immediately when recovered.
+#[allow(clippy::too_many_arguments)]
 async fn flush_xml_tool_uses(
     xml_parser: &mut CursorToolUseXmlParser,
     pending: &mut PendingExecState,
@@ -3645,6 +3626,7 @@ fn env_u64_allow_zero(name: &str, default: u64) -> u64 {
 /// TUI polls ~4Hz; publishing every thinking delta only contends on the lock.
 const MONITOR_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+#[allow(clippy::too_many_arguments)]
 fn publish_live_usage(
     monitor: &Option<(crate::monitor::MonitorHandle, String)>,
     encoder: &CursorSseEncoder,
