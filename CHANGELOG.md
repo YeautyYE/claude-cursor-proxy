@@ -6,6 +6,7 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 ## v0.1.27 (2026-08-13)
 
 - Fix ClientOnly (Workflow/Skill/mcp__*) continuation: after BiDi teardown, a tool_result-only POST is forwarded into the next Cursor Run instead of being skipped as a native exec resume. Clear the in-flight MCP checkpoint so the next turn is not a zombie resume.
+- Treat Cursor qualified MCP names (`claude-local/Workflow`, `claude-local:Workflow`) as ClientOnly and emit Anthropic `tool_use.name` `Workflow` so `/deep-research` reaches Claude Code.
 - Stop stuffing Cursor `provider_identifier` into Anthropic Workflow/MCP tool input (`additionalProperties: false`).
 - Mixed native+ClientOnly batches expose Workflow/Skill without flushing still-collecting Read/Bash into the same Anthropic pause. Starting live-run reservations count as occupied; ResumeAction reconnect keeps `mcp_tools`.
 

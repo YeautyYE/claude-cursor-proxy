@@ -39,7 +39,10 @@ use super::proto::{
     McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
-use super::request::{CursorSelectedImage, is_claude_local_tool_name};
+use super::request::{
+    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_tool_name,
+    strip_mcp_provider_prefix,
+};
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
 use super::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
@@ -1851,17 +1854,18 @@ async fn process_live_frame(
             // MCP tool_call_started (not ExecServerMessage). Expose immediately
             // so Claude Code can fulfill Workflow/Skill locally.
             if let Some(mapped) = map_tool_call_started(&started) {
-                let allowed = allowed_tool_names
-                    .map(|set| set.contains(&mapped.name))
-                    .unwrap_or(true);
-                if allowed && is_claude_local_tool_name(&mapped.name) {
+                let provider = mcp_provider_identifier(&started);
+                if let Some(emit_name) =
+                    client_only_anthropic_name(&mapped.name, provider, allowed_tool_names)
+                {
                     if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
                         eprintln!(
-                            "[ccp-cursor] mcp tool_call_started → ClientOnly {}",
-                            mapped.name
+                            "[ccp-cursor] mcp tool_call_started → ClientOnly {} (wire={})",
+                            emit_name, mapped.name
                         );
                     }
-                    let exec = mcp_client_only_pending_exec(&mapped);
+                    let mut exec = mcp_client_only_pending_exec(&mapped);
+                    exec.claude_name = emit_name;
                     pending.queue(exec, Duration::ZERO);
                     return expose_collected_tools(pending, pending_shared, sink).await;
                 }
@@ -1923,11 +1927,11 @@ async fn process_live_frame(
                         // Claude-local tools (Workflow/Skill/…) appear as XML in
                         // Fable text when advertised via `<tools>`. Native
                         // Read/Bash still come through ExecServerMessage.
-                        let allowed = allowed_tool_names
-                            .map(|set| set.contains(&tool_use.name))
-                            .unwrap_or(true);
-                        if allowed && is_claude_local_tool_name(&tool_use.name) {
-                            let exec = client_only_pending_exec(&tool_use);
+                        if let Some(emit_name) =
+                            client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
+                        {
+                            let mut exec = client_only_pending_exec(&tool_use);
+                            exec.claude_name = emit_name;
                             // Expose immediately — Cursor may turn_ended right
                             // after the XML in the same chunk; waiting for the
                             // outer select would race into "pending native tools".
@@ -2180,11 +2184,12 @@ async fn flush_xml_tool_uses(
             }
             RecoveredCursorEvent::Text(_) => {}
             RecoveredCursorEvent::ToolUse(tool_use) => {
-                let allowed = allowed_tool_names
-                    .map(|set| set.contains(&tool_use.name))
-                    .unwrap_or(true);
-                if allowed && is_claude_local_tool_name(&tool_use.name) {
-                    pending.queue(client_only_pending_exec(&tool_use), Duration::ZERO);
+                if let Some(emit_name) =
+                    client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
+                {
+                    let mut exec = client_only_pending_exec(&tool_use);
+                    exec.claude_name = emit_name;
+                    pending.queue(exec, Duration::ZERO);
                     exposed_client_only = true;
                 } else if !tool_use.name.is_empty() {
                     let input_json =
@@ -2235,6 +2240,61 @@ fn client_only_pending_exec(
         claude_input: serde_json::Value::Object(tool_use.input.clone()),
         kind: CursorExecKind::ClientOnly,
     }
+}
+
+fn mcp_provider_identifier(started: &super::proto::ToolCallStarted) -> &str {
+    started
+        .tool_call
+        .as_ref()
+        .and_then(|tc| tc.mcp_tool_call.as_ref())
+        .and_then(|call| call.args.as_ref())
+        .map(|args| args.provider_identifier.as_str())
+        .unwrap_or("")
+}
+
+fn qualified_mcp_provider(name: &str) -> Option<&str> {
+    name.split_once('/')
+        .or_else(|| name.split_once(':'))
+        .and_then(|(provider, tool)| {
+            (!provider.is_empty() && !tool.is_empty() && !tool.contains('/') && !tool.contains(':'))
+                .then_some(provider)
+        })
+}
+
+/// Decide whether an MCP/XML tool should be ClientOnly, and which Anthropic
+/// `tool_use.name` to emit. Cursor may send `claude-local/Workflow` while Claude
+/// Code advertised `Workflow`.
+fn client_only_anthropic_name(
+    mapped_name: &str,
+    provider_identifier: &str,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    let stripped = strip_mcp_provider_prefix(mapped_name);
+    if stripped.is_empty() {
+        return None;
+    }
+    let local = is_claude_local_tool_name(stripped)
+        || (stripped != mapped_name && is_claude_local_tool_name(mapped_name));
+    if !local {
+        return None;
+    }
+
+    let in_advertised = match allowed {
+        None => true,
+        Some(set) => set.contains(mapped_name) || set.contains(stripped),
+    };
+    let claude_local_provider = provider_identifier == CLAUDE_LOCAL_MCP_PROVIDER
+        || qualified_mcp_provider(mapped_name) == Some(CLAUDE_LOCAL_MCP_PROVIDER);
+    if !claude_local_provider && !in_advertised {
+        return None;
+    }
+
+    if let Some(set) = allowed {
+        if let Some(hit) = set.get(stripped) {
+            return Some(hit.clone());
+        }
+    }
+    Some(stripped.to_string())
 }
 
 fn mcp_client_only_pending_exec(
@@ -3200,6 +3260,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_only_anthropic_name_strips_qualified_mcp_names() {
+        let allowed = BTreeSet::from(["Workflow".to_string(), "Skill".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("claude-local/Workflow", "claude-local", Some(&allowed))
+                .as_deref(),
+            Some("Workflow")
+        );
+        assert_eq!(
+            client_only_anthropic_name("claude-local:Workflow", "", Some(&allowed)).as_deref(),
+            Some("Workflow")
+        );
+        assert_eq!(
+            client_only_anthropic_name("Workflow", "claude-local", Some(&allowed)).as_deref(),
+            Some("Workflow")
+        );
+        assert_eq!(
+            client_only_anthropic_name("Read", "", Some(&allowed)),
+            None,
+            "native tools must not become ClientOnly"
+        );
+        let read_only = BTreeSet::from(["Read".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("claude-local/Workflow", "claude-local", Some(&read_only))
+                .as_deref(),
+            Some("Workflow"),
+            "claude-local provider still exposes Workflow when tools[].name did not match"
+        );
+        assert_eq!(
+            client_only_anthropic_name("plugin/search", "plugin", Some(&allowed)),
+            None,
+            "non-claude-local qualified names stay UI transcript unless advertised"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_workflow_tool_call_started_exposes_client_only() {
         use super::super::connect::encode_connect_frame;
@@ -3302,6 +3397,134 @@ mod tests {
                 );
             }
             other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+    }
+
+    async fn client_only_tools_from_mcp_started(
+        tool_name: &str,
+        name: &str,
+        provider: &str,
+    ) -> Vec<LiveNativeTool> {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "mcp-wf-q".into(),
+                    model_call_id: "model-q".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: name.into(),
+                                tool_name: tool_name.into(),
+                                tool_call_id: "mcp-wf-q".into(),
+                                provider_identifier: provider.into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("name".into(), br#""deep-research""#.to_vec());
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+        )
+        .await;
+        assert!(
+            !cont,
+            "qualified MCP Workflow ({tool_name}) must end BiDi segment"
+        );
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => tools,
+            other => panic!("expected NativeToolBatch for {tool_name}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_qualified_workflow_name_exposes_client_only_as_workflow() {
+        for (tool_name, name, provider) in [
+            (
+                "claude-local/Workflow",
+                "claude-local/Workflow",
+                "claude-local",
+            ),
+            ("claude-local:Workflow", "Workflow", "claude-local"),
+            ("Workflow", "claude-local/Workflow", "claude-local"),
+        ] {
+            let tools = client_only_tools_from_mcp_started(tool_name, name, provider).await;
+            assert_eq!(tools.len(), 1, "{tool_name} / {name}");
+            assert_eq!(
+                tools[0].name, "Workflow",
+                "Anthropic tool_use.name must be Workflow, not the qualified MCP name {tool_name}"
+            );
+            assert_eq!(
+                tools[0].input.get("name").and_then(|v| v.as_str()),
+                Some("deep-research")
+            );
+            assert!(
+                tools[0].input.get("provider_identifier").is_none(),
+                "Workflow Anthropic input must not include provider_identifier"
+            );
         }
     }
 

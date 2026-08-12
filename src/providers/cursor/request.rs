@@ -128,6 +128,22 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
     !name.is_empty() && !is_cursor_native_tool_name(name)
 }
 
+/// Cursor may qualify MCP names as `provider/tool` or `provider:tool`
+/// (`claude-local/Workflow`). Anthropic `tools[].name` is the bare tool.
+pub(crate) fn strip_mcp_provider_prefix(name: &str) -> &str {
+    for sep in ['/', ':'] {
+        if let Some((provider, tool)) = name.split_once(sep)
+            && !provider.is_empty()
+            && !tool.is_empty()
+            && !tool.contains('/')
+            && !tool.contains(':')
+        {
+            return tool;
+        }
+    }
+    name
+}
+
 /// Stable provider id for Claude Code client-local tools advertised as MCP.
 ///
 /// Official Cursor CLI always sets `providerIdentifier` + `toolName` on each
@@ -756,6 +772,22 @@ mod tests {
 
     /// Serialize tests that mutate process-wide CCP_CURSOR_* env flags.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn strip_mcp_provider_prefix_handles_slash_and_colon() {
+        assert_eq!(
+            strip_mcp_provider_prefix("claude-local/Workflow"),
+            "Workflow"
+        );
+        assert_eq!(
+            strip_mcp_provider_prefix("claude-local:Workflow"),
+            "Workflow"
+        );
+        assert_eq!(strip_mcp_provider_prefix("Workflow"), "Workflow");
+        assert_eq!(strip_mcp_provider_prefix("mcp__x__y"), "mcp__x__y");
+        assert_eq!(strip_mcp_provider_prefix("plugin/search"), "search");
+        assert_eq!(strip_mcp_provider_prefix("a/b/c"), "a/b/c");
+    }
 
     #[test]
     fn claude_local_mcp_tools_includes_workflow_skill_not_read() {
