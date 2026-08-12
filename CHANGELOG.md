@@ -3,6 +3,14 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.35 (2026-08-13)
+
+- Live stream decode failures include the reqwest/hyper/h2 source chain (so TUI shows `connection reset` / `unexpected EOF`, not just `error decoding response body`).
+- ResumeAction reconnect after a dropped Cursor stream: first attempt is immediate; retryable open failures loop up to `CCP_CURSOR_RECONNECT_MAX` and can flip to HTTP/1. Unexposed collecting tools are `control_close`d; Claude-owed `tool_result`s stay queued so a mid-tool disconnect can resume. Skip/fail reasons are logged and appended to the Anthropic `event: error`.
+- Conversation checkpoints are persisted as soon as Cursor sends `conversation_checkpoint_update`, not only when the BiDi driver exits.
+- Tool-result resume retries ResumeAction once if the request stream was already closed.
+- `CCP_CURSOR_NO_PROXY=1` skips HTTP(S)_PROXY for Cursor API (Clash/Surge TUN still needs a DIRECT rule for `*.cursor.sh`).
+
 ## v0.1.34 (2026-08-13)
 
 - Route live Cursor catalog ids (`claude-fable-5-thinking-high[1m]`, …) through `/v1/messages`; overlapping `gpt-5.5` without a `cursor:` prefix still goes to Codex.

@@ -176,6 +176,7 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 | `CCP_CURSOR_EMBED_SYSTEM` | 关 | 把 Anthropic `system` 塞进 Cursor（可能触发 Fable 注入防御） |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | 关 | 强制倾倒全部 tools schema；BiDi 已默认保留 `Workflow`/`Skill` 等 |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `15` | 下游 keep-alive 间隔（秒） |
+| `CCP_CURSOR_NO_PROXY` | 关 | 对 Cursor API 跳过 HTTP(S)_PROXY（`1` / `true`） |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | 未设置 | 调试日志 |
 
 ### Claude Code 侧（非代理配置）
@@ -218,6 +219,7 @@ claude-cursor-proxy cursor auth status
 | 工具调用重复 | 加上 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
 | `/deep-research` 只用 Bash/curl | 升级代理；transcript 应有 `Workflow`；必要时 `enableWorkflows: true` |
 | 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| 约 8 分钟后 502 `error decoding response body` | 升级到 ≥0.1.35 并重启 serve。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；HTTP 代理模式可设 `CCP_CURSOR_NO_PROXY=1`；仍断可试 `CCP_CURSOR_HTTP1=1` |
 
 ---
 

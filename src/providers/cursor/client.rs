@@ -100,13 +100,18 @@ impl CursorHttpClient {
         if is_cleartext {
             // Mock/tests use http://127.0.0.1 — never send loopback through Clash.
             builder = builder.no_proxy().http2_prior_knowledge();
-        } else if prefer_http1 {
-            builder = builder.http1_only();
         } else {
-            builder = builder
-                .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
-                .http2_keep_alive_while_idle(true)
-                .http2_keep_alive_interval(std::time::Duration::from_secs(10));
+            if cursor_http_bypass_proxy(std::env::var("CCP_CURSOR_NO_PROXY").ok().as_deref()) {
+                builder = builder.no_proxy();
+            }
+            if prefer_http1 {
+                builder = builder.http1_only();
+            } else {
+                builder = builder
+                    .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
+                    .http2_keep_alive_while_idle(true)
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(10));
+            }
         }
 
         let client = builder.build().expect("CursorHttpClient: reqwest client");
@@ -827,6 +832,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+/// `CCP_CURSOR_NO_PROXY=1` skips HTTP(S)_PROXY for Cursor API calls.
+/// Clash/Surge TUN mode ignores this — those users need a DIRECT rule for `*.cursor.sh`.
+pub(crate) fn cursor_http_bypass_proxy(raw: Option<&str>) -> bool {
+    matches!(
+        raw.unwrap_or("").trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Re-encode a decoded Connect frame into the retained response body.
@@ -1554,5 +1568,15 @@ mod tests {
         assert_eq!(tools.tools.len(), 1);
         assert_eq!(tools.tools[0].name, "Workflow");
         assert_eq!(tools.tools[0].provider_identifier, "claude-local");
+    }
+
+    #[test]
+    fn cursor_http_bypass_proxy_parses_truthy_flags() {
+        assert!(!cursor_http_bypass_proxy(None));
+        assert!(!cursor_http_bypass_proxy(Some("")));
+        assert!(!cursor_http_bypass_proxy(Some("0")));
+        assert!(cursor_http_bypass_proxy(Some("1")));
+        assert!(cursor_http_bypass_proxy(Some("true")));
+        assert!(cursor_http_bypass_proxy(Some(" YES ")));
     }
 }

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -517,6 +518,26 @@ impl PendingExecState {
         self.awaiting = client_awaiting;
         if self.awaiting.is_empty() {
             self.awaiting_since = None;
+        }
+        natives
+    }
+
+    /// Close unexposed native execs before ResumeAction. Claude-owed `awaiting`
+    /// tools stay queued so their `tool_result` can be written on the new stream.
+    fn drain_collecting_natives(&mut self) -> Vec<PendingCursorExec> {
+        let mut natives = Vec::new();
+        let mut keep = Vec::new();
+        for exec in self.collecting.drain(..) {
+            if matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly) {
+                keep.push(exec);
+            } else {
+                natives.push(exec);
+            }
+        }
+        self.collecting = keep;
+        if self.collecting.is_empty() {
+            self.collecting_since = None;
+            self.collect_deadline = None;
         }
         natives
     }
@@ -1393,7 +1414,7 @@ where
         while let Some(item) = stream.next().await {
             let mapped = match item {
                 Ok(chunk) => Ok(Some(chunk)),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(format_error_chain(&e)),
             };
             if tx.send(mapped).await.is_err() {
                 return;
@@ -1444,107 +1465,214 @@ fn abrupt_eof_should_error(_had_progress: bool) -> bool {
     true
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveReconnectOutcome {
+    Reconnected,
+    Skipped(&'static str),
+    Failed(String),
+}
+
+fn format_error_chain(err: &dyn Error) -> String {
+    let mut parts = Vec::new();
+    let mut current: Option<&dyn Error> = Some(err);
+    while let Some(e) = current {
+        let text = e.to_string();
+        if parts
+            .last()
+            .is_none_or(|prev: &String| prev != &text && !prev.contains(&text))
+        {
+            parts.push(text);
+        }
+        current = e.source();
+    }
+    parts.join(": ")
+}
+
+fn live_reconnect_skip_reason(
+    latest_checkpoint: &Option<Vec<u8>>,
+    opening_checkpoint: &Option<Vec<u8>>,
+    reconnect_attempts: u32,
+    max_reconnects: u32,
+) -> Option<&'static str> {
+    let has_checkpoint = latest_checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| !checkpoint.is_empty())
+        || opening_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| !checkpoint.is_empty());
+    if !has_checkpoint {
+        return Some("no checkpoint");
+    }
+    if reconnect_attempts >= max_reconnects {
+        return Some("reconnect budget exhausted");
+    }
+    None
+}
+
+/// First ResumeAction is immediate; later attempts match CLI 1s×2^n + 20% jitter, cap 60s.
+fn live_reconnect_backoff_ms(attempt: u32) -> u64 {
+    if attempt <= 1 {
+        return 0;
+    }
+    let shift = (attempt - 2).min(6);
+    let base_ms = 1_000u64 << shift;
+    let jitter = ((base_ms as f64) * 0.2 * ((attempt as f64 * 0.37) % 1.0)) as u64;
+    (base_ms + jitter).min(60_000)
+}
+
+fn reconnect_note(outcome: &LiveReconnectOutcome) -> String {
+    match outcome {
+        LiveReconnectOutcome::Reconnected => String::new(),
+        LiveReconnectOutcome::Skipped(reason) => {
+            format!(" (reconnect skipped: {reason})")
+        }
+        LiveReconnectOutcome::Failed(detail) => {
+            format!(" (reconnect failed: {detail})")
+        }
+    }
+}
+
+fn log_live_reconnect(outcome: &LiveReconnectOutcome, attempts: u32, max_reconnects: u32) {
+    let mut fields = serde_json::Map::new();
+    fields.insert("attempts".into(), serde_json::json!(attempts));
+    fields.insert("max".into(), serde_json::json!(max_reconnects));
+    match outcome {
+        LiveReconnectOutcome::Reconnected => {
+            fields.insert("outcome".into(), serde_json::json!("ok"));
+            crate::logging::create_logger("cursor").info("live_reconnect", Some(fields));
+        }
+        LiveReconnectOutcome::Skipped(reason) => {
+            fields.insert("outcome".into(), serde_json::json!("skipped"));
+            fields.insert("reason".into(), serde_json::json!(reason));
+            crate::logging::create_logger("cursor").warn("live_reconnect", Some(fields));
+        }
+        LiveReconnectOutcome::Failed(detail) => {
+            fields.insert("outcome".into(), serde_json::json!("failed"));
+            fields.insert("detail".into(), serde_json::json!(detail));
+            crate::logging::create_logger("cursor").warn("live_reconnect", Some(fields));
+        }
+    }
+}
+
 /// Re-open AgentService/Run with `ResumeAction` after a transport stall.
-/// Returns true when a new upstream was installed and the driver should continue.
+/// Retries retryable open failures up to `max_reconnects` (first attempt has no delay).
 #[allow(clippy::too_many_arguments)]
 async fn try_live_reconnect(
-    reconnect: &LiveReconnectContext,
+    reconnect: &mut LiveReconnectContext,
     outbound: &mut ClientOutbound,
     upstream_tx: &mpsc::Sender<Result<Option<Bytes>, String>>,
     decoder: &mut ConnectFrameDecoder,
     latest_checkpoint: &Option<Vec<u8>>,
     kv_blobs: &HashMap<Vec<u8>, Vec<u8>>,
-    pending: &PendingExecState,
+    pending: &mut PendingExecState,
     reconnect_attempts: &mut u32,
     max_reconnects: u32,
     last_progress: &mut Instant,
     resume_grace_until: &mut Option<Instant>,
     resume_grace: Duration,
-) -> bool {
-    if !pending.is_empty() {
-        return false;
-    }
+) -> LiveReconnectOutcome {
     let checkpoint = latest_checkpoint
         .as_ref()
         .filter(|c| !c.is_empty())
         .or(reconnect
             .opening_checkpoint
             .as_ref()
-            .filter(|c| !c.is_empty()));
+            .filter(|c| !c.is_empty()))
+        .cloned();
     let Some(checkpoint) = checkpoint else {
-        return false;
-    };
-    if *reconnect_attempts >= max_reconnects {
-        return false;
-    }
-    *reconnect_attempts += 1;
-
-    // CLI turn-runner: base 1s * 2^attempt, cap 60s, +20% jitter.
-    let base_ms = 1_000u64 << (*reconnect_attempts - 1).min(6);
-    let jitter = ((base_ms as f64) * 0.2 * ((*reconnect_attempts as f64 * 0.37) % 1.0)) as u64;
-    tokio::time::sleep(Duration::from_millis((base_ms + jitter).min(60_000))).await;
-
-    let cont = super::conversation::RunContinuation {
-        conversation_id: reconnect.conversation_id.clone(),
-        conversation_state: checkpoint.clone(),
-        pre_fetched_blobs: kv_blobs
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        has_checkpoint: true,
-    };
-    let resolved = match super::model::resolve_cursor_model(&reconnect.model_id) {
-        Ok(r) => r,
-        Err(_) => super::model::CursorModelResolution {
-            model_id: reconnect.model_id.clone(),
-            mode: super::model::CursorAgentMode::Agent,
-        },
-    };
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let run_request =
-        build_resume_run_request(&resolved, &request_id, &cont, reconnect.mcp_tools.clone());
-    let first_message = AgentClientMessage {
-        run_request: Some(run_request),
-        exec_client_message: None,
-        kv_client_message: None,
-        exec_client_control_message: None,
-        interaction_response: None,
-        client_heartbeat: None,
+        let outcome = LiveReconnectOutcome::Skipped("no checkpoint");
+        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+        return outcome;
     };
 
-    match reconnect
-        .http
-        .open_live_transport(
-            &reconnect.token,
-            &request_id,
-            &first_message,
-            &reconnect.identity,
-            reconnect.force_http1,
-            /*allow_h1_fallback=*/ !reconnect.force_http1,
-        )
-        .await
-    {
-        Ok((new_outbound, response)) => {
-            if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
-                eprintln!(
-                    "[ccp-cursor] ResumeAction reconnect ok (attempt {reconnect_attempts}/{max_reconnects})"
-                );
-            }
-            *outbound = new_outbound;
-            spawn_upstream_pump(response.bytes_stream(), upstream_tx.clone());
-            *decoder = ConnectFrameDecoder::new();
-            *last_progress = Instant::now();
-            *resume_grace_until = Some(Instant::now() + resume_grace);
-            true
+    let mut closed_collecting = false;
+    let mut last_fail: Option<String> = None;
+    loop {
+        if let Some(reason) = live_reconnect_skip_reason(
+            latest_checkpoint,
+            &reconnect.opening_checkpoint,
+            *reconnect_attempts,
+            max_reconnects,
+        ) {
+            let outcome = last_fail
+                .map(LiveReconnectOutcome::Failed)
+                .unwrap_or(LiveReconnectOutcome::Skipped(reason));
+            log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+            return outcome;
         }
-        Err(err) => {
-            if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
-                eprintln!(
-                    "[ccp-cursor] ResumeAction reconnect failed: {} ({})",
-                    err.message, err.status
-                );
+        if !closed_collecting {
+            let _ = control_close_collecting_natives(pending, outbound).await;
+            closed_collecting = true;
+        }
+        *reconnect_attempts += 1;
+        let delay_ms = live_reconnect_backoff_ms(*reconnect_attempts);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let cont = super::conversation::RunContinuation {
+            conversation_id: reconnect.conversation_id.clone(),
+            conversation_state: checkpoint.clone(),
+            pre_fetched_blobs: kv_blobs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            has_checkpoint: true,
+        };
+        let resolved = match super::model::resolve_cursor_model(&reconnect.model_id) {
+            Ok(r) => r,
+            Err(_) => super::model::CursorModelResolution {
+                model_id: reconnect.model_id.clone(),
+                mode: super::model::CursorAgentMode::Agent,
+            },
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let run_request =
+            build_resume_run_request(&resolved, &request_id, &cont, reconnect.mcp_tools.clone());
+        let first_message = AgentClientMessage {
+            run_request: Some(run_request),
+            exec_client_message: None,
+            kv_client_message: None,
+            exec_client_control_message: None,
+            interaction_response: None,
+            client_heartbeat: None,
+        };
+
+        match reconnect
+            .http
+            .open_live_transport(
+                &reconnect.token,
+                &request_id,
+                &first_message,
+                &reconnect.identity,
+                reconnect.force_http1,
+                /*allow_h1_fallback=*/ !reconnect.force_http1,
+            )
+            .await
+        {
+            Ok((new_outbound, response)) => {
+                *outbound = new_outbound;
+                spawn_upstream_pump(response.bytes_stream(), upstream_tx.clone());
+                *decoder = ConnectFrameDecoder::new();
+                *last_progress = Instant::now();
+                *resume_grace_until = Some(Instant::now() + resume_grace);
+                let outcome = LiveReconnectOutcome::Reconnected;
+                log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+                return outcome;
             }
-            false
+            Err(err) => {
+                last_fail = Some(format!("{} ({})", err.message, err.status));
+                if !is_retryable_live_transport_error(&err) {
+                    let outcome = LiveReconnectOutcome::Failed(
+                        last_fail.clone().unwrap_or_else(|| err.to_string()),
+                    );
+                    log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+                    return outcome;
+                }
+                if !reconnect.force_http1 && is_http1_fallback_error(&err) {
+                    reconnect.force_http1 = true;
+                }
+            }
         }
     }
 }
@@ -1694,6 +1822,20 @@ async fn control_close_natives(pending: &mut PendingExecState, outbound: &Client
     true
 }
 
+async fn control_close_collecting_natives(
+    pending: &mut PendingExecState,
+    outbound: &ClientOutbound,
+) -> bool {
+    for exec in pending.drain_collecting_natives() {
+        if let Ok(frame) = encode_control_close(exec.id) {
+            if !outbound.send_connect_frame(frame).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 struct LiveTurnCtx<'a> {
     user_prompt: &'a str,
     request_context: &'a RequestContext,
@@ -1717,7 +1859,7 @@ async fn drive_live_run(
     seeded_blobs: HashMap<Vec<u8>, Vec<u8>>,
     user_prompt: String,
     request_context: RequestContext,
-    reconnect: LiveReconnectContext,
+    mut reconnect: LiveReconnectContext,
 ) {
     let mut sink = Some(initial_sink);
     let mut pending = PendingExecState::default();
@@ -1832,15 +1974,47 @@ async fn drive_live_run(
                         };
 
                         let mut send_failed = false;
-                        for frame in frames {
-                            if !outbound.send_connect_frame(frame).await {
+                        for frame in &frames {
+                            if !outbound.send_connect_frame(frame.clone()).await {
                                 send_failed = true;
                                 break;
                             }
                         }
                         if send_failed {
-                            let _ = ack.send(Err("Cursor request stream closed during tool resume".into()));
-                            break 'driver;
+                            let reconnect_outcome = try_live_reconnect(
+                                &mut reconnect,
+                                &mut outbound,
+                                &upstream_tx,
+                                &mut decoder,
+                                &latest_checkpoint,
+                                &kv_blobs,
+                                &mut pending,
+                                &mut reconnect_attempts,
+                                max_reconnects,
+                                &mut last_progress,
+                                &mut resume_grace_until,
+                                resume_grace,
+                            )
+                            .await;
+                            send_failed = !matches!(
+                                reconnect_outcome,
+                                LiveReconnectOutcome::Reconnected
+                            );
+                            if !send_failed {
+                                for frame in &frames {
+                                    if !outbound.send_connect_frame(frame.clone()).await {
+                                        send_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if send_failed {
+                                let _ = ack.send(Err(format!(
+                                    "Cursor request stream closed during tool resume{}",
+                                    reconnect_note(&reconnect_outcome)
+                                )));
+                                break 'driver;
+                            }
                         }
                         pending.complete_awaiting();
                         pending_shared
@@ -1884,6 +2058,9 @@ async fn drive_live_run(
                 match item {
                     Some(Ok(Some(chunk))) => {
                         reconnect_attempts = 0;
+                        let checkpoint_before = latest_checkpoint
+                            .as_ref()
+                            .map(|checkpoint| (checkpoint.as_ptr() as usize, checkpoint.len()));
                         let frames = match decoder.push(&chunk) {
                             Ok(frames) => frames,
                             Err(error) => {
@@ -1923,6 +2100,17 @@ async fn drive_live_run(
                                 break 'driver;
                             }
                         }
+                        if latest_checkpoint.as_ref().map(|checkpoint| {
+                            (checkpoint.as_ptr() as usize, checkpoint.len())
+                        }) != checkpoint_before
+                        {
+                            if let Some(checkpoint) = latest_checkpoint.as_ref() {
+                                super::conversation::save_checkpoint(
+                                    &session_id,
+                                    checkpoint.clone(),
+                                );
+                            }
+                        }
                         // Quiet window already elapsed (incl. TOOL_BATCH_MS=0):
                         // expose in this iteration so we do not wait for the
                         // next select pass behind heartbeats / idle sleep.
@@ -1943,22 +2131,22 @@ async fn drive_live_run(
                     Some(Ok(None)) | None => {
                         // Abrupt EOF without Connect END / turn_ended — try
                         // ResumeAction reconnect (CLI stall recovery).
-                        if try_live_reconnect(
-                            &reconnect,
+                        let reconnect_outcome = try_live_reconnect(
+                            &mut reconnect,
                             &mut outbound,
                             &upstream_tx,
                             &mut decoder,
                             &latest_checkpoint,
                             &kv_blobs,
-                            &pending,
+                            &mut pending,
                             &mut reconnect_attempts,
                             max_reconnects,
                             &mut last_progress,
                             &mut resume_grace_until,
                             resume_grace,
                         )
-                        .await
-                        {
+                        .await;
+                        if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                             continue 'driver;
                         }
                         // Same empty-turn recovery as FLAG_END: flush trailing
@@ -1999,7 +2187,10 @@ async fn drive_live_run(
                                 report_terminal_error(
                                     &mut sink,
                                     &terminal_error,
-                                    "Cursor upstream ended with pending native tools".into(),
+                                    format!(
+                                        "Cursor upstream ended with pending native tools{}",
+                                        reconnect_note(&reconnect_outcome)
+                                    ),
                                 )
                                 .await;
                             }
@@ -2012,7 +2203,10 @@ async fn drive_live_run(
                             report_terminal_error(
                                 &mut sink,
                                 &terminal_error,
-                                "Cursor upstream ended without turn_ended".into(),
+                                format!(
+                                    "Cursor upstream ended without turn_ended{}",
+                                    reconnect_note(&reconnect_outcome)
+                                ),
                             )
                             .await;
                             break 'driver;
@@ -2020,25 +2214,28 @@ async fn drive_live_run(
                         break 'driver;
                     }
                     Some(Err(error)) => {
-                        let message = format!("Cursor response stream: {error}");
-                        if try_live_reconnect(
-                            &reconnect,
+                        let reconnect_outcome = try_live_reconnect(
+                            &mut reconnect,
                             &mut outbound,
                             &upstream_tx,
                             &mut decoder,
                             &latest_checkpoint,
                             &kv_blobs,
-                            &pending,
+                            &mut pending,
                             &mut reconnect_attempts,
                             max_reconnects,
                             &mut last_progress,
                             &mut resume_grace_until,
                             resume_grace,
                         )
-                        .await
-                        {
+                        .await;
+                        if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                             continue 'driver;
                         }
+                        let message = format!(
+                            "Cursor response stream: {error}{}",
+                            reconnect_note(&reconnect_outcome)
+                        );
                         report_terminal_error(&mut sink, &terminal_error, message).await;
                         break 'driver;
                     }
@@ -4037,6 +4234,108 @@ mod tests {
         assert_eq!(
             opening_live_checkpoint(&[0x0a, 0x02, 0x01, 0x02]),
             Some(vec![0x0a, 0x02, 0x01, 0x02])
+        );
+    }
+
+    #[test]
+    fn reconnect_skip_reason_requires_checkpoint() {
+        assert_eq!(
+            live_reconnect_skip_reason(&None, &None, 0, 10),
+            Some("no checkpoint")
+        );
+        assert!(live_reconnect_skip_reason(&Some(vec![0x0a]), &None, 0, 10).is_none());
+        assert!(live_reconnect_skip_reason(&None, &Some(vec![0x0a]), 0, 10).is_none());
+        assert_eq!(
+            live_reconnect_skip_reason(&Some(vec![0x0a]), &None, 10, 10),
+            Some("reconnect budget exhausted")
+        );
+    }
+
+    #[test]
+    fn reconnect_note_explains_skip_and_failure() {
+        assert_eq!(reconnect_note(&LiveReconnectOutcome::Reconnected), "");
+        assert_eq!(
+            reconnect_note(&LiveReconnectOutcome::Skipped("no checkpoint")),
+            " (reconnect skipped: no checkpoint)"
+        );
+        assert_eq!(
+            reconnect_note(&LiveReconnectOutcome::Failed("timeout (504)".into())),
+            " (reconnect failed: timeout (504))"
+        );
+    }
+
+    #[test]
+    fn reconnect_skip_reason_allows_pending_tools() {
+        assert!(
+            live_reconnect_skip_reason(&Some(vec![0x01]), &None, 0, 10).is_none(),
+            "Claude-owed tool_results must not block ResumeAction; the BiDi is still needed"
+        );
+    }
+
+    #[test]
+    fn first_reconnect_has_no_backoff() {
+        assert_eq!(live_reconnect_backoff_ms(1), 0);
+        assert!(live_reconnect_backoff_ms(2) >= 1_000);
+        assert!(live_reconnect_backoff_ms(2) <= 1_200);
+        assert!(live_reconnect_backoff_ms(3) >= 2_000);
+        assert_eq!(live_reconnect_backoff_ms(20), 60_000);
+    }
+
+    #[test]
+    fn drain_collecting_natives_leaves_awaiting_intact() {
+        let mut pending = PendingExecState::default();
+        pending.queue(pending_exec(1, "read-1"), Duration::ZERO);
+        let _ = pending.expose();
+        pending.queue(pending_exec(2, "read-2"), Duration::from_millis(50));
+        let closed = pending.drain_collecting_natives();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].tool_use_id, "read-2");
+        assert_eq!(pending.awaiting().len(), 1);
+        assert_eq!(pending.awaiting()[0].tool_use_id, "read-1");
+        assert!(pending.collecting.is_empty());
+    }
+
+    #[test]
+    fn format_error_chain_appends_io_kind() {
+        let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "unexpected EOF");
+        let text = format_error_chain(&err);
+        assert!(text.contains("unexpected EOF"), "{text}");
+    }
+
+    #[test]
+    fn format_error_chain_joins_unique_sources() {
+        #[derive(Debug)]
+        struct Src(&'static str);
+        impl std::fmt::Display for Src {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Src {}
+
+        #[derive(Debug)]
+        struct Wrap {
+            msg: &'static str,
+            src: Src,
+        }
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.src)
+            }
+        }
+
+        let err = Wrap {
+            msg: "error decoding response body",
+            src: Src("connection reset"),
+        };
+        assert_eq!(
+            format_error_chain(&err),
+            "error decoding response body: connection reset"
         );
     }
 

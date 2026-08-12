@@ -172,6 +172,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_EMBED_SYSTEM` | off | Forward Anthropic `system` into Cursor user text (can trigger Fable injection loops) |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | off | Dump **all** tool schemas (large); BiDi already keeps Claude-local tools (`Workflow`/`Skill`/…) |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `15` | SSE keep-alive interval |
+| `CCP_CURSOR_NO_PROXY` | off | Skip HTTP(S)_PROXY for Cursor API (`1` / `true`) |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | unset | Debug |
 
 ### Claude Code (client) env / settings
@@ -219,6 +220,7 @@ claude-cursor-proxy cursor auth status
 | Duplicated tools | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| ~8 min 502 `error decoding response body` | Update to ≥0.1.35 and restart serve. Clash/Surge TUN: DIRECT `*.cursor.sh`. HTTP proxy mode: `CCP_CURSOR_NO_PROXY=1`. Optional: `CCP_CURSOR_HTTP1=1` |
 
 ---
 
