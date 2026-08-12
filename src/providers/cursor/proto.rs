@@ -39,6 +39,8 @@ pub struct RunRequest {
     /// Opaque ConversationState / ConversationStateStructure bytes.
     /// Wire-identical to a nested message field; empty vec = fresh turn.
     /// Subsequent turns replay the latest `conversation_checkpoint_update`.
+    /// Must be `Some` even when empty — omitting the field makes Cursor
+    /// return `Conversation state is required [invalid_argument]`.
     #[prost(bytes = "vec", optional, tag = "1")]
     pub conversation_state: Option<Vec<u8>>,
     #[prost(message, optional, tag = "2")]
@@ -1530,6 +1532,23 @@ mod tests {
         assert_eq!(decoded.rules[0].full_path, "/tmp/proj/.cursor/rules/x.mdc");
         assert_eq!(decoded.agent_skills[0].description, "demo skill");
         assert_eq!(decoded.agent_skills[0].globs, vec!["**/*.rs"]);
+    }
+
+    #[test]
+    fn empty_conversation_state_still_encodes_tag_1() {
+        let req = RunRequest {
+            conversation_state: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        // Field 1, wire type 2, length 0 → 0x0a 0x00. `None` omits the field
+        // and Cursor answers "Conversation state is required".
+        assert_eq!(buf, vec![0x0a, 0x00]);
+        let omitted = RunRequest::default();
+        let mut empty = Vec::new();
+        omitted.encode(&mut empty).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

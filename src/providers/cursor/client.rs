@@ -1207,11 +1207,7 @@ pub(crate) fn build_run_request_with_continuation(
 
     RunRequest {
         // Empty bytes = fresh ConversationState {}; otherwise opaque Structure.
-        conversation_state: if continuation.conversation_state.is_empty() {
-            None
-        } else {
-            Some(continuation.conversation_state.clone())
-        },
+        conversation_state: Some(continuation.conversation_state.clone()),
         action: Some(proto::Action {
             user_message_action: Some(proto::UserMessageAction {
                 user_message: Some(proto::UserMessage {
@@ -1296,11 +1292,7 @@ pub(crate) fn build_resume_run_request(
         .collect();
 
     RunRequest {
-        conversation_state: if continuation.conversation_state.is_empty() {
-            None
-        } else {
-            Some(continuation.conversation_state.clone())
-        },
+        conversation_state: Some(continuation.conversation_state.clone()),
         action: Some(proto::Action {
             user_message_action: None,
             resume_action: Some(proto::ResumeAction {
