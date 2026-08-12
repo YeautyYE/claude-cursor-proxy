@@ -6,6 +6,14 @@
 //! `server_tool_use` + `web_search_tool_result` SSE blocks. Cursor has no
 //! equivalent hosted tool, so we run a lightweight HTML search and synthesize
 //! that wire shape.
+//!
+//! Nested hosted `web_fetch_*` lives in [`hosted_web_fetch`]. Cursor `mod.rs`
+//! `handle_messages` should call `maybe_handle_hosted_web_fetch` immediately
+//! after the hosted web_search gate.
+
+#[path = "hosted_web_fetch.rs"]
+pub mod hosted_web_fetch;
+pub use hosted_web_fetch::maybe_handle_hosted_web_fetch;
 
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
