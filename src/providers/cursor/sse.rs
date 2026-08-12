@@ -16,6 +16,12 @@ pub const EVENT_ERROR: &str = "error";
 /// Claude Code statusline In/Out/Cached/Ctx only advance from Anthropic usage
 /// fields on `message_start` / `message_delta` — not from thinking/text deltas.
 /// Throttle mid-stream `message_delta` so Out updates live without flooding SSE.
+///
+/// Do **not** emit those progress deltas while a thinking block is open (or
+/// before the first `text_delta`). Claude Code 2.1.193 `pEo`/`s8a` treats ANY
+/// `message_delta` with `usage.output_tokens` as `{type:"end"}`, which freezes
+/// the thinking OTPS meter. Live thinking progress comes from `thinking_delta`
+/// (`ceil(len/4)` while `outputTokens` is still null).
 const USAGE_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const USAGE_PROGRESS_MIN_OUTPUT_DELTA: u64 = 8;
 
@@ -25,7 +31,7 @@ const USAGE_PROGRESS_MIN_OUTPUT_DELTA: u64 = 8;
 /// 1. message_start (with initial/estimated input + cache usage)
 /// 2. content_block_start (text)
 /// 3. content_block_delta (text deltas) / content_block_delta (thinking deltas)
-/// 4. mid-stream message_delta (accumulating output_tokens; stop_reason null)
+/// 4. mid-stream message_delta after first text_delta (stop_reason null)
 /// 5. content_block_stop
 /// 6. message_delta (final usage and stop_reason)
 /// 7. message_stop
@@ -206,6 +212,9 @@ struct CursorSseState {
     last_progress_cache_read: u64,
     last_progress_cache_write: u64,
     last_progress_at: Option<Instant>,
+    /// Mid-stream usage `message_delta` is withheld until the first text delta
+    /// so Claude Code's thinking OTPS meter can keep counting `thinking_delta`.
+    seen_text_delta: bool,
     finalized: bool,
 }
 
@@ -228,6 +237,7 @@ impl Default for CursorSseState {
             last_progress_cache_read: 0,
             last_progress_cache_write: 0,
             last_progress_at: None,
+            seen_text_delta: false,
             finalized: false,
         }
     }
@@ -397,13 +407,15 @@ impl<'a> CursorSseFramer<'a> {
             "thinking",
             text,
         );
-        self.maybe_emit_usage_progress(false);
+        // No mid-stream message_delta: Claude Code already maps thinking text →
+        // ceil(len/4) while outputTokens is null. Progress resumes on text_delta.
     }
 
     pub fn emit_text_delta(&mut self, text: &str) {
         if !self.open_text() {
             return;
         }
+        self.state.seen_text_delta = true;
         self.note_generated_text(text);
         // Hot path: avoid `json!` + intermediate String for every text chunk.
         write_content_delta(
@@ -447,9 +459,13 @@ impl<'a> CursorSseFramer<'a> {
     /// Claude Code merges `message_delta.usage` into the live message (Out from
     /// `output_tokens`; In/Cached when those fields are > 0). `stop_reason` stays
     /// null so the stream remains open. Content deltas alone never move the
-    /// statusline meters.
+    /// statusline meters. Withheld during thinking: `pEo` would treat
+    /// `usage.output_tokens` as thinking-meter end.
     fn maybe_emit_usage_progress(&mut self, force: bool) {
         if self.state.finalized || !self.state.started {
+            return;
+        }
+        if self.state.thinking_open || !self.state.seen_text_delta {
             return;
         }
         let (input, output, cache_read, cache_write) = self.usage_snapshot();
@@ -470,8 +486,9 @@ impl<'a> CursorSseFramer<'a> {
             if !significant {
                 return;
             }
-            // Never delay the first Out>0 update — Claude Code statusline stays at
-            // Out:0 until it sees message_delta.usage.output_tokens.
+            // Never delay the first Out>0 update after text has started —
+            // Claude Code statusline stays at Out:0 until it sees
+            // message_delta.usage.output_tokens.
             if !first_output
                 && let Some(last) = self.state.last_progress_at
                 && last.elapsed() < USAGE_PROGRESS_MIN_INTERVAL
@@ -944,7 +961,11 @@ mod tests {
         assert_eq!(event_names.last().copied(), Some("message_stop"));
         // Mid-stream progress may insert extra message_delta before the final one.
         assert!(
-            event_names.iter().filter(|n| **n == "message_delta").count() >= 1
+            event_names
+                .iter()
+                .filter(|n| **n == "message_delta")
+                .count()
+                >= 1
         );
     }
 
@@ -1140,19 +1161,28 @@ mod tests {
 
         let thinking_start = events
             .iter()
-            .find(|(_, data)| data.get("content_block").and_then(|c| c.get("type")) == Some(&serde_json::json!("thinking")))
+            .find(|(_, data)| {
+                data.get("content_block").and_then(|c| c.get("type"))
+                    == Some(&serde_json::json!("thinking"))
+            })
             .expect("thinking block");
         assert_eq!(thinking_start.1["index"], 0);
 
         let text_start = events
             .iter()
-            .find(|(_, data)| data.get("content_block").and_then(|c| c.get("type")) == Some(&serde_json::json!("text")))
+            .find(|(_, data)| {
+                data.get("content_block").and_then(|c| c.get("type"))
+                    == Some(&serde_json::json!("text"))
+            })
             .expect("text block");
         assert_eq!(text_start.1["index"], 1);
 
         let tool_start = events
             .iter()
-            .find(|(_, data)| data.get("content_block").and_then(|c| c.get("type")) == Some(&serde_json::json!("tool_use")))
+            .find(|(_, data)| {
+                data.get("content_block").and_then(|c| c.get("type"))
+                    == Some(&serde_json::json!("tool_use"))
+            })
             .expect("tool_use block");
         assert_eq!(tool_start.1["index"], 2);
         assert_eq!(tool_start.1["content_block"]["id"], "tool_1");
@@ -1303,41 +1333,105 @@ mod tests {
         assert_eq!(events[0].1["message"]["usage"]["output_tokens"], 0);
     }
 
+    fn is_progress_message_delta(name: &str, data: &serde_json::Value) -> bool {
+        name == EVENT_MESSAGE_DELTA && data["delta"]["stop_reason"].is_null()
+    }
+
     #[test]
-    fn mid_stream_message_delta_updates_output_tokens() {
-        let mut encoder = CursorSseEncoder::new("msg_progress", "cursor-test");
+    fn no_progress_message_delta_during_thinking() {
+        let mut encoder = CursorSseEncoder::new("msg_think", "cursor-test");
         encoder.seed_estimated_input_tokens(12_000);
         encoder.begin();
         let _ = encoder.take_bytes();
 
-        // First thinking chunk should emit a progress message_delta (Out leaves 0).
-        encoder.emit_thinking_delta("abcdefghijklmnop"); // 16 chars → 4 tok estimate
-        let chunk = encoder.take_bytes();
-        let events = parse_sse_events(&String::from_utf8_lossy(&chunk));
+        // 16 chars → 4 tok estimate. Claude Code 2.1.193 `pEo`/`s8a` treats ANY
+        // message_delta with usage.output_tokens as thinking-meter `{type:"end"}`.
+        encoder.emit_thinking_delta("abcdefghijklmnop");
+        encoder.add_output_tokens(32);
+        encoder.record_usage(12_000, 40, 0, 0);
+        std::thread::sleep(USAGE_PROGRESS_MIN_INTERVAL + Duration::from_millis(20));
+        encoder.emit_thinking_delta("more thinking text here!!");
+
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
         assert!(
             events
                 .iter()
-                .any(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "thinking_delta")
+                .any(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "thinking_delta"),
+            "thinking_delta remains the live Claude Code signal"
+        );
+        assert!(
+            events.iter().all(|(n, d)| !is_progress_message_delta(n, d)),
+            "mid-stream message_delta during thinking poisons Claude Code OTPS; got {events:?}"
+        );
+        let (input, output) = encoder.current_usage();
+        assert_eq!(input, 12_000);
+        assert!(
+            output >= 40,
+            "proxy TUI Out must keep tracking encoder.current_usage(), got {output}"
+        );
+    }
+
+    #[test]
+    fn thinking_only_turn_still_emits_final_usage() {
+        let mut encoder = CursorSseEncoder::new("msg_think_end", "cursor-test");
+        encoder.seed_estimated_input_tokens(12_000);
+        encoder.begin();
+        encoder.emit_thinking_delta("abcdefghijklmnop");
+        encoder.push_event(&CursorStreamEvent::End);
+
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
+        assert!(
+            events.iter().all(|(n, d)| !is_progress_message_delta(n, d)),
+            "thinking-only turn must not emit progress message_delta"
+        );
+        let final_delta = events
+            .iter()
+            .rev()
+            .find(|(n, d)| n == EVENT_MESSAGE_DELTA && d["delta"]["stop_reason"] == "end_turn")
+            .map(|(_, d)| d)
+            .expect("final message_delta");
+        assert_eq!(final_delta["usage"]["input_tokens"], 12_000);
+        assert!(final_delta["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 4);
+    }
+
+    #[test]
+    fn first_text_delta_may_emit_mid_stream_usage_progress() {
+        let mut encoder = CursorSseEncoder::new("msg_text_progress", "cursor-test");
+        encoder.seed_estimated_input_tokens(12_000);
+        encoder.begin();
+        let _ = encoder.take_bytes();
+
+        encoder.emit_thinking_delta("abcdefghijklmnop");
+        let think_events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
+        assert!(
+            think_events
+                .iter()
+                .all(|(n, d)| !is_progress_message_delta(n, d))
+        );
+
+        encoder.emit_text_delta("abcdefghijklmnop"); // 16 chars → first Out after thinking
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
+        assert!(
+            events
+                .iter()
+                .any(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "text_delta")
         );
         let progress = events
             .iter()
-            .find(|(n, d)| n == EVENT_MESSAGE_DELTA && d["delta"]["stop_reason"].is_null())
+            .find(|(n, d)| is_progress_message_delta(n, d))
             .map(|(_, d)| d)
-            .expect("mid-stream message_delta with null stop_reason");
+            .expect("first text_delta may start mid-stream usage message_delta");
         assert_eq!(progress["usage"]["input_tokens"], 12_000);
         assert!(progress["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 4);
 
-        // token_delta bumps Out further and should surface in another progress delta
-        // (force path via add_output_tokens when delta is significant / first after gap).
         std::thread::sleep(USAGE_PROGRESS_MIN_INTERVAL + Duration::from_millis(20));
         encoder.add_output_tokens(32);
-        let chunk = encoder.take_bytes();
-        let events = parse_sse_events(&String::from_utf8_lossy(&chunk));
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
         let progress = events
             .iter()
-            .find(|(n, d)| n == EVENT_MESSAGE_DELTA && d["delta"]["stop_reason"].is_null())
+            .find(|(n, d)| is_progress_message_delta(n, d))
             .map(|(_, d)| d)
-            .expect("token_delta message_delta");
+            .expect("token_delta message_delta after text has started");
         assert!(progress["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 32);
 
         encoder.push_event(&CursorStreamEvent::End);

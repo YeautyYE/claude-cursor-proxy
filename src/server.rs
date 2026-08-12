@@ -15,6 +15,7 @@ use axum::{
     http::{Request, StatusCode},
     response::Response,
     routing::{get, post},
+    serve::ListenerExt,
 };
 use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
@@ -89,10 +90,17 @@ pub async fn serve_listener(
         ])),
     );
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
-    axum::serve(listener, app)
+    axum::serve(listener.tap_io(enable_accepted_tcp_nodelay), app)
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
+}
+
+/// Disable Nagle on the Anthropic listen hop so tiny SSE frames flush immediately.
+fn enable_accepted_tcp_nodelay(stream: &mut tokio::net::TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::debug!("failed to set TCP_NODELAY on accepted connection: {err}");
+    }
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
@@ -885,5 +893,25 @@ fn set_mode(path: &Path, mode: u32) {
     #[cfg(not(unix))]
     {
         let _ = (path, mode);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enable_accepted_tcp_nodelay;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn accepted_connections_enable_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        enable_accepted_tcp_nodelay(&mut stream);
+        assert!(
+            stream.nodelay().unwrap(),
+            "Anthropic listen sockets must disable Nagle (TCP_NODELAY)"
+        );
+        client.await.unwrap().unwrap();
     }
 }
