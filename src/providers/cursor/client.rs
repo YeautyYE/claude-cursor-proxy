@@ -1139,7 +1139,7 @@ fn build_request_context_reply(frame: &ConnectFrame) -> Result<Option<Bytes>, Cu
             ls_result: None,
             request_context_result: Some(RequestContextResult {
                 success: Some(RequestContextSuccess {
-                    request_context: Some(RequestContext {}),
+                    request_context: Some(RequestContext::default()),
                     served_from_disk_cache: Some(false),
                 }),
                 error: None,
@@ -1296,7 +1296,7 @@ pub(crate) fn build_resume_run_request(
         action: Some(proto::Action {
             user_message_action: None,
             resume_action: Some(proto::ResumeAction {
-                request_context: Some(proto::RequestContext {}),
+                request_context: Some(proto::RequestContext::default()),
             }),
         }),
         model_details: Some(proto::ModelDetails {

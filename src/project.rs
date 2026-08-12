@@ -19,6 +19,37 @@ pub fn name_from_request<'a>(
     name_from_system(system).or_else(|| message_contents.into_iter().find_map(name_from_value))
 }
 
+/// Absolute working directory from Claude Code system / `<system-reminder>`.
+pub fn cwd_from_system(system: Option<&Value>) -> Option<String> {
+    system.and_then(cwd_from_value)
+}
+
+pub fn cwd_from_request<'a>(
+    system: Option<&Value>,
+    message_contents: impl IntoIterator<Item = &'a Value>,
+) -> Option<String> {
+    cwd_from_system(system).or_else(|| message_contents.into_iter().find_map(cwd_from_value))
+}
+
+fn cwd_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => cwd_from_text(text),
+        Value::Array(values) => values.iter().find_map(cwd_from_value),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(cwd_from_text)
+            .or_else(|| object.get("content").and_then(cwd_from_value)),
+        _ => None,
+    }
+}
+
+fn cwd_from_text(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(working_directory_from_line)
+        .map(str::to_string)
+}
+
 fn name_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => name_from_text(text),
@@ -142,6 +173,10 @@ mod tests {
         assert_eq!(
             name_from_request(None, [&content]).as_deref(),
             Some("example")
+        );
+        assert_eq!(
+            cwd_from_request(None, [&content]).as_deref(),
+            Some("/home/user/example")
         );
     }
 

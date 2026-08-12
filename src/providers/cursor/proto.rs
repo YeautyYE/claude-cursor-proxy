@@ -50,6 +50,15 @@ pub struct RunRequest {
     pub mcp_tools: Option<McpTools>,
     #[prost(string, optional, tag = "5")]
     pub conversation_id: Option<String>,
+    // Tag 6 `mcp_file_system_options` and tag 7 `skill_options` exist on
+    // `agent.v1.AgentRunRequest`. Official CLI live construction omits empty
+    // `skill_options`; skills go on RequestContext.agent_skills (tag 29).
+    // Do not send empty SkillOptions. No thinking / max_tokens / tool_choice
+    // fields exist on AgentRunRequest — thinking/effort/context are
+    // RequestedModel.parameters (see model.rs).
+    // RequestContext is NOT a RunRequest field; the server asks via
+    // ExecServerMessage.request_context_args (tag 10) and the client replies
+    // ExecClientMessage.request_context_result (tag 10).
     #[prost(string, optional, tag = "8")]
     pub custom_system_prompt: Option<String>,
     #[prost(message, optional, tag = "9")]
@@ -97,6 +106,10 @@ pub struct ResumeAction {
 pub struct UserMessageAction {
     #[prost(message, optional, tag = "1")]
     pub user_message: Option<UserMessage>,
+    // CLI `UserMessageAction` may also carry `request_context` (tag 2). Official
+    // live construction fills RequestContext on `request_context_result` (exec
+    // reply), not on RunRequest / UserMessageAction. Do not add that field here
+    // unless a captured CLI Run frame actually encodes it.
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -655,7 +668,7 @@ pub struct ShellArgs {
     pub command: String,
     #[prost(string, tag = "2")]
     pub working_directory: String,
-    /// Seconds (Cursor).
+    /// Milliseconds (Cursor CLI `agent.v1.ShellArgs.timeout`; Claude Bash too).
     #[prost(int32, tag = "3")]
     pub timeout: i32,
 }
@@ -1218,9 +1231,83 @@ pub struct RequestContextSuccess {
     pub served_from_disk_cache: Option<bool>,
 }
 
-/// Minimal empty request context — enough for the agent to continue without a full IDE workspace.
+/// `agent.v1.CursorRule` (RequestContext.rules tag 2). Minimal encodable shape.
 #[derive(Clone, PartialEq, Message)]
-pub struct RequestContext {}
+pub struct CursorRule {
+    #[prost(string, tag = "1")]
+    pub full_path: String,
+    #[prost(string, tag = "2")]
+    pub content: String,
+}
+
+/// `agent.v1.AgentSkill` (RequestContext.agent_skills tag 29).
+#[derive(Clone, PartialEq, Message)]
+pub struct AgentSkill {
+    #[prost(string, tag = "1")]
+    pub full_path: String,
+    #[prost(string, tag = "2")]
+    pub content: String,
+    #[prost(string, tag = "3")]
+    pub description: String,
+    #[prost(string, repeated, tag = "13")]
+    pub globs: Vec<String>,
+}
+
+/// `agent.v1.RequestContextEnv` (CLI). `process_working_directory` is tag 21
+/// on current CLI (not present in older open-cursor 0.1.0 extracts).
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestContextEnv {
+    #[prost(string, tag = "1")]
+    pub os_version: String,
+    #[prost(string, repeated, tag = "2")]
+    pub workspace_paths: Vec<String>,
+    #[prost(string, tag = "3")]
+    pub shell: String,
+    #[prost(bool, tag = "5")]
+    pub sandbox_enabled: bool,
+    #[prost(string, tag = "10")]
+    pub time_zone: String,
+    #[prost(string, tag = "11")]
+    pub project_folder: String,
+    /// Absolute cwd the agent should treat as process working directory.
+    #[prost(string, tag = "21")]
+    pub process_working_directory: String,
+}
+
+/// `agent.v1.GitRepoInfo`.
+#[derive(Clone, PartialEq, Message)]
+pub struct GitRepoInfo {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub status: String,
+    #[prost(string, tag = "3")]
+    pub branch_name: String,
+    #[prost(string, optional, tag = "4")]
+    pub remote_url: Option<String>,
+}
+
+/// CLI `agent.v1.RequestContext`.
+///
+/// Filled when the server sends `ExecServerMessage.request_context_args` (tag 10)
+/// and the client replies `ExecClientMessage.request_context_result` (tag 10).
+/// Not a field on `AgentRunRequest`. live.rs owns the reply; this type must
+/// encode the CLI tags so that reply can be populated.
+///
+/// Prost `Message` supplies `Default` (empty encode == previous empty message).
+/// Call sites that used `RequestContext {}` should use `RequestContext::default()`
+/// — prost does not accept Rust field-default syntax.
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestContext {
+    #[prost(message, repeated, tag = "2")]
+    pub rules: Vec<CursorRule>,
+    #[prost(message, optional, tag = "4")]
+    pub env: Option<RequestContextEnv>,
+    #[prost(message, repeated, tag = "11")]
+    pub git_repos: Vec<GitRepoInfo>,
+    #[prost(message, repeated, tag = "29")]
+    pub agent_skills: Vec<AgentSkill>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RequestContextErrorMsg {
@@ -1242,4 +1329,87 @@ pub struct GetUsableModelsRequest {
 pub struct GetUsableModelsResponse {
     #[prost(message, repeated, tag = "1")]
     pub models: Vec<ModelDetails>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn empty_request_context_encodes_to_zero_bytes() {
+        let ctx = RequestContext::default();
+        let mut buf = Vec::new();
+        ctx.encode(&mut buf).unwrap();
+        assert!(buf.is_empty(), "empty RequestContext must stay wire-empty");
+    }
+
+    #[test]
+    fn populated_request_context_uses_cli_env_git_and_skill_tags() {
+        let ctx = RequestContext {
+            env: Some(RequestContextEnv {
+                os_version: "macos".into(),
+                workspace_paths: vec!["/tmp/proj".into()],
+                shell: "/bin/zsh".into(),
+                sandbox_enabled: false,
+                time_zone: "UTC".into(),
+                project_folder: "/tmp/proj".into(),
+                process_working_directory: "/tmp/proj".into(),
+            }),
+            git_repos: vec![GitRepoInfo {
+                path: "/tmp/proj".into(),
+                status: String::new(),
+                branch_name: "main".into(),
+                remote_url: None,
+            }],
+            rules: vec![CursorRule {
+                full_path: "/tmp/proj/.cursor/rules/x.mdc".into(),
+                content: "use tabs".into(),
+            }],
+            agent_skills: vec![AgentSkill {
+                full_path: "/tmp/proj/.cursor/skills/demo/SKILL.md".into(),
+                content: "# Demo".into(),
+                description: "demo skill".into(),
+                globs: vec!["**/*.rs".into()],
+            }],
+        };
+        let mut buf = Vec::new();
+        ctx.encode(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+        // Field 2 rules → 0x12; field 4 env → 0x22; field 11 git_repos → 0x5a;
+        // field 29 agent_skills → 0xea.
+        assert!(buf.contains(&0x12), "rules tag 2 missing in {buf:?}");
+        assert!(buf.contains(&0x22), "env tag 4 missing in {buf:?}");
+        assert!(buf.contains(&0x5a), "git_repos tag 11 missing in {buf:?}");
+        assert!(
+            buf.contains(&0xea),
+            "agent_skills tag 29 missing in {buf:?}"
+        );
+        let decoded = RequestContext::decode(&buf[..]).unwrap();
+        let env = decoded.env.as_ref().unwrap();
+        assert_eq!(env.workspace_paths, vec!["/tmp/proj"]);
+        assert_eq!(env.project_folder, "/tmp/proj");
+        assert_eq!(env.process_working_directory, "/tmp/proj");
+        assert_eq!(decoded.git_repos[0].branch_name, "main");
+        assert_eq!(decoded.rules[0].full_path, "/tmp/proj/.cursor/rules/x.mdc");
+        assert_eq!(decoded.agent_skills[0].description, "demo skill");
+        assert_eq!(decoded.agent_skills[0].globs, vec!["**/*.rs"]);
+    }
+
+    #[test]
+    fn request_context_env_encodes_process_working_directory_tag_21() {
+        let env = RequestContextEnv {
+            process_working_directory: "/tmp/cwd".into(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        env.encode(&mut buf).unwrap();
+        // Field 21 wire type 2 → tag 0xaa.
+        assert!(
+            buf.contains(&0xaa),
+            "process_working_directory tag 21 missing in {buf:?}"
+        );
+        let decoded = RequestContextEnv::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.process_working_directory, "/tmp/cwd");
+    }
 }

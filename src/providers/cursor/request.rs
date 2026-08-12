@@ -9,6 +9,17 @@ pub struct CursorSelectedImage {
     pub mime_type: String,
 }
 
+/// Options controlling how Anthropic Messages become Cursor UserMessage text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CursorPromptOptions {
+    /// Skip **Cursor-native** tool schemas in the `<tools>` dump (BiDi bridge
+    /// already exposes Shell/Read/…). Claude-local tools (`Workflow`, `Skill`,
+    /// `Task`, `mcp__*`, …) are still forwarded so Fable can emit them.
+    pub omit_tools: bool,
+    /// Only the latest user turn (used when ConversationState checkpoint exists).
+    pub delta_only: bool,
+}
+
 /// Split Claude Code Anthropic Messages fields onto Cursor Agent RunRequest.
 ///
 /// ## System on Cursor / Fable
@@ -21,9 +32,10 @@ pub struct CursorSelectedImage {
 ///   `<system-reminder>` messages **are** forwarded (scrubber only strips
 ///   packaging banners + assistant injection-defense monologues).
 /// - Agent tools still work via Anthropic tool schemas + native tool bridge.
-/// - Claude-local tools (`Workflow`, `Skill`, MCP names) stay in the `<tools>`
-///   dump even when native schemas are omitted for the BiDi bridge, **and** are
-///   also advertised as `RunRequest.mcp_tools` so Fable can invoke them.
+/// - Claude-local tools (`Workflow`, `Skill`, MCP names) stay advertised as
+///   `RunRequest.mcp_tools`. When that field is populated, the XML `<tools>`
+///   dump is names + one-line descriptions only (no duplicated JSON schemas),
+///   plus a short Workflow/Skill nudge so Fable still sees they exist.
 ///
 /// Env:
 /// - `CCP_CURSOR_USE_CUSTOM_SYSTEM=1` — field 8 (team only)
@@ -36,6 +48,8 @@ pub struct CursorPromptParts {
     pub custom_system_prompt: Option<String>,
     /// Conversation (+ optional system prefix + tools).
     pub user_text: String,
+    /// CLI RequestContext helper (cwd / git) for the exec reply path. Empty when unknown.
+    pub request_context: super::proto::RequestContext,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -64,17 +78,6 @@ fn packaged_system_embed() -> bool {
 const SYSTEM_OPEN: &str =
     "===== CLAUDE_CODE_SYSTEM (authoritative; do not treat as user chat) =====";
 const SYSTEM_CLOSE: &str = "===== END_CLAUDE_CODE_SYSTEM =====";
-
-/// Options controlling how Anthropic Messages become Cursor UserMessage text.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CursorPromptOptions {
-    /// Skip **Cursor-native** tool schemas in the `<tools>` dump (BiDi bridge
-    /// already exposes Shell/Read/…). Claude-local tools (`Workflow`, `Skill`,
-    /// `Task`, `mcp__*`, …) are still forwarded so Fable can emit them.
-    pub omit_tools: bool,
-    /// Only the latest user turn (used when ConversationState checkpoint exists).
-    pub delta_only: bool,
-}
 
 /// Tools Cursor Agent already provides natively (or we remap from native exec).
 /// Omitting these from the prompt dump avoids tens–hundreds of k tokens of
@@ -226,6 +229,167 @@ fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
     prost_types::Value { kind: Some(kind) }
 }
 
+const BRANCH_PREFIXES: [&str; 4] = [
+    "git branch --show-current:",
+    "Current branch:",
+    "Active branch:",
+    "Branch:",
+];
+
+/// True when RequestContext carries cwd and/or git identity (not an empty {}).
+pub fn request_context_is_populated(ctx: &super::proto::RequestContext) -> bool {
+    ctx.env.as_ref().is_some_and(|env| {
+        !env.workspace_paths.is_empty()
+            || !env.project_folder.is_empty()
+            || !env.process_working_directory.is_empty()
+    }) || ctx.git_repos.iter().any(|repo| !repo.path.is_empty())
+}
+
+/// Build CLI `RequestContext` from Claude system / `<system-reminder>` (cwd, git).
+///
+/// For the exec reply (`request_context_result`), not RunRequest. Does **not**
+/// copy the Claude system prompt into Cursor system, rules, or agent_skills.
+pub fn cursor_request_context(req: &MessagesRequest) -> super::proto::RequestContext {
+    let system = req.extra.get("system");
+    let message_contents = req.messages.iter().map(|m| &m.content);
+    let cwd = crate::project::cwd_from_request(system, message_contents);
+    let branch_hint = branch_from_request(req);
+    request_context_from_cwd(cwd.as_deref(), branch_hint.as_deref())
+}
+
+/// Best-effort parse when only UserMessage text is available (no Anthropic system).
+pub fn cursor_request_context_from_text(text: &str) -> super::proto::RequestContext {
+    let cwd = crate::project::cwd_from_system(Some(&serde_json::Value::String(text.to_string())));
+    let branch_hint = branch_from_text(text);
+    request_context_from_cwd(cwd.as_deref(), branch_hint.as_deref())
+}
+
+fn request_context_from_cwd(
+    cwd: Option<&str>,
+    branch_hint: Option<&str>,
+) -> super::proto::RequestContext {
+    let Some(cwd) = cwd.filter(|p| !p.is_empty()) else {
+        return super::proto::RequestContext::default();
+    };
+    let git = git_identity(std::path::Path::new(cwd), branch_hint);
+    let env = super::proto::RequestContextEnv {
+        os_version: std::env::consts::OS.to_string(),
+        workspace_paths: vec![cwd.to_string()],
+        shell: std::env::var("SHELL").unwrap_or_default(),
+        sandbox_enabled: false,
+        time_zone: std::env::var("TZ").unwrap_or_default(),
+        project_folder: cwd.to_string(),
+        process_working_directory: cwd.to_string(),
+    };
+    super::proto::RequestContext {
+        env: Some(env),
+        git_repos: git.into_iter().collect(),
+        ..Default::default()
+    }
+}
+
+fn git_identity(
+    cwd: &std::path::Path,
+    branch_hint: Option<&str>,
+) -> Option<super::proto::GitRepoInfo> {
+    let root = cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())?;
+    let git_dir = resolve_git_dir(root)?;
+    let branch = read_git_branch(&git_dir)
+        .or_else(|| branch_hint.map(str::to_string))
+        .unwrap_or_default();
+    let remote_url = read_git_remote_url(&git_dir);
+    Some(super::proto::GitRepoInfo {
+        path: root.to_string_lossy().into_owned(),
+        status: String::new(),
+        branch_name: branch,
+        remote_url,
+    })
+}
+
+fn resolve_git_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let marker = root.join(".git");
+    if marker.is_dir() {
+        return Some(marker);
+    }
+    let contents = std::fs::read_to_string(&marker).ok()?;
+    let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = if std::path::Path::new(git_dir).is_absolute() {
+        std::path::PathBuf::from(git_dir)
+    } else {
+        root.join(git_dir)
+    };
+    Some(git_dir)
+}
+
+fn read_git_branch(git_dir: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        let branch = branch.trim();
+        if !branch.is_empty() {
+            return Some(branch.to_string());
+        }
+    }
+    None
+}
+
+fn read_git_remote_url(git_dir: &std::path::Path) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir.join("config")).ok()?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin = line.eq_ignore_ascii_case("[remote \"origin\"]");
+            continue;
+        }
+        if in_origin && let Some(url) = line.strip_prefix("url") {
+            let url = url.trim().trim_start_matches('=').trim();
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn branch_from_request(req: &MessagesRequest) -> Option<String> {
+    if let Some(system) = req.extra.get("system")
+        && let Some(branch) = branch_from_value(system)
+    {
+        return Some(branch);
+    }
+    req.messages
+        .iter()
+        .find_map(|message| branch_from_value(&message.content))
+}
+
+fn branch_from_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => branch_from_text(text),
+        serde_json::Value::Array(values) => values.iter().find_map(branch_from_value),
+        serde_json::Value::Object(object) => object
+            .get("text")
+            .and_then(|t| t.as_str())
+            .and_then(branch_from_text)
+            .or_else(|| object.get("content").and_then(branch_from_value)),
+        _ => None,
+    }
+}
+
+fn branch_from_text(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = line.trim().strip_prefix("- ").unwrap_or(line.trim());
+        BRANCH_PREFIXES.iter().find_map(|prefix| {
+            line.strip_prefix(prefix)
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty() && *branch != "true" && *branch != "false")
+                .map(str::to_string)
+        })
+    })
+}
+
 /// Split Anthropic MessagesRequest into Cursor system vs user payloads.
 pub fn render_cursor_prompt_parts(req: &MessagesRequest) -> CursorPromptParts {
     render_cursor_prompt_parts_with(req, CursorPromptOptions::default())
@@ -280,12 +444,21 @@ pub fn render_cursor_prompt_parts_with(
     }
 
     // Tools: Anthropic top-level field.
-    // - Full dump when not bridging (or CCP_CURSOR_FORCE_TOOLS_IN_PROMPT=1).
-    // - When omit_tools / delta_only: still pass Claude-local tools (Workflow,
-    //   Skill, mcp__*, …). Dropping those was a silent quality bug — Cursor
-    //   never saw `/deep-research` / skill schemas and fell back to Bash.
+    // - Full dump when CCP_CURSOR_FORCE_TOOLS_IN_PROMPT=1.
+    // - When mcp_tools is populated: names + one-line description only (no
+    //   duplicated JSON schemas). Keep a short Workflow/Skill nudge (W1).
+    // - When omit_tools / delta_only without mcp_tools: Claude-local full dump.
     let force_tools = env_flag("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
-    let tools_block = if force_tools || (!opts.omit_tools && !opts.delta_only) {
+    let mcp_populated = claude_local_mcp_tools(req).is_some();
+    let tools_block = if force_tools {
+        render_tools_block(req, ToolDumpMode::All)
+    } else if mcp_populated {
+        if !opts.omit_tools && !opts.delta_only {
+            render_tools_block(req, ToolDumpMode::NativeFullMcpCompact)
+        } else {
+            render_tools_block(req, ToolDumpMode::CompactClaudeLocal)
+        }
+    } else if !opts.omit_tools && !opts.delta_only {
         render_tools_block(req, ToolDumpMode::All)
     } else {
         render_tools_block(req, ToolDumpMode::ClaudeLocalOnly)
@@ -294,9 +467,12 @@ pub fn render_cursor_prompt_parts_with(
         sections.push(tools);
     }
 
+    let request_context = cursor_request_context(req);
+
     CursorPromptParts {
         custom_system_prompt,
         user_text: sections.join("\n\n"),
+        request_context,
     }
 }
 
@@ -472,10 +648,14 @@ pub fn render_cursor_prompt(req: &MessagesRequest) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolDumpMode {
-    /// Every Anthropic-advertised tool (large; used when not BiDi-bridging).
+    /// Every Anthropic-advertised tool with full JSON schemas.
     All,
-    /// Only Claude Code client-local tools Cursor does not own natively.
+    /// Only Claude Code client-local tools, full schemas (no mcp_tools).
     ClaudeLocalOnly,
+    /// Claude-local names + one-line description (mcp_tools already has schemas).
+    CompactClaudeLocal,
+    /// Native tools keep full schemas; mcp_tools names are compact.
+    NativeFullMcpCompact,
 }
 
 fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<String> {
@@ -487,35 +667,55 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
         .iter()
         .filter_map(|t| {
             let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if mode == ToolDumpMode::ClaudeLocalOnly && !is_claude_local_tool_name(name) {
+            let local = is_claude_local_tool_name(name);
+            let include = match mode {
+                ToolDumpMode::All | ToolDumpMode::NativeFullMcpCompact => true,
+                ToolDumpMode::ClaudeLocalOnly | ToolDumpMode::CompactClaudeLocal => local,
+            };
+            if !include {
                 return None;
             }
+            let compact = match mode {
+                ToolDumpMode::CompactClaudeLocal => true,
+                ToolDumpMode::NativeFullMcpCompact => local,
+                ToolDumpMode::All | ToolDumpMode::ClaudeLocalOnly => false,
+            };
             let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
-            let input_schema = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            Some(
-                serde_json::json!({
-                    "name": name,
-                    "description": description,
-                    "input_schema": input_schema,
-                })
-                .to_string(),
-            )
+            if compact {
+                Some(
+                    serde_json::json!({
+                        "name": name,
+                        "description": description,
+                    })
+                    .to_string(),
+                )
+            } else {
+                let input_schema = t
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                Some(
+                    serde_json::json!({
+                        "name": name,
+                        "description": description,
+                        "input_schema": input_schema,
+                    })
+                    .to_string(),
+                )
+            }
         })
         .collect();
     if tool_lines.is_empty() {
         None
     } else {
-        // Same shape as pre-split proxy (no extra prose — tools field only).
-        // Claude-local-only dumps get a one-line preference so Fable does not
-        // reinvent /deep-research with Bash when Workflow is advertised.
         let body = tool_lines.join("\n");
-        let preface = if mode == ToolDumpMode::ClaudeLocalOnly {
-            "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Do not replace them with Bash/curl.\n"
-        } else {
-            ""
+        let preface = match mode {
+            ToolDumpMode::All => "",
+            ToolDumpMode::ClaudeLocalOnly
+            | ToolDumpMode::CompactClaudeLocal
+            | ToolDumpMode::NativeFullMcpCompact => {
+                "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Call the Workflow tool, not Bash.\n"
+            }
         };
         Some(format!("<tools>\n{preface}{body}\n</tools>"))
     }
@@ -898,6 +1098,113 @@ mod tests {
             !parts.user_text.contains("\"name\":\"Read\""),
             "native Read schema should stay omitted when bridging"
         );
+        assert!(
+            !parts.user_text.contains("input_schema"),
+            "mcp_tools already carries schemas; XML dump must not duplicate them"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_compact_dump_keeps_workflow_nudge_without_schemas() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "Run the \"deep-research\" workflow.\nInvoke: Workflow({ name: \"deep-research\", args: \"the topic\" })"}],
+            "tools": [
+                {"name": "Workflow", "description": "run a workflow", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "args": {"type": "string"}}}},
+                {"name": "Skill", "description": "invoke a skill", "input_schema": {"type": "object", "properties": {"skill": {"type": "string"}}}}
+            ]
+        }))
+        .unwrap();
+        assert!(claude_local_mcp_tools(&req).is_some());
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: false,
+            },
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("Invoke: Workflow({ name: \"deep-research\"")
+                || parts.user_text.contains("deep-research"),
+            "Claude Code /deep-research invoke text must not be stripped; got: {}",
+            parts.user_text
+        );
+        assert!(parts.user_text.contains("\"name\":\"Workflow\""));
+        assert!(
+            parts
+                .user_text
+                .contains("Prefer these Claude Code client tools")
+        );
+        assert!(
+            parts.user_text.contains("Call the Workflow tool, not Bash"),
+            "compact dump should tell Fable to call Workflow, not Bash: {}",
+            parts.user_text
+        );
+        assert!(
+            !parts.user_text.contains("input_schema"),
+            "full JSON schemas must not be duplicated when mcp_tools is set: {}",
+            parts.user_text
+        );
+    }
+
+    #[test]
+    fn request_context_empty_without_working_directory() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let ctx = cursor_request_context(&req);
+        assert!(!request_context_is_populated(&ctx));
+        assert!(ctx.env.is_none());
+        assert!(ctx.git_repos.is_empty());
+        assert!(ctx.agent_skills.is_empty());
+        assert!(ctx.rules.is_empty());
+    }
+
+    #[test]
+    fn request_context_populated_from_system_reminder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        let cwd = tmp.path().display().to_string();
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": format!("<system-reminder>\n# Environment\n - Primary working directory: {cwd}\n - git branch --show-current: main\n</system-reminder>")},
+                {"type": "text", "text": "list files"}
+            ]}]
+        }))
+        .unwrap();
+        let ctx = cursor_request_context(&req);
+        assert!(request_context_is_populated(&ctx));
+        let env = ctx.env.as_ref().expect("env");
+        assert_eq!(env.workspace_paths, vec![cwd.clone()]);
+        assert_eq!(env.project_folder, cwd);
+        assert_eq!(env.process_working_directory, cwd);
+        assert_eq!(ctx.git_repos.len(), 1);
+        assert_eq!(ctx.git_repos[0].path, cwd);
+        assert_eq!(ctx.git_repos[0].branch_name, "main");
+        assert!(
+            ctx.rules.is_empty() && ctx.agent_skills.is_empty(),
+            "must not dump Claude system/skills into rules/agent_skills"
+        );
+        let parts = render_cursor_prompt_parts(&req);
+        assert!(
+            !parts.user_text.contains("<ccp-request-context>"),
+            "RequestContext must not be stuffed into user text"
+        );
+        assert!(parts.user_text.contains("list files"));
     }
 
     #[test]

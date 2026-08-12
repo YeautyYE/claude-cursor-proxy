@@ -343,7 +343,7 @@ fn map_shell_args(args: &ShellArgs, call_id: String) -> MappedClaudeTool {
         ));
     }
     if args.timeout > 0 {
-        // Cursor ShellArgs.timeout is milliseconds on the exec path.
+        // Cursor CLI `ShellArgs.timeout` is milliseconds (same as Claude Bash).
         input["timeout"] = serde_json::json!(args.timeout as u64);
     }
     MappedClaudeTool {
@@ -401,7 +401,7 @@ mod tests {
                     args: Some(ShellArgs {
                         command: "ls -la".into(),
                         working_directory: "/tmp".into(),
-                        timeout: 30,
+                        timeout: 30_000,
                     }),
                 }),
                 ..Default::default()
@@ -411,6 +411,48 @@ mod tests {
         let m = map_tool_call_started(&started).unwrap();
         assert_eq!(m.name, "Bash");
         assert_eq!(m.input["command"], "cd '/tmp' && ls -la");
+        assert_eq!(m.input["timeout"], 30_000);
+    }
+
+    #[test]
+    fn maps_shell_timeout_milliseconds_pass_through() {
+        let started = ToolCallStarted {
+            call_id: "c-timeout".into(),
+            tool_call: Some(ToolCall {
+                shell_tool_call: Some(ShellToolCall {
+                    args: Some(ShellArgs {
+                        command: "sleep 1".into(),
+                        working_directory: String::new(),
+                        timeout: 30_000,
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.input["timeout"], 30_000);
+        assert!(m.input.get("command").is_some());
+    }
+
+    #[test]
+    fn maps_shell_omits_timeout_when_zero() {
+        let started = ToolCallStarted {
+            call_id: "c0".into(),
+            tool_call: Some(ToolCall {
+                shell_tool_call: Some(ShellToolCall {
+                    args: Some(ShellArgs {
+                        command: "true".into(),
+                        working_directory: String::new(),
+                        timeout: 0,
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert!(m.input.get("timeout").is_none());
     }
 
     #[test]
