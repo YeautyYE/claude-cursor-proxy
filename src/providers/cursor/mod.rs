@@ -43,12 +43,14 @@ use crate::providers::cursor::hosted_web_search::{
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
 use crate::providers::cursor::live::{
-    LiveEventResult, LiveRunEvent, LiveRunIdentity, LiveRunRegistry, live_sse_response,
+    LiveEventResult, LiveRunEvent, LiveRunIdentity, LiveRunRegistry, live_run_key_for,
+    live_sse_response,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
-    CursorPromptOptions, claude_local_mcp_tools, latest_user_is_only_tool_results,
-    render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
+    CursorPromptOptions, claude_local_mcp_tools, cursor_request_context,
+    latest_user_is_only_tool_results, render_cursor_prompt, render_cursor_prompt_parts_with,
+    request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     CursorDecodeError, CursorStreamEvent, decode_cursor_upstream, decode_upstream_response,
@@ -121,21 +123,7 @@ fn record_session_input_tokens(session_id: &str, input_tokens: u64) {
     }
 }
 
-fn last_session_input_tokens(session_id: &str) -> Option<u64> {
-    let store = SESSION_USAGE.lock().unwrap_or_else(|e| e.into_inner());
-    store
-        .map
-        .get(session_id)
-        .copied()
-        .filter(|tokens| *tokens > 0)
-}
-
-fn count_tokens_for_request(session_id: Option<&str>, body: &MessagesRequest) -> u64 {
-    if let Some(session_id) = session_id.filter(|id| !id.is_empty())
-        && let Some(last) = last_session_input_tokens(session_id)
-    {
-        return last;
-    }
+fn count_tokens_for_request(_session_id: Option<&str>, body: &MessagesRequest) -> u64 {
     (render_cursor_prompt(body).len() / 4).max(1) as u64
 }
 
@@ -240,6 +228,23 @@ fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRu
             .map(str::trim)
             .filter(|id| !id.is_empty()),
     }
+}
+
+/// Cursor conversation key for prompt compaction (`delta_only` / checkpoint).
+///
+/// Must match [`live_run_key_for`] used by the BiDi worker. Nested agents share
+/// `X-Claude-Code-Session-Id` with the parent; using the raw session id here
+/// would compact the nested prompt against the parent's checkpoint while the
+/// nested Run is a fresh conversation.
+fn continuation_for_request(
+    session_id: Option<&str>,
+    ctx: &RequestContext,
+) -> crate::providers::cursor::conversation::RunContinuation {
+    let Some(sid) = session_id.filter(|s| !s.is_empty()) else {
+        return crate::providers::cursor::conversation::continuation_for(None);
+    };
+    let key = live_run_key_for(live_run_identity(sid, ctx));
+    crate::providers::cursor::conversation::continuation_for(Some(&key))
 }
 
 enum LiveResumeOutcome {
@@ -445,33 +450,6 @@ impl Provider for CursorProvider {
             );
         }
 
-        // Claude Code WebSearchTool /deep-research nests Anthropic hosted
-        // web_search_20250305. Cursor has no equivalent — emulate the SSE shape
-        // with a lightweight HTML search so research workflows can proceed.
-        if is_hosted_web_search_request(&body) {
-            let query = extract_web_search_query(&body).unwrap_or_default();
-            if query.trim().is_empty() {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    "web_search requires a non-empty query",
-                );
-            }
-            let (hits, error) = match search_web(&query).await {
-                Ok(hits) => (hits, None),
-                Err(err) => (Vec::new(), Some(err)),
-            };
-            if want_stream {
-                return hosted_web_search_sse_response(message_id, wire_model, query, hits, error);
-            }
-            return hosted_web_search_json_response(message_id, wire_model, query, hits, error);
-        }
-
-        // Nested Anthropic hosted web_fetch_* (Claude Code /deep-research).
-        if let Some(resp) = maybe_handle_hosted_web_fetch(&body, &message_id, &wire_model).await {
-            return resp;
-        }
-
         // True Cursor BiDi continuation: the preceding Anthropic response ended
         // at tool_use, but the upstream AgentService/Run stream is still alive.
         // Route the matching tool_result back onto that exact request stream
@@ -576,9 +554,37 @@ impl Provider for CursorProvider {
             }
         }
 
+        // Hosted search/fetch run after Cursor auth so a logged-out proxy is
+        // not an open SSRF/search endpoint. Incoming Anthropic tokens are still
+        // unused; the gate is the stored Cursor login on this host.
+        if is_hosted_web_search_request(&body) {
+            let query = extract_web_search_query(&body).unwrap_or_default();
+            if query.trim().is_empty() {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "web_search requires a non-empty query",
+                );
+            }
+            let (hits, error) = match search_web(&query).await {
+                Ok(hits) => (hits, None),
+                Err(err) => (Vec::new(), Some(err)),
+            };
+            if want_stream {
+                return hosted_web_search_sse_response(message_id, wire_model, query, hits, error);
+            }
+            return hosted_web_search_json_response(message_id, wire_model, query, hits, error);
+        }
+        if let Some(resp) = maybe_handle_hosted_web_fetch(&body, &message_id, &wire_model).await {
+            return resp;
+        }
+
         let session_id = ctx.session_id.as_deref();
         let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
-        let continuation = crate::providers::cursor::conversation::continuation_for(session_id);
+        let continuation_key = session_id
+            .filter(|s| !s.is_empty())
+            .map(|sid| live_run_key_for(live_run_identity(sid, &ctx)));
+        let continuation = continuation_for_request(session_id, &ctx);
         let client_only_continuation =
             request_has_client_only_tool_results(&body) || latest_user_is_only_tool_results(&body);
         let parts = render_cursor_prompt_parts_with(
@@ -646,6 +652,7 @@ impl Provider for CursorProvider {
                         identity,
                         allowed.clone(),
                         mcp_tools.clone(),
+                        cursor_request_context(&body),
                     )
                     .await
                 {
@@ -664,6 +671,7 @@ impl Provider for CursorProvider {
                                         identity,
                                         allowed.clone(),
                                         mcp_tools.clone(),
+                                        cursor_request_context(&body),
                                     )
                                     .await
                             }
@@ -699,9 +707,12 @@ impl Provider for CursorProvider {
             }
 
             if let Some(error) = start_error {
-                // Transport open failed — fall through to buffered run_agent
-                // only when tools were not advertised (bridge path must stay live).
-                if bridge_eligible {
+                // Only fall through to buffered run_agent on transport failures.
+                // 400/401/403/429 are semantic — retrying wastes quota and can
+                // duplicate a request Cursor already accepted.
+                if bridge_eligible
+                    || !crate::providers::cursor::live::is_retryable_live_transport_error(&error)
+                {
                     return map_cursor_error_to_response(&error);
                 }
             } else if bridge_eligible {
@@ -715,7 +726,14 @@ impl Provider for CursorProvider {
         }
 
         let upstream = match client
-            .run_agent_with_session(&token, user_text, model, &images, custom_system, session_id)
+            .run_agent_with_session(
+                &token,
+                user_text,
+                model,
+                &images,
+                custom_system,
+                continuation_key.as_deref(),
+            )
             .await
         {
             Ok(r) => r,
@@ -731,7 +749,7 @@ impl Provider for CursorProvider {
                                 model,
                                 &images,
                                 custom_system,
-                                session_id,
+                                continuation_key.as_deref(),
                             )
                             .await
                         {
@@ -1058,12 +1076,15 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_uses_last_turn_ended_input_tokens_for_session() {
+    fn count_tokens_uses_current_request_body_not_previous_turn() {
         let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
         reset_session_usage_for_test();
         record_session_input_tokens("sess-count-last", 53_037);
-        let tokens = count_tokens_for_request(Some("sess-count-last"), &hello_body());
-        assert_eq!(tokens, 53_037);
+        let body = hello_body();
+        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        let tokens = count_tokens_for_request(Some("sess-count-last"), &body);
+        assert_eq!(tokens, expected);
+        assert_ne!(tokens, 53_037);
     }
 
     #[test]
@@ -1110,6 +1131,50 @@ mod tests {
         assert_eq!(identity.agent_id, Some("agent%2Fchild"));
         assert_eq!(identity.parent_agent_id, Some("agent%2Fparent"));
         assert!(identity.is_nested());
+    }
+
+    #[test]
+    fn nested_agent_prompt_continuation_ignores_parent_checkpoint() {
+        let session = format!("parent-session-{}", uuid::Uuid::new_v4());
+        crate::providers::cursor::conversation::save_checkpoint(
+            &session,
+            vec![0x0a, 0x02, 0x01, 0x02],
+        );
+        let nested = RequestContext {
+            req_id: "req".into(),
+            session_id: Some(session.clone()),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders {
+                agent_id: Some("agent%2Fchild".into()),
+                parent_agent_id: Some("agent%2Fparent".into()),
+                app: Some("cli-bg".into()),
+            },
+        };
+        let nested_cont = continuation_for_request(Some(&session), &nested);
+        assert!(
+            !nested_cont.has_checkpoint,
+            "nested agent must not compact against the parent Cursor checkpoint"
+        );
+
+        let parent = RequestContext {
+            req_id: "req".into(),
+            session_id: Some(session.clone()),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders {
+                agent_id: None,
+                parent_agent_id: None,
+                app: Some("cli".into()),
+            },
+        };
+        let parent_cont = continuation_for_request(Some(&session), &parent);
+        assert!(parent_cont.has_checkpoint);
+        assert_eq!(parent_cont.conversation_state, vec![0x0a, 0x02, 0x01, 0x02]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::providers::cursor::client::CursorUpstreamResponse;
+use crate::providers::cursor::connect::anthropic_error_type_from_live_error;
 use crate::providers::cursor::response::{CursorStreamEvent, decode_upstream_response};
 
 /// SSE event name constants.
@@ -100,7 +101,7 @@ fn format_sse_error(error: &str) -> Vec<u8> {
     let data = serde_json::json!({
         "type": "error",
         "error": {
-            "type": "api_error",
+            "type": anthropic_error_type_from_live_error(error),
             "message": error
         }
     });
@@ -1109,6 +1110,19 @@ mod tests {
         assert_eq!(name, "error");
         assert_eq!(data["error"]["type"], "api_error");
         assert_eq!(data["error"]["message"], "something broke");
+    }
+
+    #[test]
+    fn sse_error_preserves_rate_limit_type() {
+        let sse = format_sse_error("Connect error 429: quota [resource_exhausted]");
+        let sse_str = String::from_utf8_lossy(&sse);
+        let events = parse_sse_events(&sse_str);
+        let (_, data) = &events[0];
+        assert_eq!(data["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            data["error"]["message"],
+            "Connect error 429: quota [resource_exhausted]"
+        );
     }
 
     #[test]

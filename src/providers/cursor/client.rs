@@ -393,7 +393,7 @@ impl CursorHttpClient {
             .bearer_auth(token)
             .header("content-type", "application/connect+proto")
             .header("connect-protocol-version", "1")
-            .header("connect-accept-encoding", "gzip,br")
+            .header("connect-accept-encoding", "gzip")
             .header("user-agent", "connect-es/1.6.1")
             .header("x-cursor-client-type", &client_type)
             .header("x-cursor-client-version", &client_version)

@@ -776,6 +776,15 @@ impl MonitorStore {
         output_tokens: Option<u64>,
         error: Option<String>,
     ) {
+        if status == RequestStatus::Completed
+            && self.recent.iter().any(|request| {
+                request.request_id == request_id && request.status == RequestStatus::Failed
+            })
+        {
+            // Live SSE always ends HTTP 200; a prior stream `event: error`
+            // already recorded the Connect failure (typically 502).
+            return;
+        }
         let mut active = self
             .active
             .remove(request_id)
@@ -1291,14 +1300,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_requests_preserve_error_summary() {
+    fn failed_stream_status_is_not_overwritten_by_later_completed_200() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
-        monitor.request_failed("r1", Some(400), "Unknown model");
+        monitor.request_failed("r1", Some(502), "Conversation state is required");
+        monitor.request_completed("r1", 200, None, None);
         let state = monitor.snapshot();
+        assert_eq!(state.recent.len(), 1);
         assert_eq!(state.recent[0].status, RequestStatus::Failed);
-        assert_eq!(state.recent[0].http_status, Some(400));
-        assert_eq!(state.recent[0].error.as_deref(), Some("Unknown model"));
+        assert_eq!(state.recent[0].http_status, Some(502));
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("Conversation state is required")
+        );
     }
 
     #[test]

@@ -23,7 +23,8 @@ use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
 };
 use super::connect::{
-    ConnectFrame, ConnectFrameDecoder, FLAG_END, encode_connect_frame, parse_connect_error,
+    ConnectFrame, ConnectFrameDecoder, FLAG_END, anthropic_error_type_from_live_error,
+    encode_connect_frame, parse_connect_error,
 };
 use super::exec_results::{
     CursorExecKind, PendingCursorExec, encode_control_close, encode_control_throw,
@@ -43,8 +44,8 @@ use super::proto::{
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
 use super::request::{
-    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, cursor_request_context_from_text,
-    is_claude_local_tool_name, strip_mcp_provider_prefix,
+    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_tool_name,
+    strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
@@ -977,6 +978,7 @@ impl CursorHttpClient {
             LiveRunIdentity::parent(session_id),
             allowed_tool_names,
             mcp_tools,
+            super::proto::RequestContext::default(),
         )
         .await
     }
@@ -995,6 +997,7 @@ impl CursorHttpClient {
         identity: LiveRunIdentity<'_>,
         allowed_tool_names: Option<BTreeSet<String>>,
         mcp_tools: Option<super::proto::McpTools>,
+        request_context: super::proto::RequestContext,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -1079,6 +1082,7 @@ impl CursorHttpClient {
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
             mcp_tools: mcp_tools.clone(),
+            opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
         };
         // Match event fan-out: a tiny upstream queue stalls the reqwest body
         // pump (and Cursor's TCP window) during thinking bursts.
@@ -1099,6 +1103,7 @@ impl CursorHttpClient {
             run_id,
             seeded_blobs,
             prompt.to_string(),
+            request_context,
             reconnect,
         ));
 
@@ -1159,7 +1164,7 @@ impl CursorHttpClient {
             .bearer_auth(token)
             .header("content-type", "application/connect+proto")
             .header("connect-protocol-version", "1")
-            .header("connect-accept-encoding", "gzip,br")
+            .header("connect-accept-encoding", "gzip")
             .header("user-agent", "connect-es/1.6.1")
             .header("x-cursor-client-type", &identity.client_type)
             .header("x-cursor-client-version", &identity.client_version)
@@ -1234,13 +1239,12 @@ impl CursorHttpClient {
             .bearer_auth(token)
             .header("content-type", "application/connect+proto")
             .header("connect-protocol-version", "1")
-            .header("connect-accept-encoding", "gzip,br")
+            .header("connect-accept-encoding", "gzip")
             .header("user-agent", "connect-es/1.6.1")
             .header("x-cursor-client-type", &identity.client_type)
             .header("x-cursor-client-version", &identity.client_version)
             .header("x-ghost-mode", &identity.ghost_mode)
             .header("x-request-id", request_id)
-            .header("x-cursor-streaming", "true")
             .header("x-original-request-id", request_id);
 
         if identity.ide_profile {
@@ -1370,6 +1374,7 @@ struct LiveReconnectContext {
     conversation_id: Option<String>,
     force_http1: bool,
     mcp_tools: Option<super::proto::McpTools>,
+    opening_checkpoint: Option<Vec<u8>>,
 }
 
 type LiveUpstream = mpsc::Receiver<Result<Option<Bytes>, String>>;
@@ -1403,13 +1408,40 @@ fn is_http1_fallback_error(err: &CursorError) -> bool {
         err.status,
         // Proxy/CDN HTTP version rejects (Surge/Clash 464), gateway blips, or
         // Connect "unimplemented"/BiDi-disabled style failures.
-        408 | 421 | 429 | 464 | 502 | 503 | 504
+        408 | 421 | 464 | 502 | 503 | 504
     ) || err.message.contains("error sending request")
         || err.message.contains("connection")
         || err
             .detail
             .as_deref()
             .is_some_and(|d| d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi"))
+}
+
+/// Semantic Cursor errors (400/401/403/429) must not be retried on another
+/// transport — that burns quota and can duplicate an already-accepted run.
+pub(crate) fn is_retryable_live_transport_error(err: &CursorError) -> bool {
+    matches!(err.status, 0 | 408 | 421 | 464 | 502 | 503 | 504)
+        || err.message.contains("error sending request")
+        || err.message.contains("connection")
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi"))
+}
+
+/// Server keep-alives must not reset setup/stream idle clocks.
+fn record_server_heartbeat(_last_progress: &mut Instant) {}
+
+fn opening_live_checkpoint(state: &[u8]) -> Option<Vec<u8>> {
+    if state.is_empty() {
+        None
+    } else {
+        Some(state.to_vec())
+    }
+}
+
+fn abrupt_eof_should_error(_had_progress: bool) -> bool {
+    true
 }
 
 /// Re-open AgentService/Run with `ResumeAction` after a transport stall.
@@ -1432,7 +1464,14 @@ async fn try_live_reconnect(
     if !pending.is_empty() {
         return false;
     }
-    let Some(checkpoint) = latest_checkpoint.as_ref().filter(|c| !c.is_empty()) else {
+    let checkpoint = latest_checkpoint
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .or(reconnect
+            .opening_checkpoint
+            .as_ref()
+            .filter(|c| !c.is_empty()));
+    let Some(checkpoint) = checkpoint else {
         return false;
     };
     if *reconnect_attempts >= max_reconnects {
@@ -1677,6 +1716,7 @@ async fn drive_live_run(
     run_id: String,
     seeded_blobs: HashMap<Vec<u8>, Vec<u8>>,
     user_prompt: String,
+    request_context: RequestContext,
     reconnect: LiveReconnectContext,
 ) {
     let mut sink = Some(initial_sink);
@@ -1684,7 +1724,7 @@ async fn drive_live_run(
     let mut deferred = VecDeque::<LiveEventResult>::new();
     let mut decoder = ConnectFrameDecoder::new();
     let mut kv_blobs = seeded_blobs;
-    let mut latest_checkpoint: Option<Vec<u8>> = None;
+    let mut latest_checkpoint = reconnect.opening_checkpoint.clone();
     let mut saw_text = false;
     let mut useful = false;
     let mut logical_tools_waiting = LogicalToolTracker::default();
@@ -1693,7 +1733,6 @@ async fn drive_live_run(
     let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
     let mut coalescer = LiveDeltaCoalescer::default();
     let mut decode_failures: u32 = 0;
-    let request_context = cursor_request_context_from_text(&user_prompt);
     let run_started = Instant::now();
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
@@ -1969,24 +2008,15 @@ async fn drive_live_run(
                         if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
                             break 'driver;
                         }
-                        if !emit_empty_turn_note_if_needed(
-                            &mut saw_text,
-                            &mut useful,
-                            &mut sink,
-                            &mut deferred,
-                            &mut pending,
-                            &pending_shared,
-                            allowed_tool_names.as_ref(),
-                            &user_prompt,
-                            "eof",
-                        )
-                        .await
-                        {
+                        if abrupt_eof_should_error(useful || saw_text) {
+                            report_terminal_error(
+                                &mut sink,
+                                &terminal_error,
+                                "Cursor upstream ended without turn_ended".into(),
+                            )
+                            .await;
                             break 'driver;
                         }
-                        let _ =
-                            emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End)
-                                .await;
                         break 'driver;
                     }
                     Some(Err(error)) => {
@@ -2138,6 +2168,9 @@ async fn drive_live_run(
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .any(|exec| matches!(exec.kind, CursorExecKind::ClientOnly));
+    if client_only_teardown && pending.has_outstanding_native() {
+        let _ = control_close_natives(&mut pending, &outbound).await;
+    }
     if client_only_teardown {
         super::conversation::clear_checkpoint(&session_id);
     } else if let Some(checkpoint) = latest_checkpoint.take() {
@@ -2299,7 +2332,7 @@ async fn process_live_frame(
     if let Some(kv) = message.kv_server_message {
         match encode_kv_reply(&kv, kv_blobs) {
             Ok(Some(reply)) => {
-                if !outbound.send_connect_frame(reply).await {
+                if !send_frame_or_fail(outbound, sink, terminal_error, reply, "KV reply").await {
                     return false;
                 }
             }
@@ -2332,7 +2365,9 @@ async fn process_live_frame(
         }
         match encode_interaction_auto_response(&query) {
             Ok(Some(reply)) => {
-                if !outbound.send_connect_frame(reply).await {
+                if !send_frame_or_fail(outbound, sink, terminal_error, reply, "interaction reply")
+                    .await
+                {
                     return false;
                 }
             }
@@ -2356,12 +2391,20 @@ async fn process_live_frame(
                 .unwrap_or_else(RequestContext::default);
             match encode_request_context_reply(&exec, &context) {
                 Ok(reply) => {
-                    if !outbound.send_connect_frame(reply).await {
+                    if !send_frame_or_fail(
+                        outbound,
+                        sink,
+                        terminal_error,
+                        reply,
+                        "request_context reply",
+                    )
+                    .await
+                    {
                         return false;
                     }
                 }
                 Err(error) => {
-                    let _ = emit_or_defer(sink, deferred, Err(error.to_string())).await;
+                    report_terminal_error(sink, terminal_error, error.to_string()).await;
                     return false;
                 }
             }
@@ -2378,7 +2421,15 @@ async fn process_live_frame(
                 "Unsupported Cursor exec tool (mapped: shell/write/delete/grep/read/ls; not PiWrite/ApplyAgentDiff)".into(),
             ) {
                 for frame in frames {
-                    if !outbound.send_connect_frame(frame).await {
+                    if !send_frame_or_fail(
+                        outbound,
+                        sink,
+                        terminal_error,
+                        frame,
+                        "exec throw",
+                    )
+                    .await
+                    {
                         return false;
                     }
                 }
@@ -2395,7 +2446,9 @@ async fn process_live_frame(
                 format!("Tool {} is not advertised", native.claude_name),
             ) {
                 for frame in frames {
-                    if !outbound.send_connect_frame(frame).await {
+                    if !send_frame_or_fail(outbound, sink, terminal_error, frame, "exec throw")
+                        .await
+                    {
                         return false;
                     }
                 }
@@ -2556,6 +2609,21 @@ async fn process_interaction_update(
                 *last_progress = Instant::now();
                 return expose_collected_tools(pending, pending_shared, sink).await;
             }
+            if mapped.name == "Glob"
+                && let Some(emit_name) = resolve_advertised_name("Glob", allowed_tool_names)
+            {
+                // Official ExecServerMessage has no glob_args (0xlane agent_v1).
+                // tool_call_started is the only signal — expose as ClientOnly.
+                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                    return false;
+                }
+                let mut exec = mcp_client_only_pending_exec(&mapped);
+                exec.claude_name = emit_name;
+                pending.queue(exec, Duration::ZERO);
+                *useful = true;
+                *last_progress = Instant::now();
+                return expose_collected_tools(pending, pending_shared, sink).await;
+            }
         }
         // Native UI transcript only. Execution is driven by ExecServerMessage,
         // otherwise tool_call_started + exec duplicates.
@@ -2586,9 +2654,8 @@ async fn process_interaction_update(
         }
     }
     if update.heartbeat.is_some() {
-        // Server keep-alive during quiet thinking — refresh idle timers so
-        // we do not invent End / stall while BiDi is still healthy.
-        *last_progress = Instant::now();
+        // Server keep-alive during quiet thinking — do not refresh idle timers.
+        record_server_heartbeat(last_progress);
     }
     if let Some(text) = update.text_delta
         && !text.text.is_empty()
@@ -2835,6 +2902,20 @@ async fn emit_empty_turn_note_if_needed(
     .await
 }
 
+async fn send_frame_or_fail(
+    outbound: &ClientOutbound,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    frame: Bytes,
+    what: &str,
+) -> bool {
+    if outbound.send_connect_frame(frame).await {
+        return true;
+    }
+    report_terminal_error(sink, terminal_error, format!("Cursor {what} send failed")).await;
+    false
+}
+
 async fn report_terminal_error(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
@@ -2887,11 +2968,12 @@ async fn expose_collected_tools(
     *sink = None;
     // Client-only tools (Workflow/Skill/AskUserQuestion) are fulfilled by Claude
     // Code locally. End this BiDi run so the next Anthropic turn starts fresh
-    // with tool_result history — unless native Read/Bash are still in-flight.
-    if client_only && pending.has_outstanding_native() {
-        return true;
+    // with tool_result history — including mixed batches that still have native
+    // Read/Bash collecting (those execs are control_closed on driver teardown).
+    if client_only {
+        return false;
     }
-    !client_only
+    true
 }
 
 /// Drain buffered XML `<tool_use>` on turn/stream end and expose Claude-local
@@ -3445,8 +3527,8 @@ fn encode_request_context_reply(
     // ExecClientMessage.request_context_result (tag 10).
     //
     // proto.rs already has env.process_working_directory (tag 21), git_repos
-    // (tag 11), and agent_skills (tag 29). cwd/git come from the request
-    // system-reminder via `cursor_request_context_from_text` — do not dump the
+    // (tag 11), and agent_skills (tag 29). cwd/git come from
+    // `cursor_request_context` on the Anthropic body — do not dump the
     // full Claude system prompt. agent_skills stays empty here (no skill
     // corpus on this path).
     let message = AgentClientMessage {
@@ -3581,17 +3663,9 @@ fn encode_interaction_auto_response(
         matched = true;
     }
     if !matched {
-        // Unknown / future InteractionQuery — reject rather than hang the BiDi
-        // stream waiting for an IDE approval UI that will never appear.
-        response.ask_question_interaction_response = Some(AskQuestionInteractionResponse {
-            result: Some(AskQuestionResult {
-                rejected: Some(AskQuestionRejected {
-                    reason:
-                        "claude-code-proxy: unsupported InteractionQuery; cannot present Cursor UI"
-                            .into(),
-                }),
-            }),
-        });
+        return Err(CursorError::internal(
+            "unsupported InteractionQuery; cannot present Cursor UI",
+        ));
     }
     encode_agent_message(&AgentClientMessage {
         run_request: None,
@@ -3792,9 +3866,19 @@ pub fn live_sse_response(
                             }
                             Some(Err(error)) => {
                                 state.done = true;
+                                let error_type = anthropic_error_type_from_live_error(&error);
+                                let status = match error_type {
+                                    "rate_limit_error" => 429,
+                                    "authentication_error" => 401,
+                                    "permission_error" => 403,
+                                    _ => 502,
+                                };
+                                if let Some((ref handle, ref req_id)) = state.monitor {
+                                    handle.request_failed(req_id, Some(status), error.clone());
+                                }
                                 let data = serde_json::json!({
                                     "type": "error",
-                                    "error": {"type": "api_error", "message": error}
+                                    "error": {"type": error_type, "message": error}
                                 });
                                 return Some((
                                     Ok(Bytes::from(format_sse_event_bytes(EVENT_ERROR, &data))),
@@ -3900,6 +3984,7 @@ mod tests {
             conversation_id: Some("conv-test".into()),
             force_http1: false,
             mcp_tools: None,
+            opening_checkpoint: None,
         }
     }
 
@@ -3911,6 +3996,74 @@ mod tests {
             Some("Read")
         );
         assert!(resolve_advertised_name("Bash", Some(&allowed)).is_none());
+    }
+
+    #[test]
+    fn server_heartbeat_does_not_refresh_idle_progress() {
+        let mut last_progress = Instant::now() - Duration::from_secs(45);
+        let before = last_progress;
+        record_server_heartbeat(&mut last_progress);
+        assert_eq!(
+            last_progress, before,
+            "heartbeats keep TCP alive but must not reset setup/stream idle"
+        );
+    }
+
+    #[test]
+    fn rate_limit_is_not_an_http1_fallback() {
+        let err = CursorError::new(429, "rate limited", None);
+        assert!(
+            !is_http1_fallback_error(&err),
+            "429 must not be retried over H1 after H2 already consumed the quota"
+        );
+    }
+
+    #[test]
+    fn semantic_client_errors_are_not_retryable_live_transports() {
+        for status in [400, 401, 403, 404, 429] {
+            let err = CursorError::new(status, "no", None);
+            assert!(
+                !is_retryable_live_transport_error(&err),
+                "HTTP {status} must not fall through to buffered run_agent"
+            );
+        }
+        let transport = CursorError::new(502, "error sending request", None);
+        assert!(is_retryable_live_transport_error(&transport));
+    }
+
+    #[test]
+    fn opening_checkpoint_seeds_reconnect_state() {
+        assert!(opening_live_checkpoint(&[]).is_none());
+        assert_eq!(
+            opening_live_checkpoint(&[0x0a, 0x02, 0x01, 0x02]),
+            Some(vec![0x0a, 0x02, 0x01, 0x02])
+        );
+    }
+
+    #[test]
+    fn abrupt_eof_without_turn_ended_is_an_error() {
+        assert!(abrupt_eof_should_error(true));
+        assert!(abrupt_eof_should_error(false));
+    }
+
+    #[test]
+    fn connect_errors_map_to_anthropic_error_types() {
+        assert_eq!(
+            anthropic_error_type_from_live_error("Connect error 429: quota [resource_exhausted]"),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Connect error 401: no [unauthenticated]"),
+            "authentication_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Connect error 403: no [permission_denied]"),
+            "permission_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Cursor stream stalled"),
+            "api_error"
+        );
     }
 
     #[test]
@@ -4142,8 +4295,8 @@ mod tests {
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let keep_bidi = expose_collected_tools(&mut pending, &pending_shared, &mut sink).await;
         assert!(
-            keep_bidi,
-            "mixed ClientOnly+native must keep BiDi for in-flight Read/Bash"
+            !keep_bidi,
+            "mixed ClientOnly+native must end BiDi so the next POST includes Workflow/Skill results"
         );
         let event = event_rx.recv().await.expect("NativeToolBatch");
         match event {
@@ -4318,7 +4471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interaction_heartbeat_refreshes_idle_progress() {
+    async fn interaction_heartbeat_does_not_refresh_idle_progress() {
         use super::super::connect::encode_connect_frame;
         use super::super::proto::{AgentServerMessage, InteractionHeartbeat, InteractionUpdate};
         use prost::Message;
@@ -4385,8 +4538,8 @@ mod tests {
         .await;
         assert!(cont);
         assert!(
-            last_progress.elapsed() < Duration::from_secs(1),
-            "server InteractionUpdate.heartbeat must refresh idle timer"
+            last_progress.elapsed() >= Duration::from_secs(599),
+            "server InteractionUpdate.heartbeat must not reset setup/stream idle"
         );
     }
 
@@ -4530,6 +4683,107 @@ mod tests {
                 );
             }
             other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_tool_call_started_exposes_client_only() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, GlobToolArgs, GlobToolCall, InteractionUpdate, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "glob-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        glob_tool_call: Some(GlobToolCall {
+                            args: Some(GlobToolArgs {
+                                glob_pattern: "**/*.rs".into(),
+                                target_directory: Some("/tmp/proj".into()),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["Glob".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        assert!(
+            !cont,
+            "Glob has no ExecServerMessage arm; expose ClientOnly and end the segment"
+        );
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "Glob");
+                assert_eq!(
+                    tools[0].input.get("pattern").and_then(|v| v.as_str()),
+                    Some("**/*.rs")
+                );
+            }
+            other => panic!("expected Glob NativeToolBatch, got {other:?}"),
         }
     }
 
@@ -5692,6 +5946,21 @@ mod tests {
     }
 
     #[test]
+    fn unknown_interaction_query_does_not_use_ask_question_oneof() {
+        use super::super::proto::InteractionQuery;
+
+        let query = InteractionQuery {
+            id: 99,
+            ..Default::default()
+        };
+        let result = encode_interaction_auto_response(&query);
+        assert!(
+            result.is_err(),
+            "unmatched InteractionQuery must error instead of AskQuestion oneof"
+        );
+    }
+
+    #[test]
     fn completed_terminal_failure_does_not_look_generating() {
         let session = format!("fail-session-{}", uuid::Uuid::new_v4());
         let (command_tx, _command_rx) = mpsc::channel(1);
@@ -6005,6 +6274,7 @@ mod tests {
             "multi-test-run".into(),
             HashMap::new(),
             String::new(),
+            RequestContext::default(),
             test_reconnect_context(),
         ));
         let handle = CursorLiveRunHandle {
@@ -6294,6 +6564,7 @@ mod tests {
             "heartbeat-drop-run".into(),
             HashMap::new(),
             String::new(),
+            RequestContext::default(),
             test_reconnect_context(),
         ));
 
@@ -6348,6 +6619,7 @@ mod tests {
             "drop-test-run".into(),
             HashMap::new(),
             String::new(),
+            RequestContext::default(),
             test_reconnect_context(),
         ));
 

@@ -147,6 +147,13 @@ impl Registry {
             }
         }
 
+        // `/v1/models` lists live Cursor catalog ids (e.g. claude-fable-5-thinking-high[1m])
+        // that are not in the static registry. Route those to Cursor only when no other
+        // provider already claimed the exact id (gpt-5.5 stays Codex).
+        if self.handlers.contains_key("cursor") && is_unclaimed_cursor_catalog_id(&normalized) {
+            return self.handlers.get("cursor").cloned();
+        }
+
         None
     }
 
@@ -181,6 +188,15 @@ pub fn is_cursor_model(model: &str) -> bool {
     CURSOR_PREFIXES
         .iter()
         .any(|prefix| model.starts_with(prefix))
+}
+
+fn is_unclaimed_cursor_catalog_id(model: &str) -> bool {
+    if let Some(live) = crate::providers::cursor::model::cached_live_usable_models()
+        && live.iter().any(|id| id == model)
+    {
+        return true;
+    }
+    crate::providers::cursor::model::resolve_cursor_model(model).is_ok()
 }
 
 struct PlaceholderProvider {
@@ -368,6 +384,36 @@ mod tests {
         assert_eq!(
             registry
                 .provider_for_model("cursor-ask:gpt-5.5", None)
+                .unwrap()
+                .name(),
+            "cursor"
+        );
+    }
+
+    #[test]
+    fn live_cursor_catalog_ids_route_to_cursor() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in [
+            "claude-fable-5-thinking-high",
+            "claude-fable-5-thinking-high[1m]",
+            "claude-fable-5-thinking-max",
+            "composer-2.5-fast",
+        ] {
+            let p = registry.provider_for_model(model, None);
+            assert_eq!(
+                p.expect(model).name(),
+                "cursor",
+                "{model} is advertised by Cursor and must be routable"
+            );
+        }
+        assert_eq!(
+            registry.provider_for_model("gpt-5.5", None).unwrap().name(),
+            "codex",
+            "overlapping gpt-5.5 without cursor: prefix stays Codex"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("cursor:gpt-5.5", None)
                 .unwrap()
                 .name(),
             "cursor"

@@ -3,6 +3,25 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.34 (2026-08-13)
+
+- Route live Cursor catalog ids (`claude-fable-5-thinking-high[1m]`, …) through `/v1/messages`; overlapping `gpt-5.5` without a `cursor:` prefix still goes to Codex.
+- Mixed Workflow/Skill + native Read/Bash batches end the BiDi run so the next POST includes ClientOnly `tool_result` history (in-flight native execs are `control_close`d).
+- Abrupt live EOF without `turn_ended` is an Anthropic `event: error`, not a successful `message_stop`. Failed KV/context/interaction sends are terminal errors too.
+- Server heartbeats no longer reset setup/stream idle clocks (heartbeat-only stalls recover at 45–120s instead of the 1800s hard timeout).
+- Hosted `web_fetch`: reject unresolvable / trailing-dot localhost hosts, cap the body while streaming, and require a stored Cursor login. Gzip Connect envelopes are size-capped; advertise `gzip` only (not Brotli).
+- Do not H2→H1-fallback or buffered-retry 429/400/401/403. Reconnect can use the opening checkpoint. `count_tokens` uses the current request body. Conversation files are `0700`/`0600` and abandoned disk TTLs are scanned. HTTP/1 `BidiAppend` has a 30s timeout. Live Connect errors map to `rate_limit_error` / `authentication_error` / `permission_error`.
+
+## v0.1.33 (2026-08-13)
+
+- Nested Claude Code agents (`x-claude-code-agent-id`) compact prompts against `{session}::agent::{id}`, not the parent session checkpoint.
+- Restore Workflow / Skill / `mcp__*` JSON Schema on `RunRequest.mcp_tools` as `Value.struct_value` (the 0.1.31 `{type:object}` strip was leftover conservatism).
+- Expose Cursor Glob `tool_call_started` as ClientOnly — official `ExecServerMessage` has no `glob_args`.
+- Unmatched `InteractionQuery` errors the BiDi turn instead of answering on the AskQuestion oneof.
+- Alias `haiku` resolves to `claude-haiku-4-5`.
+- TUI keeps a stream `event: error` as HTTP 502 instead of overwriting with the SSE envelope 200.
+- Cursor conversation checkpoints persist under the state dir (or `CCP_CURSOR_CONV_DIR`) so a proxy restart does not drop `conversation_state`.
+
 ## v0.1.32 (2026-08-13)
 
 - Always send `RunRequest.conversation_state` (empty bytes for a fresh turn). 0.1.31 omitted the field when empty; Cursor then returned `Conversation state is required [invalid_argument]`.

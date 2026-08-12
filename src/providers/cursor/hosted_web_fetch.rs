@@ -216,6 +216,7 @@ pub fn validate_fetch_url(url: &str) -> Result<url::Url, FetchError> {
 fn host_is_blocked(host: &str) -> bool {
     let lower = host
         .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
         .to_ascii_lowercase();
     if lower == "localhost"
         || lower.ends_with(".localhost")
@@ -479,14 +480,19 @@ pub async fn fetch_web(url: &str) -> Result<FetchedPage, FetchError> {
                 return attempt.error("too many redirects");
             }
             match validate_fetch_url(attempt.url().as_str()) {
-                Ok(_) => attempt.follow(),
+                Ok(url) => {
+                    if let Err(e) = reject_resolved_blocked_ips(url.host_str().unwrap_or("")) {
+                        return attempt.error(e.message);
+                    }
+                    attempt.follow()
+                }
                 Err(e) => attempt.error(e.message),
             }
         }))
         .build()
         .map_err(|e| FetchError::new("unavailable", format!("web fetch client: {e}")))?;
 
-    let response = client.get(parsed.as_str()).send().await.map_err(|e| {
+    let mut response = client.get(parsed.as_str()).send().await.map_err(|e| {
         FetchError::new(
             "url_not_accessible",
             format!("web fetch request failed: {e}"),
@@ -518,11 +524,50 @@ pub async fn fetch_web(url: &str) -> Result<FetchedPage, FetchError> {
         .unwrap_or("")
         .to_string();
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| FetchError::new("url_not_accessible", format!("web fetch body: {e}")))?;
-    process_http_body(&final_url, &content_type, &bytes)
+    let mut body = Vec::new();
+    // Stream with a hard cap so a compression bomb cannot fill RAM first.
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(FetchError::new(
+                    "url_not_accessible",
+                    format!("web fetch body: {e}"),
+                ));
+            }
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+            return Err(FetchError::new(
+                "url_not_accessible",
+                format!("response larger than {MAX_BODY_BYTES} bytes"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    process_http_body(&final_url, &content_type, &body)
+}
+
+#[cfg(test)]
+fn copy_limited<R: std::io::Read>(mut reader: R, max: usize) -> Result<Vec<u8>, FetchError> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| FetchError::new("url_not_accessible", format!("web fetch body: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        if out.len().saturating_add(n) > max {
+            return Err(FetchError::new(
+                "url_not_accessible",
+                format!("response larger than {max} bytes"),
+            ));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
 }
 
 fn reject_resolved_blocked_ips(host: &str) -> Result<(), FetchError> {
@@ -539,9 +584,20 @@ fn reject_resolved_blocked_ips(host: &str) -> Result<(), FetchError> {
         return Ok(());
     }
     let addrs = match (host, 0u16).to_socket_addrs() {
-        Ok(a) => a,
-        Err(_) => return Ok(()),
+        Ok(a) => a.collect::<Vec<_>>(),
+        Err(_) => {
+            return Err(FetchError::new(
+                "url_not_allowed",
+                format!("host {host} could not be resolved"),
+            ));
+        }
     };
+    if addrs.is_empty() {
+        return Err(FetchError::new(
+            "url_not_allowed",
+            format!("host {host} could not be resolved"),
+        ));
+    }
     for addr in addrs {
         if ip_is_blocked(addr.ip()) {
             return Err(FetchError::new(
@@ -915,6 +971,32 @@ mod tests {
     fn rejects_non_http_scheme() {
         let err = validate_fetch_url("ftp://example.com/file").unwrap_err();
         assert_eq!(err.code, "url_not_allowed");
+    }
+
+    #[test]
+    fn rejects_trailing_dot_localhost() {
+        assert_eq!(
+            validate_fetch_url("http://localhost./secret")
+                .unwrap_err()
+                .code,
+            "url_not_allowed"
+        );
+    }
+
+    #[test]
+    fn rejects_unresolvable_hostname_instead_of_allowing() {
+        let err = reject_resolved_blocked_ips("not a host!!!")
+            .expect_err("DNS failure must not skip SSRF checks");
+        assert_eq!(err.code, "url_not_allowed");
+    }
+
+    #[test]
+    fn copy_limited_stops_before_buffering_the_whole_body() {
+        let src = vec![0u8; MAX_BODY_BYTES + 32];
+        let err = copy_limited(&src[..], MAX_BODY_BYTES).unwrap_err();
+        assert_eq!(err.code, "url_not_accessible");
+        let ok = copy_limited(&src[..MAX_BODY_BYTES], MAX_BODY_BYTES).unwrap();
+        assert_eq!(ok.len(), MAX_BODY_BYTES);
     }
 
     #[test]

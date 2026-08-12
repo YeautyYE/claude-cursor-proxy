@@ -143,8 +143,11 @@ fn advertise_as_cursor_mcp(name: &str) -> bool {
         || bare.starts_with("mcp__")
 }
 
-fn mcp_input_schema_value() -> prost_types::Value {
-    let schema = json_to_prost_struct(&serde_json::json!({ "type": "object" }))
+fn mcp_input_schema_value(tool: &serde_json::Value) -> prost_types::Value {
+    let schema = tool
+        .get("input_schema")
+        .and_then(json_to_prost_struct)
+        .or_else(|| json_to_prost_struct(&serde_json::json!({ "type": "object" })))
         .expect("minimal object schema");
     prost_types::Value {
         kind: Some(prost_types::value::Kind::StructValue(schema)),
@@ -181,10 +184,9 @@ pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
 ///
 /// Wire shape must match `agent.v1.McpToolDefinition`: `input_schema` is a
 /// `google.protobuf.Value` (`struct_value`), plus `provider_identifier` /
-/// `tool_name`. Only Workflow / Skill / `mcp__*` are advertised — dumping
-/// every Claude-local tool (Task, AskUserQuestion, …) with full JSON Schema
-/// as a raw Struct made Cursor reject the Run with
-/// `parse binary: invalid end group tag`.
+/// `tool_name`. Only Workflow / Skill / `mcp__*` are advertised. The Anthropic
+/// `input_schema` object is copied into that Value (not a raw Struct at tag 3,
+/// which Cursor rejected with `invalid end group tag`).
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
     let tools = req.extra.get("tools")?.as_array()?;
     let mapped: Vec<super::proto::McpTool> = tools
@@ -206,7 +208,7 @@ pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::Mcp
                 provider_identifier: CLAUDE_LOCAL_MCP_PROVIDER.to_string(),
                 name,
                 description,
-                input_schema: Some(mcp_input_schema_value()),
+                input_schema: Some(mcp_input_schema_value(tool)),
             })
         })
         .collect();
@@ -1045,8 +1047,8 @@ mod tests {
                     Some("object")
                 );
                 assert!(
-                    !schema.fields.contains_key("properties"),
-                    "full JSON Schema must not be copied onto mcp_tools"
+                    schema.fields.contains_key("properties"),
+                    "Workflow JSON Schema properties must be advertised on mcp_tools"
                 );
             }
             other => panic!("input_schema must be Value.struct_value, got {other:?}"),

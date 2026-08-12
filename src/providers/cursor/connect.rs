@@ -4,6 +4,9 @@ use bytes::{Bytes, BytesMut};
 pub const FLAG_GZIP: u8 = 0x01;
 pub const FLAG_END: u8 = 0x02;
 
+/// Cap gzip Connect payloads so a compressed envelope cannot expand without bound.
+pub const MAX_GZIP_DECODE_BYTES: usize = 8 * 1024 * 1024;
+
 /// A single Connect frame with flags and payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectFrame {
@@ -103,10 +106,29 @@ impl ConnectFrameDecoder {
 /// on frame flags & FLAG_GZIP.
 pub fn decode_gzip_frame(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(payload);
+    let mut decoder = flate2::read::GzDecoder::new(payload).take(MAX_GZIP_DECODE_BYTES as u64 + 1);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out)?;
+    if out.len() > MAX_GZIP_DECODE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "gzip payload exceeds limit",
+        ));
+    }
     Ok(out)
+}
+
+/// Map a live/Connect error string onto Anthropic SSE `error.type`.
+pub fn anthropic_error_type_from_live_error(error: &str) -> &'static str {
+    if error.contains("[resource_exhausted]") || error.contains("Connect error 429") {
+        "rate_limit_error"
+    } else if error.contains("[unauthenticated]") || error.contains("Connect error 401") {
+        "authentication_error"
+    } else if error.contains("[permission_denied]") || error.contains("Connect error 403") {
+        "permission_error"
+    } else {
+        "api_error"
+    }
 }
 
 /// Parse a Connect end-frame JSON error payload into a structured error.
@@ -409,5 +431,21 @@ mod tests {
 
         let decompressed = decode_gzip_frame(&frames[0].payload).unwrap();
         assert_eq!(decompressed, b"hello gzip");
+    }
+
+    #[test]
+    fn gzip_frame_rejects_unbounded_expansion() {
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast());
+            let chunk = vec![0u8; 64 * 1024];
+            for _ in 0..(MAX_GZIP_DECODE_BYTES / chunk.len() + 2) {
+                encoder.write_all(&chunk).unwrap();
+            }
+            encoder.finish().unwrap();
+        }
+        assert!(decode_gzip_frame(&compressed).is_err());
     }
 }

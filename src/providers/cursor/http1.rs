@@ -23,6 +23,9 @@ const MAX_IN_FLIGHT: usize = 16;
 /// Transient BidiAppend retries (CLI turn-runner: transport ≤10, server ≥3 throws).
 const APPEND_MAX_ATTEMPTS: u32 = 4;
 
+/// Whole-request cap so a stalled unary append cannot freeze the live driver.
+const APPEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Session that appends client messages onto an open RunSSE stream.
 #[derive(Clone)]
 pub struct BidiAppendSession {
@@ -104,10 +107,14 @@ impl BidiAppendSession {
                 req = req.header(name.as_str(), value.as_str());
             }
 
-            let resp = match req.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
+            let resp = match tokio::time::timeout(APPEND_TIMEOUT, req.send()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
                     last_err = Some(CursorError::from_reqwest(e, 30));
+                    continue;
+                }
+                Err(_) => {
+                    last_err = Some(CursorError::new(408, "BidiAppend timed out", None));
                     continue;
                 }
             };

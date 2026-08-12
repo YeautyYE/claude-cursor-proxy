@@ -114,7 +114,7 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             mode: CursorAgentMode::Agent,
         }),
         "haiku" => Ok(CursorModelResolution {
-            model_id: "claude-4.5-sonnet".to_string(),
+            model_id: "claude-haiku-4-5".to_string(),
             mode: CursorAgentMode::Agent,
         }),
         "sonnet" | "claude-sonnet-5" => Ok(CursorModelResolution {
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(r.model_id, "claude-fable-5-thinking-high");
 
         let r = resolve_cursor_model("haiku").unwrap();
-        assert_eq!(r.model_id, "claude-4.5-sonnet");
+        assert_eq!(r.model_id, "claude-haiku-4-5");
     }
 
     #[test]
