@@ -4101,6 +4101,57 @@ mod tests {
     }
 
     #[test]
+    fn live_run_identity_from_mod_headers_keys_separate_slot() {
+        // Mirrors `mod.rs` `live_run_identity`: nested POSTs keep the parent
+        // `X-Claude-Code-Session-Id` and add URL-encoded agent headers.
+        LiveRunRegistry::clear();
+        let session = "parent-session";
+        let parent = LiveRunIdentity::parent(session);
+        let nested = LiveRunIdentity {
+            session_id: session,
+            agent_id: Some("agent%2Fchild"),
+            parent_agent_id: Some("agent%2Fparent"),
+        };
+        assert_eq!(live_run_key_for(parent), session);
+        assert_eq!(
+            live_run_key_for(nested),
+            format!("{session}::agent::agent%2Fchild")
+        );
+        assert!(nested.is_nested());
+        assert!(!parent.is_nested());
+
+        let parent_res =
+            LiveRunRegistry::reserve_run(session, parent.agent_id).expect("parent reserve");
+        parent_res
+            .insert(dummy_handle("parent-run"))
+            .expect("insert parent");
+        let nested_res = LiveRunRegistry::reserve_run(session, nested.agent_id)
+            .expect("nested agent_id must not collide with the parent slot");
+        nested_res
+            .insert(dummy_handle("nested-run"))
+            .expect("insert nested");
+
+        assert_eq!(
+            LiveRunRegistry::get_run(session, parent.agent_id)
+                .unwrap()
+                .run_id,
+            "parent-run"
+        );
+        assert_eq!(
+            LiveRunRegistry::get_run(session, nested.agent_id)
+                .unwrap()
+                .run_id,
+            "nested-run"
+        );
+        let _ = LiveRunRegistry::supersede_run(session, parent.agent_id);
+        assert!(
+            LiveRunRegistry::get_run(session, nested.agent_id).is_some(),
+            "supersede_run on the parent slot must leave the nested agent"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
     fn tool_result_batch_requires_each_pending_id_exactly_once() {
         let pending = vec![pending_exec(1, "tool-1"), pending_exec(2, "tool-2")];
         let result = |id: &str| {
