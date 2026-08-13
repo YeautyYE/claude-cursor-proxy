@@ -63,7 +63,12 @@ async fn healthz_returns_ok() {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
-    assert_eq!(body, json!({"ok": true}));
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert!(
+        body["started_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "healthz must identify the running process, not the file on disk"
+    );
 }
 
 #[tokio::test]

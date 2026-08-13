@@ -1,7 +1,10 @@
 use prost::Message;
 
 use super::connect::encode_connect_frame;
-use super::proto::{AgentServerMessage, InteractionUpdate, TextDelta, ThinkingDelta, TurnEnded};
+use super::proto::{
+    AgentServerMessage, InteractionHeartbeat, InteractionUpdate, TextDelta, ThinkingDelta,
+    TurnEnded,
+};
 
 pub(crate) fn text_frame(text: &str) -> Vec<u8> {
     encode_agent_message(AgentServerMessage {
@@ -87,6 +90,27 @@ pub(crate) fn usage_frame_full(
 
 pub(crate) fn end_frame() -> Vec<u8> {
     encode_connect_frame(b"", 2).to_vec()
+}
+
+pub(crate) fn heartbeat_frame() -> Vec<u8> {
+    encode_agent_message(AgentServerMessage {
+        conversation_checkpoint_update: None,
+        interaction_update: Some(InteractionUpdate {
+            heartbeat: Some(InteractionHeartbeat {}),
+            text_delta: None,
+            tool_call_started: None,
+            tool_call_completed: None,
+            thinking_delta: None,
+            thinking_completed: None,
+            token_delta: None,
+            partial_tool_call: None,
+            tool_call_delta: None,
+            turn_ended: None,
+        }),
+        kv_server_message: None,
+        interaction_query: None,
+        exec_server_message: None,
+    })
 }
 
 fn encode_agent_message(msg: AgentServerMessage) -> Vec<u8> {

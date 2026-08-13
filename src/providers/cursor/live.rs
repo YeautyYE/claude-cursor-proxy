@@ -542,6 +542,16 @@ impl PendingExecState {
         natives
     }
 
+    fn restore_collecting_natives(&mut self, natives: Vec<PendingCursorExec>) {
+        if natives.is_empty() {
+            return;
+        }
+        if self.collecting.is_empty() {
+            self.collecting_since = Some(Instant::now());
+        }
+        self.collecting.extend(natives);
+    }
+
     fn oldest_since(&self) -> Option<Instant> {
         match (self.awaiting_since, self.collecting_since) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -1102,6 +1112,7 @@ impl CursorHttpClient {
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
+            http1_rejected: false,
             mcp_tools: mcp_tools.clone(),
             opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
         };
@@ -1160,7 +1171,9 @@ impl CursorHttpClient {
                         err.status
                     );
                 }
-                self.open_http1_run_sse(token, request_id, first_message, identity)
+                // Pin a real http1_only client. Reusing `self` still negotiates H2.
+                CursorHttpClient::with_prefer_http1(true)
+                    .open_http1_run_sse(token, request_id, first_message, identity)
                     .await
             }
             Err(err) => Err(err),
@@ -1394,6 +1407,8 @@ struct LiveReconnectContext {
     model_id: String,
     conversation_id: Option<String>,
     force_http1: bool,
+    /// Clash/Surge 464/421 while on HTTP/1. Do not oscillate back to H1.
+    http1_rejected: bool,
     mcp_tools: Option<super::proto::McpTools>,
     opening_checkpoint: Option<Vec<u8>>,
 }
@@ -1437,6 +1452,128 @@ fn spawn_upstream_pump_prefixed<S>(
         }
         let _ = tx.send(Ok(None)).await;
     });
+}
+
+/// Drop the previous generation's receiver so a retired pump's `Ok(None)` cannot
+/// be consumed as EOF on a healthy replacement stream.
+fn fence_live_upstream(
+    upstream: &mut LiveUpstream,
+    upstream_tx: &mut mpsc::Sender<Result<Option<Bytes>, String>>,
+) -> mpsc::Sender<Result<Option<Bytes>, String>> {
+    let (new_tx, new_rx) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
+    *upstream_tx = new_tx.clone();
+    *upstream = new_rx;
+    new_tx
+}
+
+fn live_reconnect_should_reset_budget(frames: &[ConnectFrame]) -> bool {
+    frames.iter().any(connect_frame_resets_reconnect_budget)
+}
+
+fn connect_frame_resets_reconnect_budget(frame: &ConnectFrame) -> bool {
+    if frame.payload.is_empty() {
+        return false;
+    }
+    match proto::AgentServerMessage::decode(frame.payload.as_ref()) {
+        Ok(message) => server_message_resets_reconnect_budget(&message),
+        Err(_) => false,
+    }
+}
+
+fn server_message_resets_reconnect_budget(message: &proto::AgentServerMessage) -> bool {
+    if message.exec_server_message.is_some()
+        || message
+            .conversation_checkpoint_update
+            .as_ref()
+            .is_some_and(|checkpoint| !checkpoint.is_empty())
+        || message.kv_server_message.is_some()
+        || message.interaction_query.is_some()
+    {
+        return true;
+    }
+    let Some(update) = message.interaction_update.as_ref() else {
+        return false;
+    };
+    !heartbeat_only_interaction(update) && interaction_has_model_progress(update)
+}
+
+fn heartbeat_only_interaction(update: &InteractionUpdate) -> bool {
+    update.heartbeat.is_some()
+        && update.text_delta.is_none()
+        && update.thinking_delta.is_none()
+        && update.tool_call_started.is_none()
+        && update.tool_call_completed.is_none()
+        && update.thinking_completed.is_none()
+        && update.partial_tool_call.is_none()
+        && update.token_delta.is_none()
+        && update.turn_ended.is_none()
+        && update.tool_call_delta.is_none()
+}
+
+fn interaction_has_model_progress(update: &InteractionUpdate) -> bool {
+    update.text_delta.is_some()
+        || update.thinking_delta.is_some()
+        || update.tool_call_started.is_some()
+        || update.tool_call_completed.is_some()
+        || update.thinking_completed.is_some()
+        || update.partial_tool_call.is_some()
+        || update.token_delta.is_some()
+        || update.turn_ended.is_some()
+        || update.tool_call_delta.is_some()
+}
+
+/// Reconnect transport is owned by `force_http1`, not `CCP_CURSOR_HTTP1`.
+/// Otherwise 464 flip-back still builds an `http1_only` client.
+fn reconnect_prefers_http1(force_http1: bool) -> bool {
+    force_http1
+}
+
+const LIVE_RECONNECT_OPEN_CAP: Duration = Duration::from_secs(20);
+
+fn live_reconnect_open_timeout(remaining: Duration) -> Duration {
+    remaining.min(LIVE_RECONNECT_OPEN_CAP)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveReconnectTransportAction {
+    KeepTrying,
+    ForceHttp1,
+    FlipToH2,
+    GiveUp(&'static str),
+}
+
+fn live_reconnect_on_open_error(
+    force_http1: bool,
+    http1_rejected: bool,
+    err: &CursorError,
+) -> LiveReconnectTransportAction {
+    if force_http1 && matches!(err.status, 421 | 464) {
+        if http1_rejected {
+            return LiveReconnectTransportAction::GiveUp(
+                "HTTP/1 rejected (464) after HTTP/2 already failed",
+            );
+        }
+        return LiveReconnectTransportAction::FlipToH2;
+    }
+    if http1_rejected {
+        return LiveReconnectTransportAction::GiveUp(
+            "HTTP/1 rejected by proxy and HTTP/2 still failing",
+        );
+    }
+    if !force_http1 && is_http1_fallback_error(err) {
+        return LiveReconnectTransportAction::ForceHttp1;
+    }
+    LiveReconnectTransportAction::KeepTrying
+}
+
+fn live_reconnect_on_hollow_body(http1_rejected: bool) -> LiveReconnectTransportAction {
+    if http1_rejected {
+        LiveReconnectTransportAction::GiveUp(
+            "HTTP/1 rejected by proxy and HTTP/2 resume was hollow",
+        )
+    } else {
+        LiveReconnectTransportAction::ForceHttp1
+    }
 }
 
 fn is_http1_fallback_error(err: &CursorError) -> bool {
@@ -1581,17 +1718,20 @@ fn prepare_live_reconnect(
     }
 }
 
-const LIVE_RECONNECT_FIRST_BYTE: Duration = Duration::from_secs(3);
+/// Peek ~1ms for an already-buffered RST/EOF. Quiet Fable thinking is healthy:
+/// do not wait seconds (that blocked owed `tool_result`s and false-aborted resumes).
+const LIVE_RECONNECT_IMMEDIATE: Duration = Duration::from_millis(1);
 
-async fn take_first_live_chunk<S>(mut stream: S) -> Result<(Bytes, S), String>
+async fn take_immediate_resume_chunk<S, E>(mut stream: S) -> Result<(Option<Bytes>, S), String>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: Error,
 {
-    match tokio::time::timeout(LIVE_RECONNECT_FIRST_BYTE, stream.next()).await {
-        Ok(Some(Ok(chunk))) => Ok((chunk, stream)),
+    match tokio::time::timeout(LIVE_RECONNECT_IMMEDIATE, stream.next()).await {
+        Ok(Some(Ok(chunk))) => Ok(((!chunk.is_empty()).then_some(chunk), stream)),
         Ok(Some(Err(error))) => Err(format_error_chain(&error)),
         Ok(None) => Err("Cursor resume stream ended before the first byte".into()),
-        Err(_) => Err("Cursor resume stream produced no bytes within 3s".into()),
+        Err(_) => Ok((None, stream)),
     }
 }
 
@@ -1641,7 +1781,8 @@ fn log_live_reconnect(
 async fn try_live_reconnect(
     reconnect: &mut LiveReconnectContext,
     outbound: &mut ClientOutbound,
-    upstream_tx: &mpsc::Sender<Result<Option<Bytes>, String>>,
+    upstream: &mut LiveUpstream,
+    upstream_tx: &mut mpsc::Sender<Result<Option<Bytes>, String>>,
     decoder: &mut ConnectFrameDecoder,
     latest_checkpoint: &Option<Vec<u8>>,
     kv_blobs: &HashMap<Vec<u8>, Vec<u8>>,
@@ -1651,6 +1792,7 @@ async fn try_live_reconnect(
     last_progress: &mut Instant,
     resume_grace_until: &mut Option<Instant>,
     resume_grace: Duration,
+    hard_deadline: Instant,
 ) -> LiveReconnectOutcome {
     let checkpoint = latest_checkpoint
         .as_ref()
@@ -1662,7 +1804,12 @@ async fn try_live_reconnect(
         .cloned();
     let Some(checkpoint) = checkpoint else {
         let outcome = LiveReconnectOutcome::Skipped("no checkpoint");
-        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+        log_live_reconnect(
+            &outcome,
+            *reconnect_attempts,
+            max_reconnects,
+            &reconnect.http,
+        );
         return outcome;
     };
 
@@ -1670,6 +1817,18 @@ async fn try_live_reconnect(
     let mut last_fail: Option<String> = None;
     let mut last_was_hollow = false;
     loop {
+        if Instant::now() >= hard_deadline {
+            let outcome = LiveReconnectOutcome::Failed(
+                last_fail.unwrap_or_else(|| "hard timeout during reconnect".into()),
+            );
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+            );
+            return outcome;
+        }
         if let Some(reason) = live_reconnect_skip_reason(
             latest_checkpoint,
             &reconnect.opening_checkpoint,
@@ -1679,7 +1838,12 @@ async fn try_live_reconnect(
             let outcome = last_fail
                 .map(LiveReconnectOutcome::Failed)
                 .unwrap_or(LiveReconnectOutcome::Skipped(reason));
-            log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+            );
             return outcome;
         }
         if !closed_collecting {
@@ -1692,11 +1856,8 @@ async fn try_live_reconnect(
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         last_was_hollow = false;
-        // Pin HTTP/1.1 on the reqwest client itself. Posting RunSSE with an H2
-        // client still negotiates HTTP/2 and dies with INTERNAL_ERROR.
-        reconnect.http = CursorHttpClient::with_prefer_http1(
-            reconnect.force_http1 || super::http1::prefer_http1_agent(),
-        );
+        reconnect.http =
+            CursorHttpClient::with_prefer_http1(reconnect_prefers_http1(reconnect.force_http1));
 
         let cont = super::conversation::RunContinuation {
             conversation_id: reconnect.conversation_id.clone(),
@@ -1726,59 +1887,130 @@ async fn try_live_reconnect(
             client_heartbeat: None,
         };
 
-        match reconnect
-            .http
-            .open_live_transport(
+        let open_wait =
+            live_reconnect_open_timeout(hard_deadline.saturating_duration_since(Instant::now()));
+        if open_wait.is_zero() {
+            let outcome = LiveReconnectOutcome::Failed(
+                last_fail.unwrap_or_else(|| "hard timeout during reconnect".into()),
+            );
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+            );
+            return outcome;
+        }
+
+        let opened = tokio::time::timeout(
+            open_wait,
+            reconnect.http.open_live_transport(
                 &reconnect.token,
                 &request_id,
                 &first_message,
                 &reconnect.identity,
                 reconnect.force_http1,
                 /*allow_h1_fallback=*/ !reconnect.force_http1,
-            )
-            .await
-        {
-            Ok((new_outbound, response)) => {
+            ),
+        )
+        .await;
+
+        match opened {
+            Err(_) => {
+                last_fail = Some("reconnect open timed out".into());
+                last_was_hollow = true;
+            }
+            Ok(Ok((new_outbound, response))) => {
                 let stream = response.bytes_stream();
-                match take_first_live_chunk(stream).await {
-                    Ok((chunk, rest)) => {
+                match take_immediate_resume_chunk(stream).await {
+                    Ok((prefix, rest)) => {
                         *outbound = new_outbound;
-                        spawn_upstream_pump_prefixed(Some(chunk), rest, upstream_tx.clone());
+                        let pump_tx = fence_live_upstream(upstream, upstream_tx);
+                        spawn_upstream_pump_prefixed(prefix, rest, pump_tx);
                         *decoder = ConnectFrameDecoder::new();
                         *last_progress = Instant::now();
                         *resume_grace_until = Some(Instant::now() + resume_grace);
                         let outcome = LiveReconnectOutcome::Reconnected;
-                        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+                        log_live_reconnect(
+                            &outcome,
+                            *reconnect_attempts,
+                            max_reconnects,
+                            &reconnect.http,
+                        );
                         return outcome;
                     }
                     Err(msg) => {
                         last_fail = Some(msg.clone());
                         last_was_hollow = true;
-                        if !reconnect.force_http1 {
-                            reconnect.force_http1 = true;
-                            let mut fields = serde_json::Map::new();
-                            fields
-                                .insert("attempts".into(), serde_json::json!(*reconnect_attempts));
-                            fields.insert("detail".into(), serde_json::json!(msg));
-                            crate::logging::create_logger("cursor")
-                                .warn("live_reconnect_http1", Some(fields));
+                        match live_reconnect_on_hollow_body(reconnect.http1_rejected) {
+                            LiveReconnectTransportAction::GiveUp(reason) => {
+                                let outcome =
+                                    LiveReconnectOutcome::Failed(format!("{msg} ({reason})"));
+                                log_live_reconnect(
+                                    &outcome,
+                                    *reconnect_attempts,
+                                    max_reconnects,
+                                    &reconnect.http,
+                                );
+                                return outcome;
+                            }
+                            LiveReconnectTransportAction::ForceHttp1 => {
+                                reconnect.force_http1 = true;
+                                let mut fields = serde_json::Map::new();
+                                fields.insert(
+                                    "attempts".into(),
+                                    serde_json::json!(*reconnect_attempts),
+                                );
+                                fields.insert("detail".into(), serde_json::json!(msg));
+                                crate::logging::create_logger("cursor")
+                                    .warn("live_reconnect_http1", Some(fields));
+                            }
+                            LiveReconnectTransportAction::FlipToH2
+                            | LiveReconnectTransportAction::KeepTrying => {}
                         }
                     }
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 last_fail = Some(format!("{} ({})", err.message, err.status));
                 if !is_retryable_live_transport_error(&err) {
                     let outcome = LiveReconnectOutcome::Failed(
                         last_fail.clone().unwrap_or_else(|| err.to_string()),
                     );
-                    log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+                    log_live_reconnect(
+                        &outcome,
+                        *reconnect_attempts,
+                        max_reconnects,
+                        &reconnect.http,
+                    );
                     return outcome;
                 }
-                if reconnect.force_http1 && matches!(err.status, 421 | 464) {
-                    reconnect.force_http1 = false;
-                } else if !reconnect.force_http1 && is_http1_fallback_error(&err) {
-                    reconnect.force_http1 = true;
+                match live_reconnect_on_open_error(
+                    reconnect.force_http1,
+                    reconnect.http1_rejected,
+                    &err,
+                ) {
+                    LiveReconnectTransportAction::GiveUp(reason) => {
+                        let outcome = LiveReconnectOutcome::Failed(format!(
+                            "{} ({reason})",
+                            last_fail.as_deref().unwrap_or(reason)
+                        ));
+                        log_live_reconnect(
+                            &outcome,
+                            *reconnect_attempts,
+                            max_reconnects,
+                            &reconnect.http,
+                        );
+                        return outcome;
+                    }
+                    LiveReconnectTransportAction::FlipToH2 => {
+                        reconnect.force_http1 = false;
+                        reconnect.http1_rejected = true;
+                    }
+                    LiveReconnectTransportAction::ForceHttp1 => {
+                        reconnect.force_http1 = true;
+                    }
+                    LiveReconnectTransportAction::KeepTrying => {}
                 }
             }
         }
@@ -1934,14 +2166,26 @@ async fn control_close_collecting_natives(
     pending: &mut PendingExecState,
     outbound: &ClientOutbound,
 ) -> bool {
-    for exec in pending.drain_collecting_natives() {
-        if let Ok(frame) = encode_control_close(exec.id) {
-            if !outbound.send_connect_frame(frame).await {
-                return false;
-            }
+    let natives = pending.drain_collecting_natives();
+    let mut unsent = Vec::new();
+    let mut iter = natives.into_iter();
+    let mut all_ok = true;
+    for exec in iter.by_ref() {
+        let Ok(frame) = encode_control_close(exec.id) else {
+            all_ok = false;
+            unsent.push(exec);
+            unsent.extend(iter);
+            break;
+        };
+        if !outbound.send_connect_frame(frame).await {
+            all_ok = false;
+            unsent.push(exec);
+            unsent.extend(iter);
+            break;
         }
     }
-    true
+    pending.restore_collecting_natives(unsent);
+    all_ok
 }
 
 struct LiveTurnCtx<'a> {
@@ -1954,7 +2198,7 @@ struct LiveTurnCtx<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_run(
     mut upstream: LiveUpstream,
-    upstream_tx: mpsc::Sender<Result<Option<Bytes>, String>>,
+    mut upstream_tx: mpsc::Sender<Result<Option<Bytes>, String>>,
     mut outbound: ClientOutbound,
     mut command_rx: mpsc::Receiver<RunCommand>,
     initial_sink: mpsc::Sender<LiveEventResult>,
@@ -2025,6 +2269,7 @@ async fn drive_live_run(
         u64::MAX / 4, // disabled unless explicitly overridden
     ));
     let hard = Duration::from_secs(env_u64("CCP_CURSOR_TIMEOUT_SECS", 1800));
+    let hard_deadline = run_started + hard;
     let tool_ttl = Duration::from_secs(env_u64("CCP_CURSOR_TOOL_TTL_SECS", 600));
     // CLI transport/stall retries: 10 (prod). Keep Anthropic SSE open across
     // brief Cursor disconnects when we have a checkpoint to ResumeAction.
@@ -2099,7 +2344,8 @@ async fn drive_live_run(
                             let reconnect_outcome = try_live_reconnect(
                                 &mut reconnect,
                                 &mut outbound,
-                                &upstream_tx,
+                                &mut upstream,
+                                &mut upstream_tx,
                                 &mut decoder,
                                 &latest_checkpoint,
                                 &kv_blobs,
@@ -2109,6 +2355,7 @@ async fn drive_live_run(
                                 &mut last_progress,
                                 &mut resume_grace_until,
                                 resume_grace,
+                                hard_deadline,
                             )
                             .await;
                             send_failed = !matches!(
@@ -2173,10 +2420,6 @@ async fn drive_live_run(
             item = upstream.recv() => {
                 match item {
                     Some(Ok(Some(chunk))) => {
-                        if !chunk.is_empty() {
-                            got_chunk_since_reconnect = true;
-                            reconnect_attempts = 0;
-                        }
                         let checkpoint_before = latest_checkpoint
                             .as_ref()
                             .map(|checkpoint| (checkpoint.as_ptr() as usize, checkpoint.len()));
@@ -2188,6 +2431,10 @@ async fn drive_live_run(
                                 break 'driver;
                             }
                         };
+                        if live_reconnect_should_reset_budget(&frames) {
+                            got_chunk_since_reconnect = true;
+                            reconnect_attempts = 0;
+                        }
                         for frame in frames {
                             let mut turn = LiveTurnCtx {
                                 user_prompt: &user_prompt,
@@ -2259,7 +2506,8 @@ async fn drive_live_run(
                         let reconnect_outcome = try_live_reconnect(
                             &mut reconnect,
                             &mut outbound,
-                            &upstream_tx,
+                            &mut upstream,
+                            &mut upstream_tx,
                             &mut decoder,
                             &latest_checkpoint,
                             &kv_blobs,
@@ -2269,6 +2517,7 @@ async fn drive_live_run(
                             &mut last_progress,
                             &mut resume_grace_until,
                             resume_grace,
+                            hard_deadline,
                         )
                         .await;
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
@@ -2349,7 +2598,8 @@ async fn drive_live_run(
                         let reconnect_outcome = try_live_reconnect(
                             &mut reconnect,
                             &mut outbound,
-                            &upstream_tx,
+                            &mut upstream,
+                            &mut upstream_tx,
                             &mut decoder,
                             &latest_checkpoint,
                             &kv_blobs,
@@ -2359,6 +2609,7 @@ async fn drive_live_run(
                             &mut last_progress,
                             &mut resume_grace_until,
                             resume_grace,
+                            hard_deadline,
                         )
                         .await;
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
@@ -4313,6 +4564,7 @@ mod tests {
             model_id: "composer-2.5".into(),
             conversation_id: Some("conv-test".into()),
             force_http1: false,
+            http1_rejected: false,
             mcp_tools: None,
             opening_checkpoint: None,
         }
@@ -4445,6 +4697,151 @@ mod tests {
         let msg = "error decoding response body: error reading a body from connection: stream error received: unexpected internal error encountered";
         assert!(is_h2_stream_reset(msg));
         assert!(!is_h2_stream_reset("Connect error 429: quota"));
+    }
+
+    fn decoded_frames(bytes: &[u8]) -> Vec<ConnectFrame> {
+        ConnectFrameDecoder::new().push(bytes).unwrap()
+    }
+
+    #[test]
+    fn heartbeat_frames_do_not_reset_reconnect_budget() {
+        let frames = decoded_frames(&super::super::test_frames::heartbeat_frame());
+        assert!(
+            !live_reconnect_should_reset_budget(&frames),
+            "server heartbeats must not replenish ResumeAction attempts"
+        );
+        assert!(!live_reconnect_should_reset_budget(&[]));
+        assert!(!live_reconnect_should_reset_budget(&[ConnectFrame {
+            flags: 0,
+            payload: Bytes::new(),
+        }]));
+        let partial = vec![0x00, 0x00, 0x00];
+        assert!(
+            !live_reconnect_should_reset_budget(&decoded_frames(&partial)),
+            "incomplete Connect bytes must not reset the budget"
+        );
+    }
+
+    #[test]
+    fn text_frames_reset_reconnect_budget() {
+        let frames = decoded_frames(&super::super::test_frames::text_frame("hello"));
+        assert!(live_reconnect_should_reset_budget(&frames));
+    }
+
+    #[test]
+    fn reconnect_client_follows_force_flag_not_env() {
+        assert!(
+            reconnect_prefers_http1(true),
+            "H2 INTERNAL_ERROR must pin http1_only()"
+        );
+        assert!(
+            !reconnect_prefers_http1(false),
+            "464 flip-back must rebuild H2 even when CCP_CURSOR_HTTP1=1"
+        );
+    }
+
+    #[test]
+    fn h1_464_after_h2_hollow_gives_up_instead_of_oscillating() {
+        let clash = CursorError::new(464, "incompatible version", None);
+        assert_eq!(
+            live_reconnect_on_open_error(true, false, &clash),
+            LiveReconnectTransportAction::FlipToH2
+        );
+        assert_eq!(
+            live_reconnect_on_open_error(true, true, &clash),
+            LiveReconnectTransportAction::GiveUp(
+                "HTTP/1 rejected (464) after HTTP/2 already failed"
+            )
+        );
+        assert_eq!(
+            live_reconnect_on_hollow_body(true),
+            LiveReconnectTransportAction::GiveUp(
+                "HTTP/1 rejected by proxy and HTTP/2 resume was hollow"
+            )
+        );
+        assert_eq!(
+            live_reconnect_on_hollow_body(false),
+            LiveReconnectTransportAction::ForceHttp1
+        );
+        let h2_reset = CursorError::new(
+            0,
+            "stream error received: unexpected internal error encountered",
+            None,
+        );
+        assert_eq!(
+            live_reconnect_on_open_error(false, true, &h2_reset),
+            LiveReconnectTransportAction::GiveUp(
+                "HTTP/1 rejected by proxy and HTTP/2 still failing"
+            )
+        );
+    }
+
+    #[test]
+    fn reconnect_open_timeout_is_capped_inside_hard_deadline() {
+        assert_eq!(
+            live_reconnect_open_timeout(Duration::from_secs(1800)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            live_reconnect_open_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(live_reconnect_open_timeout(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn silent_resume_open_is_accepted_without_waiting_seconds() {
+        let stream = futures_util::stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let result = take_immediate_resume_chunk(stream).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "quiet Fable thinking must not sit behind a 3s first-byte gate"
+        );
+        let (prefix, _) = result.expect("silent open is healthy");
+        assert!(prefix.is_none());
+    }
+
+    #[tokio::test]
+    async fn immediate_resume_eof_is_hollow() {
+        let stream = futures_util::stream::empty::<Result<Bytes, reqwest::Error>>();
+        let err = take_immediate_resume_chunk(stream)
+            .await
+            .expect_err("HTTP 200 then immediate EOF is hollow");
+        assert!(err.contains("ended before the first byte"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fence_live_upstream_drops_stale_pump_eof() {
+        let (old_tx, old_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(8);
+        let mut upstream = old_rx;
+        let mut upstream_tx = old_tx.clone();
+        let new_tx = fence_live_upstream(&mut upstream, &mut upstream_tx);
+        let _ = old_tx.send(Ok(None)).await;
+        new_tx
+            .send(Ok(Some(Bytes::from_static(b"fresh"))))
+            .await
+            .unwrap();
+        let got = upstream.recv().await;
+        assert_eq!(got, Some(Ok(Some(Bytes::from_static(b"fresh")))));
+    }
+
+    #[tokio::test]
+    async fn control_close_keeps_natives_when_send_fails() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let outbound = ClientOutbound::Bidi(tx);
+        let mut pending = PendingExecState::default();
+        pending.queue(pending_exec(2, "read-2"), Duration::from_millis(50));
+        assert_eq!(pending.collecting.len(), 1);
+        let ok = control_close_collecting_natives(&mut pending, &outbound).await;
+        assert!(!ok);
+        assert_eq!(
+            pending.collecting.len(),
+            1,
+            "failed close must not drain collecting natives"
+        );
+        assert_eq!(pending.collecting[0].tool_use_id, "read-2");
     }
 
     #[test]

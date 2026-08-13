@@ -26,8 +26,10 @@ use std::fs::{self, File};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+
+static PROCESS_STARTED_AT: LazyLock<String> = LazyLock::new(|| jiff::Timestamp::now().to_string());
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -89,6 +91,8 @@ pub async fn serve_listener(
                         .map(|path| path.display().to_string())
                 ),
             ),
+            ("version".to_string(), json!(env!("CARGO_PKG_VERSION"))),
+            ("startedAt".to_string(), json!(PROCESS_STARTED_AT.as_str())),
         ])),
     );
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
@@ -127,7 +131,11 @@ struct AppState {
 }
 
 async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
+    Json(json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at": PROCESS_STARTED_AT.as_str(),
+    }))
 }
 
 /// Anthropic/OpenAI-compatible model list.

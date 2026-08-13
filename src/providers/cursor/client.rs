@@ -55,6 +55,40 @@ pub struct CursorHttpClient {
     http1_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorReqwestMode {
+    Http1Only,
+    Http2Alpn,
+    CleartextH2PriorKnowledge,
+}
+
+pub(crate) fn cursor_reqwest_mode(prefer_http1: bool, is_cleartext: bool) -> CursorReqwestMode {
+    if is_cleartext {
+        CursorReqwestMode::CleartextH2PriorKnowledge
+    } else if prefer_http1 {
+        CursorReqwestMode::Http1Only
+    } else {
+        CursorReqwestMode::Http2Alpn
+    }
+}
+
+fn apply_cursor_reqwest_mode(
+    builder: reqwest::ClientBuilder,
+    mode: CursorReqwestMode,
+) -> reqwest::ClientBuilder {
+    match mode {
+        CursorReqwestMode::CleartextH2PriorKnowledge => {
+            // Mock/tests use http://127.0.0.1 — never send loopback through Clash.
+            builder.no_proxy().http2_prior_knowledge()
+        }
+        CursorReqwestMode::Http1Only => builder.http1_only(),
+        CursorReqwestMode::Http2Alpn => builder
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(10)),
+    }
+}
+
 impl Default for CursorHttpClient {
     fn default() -> Self {
         Self::new()
@@ -94,23 +128,14 @@ impl CursorHttpClient {
             .tcp_keepalive(std::time::Duration::from_secs(30));
         let _ = timeout_secs; // retained for error messages / hard-timeout default
 
-        let http1_only = prefer_http1 && !is_cleartext;
-        if is_cleartext {
-            // Mock/tests use http://127.0.0.1 — never send loopback through Clash.
-            builder = builder.no_proxy().http2_prior_knowledge();
-        } else {
-            if cursor_http_bypass_proxy(std::env::var("CCP_CURSOR_NO_PROXY").ok().as_deref()) {
-                builder = builder.no_proxy();
-            }
-            if http1_only {
-                builder = builder.http1_only();
-            } else {
-                builder = builder
-                    .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
-                    .http2_keep_alive_while_idle(true)
-                    .http2_keep_alive_interval(std::time::Duration::from_secs(10));
-            }
+        let mode = cursor_reqwest_mode(prefer_http1, is_cleartext);
+        if !is_cleartext
+            && cursor_http_bypass_proxy(std::env::var("CCP_CURSOR_NO_PROXY").ok().as_deref())
+        {
+            builder = builder.no_proxy();
         }
+        builder = apply_cursor_reqwest_mode(builder, mode);
+        let http1_only = matches!(mode, CursorReqwestMode::Http1Only);
 
         let client = builder.build().expect("CursorHttpClient: reqwest client");
 
@@ -1590,7 +1615,72 @@ mod tests {
             http1.prefers_http1(),
             "RunSSE fallback must use http1_only(), not an H2 client posting to RunSSE"
         );
+        assert_eq!(
+            cursor_reqwest_mode(true, false),
+            CursorReqwestMode::Http1Only
+        );
         let http2 = CursorHttpClient::with_prefer_http1(false);
         assert!(!http2.prefers_http1());
+        assert_eq!(
+            cursor_reqwest_mode(false, false),
+            CursorReqwestMode::Http2Alpn
+        );
+        assert_eq!(
+            cursor_reqwest_mode(true, true),
+            CursorReqwestMode::CleartextH2PriorKnowledge
+        );
+    }
+
+    async fn collect_preface(mode: CursorReqwestMode) -> Vec<u8> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 32];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                .await
+                .unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+        let client = apply_cursor_reqwest_mode(
+            reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2)),
+            mode,
+        )
+        .build()
+        .unwrap();
+        let url = format!("http://{addr}/");
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.get(url).send()).await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server join")
+            .expect("server task")
+    }
+
+    #[tokio::test]
+    async fn http1_only_mode_sends_http11_not_h2_preface() {
+        let preface = collect_preface(CursorReqwestMode::Http1Only).await;
+        assert!(
+            !preface.starts_with(b"PRI * HTTP/2.0"),
+            "Http1Only must not send the HTTP/2 preface: {:?}",
+            String::from_utf8_lossy(&preface)
+        );
+        assert!(
+            preface.starts_with(b"GET "),
+            "Http1Only must speak HTTP/1.1, got {:?}",
+            String::from_utf8_lossy(&preface)
+        );
+    }
+
+    #[tokio::test]
+    async fn cleartext_h2_mode_sends_pri_preface() {
+        let preface = collect_preface(CursorReqwestMode::CleartextH2PriorKnowledge).await;
+        assert!(
+            preface.starts_with(b"PRI * HTTP/2.0"),
+            "cleartext mock path must keep h2 prior knowledge, got {:?}",
+            String::from_utf8_lossy(&preface)
+        );
     }
 }

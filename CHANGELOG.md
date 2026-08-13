@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.38 (2026-08-13)
+
+- Live reconnect no longer false-aborts quiet Fable resumes (3s first-byte gate) or replenishes the retry budget on heartbeats / partial bytes. Retired pumps are fenced so a stale EOF cannot kill a healthy HTTP/1 replacement. H2 hollow + Clash 464 fail fast instead of oscillating; 464 flip-back rebuilds a real H2 client even when `CCP_CURSOR_HTTP1=1`. Failed `control_close` keeps collecting natives. `/healthz` reports the running version and start time.
+
 ## v0.1.37 (2026-08-13)
 
 - Root-cause fix for `unexpected internal error` + `reconnect budget exhausted`: HTTP 200 ResumeAction was treated as success before any body bytes, and the "HTTP/1" fallback still used an HTTP/2 reqwest client for `/RunSSE`. Wait for the first body byte, pin `http1_only()` when falling back, and skip exponential backoff on zero-byte RSTs (that backoff was the 5-minute 502).
