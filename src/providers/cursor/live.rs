@@ -1662,7 +1662,12 @@ async fn try_live_reconnect(
         .cloned();
     let Some(checkpoint) = checkpoint else {
         let outcome = LiveReconnectOutcome::Skipped("no checkpoint");
-        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+        log_live_reconnect(
+            &outcome,
+            *reconnect_attempts,
+            max_reconnects,
+            &reconnect.http,
+        );
         return outcome;
     };
 
@@ -1679,7 +1684,12 @@ async fn try_live_reconnect(
             let outcome = last_fail
                 .map(LiveReconnectOutcome::Failed)
                 .unwrap_or(LiveReconnectOutcome::Skipped(reason));
-            log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+            );
             return outcome;
         }
         if !closed_collecting {
@@ -1748,7 +1758,12 @@ async fn try_live_reconnect(
                         *last_progress = Instant::now();
                         *resume_grace_until = Some(Instant::now() + resume_grace);
                         let outcome = LiveReconnectOutcome::Reconnected;
-                        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+                        log_live_reconnect(
+                            &outcome,
+                            *reconnect_attempts,
+                            max_reconnects,
+                            &reconnect.http,
+                        );
                         return outcome;
                     }
                     Err(msg) => {
@@ -1772,7 +1787,12 @@ async fn try_live_reconnect(
                     let outcome = LiveReconnectOutcome::Failed(
                         last_fail.clone().unwrap_or_else(|| err.to_string()),
                     );
-                    log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+                    log_live_reconnect(
+                        &outcome,
+                        *reconnect_attempts,
+                        max_reconnects,
+                        &reconnect.http,
+                    );
                     return outcome;
                 }
                 if reconnect.force_http1 && matches!(err.status, 421 | 464) {

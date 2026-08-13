@@ -139,23 +139,28 @@ async fn healthz() -> Json<serde_json::Value> {
 /// Claude Code sees a `[1m]` marker (1M context) on this surface.
 async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     use crate::providers::cursor::model::{
-        anthropic_list_model_id, cursor_anthropic_surface_models,
+        CURSOR_GROK_46_ALIAS, anthropic_list_model_id, cursor_anthropic_surface_models,
     };
 
     let mut seen = std::collections::BTreeSet::new();
     let mut data: Vec<Value> = Vec::new();
+    let discovery_allowlist = std::env::var("CCP_CLAUDE_MODEL_DISCOVERY_ALLOWLIST").ok();
 
     let push = |data: &mut Vec<Value>,
                 seen: &mut std::collections::BTreeSet<String>,
                 id: String,
                 owned_by: &str| {
         if seen.insert(id.clone()) {
-            data.push(json!({
+            let mut item = json!({
                 "id": id,
                 "object": "model",
                 "created": 0,
                 "owned_by": owned_by,
-            }));
+            });
+            if item["id"] == CURSOR_GROK_46_ALIAS {
+                item["display_name"] = json!("Cursor Grok 4.6");
+            }
+            data.push(item);
         }
     };
 
@@ -164,7 +169,10 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
         if let Ok(ids) = client.fetch_usable_models(&auth.access_token).await {
             for id in ids {
                 // Fable catalog → …[1m]; other catalog ids unchanged.
-                push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
+                let surface = anthropic_list_model_id(&id);
+                if model_allowed_by_discovery_filter(&surface, discovery_allowlist.as_deref()) {
+                    push(&mut data, &mut seen, surface, "cursor");
+                }
             }
         }
     }
@@ -175,27 +183,43 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
         } else {
             id
         };
-        push(&mut data, &mut seen, surface, &provider);
+        if model_allowed_by_discovery_filter(&surface, discovery_allowlist.as_deref()) {
+            push(&mut data, &mut seen, surface, &provider);
+        }
     }
 
     if data.is_empty() {
         for id in cursor_anthropic_surface_models() {
-            push(&mut data, &mut seen, id, "cursor");
+            if model_allowed_by_discovery_filter(&id, discovery_allowlist.as_deref()) {
+                push(&mut data, &mut seen, id, "cursor");
+            }
         }
     } else {
         // Ensure the Fable 1M wire id is always present for gateway discovery.
-        push(
-            &mut data,
-            &mut seen,
-            anthropic_list_model_id("claude-fable-5"),
-            "cursor",
-        );
+        let fable = anthropic_list_model_id("claude-fable-5");
+        if model_allowed_by_discovery_filter(&fable, discovery_allowlist.as_deref()) {
+            push(&mut data, &mut seen, fable, "cursor");
+        }
     }
 
     Json(json!({
         "object": "list",
         "data": data,
     }))
+}
+
+fn model_allowed_by_discovery_filter(id: &str, allowlist: Option<&str>) -> bool {
+    let lower = id.to_ascii_lowercase();
+    if !lower.starts_with("claude") && !lower.starts_with("anthropic") {
+        return true;
+    }
+    let Some(allowlist) = allowlist else {
+        return true;
+    };
+    allowlist
+        .split(',')
+        .map(str::trim)
+        .any(|allowed| !allowed.is_empty() && allowed.eq_ignore_ascii_case(id))
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -1050,7 +1074,7 @@ fn set_mode(path: &Path, mode: u32) {
 mod tests {
     use super::{
         claude_code_headers_from, derive_fallback_session_id, enable_accepted_tcp_nodelay,
-        resolve_session_id, session_id_from_headers,
+        model_allowed_by_discovery_filter, resolve_session_id, session_id_from_headers,
     };
     use crate::anthropic::schema::MessagesRequest;
     use serde_json::json;
@@ -1067,6 +1091,20 @@ mod tests {
             "metadata": {"user_id": user_id},
             "system": format!("# Environment\n - Primary working directory: {cwd}\n - Is a git repository: true")
         }))
+    }
+
+    #[test]
+    fn discovery_allowlist_only_filters_anthropic_shaped_ids() {
+        let allowlist = Some("claude-cursor-grok-4.6");
+        assert!(model_allowed_by_discovery_filter(
+            "claude-cursor-grok-4.6",
+            allowlist
+        ));
+        assert!(!model_allowed_by_discovery_filter(
+            "claude-opus-5-thinking-high",
+            allowlist
+        ));
+        assert!(model_allowed_by_discovery_filter("gpt-5.6-sol", allowlist));
     }
 
     #[tokio::test]

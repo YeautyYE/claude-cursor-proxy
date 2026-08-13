@@ -46,7 +46,9 @@ use crate::providers::cursor::live::{
     LiveEventResult, LiveRunEvent, LiveRunIdentity, LiveRunRegistry, live_run_key_for,
     live_sse_response,
 };
-use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
+use crate::providers::cursor::model::{
+    anthropic_wire_model, apply_requested_effort, resolve_cursor_model,
+};
 use crate::providers::cursor::request::{
     CursorPromptOptions, claude_local_mcp_tools, cursor_request_context,
     latest_user_is_only_tool_results, render_cursor_prompt, render_cursor_prompt_parts_with,
@@ -60,6 +62,7 @@ use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
     start_cursor_tool_bridge,
 };
+use crate::providers::translate_shared::read_effort;
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -441,6 +444,27 @@ impl Provider for CursorProvider {
         let model = body.model.as_deref().unwrap_or("cursor");
         let wire_model = anthropic_wire_model(model);
 
+        let effort = match read_effort(&body) {
+            Ok(effort) => effort,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
+        let upstream_model = match apply_requested_effort(model, effort) {
+            Ok(model) => model,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Model \"{model}\" is not supported: {error}"),
+                );
+            }
+        };
+
         let resolved = resolve_cursor_model(model);
         if let Err(e) = resolved {
             return json_error(
@@ -646,7 +670,7 @@ impl Provider for CursorProvider {
                     .start_live_agent_with_identity(
                         &token,
                         user_text,
-                        model,
+                        &upstream_model,
                         &images,
                         custom_system,
                         identity,
@@ -665,7 +689,7 @@ impl Provider for CursorProvider {
                                     .start_live_agent_with_identity(
                                         &token,
                                         user_text,
-                                        model,
+                                        &upstream_model,
                                         &images,
                                         custom_system,
                                         identity,
@@ -729,7 +753,7 @@ impl Provider for CursorProvider {
             .run_agent_with_session(
                 &token,
                 user_text,
-                model,
+                &upstream_model,
                 &images,
                 custom_system,
                 continuation_key.as_deref(),
@@ -746,7 +770,7 @@ impl Provider for CursorProvider {
                             .run_agent_with_session(
                                 &token,
                                 user_text,
-                                model,
+                                &upstream_model,
                                 &images,
                                 custom_system,
                                 continuation_key.as_deref(),

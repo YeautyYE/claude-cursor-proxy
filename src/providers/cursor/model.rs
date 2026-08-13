@@ -8,6 +8,8 @@
 //!   `composer-2.5-fast` are recognized.
 //! - `cursor-agent:` is also supported for agent mode routing.
 
+pub const CURSOR_GROK_46_ALIAS: &str = "claude-cursor-grok-4.6";
+
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor",
     "cursor-agent",
@@ -17,6 +19,7 @@ pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor-ask",
     "composer-2.5",
     "composer-2.5-fast",
+    CURSOR_GROK_46_ALIAS,
 ];
 
 /// Agent mode derived from model prefix or name.
@@ -125,6 +128,11 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             model_id: "claude-opus-4-8-high".to_string(),
             mode: CursorAgentMode::Agent,
         }),
+        // Anthropic-shaped alias so Claude Code gateway discovery exposes Grok.
+        CURSOR_GROK_46_ALIAS => Ok(CursorModelResolution {
+            model_id: "cursor-grok-4.6-high".to_string(),
+            mode: CursorAgentMode::Agent,
+        }),
         // Pass through full Cursor catalog ids (claude-fable-5-thinking-high, …).
         other
             if other.starts_with("claude-")
@@ -144,6 +152,32 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             "unknown cursor model: {model}. Use cursor:<id> with a CLI catalog id (e.g. cursor:claude-fable-5-thinking-max, cursor:composer-2.5)"
         )),
     }
+}
+
+/// Apply Anthropic `output_config.effort` to Cursor catalog models whose
+/// effort tier is encoded in the model id.
+pub fn apply_requested_effort(model: &str, effort: Option<&str>) -> Result<String, String> {
+    let Some(effort) = effort else {
+        return Ok(model.to_string());
+    };
+    let resolved = resolve_cursor_model(model)?;
+    let suffixes = ["-medium", "-xhigh", "-high", "-low", "-max"];
+    let Some(suffix) = suffixes
+        .iter()
+        .find(|suffix| resolved.model_id.ends_with(**suffix))
+    else {
+        return Ok(model.to_string());
+    };
+
+    // Cursor currently exposes Grok 4.6 only through xhigh; Claude Code may
+    // still offer `max`, so use Cursor's highest available tier.
+    let effective_effort = if resolved.model_id.starts_with("cursor-grok-4.6-") && effort == "max" {
+        "xhigh"
+    } else {
+        effort
+    };
+    let stem = resolved.model_id.trim_end_matches(suffix);
+    Ok(format!("cursor:{stem}-{effective_effort}"))
 }
 
 /// Claude Code / ccstatusline treat bare `fable` as a ~200k window unless the
@@ -444,6 +478,33 @@ mod tests {
 
         let r = resolve_cursor_model("haiku").unwrap();
         assert_eq!(r.model_id, "claude-haiku-4-5");
+
+        let r = resolve_cursor_model("claude-cursor-grok-4.6").unwrap();
+        assert_eq!(r.model_id, "cursor-grok-4.6-high");
+    }
+
+    #[test]
+    fn requested_effort_selects_cursor_catalog_tier() {
+        assert_eq!(
+            apply_requested_effort("cursor:gpt-5.6-sol-medium[1m]", Some("low")).unwrap(),
+            "cursor:gpt-5.6-sol-low"
+        );
+        assert_eq!(
+            apply_requested_effort("cursor:claude-opus-5-thinking-high[1m]", Some("max")).unwrap(),
+            "cursor:claude-opus-5-thinking-max"
+        );
+        assert_eq!(
+            apply_requested_effort("claude-cursor-grok-4.6", Some("xhigh")).unwrap(),
+            "cursor:cursor-grok-4.6-xhigh"
+        );
+        assert_eq!(
+            apply_requested_effort("claude-cursor-grok-4.6", Some("max")).unwrap(),
+            "cursor:cursor-grok-4.6-xhigh"
+        );
+        assert_eq!(
+            apply_requested_effort("cursor:composer-2.5", Some("high")).unwrap(),
+            "cursor:composer-2.5"
+        );
     }
 
     #[test]
