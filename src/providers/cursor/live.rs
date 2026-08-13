@@ -1941,16 +1941,23 @@ fn live_reconnect_open_allow_h1(_reconnect: &LiveReconnectContext, _now: Instant
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_idle_stall_message(
     useful: bool,
     saw_text: bool,
     tools_advertised: bool,
     pending_empty: bool,
     since_progress: Duration,
+    since_liveness: Duration,
     setup_idle: Duration,
     stream_idle: Duration,
 ) -> Option<&'static str> {
-    if !useful && since_progress >= setup_idle {
+    // Dead stream: no frames at all (including server heartbeats).
+    if !useful && since_liveness >= setup_idle {
+        return Some("Cursor stream produced no useful progress");
+    }
+    // Alive heartbeat-only thinking (Fable high) — wait 2× stream idle, not 45s.
+    if !useful && since_progress >= stream_idle.saturating_mul(2) {
         return Some("Cursor stream produced no useful progress");
     }
     if useful && !saw_text && since_progress >= stream_idle && !tools_advertised {
@@ -2863,6 +2870,7 @@ async fn drive_live_run(
     let mut useful = false;
     let mut logical_tools_waiting = LogicalToolTracker::default();
     let mut last_progress = Instant::now();
+    let mut last_liveness = last_progress;
     let mut resume_grace_until: Option<Instant> = None;
     let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
     let mut coalescer = LiveDeltaCoalescer::default();
@@ -2897,9 +2905,8 @@ async fn drive_live_run(
     // Cache idle/timeout knobs once — the 250ms idle arm used to re-parse env
     // on every tick (thousands of times during long thinking).
     let setup_idle = Duration::from_secs(env_u64("CCP_CURSOR_SETUP_IDLE_SECS", 45));
-    // CLI stall-detector failTimeoutMs default 30s; we stay looser because
-    // server InteractionUpdate.heartbeat refreshes last_progress (CLI treats
-    // heartbeat-only as 3× fail = 90s).
+    // CLI stall-detector failTimeoutMs default 30s; heartbeat-only thinking is
+    // 2× stream idle (240s). setup_idle is only for a stream with no frames.
     let stream_idle = Duration::from_secs(env_u64("CCP_CURSOR_IDLE_SECS", 120));
     // Live path always waits for Cursor `turn_ended` (or hard timeout). The old
     // 8s complete_idle for tool-less runs truncated Fable quiet thinking.
@@ -2983,6 +2990,7 @@ async fn drive_live_run(
             allowed_tool_names.is_some(),
             pending.is_empty(),
             last_progress.elapsed(),
+            last_liveness.elapsed(),
             setup_idle,
             stream_idle,
         ) {
@@ -3028,6 +3036,7 @@ async fn drive_live_run(
                 };
                 if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                     got_chunk_since_reconnect = false;
+                    last_liveness = Instant::now();
                     continue 'driver;
                 }
                 report_terminal_error(
@@ -3187,6 +3196,7 @@ async fn drive_live_run(
                         useful = false;
                         logical_tools_waiting.clear();
                         last_progress = Instant::now();
+                        last_liveness = last_progress;
                         // After tool results, Cursor often thinks quietly before the
                         // next text/tool delta. Don't trip setup_idle during that gap
                         // (was the "no useful progress" hang after a healthy tool_use).
@@ -3218,6 +3228,7 @@ async fn drive_live_run(
             item = upstream.recv() => {
                 match item {
                     Some(Ok(Some(chunk))) => {
+                        last_liveness = Instant::now();
                         let checkpoint_before = latest_checkpoint
                             .as_ref()
                             .map(|checkpoint| (checkpoint.as_ptr() as usize, checkpoint.len()));
@@ -3334,6 +3345,7 @@ async fn drive_live_run(
                         };
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                             got_chunk_since_reconnect = false;
+                            last_liveness = Instant::now();
                             continue 'driver;
                         }
                         // Same empty-turn recovery as FLAG_END: flush trailing
@@ -3446,6 +3458,7 @@ async fn drive_live_run(
                         };
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                             got_chunk_since_reconnect = false;
+                            last_liveness = Instant::now();
                             continue 'driver;
                         }
                         let message = format!(
@@ -5824,26 +5837,41 @@ mod tests {
     fn tool_turn_stalls_after_double_stream_idle_without_text() {
         let setup = Duration::from_secs(45);
         let idle = Duration::from_secs(120);
-        assert!(live_idle_stall_message(false, false, true, true, setup, setup, idle).is_some());
+        let fresh = Duration::from_millis(200);
+        assert_eq!(
+            live_idle_stall_message(false, false, true, true, setup, setup, setup, idle),
+            Some("Cursor stream produced no useful progress"),
+            "a stream with no frames at all still dies at setup_idle"
+        );
         assert!(
-            live_idle_stall_message(true, false, true, true, idle, setup, idle).is_none(),
+            live_idle_stall_message(false, false, true, true, setup, fresh, setup, idle).is_none(),
+            "heartbeat-only Fable thinking must not die at 45s setup_idle"
+        );
+        assert_eq!(
+            live_idle_stall_message(false, false, true, true, idle * 2, fresh, setup, idle),
+            Some("Cursor stream produced no useful progress"),
+            "heartbeat-only thinking still stalls at 2× stream idle"
+        );
+        assert!(
+            live_idle_stall_message(true, false, true, true, idle, fresh, setup, idle).is_none(),
             "tools advertised: 120s of thinking-only is still allowed"
         );
         assert_eq!(
-            live_idle_stall_message(true, false, true, true, idle * 2, setup, idle),
+            live_idle_stall_message(true, false, true, true, idle * 2, fresh, setup, idle),
             Some("Cursor stream stalled after partial progress")
         );
         assert_eq!(
-            live_idle_stall_message(true, true, true, true, idle * 2, setup, idle),
+            live_idle_stall_message(true, true, true, true, idle * 2, fresh, setup, idle),
             Some("Cursor stream stalled after partial progress"),
             "heartbeat-only silence after text must ResumeAction or error, not wait 1800s"
         );
         assert!(
-            live_idle_stall_message(true, true, true, true, idle, setup, idle).is_none(),
+            live_idle_stall_message(true, true, true, true, idle, fresh, setup, idle).is_none(),
             "one stream-idle window of quiet thinking after text is still allowed"
         );
         assert!(
-            live_idle_stall_message(true, false, true, false, idle * 2, setup, idle).is_none(),
+            live_idle_stall_message(true, false, true, false, idle * 2, fresh, setup, idle)
+                .is_none(),
             "do not stall while Claude still owes native tool_results"
         );
     }

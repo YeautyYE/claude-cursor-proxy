@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.43 (2026-08-14)
+
+- Fable `high` thinking no longer dies at 45s with `Cursor stream produced no useful progress`. `setup_idle` only fires when the Cursor stream has gone silent (no frames, including heartbeats). Heartbeat-only thinking waits 2× stream idle (240s default), same budget as a thinking-only turn that already advertised tools.
+
 ## v0.1.42 (2026-08-13)
 
 - Stop the 0.1.41 20s-open → buffered-duplicate cascade. H2 first-open is 20s (`CCP_CURSOR_LIVE_H2_OPEN_SECS`); HTTP/1 is 90s (`CCP_CURSOR_LIVE_OPEN_SECS`) and only after an explicit 421/464/`HTTP_1_1_REQUIRED` — a timed-out H2 `.send()` does not start a second Run. Live start errors do not fall through to buffered `/Run`.
