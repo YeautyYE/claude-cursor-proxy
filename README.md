@@ -220,7 +220,7 @@ claude-cursor-proxy cursor auth status
 | Duplicated tools | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
-| ~8 min 502 `error decoding response body` | Update to ≥0.1.36 and restart serve. Clash/Surge TUN: DIRECT `*.cursor.sh`. HTTP proxy mode: `CCP_CURSOR_NO_PROXY=1`. Optional: `CCP_CURSOR_HTTP1=1` |
+| ~8 min 502 `error decoding response body` | Update to ≥0.1.37 and restart serve. Clash/Surge TUN: DIRECT `*.cursor.sh`. HTTP proxy mode: `CCP_CURSOR_NO_PROXY=1`. Optional: `CCP_CURSOR_HTTP1=1` |
 
 ---
 

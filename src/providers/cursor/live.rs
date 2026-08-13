@@ -1409,7 +1409,22 @@ fn spawn_upstream_pump<S>(stream: S, tx: mpsc::Sender<Result<Option<Bytes>, Stri
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
+    spawn_upstream_pump_prefixed(None, stream, tx);
+}
+
+fn spawn_upstream_pump_prefixed<S>(
+    prefix: Option<Bytes>,
+    stream: S,
+    tx: mpsc::Sender<Result<Option<Bytes>, String>>,
+) where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+{
     tokio::spawn(async move {
+        if let Some(chunk) = prefix
+            && tx.send(Ok(Some(chunk))).await.is_err()
+        {
+            return;
+        }
         let mut stream = stream;
         while let Some(item) = stream.next().await {
             let mapped = match item {
@@ -1510,8 +1525,10 @@ fn live_reconnect_skip_reason(
 }
 
 /// First ResumeAction is immediate; later attempts match CLI 1s×2^n + 20% jitter, cap 60s.
-fn live_reconnect_backoff_ms(attempt: u32) -> u64 {
-    if attempt <= 1 {
+/// Hollow (HTTP 200 then zero-byte RST) retries stay at 0ms — backoff was turning
+/// ten instant INTERNAL_ERRORs into a 5-minute 502.
+fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool) -> u64 {
+    if hollow || attempt <= 1 {
         return 0;
     }
     let shift = (attempt - 2).min(6);
@@ -1527,32 +1544,54 @@ fn is_h2_stream_reset(message: &str) -> bool {
         || message.contains("http2")
 }
 
-/// A ResumeAction that returns HTTP 200 then RSTs with zero body bytes is a
-/// poisoned H2 connection (or a proxy killing BiDi). Flip to RunSSE before the
-/// reconnect budget is burned on the same pool.
+/// H2 `INTERNAL_ERROR` mid-stream: ResumeAction on H2 is always hollow in
+/// production. Switch that run to a real `http1_only` RunSSE client immediately.
 fn live_reconnect_should_force_http1(
     got_chunk_since_reconnect: bool,
     reconnect_attempts: u32,
     already_http1: bool,
+    stream_error: Option<&str>,
 ) -> bool {
-    !already_http1 && !got_chunk_since_reconnect && reconnect_attempts > 0
+    if already_http1 {
+        return false;
+    }
+    if stream_error.is_some_and(is_h2_stream_reset) {
+        return true;
+    }
+    !got_chunk_since_reconnect && reconnect_attempts > 0
 }
 
 fn prepare_live_reconnect(
     reconnect: &mut LiveReconnectContext,
     got_chunk_since_reconnect: bool,
     reconnect_attempts: u32,
+    stream_error: Option<&str>,
 ) {
     if live_reconnect_should_force_http1(
         got_chunk_since_reconnect,
         reconnect_attempts,
         reconnect.force_http1,
+        stream_error,
     ) {
         reconnect.force_http1 = true;
         let mut fields = serde_json::Map::new();
         fields.insert("attempts".into(), serde_json::json!(reconnect_attempts));
-        fields.insert("reason".into(), serde_json::json!("hollow_h2_reconnect"));
+        fields.insert("reason".into(), serde_json::json!("h2_stream_reset"));
         crate::logging::create_logger("cursor").warn("live_reconnect_http1", Some(fields));
+    }
+}
+
+const LIVE_RECONNECT_FIRST_BYTE: Duration = Duration::from_secs(3);
+
+async fn take_first_live_chunk<S>(mut stream: S) -> Result<(Bytes, S), String>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    match tokio::time::timeout(LIVE_RECONNECT_FIRST_BYTE, stream.next()).await {
+        Ok(Some(Ok(chunk))) => Ok((chunk, stream)),
+        Ok(Some(Err(error))) => Err(format_error_chain(&error)),
+        Ok(None) => Err("Cursor resume stream ended before the first byte".into()),
+        Err(_) => Err("Cursor resume stream produced no bytes within 3s".into()),
     }
 }
 
@@ -1568,10 +1607,16 @@ fn reconnect_note(outcome: &LiveReconnectOutcome) -> String {
     }
 }
 
-fn log_live_reconnect(outcome: &LiveReconnectOutcome, attempts: u32, max_reconnects: u32) {
+fn log_live_reconnect(
+    outcome: &LiveReconnectOutcome,
+    attempts: u32,
+    max_reconnects: u32,
+    http: &CursorHttpClient,
+) {
     let mut fields = serde_json::Map::new();
     fields.insert("attempts".into(), serde_json::json!(attempts));
     fields.insert("max".into(), serde_json::json!(max_reconnects));
+    fields.insert("http1".into(), serde_json::json!(http.prefers_http1()));
     match outcome {
         LiveReconnectOutcome::Reconnected => {
             fields.insert("outcome".into(), serde_json::json!("ok"));
@@ -1617,12 +1662,13 @@ async fn try_live_reconnect(
         .cloned();
     let Some(checkpoint) = checkpoint else {
         let outcome = LiveReconnectOutcome::Skipped("no checkpoint");
-        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
         return outcome;
     };
 
     let mut closed_collecting = false;
     let mut last_fail: Option<String> = None;
+    let mut last_was_hollow = false;
     loop {
         if let Some(reason) = live_reconnect_skip_reason(
             latest_checkpoint,
@@ -1633,7 +1679,7 @@ async fn try_live_reconnect(
             let outcome = last_fail
                 .map(LiveReconnectOutcome::Failed)
                 .unwrap_or(LiveReconnectOutcome::Skipped(reason));
-            log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+            log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
             return outcome;
         }
         if !closed_collecting {
@@ -1641,13 +1687,16 @@ async fn try_live_reconnect(
             closed_collecting = true;
         }
         *reconnect_attempts += 1;
-        let delay_ms = live_reconnect_backoff_ms(*reconnect_attempts);
+        let delay_ms = live_reconnect_backoff_ms_for(*reconnect_attempts, last_was_hollow);
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        // Drop the reqwest H2 pool: a RST INTERNAL_ERROR leaves a connection
-        // that still looks idle, so the next ResumeAction 200s then dies instantly.
-        reconnect.http = CursorHttpClient::new();
+        last_was_hollow = false;
+        // Pin HTTP/1.1 on the reqwest client itself. Posting RunSSE with an H2
+        // client still negotiates HTTP/2 and dies with INTERNAL_ERROR.
+        reconnect.http = CursorHttpClient::with_prefer_http1(
+            reconnect.force_http1 || super::http1::prefer_http1_agent(),
+        );
 
         let cont = super::conversation::RunContinuation {
             conversation_id: reconnect.conversation_id.clone(),
@@ -1690,14 +1739,32 @@ async fn try_live_reconnect(
             .await
         {
             Ok((new_outbound, response)) => {
-                *outbound = new_outbound;
-                spawn_upstream_pump(response.bytes_stream(), upstream_tx.clone());
-                *decoder = ConnectFrameDecoder::new();
-                *last_progress = Instant::now();
-                *resume_grace_until = Some(Instant::now() + resume_grace);
-                let outcome = LiveReconnectOutcome::Reconnected;
-                log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
-                return outcome;
+                let stream = response.bytes_stream();
+                match take_first_live_chunk(stream).await {
+                    Ok((chunk, rest)) => {
+                        *outbound = new_outbound;
+                        spawn_upstream_pump_prefixed(Some(chunk), rest, upstream_tx.clone());
+                        *decoder = ConnectFrameDecoder::new();
+                        *last_progress = Instant::now();
+                        *resume_grace_until = Some(Instant::now() + resume_grace);
+                        let outcome = LiveReconnectOutcome::Reconnected;
+                        log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
+                        return outcome;
+                    }
+                    Err(msg) => {
+                        last_fail = Some(msg.clone());
+                        last_was_hollow = true;
+                        if !reconnect.force_http1 {
+                            reconnect.force_http1 = true;
+                            let mut fields = serde_json::Map::new();
+                            fields
+                                .insert("attempts".into(), serde_json::json!(*reconnect_attempts));
+                            fields.insert("detail".into(), serde_json::json!(msg));
+                            crate::logging::create_logger("cursor")
+                                .warn("live_reconnect_http1", Some(fields));
+                        }
+                    }
+                }
             }
             Err(err) => {
                 last_fail = Some(format!("{} ({})", err.message, err.status));
@@ -1705,7 +1772,7 @@ async fn try_live_reconnect(
                     let outcome = LiveReconnectOutcome::Failed(
                         last_fail.clone().unwrap_or_else(|| err.to_string()),
                     );
-                    log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
+                    log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects, &reconnect.http);
                     return outcome;
                 }
                 if reconnect.force_http1 && matches!(err.status, 421 | 464) {
@@ -2027,6 +2094,7 @@ async fn drive_live_run(
                                 &mut reconnect,
                                 got_chunk_since_reconnect,
                                 reconnect_attempts,
+                                None,
                             );
                             let reconnect_outcome = try_live_reconnect(
                                 &mut reconnect,
@@ -2186,6 +2254,7 @@ async fn drive_live_run(
                             &mut reconnect,
                             got_chunk_since_reconnect,
                             reconnect_attempts,
+                            None,
                         );
                         let reconnect_outcome = try_live_reconnect(
                             &mut reconnect,
@@ -2275,6 +2344,7 @@ async fn drive_live_run(
                             &mut reconnect,
                             got_chunk_since_reconnect,
                             reconnect_attempts,
+                            Some(error.as_str()),
                         );
                         let reconnect_outcome = try_live_reconnect(
                             &mut reconnect,
@@ -4337,28 +4407,37 @@ mod tests {
 
     #[test]
     fn first_reconnect_has_no_backoff() {
-        assert_eq!(live_reconnect_backoff_ms(1), 0);
-        assert!(live_reconnect_backoff_ms(2) >= 1_000);
-        assert!(live_reconnect_backoff_ms(2) <= 1_200);
-        assert!(live_reconnect_backoff_ms(3) >= 2_000);
-        assert_eq!(live_reconnect_backoff_ms(20), 60_000);
+        assert_eq!(live_reconnect_backoff_ms_for(1, false), 0);
+        assert!(live_reconnect_backoff_ms_for(2, false) >= 1_000);
+        assert!(live_reconnect_backoff_ms_for(2, false) <= 1_200);
+        assert!(live_reconnect_backoff_ms_for(3, false) >= 2_000);
+        assert_eq!(live_reconnect_backoff_ms_for(20, false), 60_000);
+        assert_eq!(
+            live_reconnect_backoff_ms_for(10, true),
+            0,
+            "zero-byte INTERNAL_ERROR must not wait 60s between attempts"
+        );
     }
 
     #[test]
     fn hollow_h2_reconnect_forces_http1() {
+        let rst = "error decoding response body: error reading a body from connection: stream error received: unexpected internal error encountered";
         assert!(
-            !live_reconnect_should_force_http1(true, 0, false),
-            "a healthy stream that later RSTs should retry H2 on a fresh client first"
+            live_reconnect_should_force_http1(true, 0, false, Some(rst)),
+            "H2 INTERNAL_ERROR must switch to real HTTP/1.1 immediately — ResumeAction on H2 is always hollow"
         );
         assert!(
-            live_reconnect_should_force_http1(false, 1, false),
-            "open-200 then immediate INTERNAL_ERROR must not burn the budget on H2"
+            !live_reconnect_should_force_http1(true, 0, false, Some("upstream ended")),
+            "clean EOF after progress may retry H2 on a fresh client"
         );
-        assert!(
-            !live_reconnect_should_force_http1(false, 1, true),
-            "already on HTTP/1"
-        );
-        assert!(!live_reconnect_should_force_http1(true, 3, false));
+        assert!(live_reconnect_should_force_http1(false, 1, false, None));
+        assert!(!live_reconnect_should_force_http1(
+            false,
+            1,
+            true,
+            Some(rst)
+        ));
+        assert!(!live_reconnect_should_force_http1(true, 3, false, None));
     }
 
     #[test]

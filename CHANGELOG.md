@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.37 (2026-08-13)
+
+- Root-cause fix for `unexpected internal error` + `reconnect budget exhausted`: HTTP 200 ResumeAction was treated as success before any body bytes, and the "HTTP/1" fallback still used an HTTP/2 reqwest client for `/RunSSE`. Wait for the first body byte, pin `http1_only()` when falling back, and skip exponential backoff on zero-byte RSTs (that backoff was the 5-minute 502).
+
 ## v0.1.36 (2026-08-13)
 
 - Do not spend the ResumeAction budget on HTTP/2 `INTERNAL_ERROR` after a 200: drop the poisoned connection pool, and if a reconnect returns zero body bytes, switch that run to HTTP/1 `RunSSE` (Clash 464 falls back to a fresh H2 client).

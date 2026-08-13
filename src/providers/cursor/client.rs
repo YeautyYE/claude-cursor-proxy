@@ -52,6 +52,7 @@ pub struct CursorHttpClient {
     pub(crate) client: reqwest::Client,
     pub(crate) base_url: String,
     pub(crate) timeout_secs: u64,
+    http1_only: bool,
 }
 
 impl Default for CursorHttpClient {
@@ -66,22 +67,18 @@ impl CursorHttpClient {
     }
 
     pub fn new() -> Self {
+        Self::with_prefer_http1(super::http1::prefer_http1_agent())
+    }
+
+    /// Build a client pinned to HTTP/1.1 (`true`) or HTTP/2 (`false`).
+    ///
+    /// RunSSE fallback must use this with `true`. A default H2 client posting to
+    /// `/RunSSE` still negotiates HTTP/2, which is what made 0.1.36's "HTTP/1"
+    /// reconnect die with `stream error received: unexpected internal error`.
+    pub fn with_prefer_http1(prefer_http1: bool) -> Self {
         let base_url = config::cursor_base_url();
         let is_cleartext = base_url.starts_with("http://");
         let timeout_secs = config::cursor_request_timeout_secs();
-
-        // Surge/Clash HTTP proxies often return **HTTP 464** for forced HTTP/1.1
-        // against api2.cursor.sh. Official CLI defaults to H2
-        // (`network.useHttp1ForAgent: false`). Only force H1 when
-        // CCP_CURSOR_HTTP1=1.
-        let prefer_http1 = std::env::var("CCP_CURSOR_HTTP1")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
 
         // No whole-request timeout on the HTTP client: BiDi agent turns can exceed
         // several minutes while still streaming. Completion / stall is enforced in
@@ -97,6 +94,7 @@ impl CursorHttpClient {
             .tcp_keepalive(std::time::Duration::from_secs(30));
         let _ = timeout_secs; // retained for error messages / hard-timeout default
 
+        let http1_only = prefer_http1 && !is_cleartext;
         if is_cleartext {
             // Mock/tests use http://127.0.0.1 — never send loopback through Clash.
             builder = builder.no_proxy().http2_prior_knowledge();
@@ -104,7 +102,7 @@ impl CursorHttpClient {
             if cursor_http_bypass_proxy(std::env::var("CCP_CURSOR_NO_PROXY").ok().as_deref()) {
                 builder = builder.no_proxy();
             }
-            if prefer_http1 {
+            if http1_only {
                 builder = builder.http1_only();
             } else {
                 builder = builder
@@ -120,7 +118,12 @@ impl CursorHttpClient {
             client,
             base_url,
             timeout_secs,
+            http1_only,
         }
+    }
+
+    pub(crate) fn prefers_http1(&self) -> bool {
+        self.http1_only
     }
 
     /// Fetch the live Cursor model catalog via `AgentService/GetUsableModels`.
@@ -1578,5 +1581,16 @@ mod tests {
         assert!(cursor_http_bypass_proxy(Some("1")));
         assert!(cursor_http_bypass_proxy(Some("true")));
         assert!(cursor_http_bypass_proxy(Some(" YES ")));
+    }
+
+    #[test]
+    fn with_prefer_http1_builds_an_http1_only_client() {
+        let http1 = CursorHttpClient::with_prefer_http1(true);
+        assert!(
+            http1.prefers_http1(),
+            "RunSSE fallback must use http1_only(), not an H2 client posting to RunSSE"
+        );
+        let http2 = CursorHttpClient::with_prefer_http1(false);
+        assert!(!http2.prefers_http1());
     }
 }
