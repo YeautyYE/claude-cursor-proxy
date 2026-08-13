@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.40 (2026-08-13)
+
+- Stop replaying historical Anthropic screenshots as new Cursor `selected_images`. Claude Code sends the full `messages` array; those old base64 blocks were given fresh UUIDs while `conversation_state` still held earlier image ids, so Cursor 502'd `Image not found [internal]` on text-only turns. Only the current user turn is attached, empty base64 is skipped, and image UUIDs are stable for the same bytes. A missing-image Connect END clears the poisoned checkpoint so the next retry is not doomed.
+
 ## v0.1.39 (2026-08-13)
 
 - Claude Code `stream=false` (non-streaming fallback after a 502) now uses the same live BiDi path as streaming, then collects events into one Anthropic JSON body. That path was the 45s `idle timeout` / `0 response bytes` 502: buffered H2 `/Run` never saw request_context. Live continuation no longer 400s when the retry is non-streaming.

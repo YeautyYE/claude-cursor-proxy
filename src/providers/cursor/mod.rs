@@ -717,6 +717,18 @@ impl Provider for CursorProvider {
             },
         );
         let images = request::cursor_selected_images(&body);
+        if !images.is_empty() {
+            create_logger("cursor").info(
+                "selected_images",
+                Some(serde_json::Map::from_iter([
+                    ("count".into(), serde_json::json!(images.len())),
+                    (
+                        "hasCheckpoint".into(),
+                        serde_json::json!(continuation.has_checkpoint),
+                    ),
+                ])),
+            );
+        }
         let custom_system = parts.custom_system_prompt.as_deref();
         let user_text = parts.user_text.as_str();
 

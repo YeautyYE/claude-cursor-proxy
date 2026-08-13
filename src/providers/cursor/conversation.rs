@@ -374,16 +374,15 @@ pub fn reset_for_test() {
 }
 
 #[cfg(test)]
+pub(crate) static STORE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
-
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn get_or_create_reuses_conversation_id() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         reset_for_test();
         let a = get_or_create("sess-1");
         let b = get_or_create("sess-1");
@@ -393,7 +392,7 @@ mod tests {
 
     #[test]
     fn checkpoint_and_blobs_round_trip() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         reset_for_test();
         let _ = get_or_create("sess-2");
         save_checkpoint("sess-2", vec![0x0a, 0x02, 0x01, 0x02]);
@@ -412,7 +411,7 @@ mod tests {
 
     #[test]
     fn clear_checkpoint_drops_state_but_keeps_conversation_id() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         reset_for_test();
         let created = get_or_create("sess-clear");
         save_checkpoint("sess-clear", vec![0x0a, 0x02, 0x01, 0x02]);
@@ -438,7 +437,7 @@ mod tests {
         use crate::providers::cursor::client::build_run_request_with_continuation;
         use crate::providers::cursor::model::resolve_cursor_model;
 
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         reset_for_test();
         save_checkpoint("sess-build", vec![0x08, 0x01]);
         let mut blobs = HashMap::new();
@@ -465,7 +464,7 @@ mod tests {
 
     #[test]
     fn checkpoint_reloads_from_disk_after_memory_drop() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
@@ -495,7 +494,7 @@ mod tests {
     #[test]
     fn persisted_conversation_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
@@ -527,7 +526,7 @@ mod tests {
 
     #[test]
     fn expire_abandoned_disk_conversations_ignores_memory_map() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());

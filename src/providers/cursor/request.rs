@@ -749,13 +749,18 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
 
 /// Extract selected images from the request, mimicking `cursorSelectedImages`.
 ///
-/// Only base64 source images are included. URL images are skipped.
-/// Images nested inside tool_result blocks are also collected.
+/// Only base64 source images with non-empty data are included. URL images are
+/// skipped. Images nested inside tool_result blocks are also collected.
+///
+/// Scope is the **current user turn** (trailing user messages after the last
+/// assistant). Replaying older Anthropic history screenshots as new
+/// `selected_images` with fresh UUIDs makes Cursor look up stale asset ids and
+/// 502 `Image not found [internal]`.
 pub fn cursor_selected_images(req: &MessagesRequest) -> Vec<CursorSelectedImage> {
     let mut images: Vec<CursorSelectedImage> = Vec::new();
     let mut index: u32 = 0;
 
-    for message in &req.messages {
+    for message in current_turn_user_messages(req) {
         let blocks = message_blocks(message);
         for block in &blocks {
             collect_image_blocks(block, &mut index, &mut images);
@@ -763,6 +768,28 @@ pub fn cursor_selected_images(req: &MessagesRequest) -> Vec<CursorSelectedImage>
     }
 
     images
+}
+
+/// User messages after the last assistant message (the in-flight Anthropic turn).
+fn current_turn_user_messages(req: &MessagesRequest) -> Vec<&crate::anthropic::schema::Message> {
+    let mut trailing: Vec<&crate::anthropic::schema::Message> = Vec::new();
+    for message in req.messages.iter().rev() {
+        if message.role == "user" {
+            trailing.push(message);
+        } else if message.role == "assistant" {
+            break;
+        }
+    }
+    trailing.reverse();
+    trailing
+}
+
+fn stable_image_uuid(data: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(bytes).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -948,11 +975,14 @@ fn collect_image_blocks(
             return;
         }
         let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+        if data.trim().is_empty() {
+            return;
+        }
         let media_type = source
             .get("media_type")
             .and_then(|m| m.as_str())
             .unwrap_or("image/png");
-        let uuid = uuid::Uuid::new_v4().to_string();
+        let uuid = stable_image_uuid(data);
         *index += 1;
         let extension = image_extension(media_type);
         images.push(CursorSelectedImage {
@@ -1644,6 +1674,91 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/png");
         assert_eq!(images[0].data, "AAAA");
+    }
+
+    #[test]
+    fn selected_images_ignore_history_after_assistant_turn() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "old screenshot"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "OLDIMG"}}
+                    ]
+                },
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "just text this turn"}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            cursor_selected_images(&req).is_empty(),
+            "replaying historical screenshots as new selected_images causes Cursor Image not found"
+        );
+    }
+
+    #[test]
+    fn selected_images_keep_current_turn_after_assistant() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "OLDIMG"}}
+                    ]
+                },
+                {"role": "assistant", "content": "ok"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "NEWIMG"}}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let images = cursor_selected_images(&req);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "NEWIMG");
+    }
+
+    #[test]
+    fn selected_images_skip_empty_base64() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "REAL"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let images = cursor_selected_images(&req);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "REAL");
+    }
+
+    #[test]
+    fn selected_images_uuid_is_stable_for_same_bytes() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "SAME"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let a = cursor_selected_images(&req);
+        let b = cursor_selected_images(&req);
+        assert_eq!(a[0].uuid, b[0].uuid);
     }
 
     #[test]

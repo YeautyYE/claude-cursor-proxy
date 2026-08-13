@@ -131,6 +131,11 @@ pub fn anthropic_error_type_from_live_error(error: &str) -> &'static str {
     }
 }
 
+pub fn cursor_connect_error_is_missing_image(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("image not found") || lower.contains("imagenotfound")
+}
+
 /// Parse a Connect end-frame JSON error payload into a structured error.
 ///
 /// Returns `None` if the payload is empty or not valid Connect error JSON.
@@ -380,6 +385,17 @@ mod tests {
         assert_eq!(err.code, "resource_exhausted");
         assert_eq!(err.status, 429);
         assert_eq!(err.message, "quota exceeded");
+    }
+
+    #[test]
+    fn missing_image_connect_error_is_detected() {
+        assert!(cursor_connect_error_is_missing_image("Image not found"));
+        assert!(cursor_connect_error_is_missing_image(
+            "Connect error 502: Image not found [internal]"
+        ));
+        assert!(!cursor_connect_error_is_missing_image(
+            "unexpected internal error"
+        ));
     }
 
     #[test]

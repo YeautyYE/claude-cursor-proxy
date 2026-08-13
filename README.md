@@ -221,6 +221,7 @@ claude-cursor-proxy cursor auth status
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 | 45s 502 `idle timeout` / `0 response bytes` | Update to ≥0.1.39 and restart serve. Still set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`. Clash/Surge TUN: DIRECT `*.cursor.sh`. Optional: `CCP_CURSOR_HTTP1=1` |
+| 502 `Image not found [internal]` on a text-only turn | Update to ≥0.1.40 and restart serve, then retry the same message once (the poisoned conversation checkpoint is cleared on that error). A new Claude Code session also works. |
 | ~8 min 502 `error decoding response body` | Update to ≥0.1.38 and restart serve. Clash/Surge TUN: DIRECT `*.cursor.sh`. HTTP proxy mode: `CCP_CURSOR_NO_PROXY=1`. Optional: `CCP_CURSOR_HTTP1=1` |
 
 ---

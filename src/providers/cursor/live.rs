@@ -24,7 +24,8 @@ use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
 };
 use super::connect::{
-    ConnectFrame, ConnectFrameDecoder, FLAG_END, anthropic_error_type_from_live_error,
+    ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END,
+    anthropic_error_type_from_live_error, cursor_connect_error_is_missing_image,
     encode_connect_frame, parse_connect_error,
 };
 use super::exec_results::{
@@ -1534,6 +1535,25 @@ fn live_reconnect_open_timeout(remaining: Duration) -> Duration {
     remaining.min(LIVE_RECONNECT_OPEN_CAP)
 }
 
+fn annotate_connect_end_error(session_id: &str, error: ConnectEndError) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert("status".into(), serde_json::json!(error.status));
+    fields.insert("code".into(), serde_json::json!(error.code));
+    fields.insert("message".into(), serde_json::json!(error.message));
+    let mut text = error.to_string();
+    if cursor_connect_error_is_missing_image(&error.message)
+        || cursor_connect_error_is_missing_image(&text)
+    {
+        super::conversation::clear_checkpoint(session_id);
+        fields.insert("checkpointCleared".into(), serde_json::json!(true));
+        text = format!(
+            "{text} (this turn had no new image; a stale Cursor image id was in the conversation checkpoint — checkpoint cleared, retry the message)"
+        );
+    }
+    crate::logging::create_logger("cursor").warn("connect_end_error", Some(fields));
+    text
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveReconnectTransportAction {
     KeepTrying,
@@ -2189,6 +2209,7 @@ async fn control_close_collecting_natives(
 }
 
 struct LiveTurnCtx<'a> {
+    session_id: &'a str,
     user_prompt: &'a str,
     request_context: &'a RequestContext,
     decode_failures: &'a mut u32,
@@ -2437,6 +2458,7 @@ async fn drive_live_run(
                         }
                         for frame in frames {
                             let mut turn = LiveTurnCtx {
+                                session_id: &session_id,
                                 user_prompt: &user_prompt,
                                 request_context: &request_context,
                                 decode_failures: &mut decode_failures,
@@ -2826,18 +2848,22 @@ async fn process_live_frame(
                 return expose_collected_tools(pending, pending_shared, sink).await;
             }
             let message = parse_connect_error(&frame.payload)
-                .map(|error| error.to_string())
+                .map(|error| {
+                    annotate_connect_end_error(
+                        turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
+                        error,
+                    )
+                })
                 .unwrap_or_else(|| "Cursor upstream ended with pending native tools".to_string());
             report_terminal_error(sink, terminal_error, message).await;
             return false;
         }
         if let Some(error) = parse_connect_error(&frame.payload) {
-            let mut fields = serde_json::Map::new();
-            fields.insert("status".into(), serde_json::json!(error.status));
-            fields.insert("code".into(), serde_json::json!(error.code));
-            fields.insert("message".into(), serde_json::json!(error.message));
-            crate::logging::create_logger("cursor").warn("connect_end_error", Some(fields));
-            report_terminal_error(sink, terminal_error, error.to_string()).await;
+            let message = annotate_connect_end_error(
+                turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
+                error,
+            );
+            report_terminal_error(sink, terminal_error, message).await;
             return false;
         } else {
             // Connect END without turn_ended used to emit bare End → silent
@@ -4777,6 +4803,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_image_connect_end_clears_poisoned_checkpoint() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        super::super::conversation::save_checkpoint("sess-img-missing", vec![0x08, 0x01]);
+        assert!(
+            super::super::conversation::continuation_for(Some("sess-img-missing")).has_checkpoint
+        );
+        let text = annotate_connect_end_error(
+            "sess-img-missing",
+            ConnectEndError {
+                status: 502,
+                code: "internal".into(),
+                message: "Image not found".into(),
+                detail: String::new(),
+            },
+        );
+        assert!(
+            text.contains("checkpoint cleared"),
+            "user-facing error must say the poisoned checkpoint was dropped: {text}"
+        );
+        assert!(
+            !super::super::conversation::continuation_for(Some("sess-img-missing")).has_checkpoint
+        );
+    }
+
+    #[test]
     fn reconnect_open_timeout_is_capped_inside_hard_deadline() {
         assert_eq!(
             live_reconnect_open_timeout(Duration::from_secs(1800)),
@@ -6352,6 +6404,7 @@ mod tests {
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
         let mut turn = LiveTurnCtx {
+            session_id: "sess-test",
             user_prompt: prompt,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
@@ -6765,6 +6818,7 @@ mod tests {
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
         let mut turn = LiveTurnCtx {
+            session_id: "sess-test",
             user_prompt: prompt,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
