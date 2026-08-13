@@ -1077,16 +1077,31 @@ impl CursorHttpClient {
         };
 
         let cursor_identity = LiveIdentityHeaders::build(token);
-        let (outbound, response) = self
-            .open_live_transport(
+        let opened = tokio::time::timeout(
+            LIVE_INITIAL_OPEN_CAP,
+            self.open_live_transport(
                 token,
                 &request_id,
                 &first_message,
                 &cursor_identity,
                 force_http1,
-                /*allow_h1_fallback=*/ !force_http1,
-            )
-            .await?;
+                live_reconnect_allow_h1_fallback(force_http1, false),
+            ),
+        )
+        .await;
+        let (outbound, response) = match opened {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(CursorError::new(
+                    504,
+                    format!(
+                        "Cursor live open timed out after {}s",
+                        LIVE_INITIAL_OPEN_CAP.as_secs()
+                    ),
+                    None,
+                ));
+            }
+        };
 
         // Larger fan-out so token deltas don't block the BiDi read loop under
         // Claude Code backpressure (coalescing in live_sse_response).
@@ -1116,6 +1131,7 @@ impl CursorHttpClient {
             http1_rejected: false,
             mcp_tools: mcp_tools.clone(),
             opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
+            recovery: LiveRecoveryEpisode::default(),
         };
         // Match event fan-out: a tiny upstream queue stalls the reqwest body
         // pump (and Cursor's TCP window) during thinking bursts.
@@ -1401,6 +1417,51 @@ impl LiveIdentityHeaders {
 }
 
 /// Context needed to reopen AgentService/Run with `ResumeAction` after a stall.
+#[derive(Debug, Default)]
+struct LiveRecoveryEpisode {
+    started: Option<Instant>,
+    opens: u32,
+    last_was_hollow: bool,
+    on_probation: bool,
+}
+
+impl LiveRecoveryEpisode {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn begin(&mut self, now: Instant) {
+        if self.started.is_none() {
+            self.started = Some(now);
+        }
+    }
+
+    fn note_delayed_hollow_if_probation(&mut self) {
+        if self.on_probation {
+            self.last_was_hollow = true;
+            self.on_probation = false;
+        }
+    }
+
+    fn remaining(&self, now: Instant) -> Duration {
+        let Some(started) = self.started else {
+            return LIVE_RECOVERY_DEADLINE;
+        };
+        LIVE_RECOVERY_DEADLINE.saturating_sub(now.saturating_duration_since(started))
+    }
+
+    fn skip_reason(&self, now: Instant) -> Option<&'static str> {
+        if self.opens >= LIVE_RECOVERY_MAX_OPENS {
+            return Some("recovery open budget exhausted");
+        }
+        if self.started.is_some() && self.remaining(now).is_zero() {
+            return Some("recovery deadline exhausted");
+        }
+        None
+    }
+}
+
+/// Context needed to reopen AgentService/Run with `ResumeAction` after a stall.
 struct LiveReconnectContext {
     http: CursorHttpClient,
     token: String,
@@ -1412,6 +1473,7 @@ struct LiveReconnectContext {
     http1_rejected: bool,
     mcp_tools: Option<super::proto::McpTools>,
     opening_checkpoint: Option<Vec<u8>>,
+    recovery: LiveRecoveryEpisode,
 }
 
 type LiveUpstream = mpsc::Receiver<Result<Option<Bytes>, String>>;
@@ -1529,10 +1591,112 @@ fn reconnect_prefers_http1(force_http1: bool) -> bool {
     force_http1
 }
 
-const LIVE_RECONNECT_OPEN_CAP: Duration = Duration::from_secs(20);
+const LIVE_RECONNECT_OPEN_CAP: Duration = Duration::from_secs(10);
+const LIVE_INITIAL_OPEN_CAP: Duration = Duration::from_secs(20);
+const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
+const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
+const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
+const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
+const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn live_reconnect_open_timeout(remaining: Duration) -> Duration {
     remaining.min(LIVE_RECONNECT_OPEN_CAP)
+}
+
+fn live_reconnect_allow_h1_fallback(force_http1: bool, http1_rejected: bool) -> bool {
+    !force_http1 && !http1_rejected
+}
+
+#[derive(Debug, Default, Clone)]
+struct TransportBreaker {
+    consecutive_fails: u32,
+    open_since: Option<Instant>,
+}
+
+impl TransportBreaker {
+    fn allows(&self, now: Instant) -> bool {
+        match self.open_since {
+            None => true,
+            Some(opened) => now.saturating_duration_since(opened) >= TRANSPORT_BREAKER_COOLDOWN,
+        }
+    }
+
+    fn on_failure(&mut self, now: Instant) {
+        self.consecutive_fails = self.consecutive_fails.saturating_add(1);
+        if self.consecutive_fails >= TRANSPORT_BREAKER_THRESHOLD {
+            self.open_since = Some(now);
+        }
+    }
+
+    fn on_success(&mut self) {
+        self.consecutive_fails = 0;
+        self.open_since = None;
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct TransportBreakers {
+    h2: TransportBreaker,
+    h1: TransportBreaker,
+}
+
+fn breaker_for(breakers: &mut TransportBreakers, http1: bool) -> &mut TransportBreaker {
+    if http1 {
+        &mut breakers.h1
+    } else {
+        &mut breakers.h2
+    }
+}
+
+static TRANSPORT_BREAKERS: LazyLock<Mutex<TransportBreakers>> =
+    LazyLock::new(|| Mutex::new(TransportBreakers::default()));
+
+fn lock_transport_breakers() -> std::sync::MutexGuard<'static, TransportBreakers> {
+    TRANSPORT_BREAKERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn record_transport_failure(http1: bool, now: Instant) {
+    breaker_for(&mut lock_transport_breakers(), http1).on_failure(now);
+}
+
+fn record_transport_success(http1: bool) {
+    breaker_for(&mut lock_transport_breakers(), http1).on_success();
+}
+
+fn apply_transport_breakers(reconnect: &mut LiveReconnectContext, now: Instant) {
+    let breakers = lock_transport_breakers();
+    if !breakers.h2.allows(now) {
+        reconnect.force_http1 = true;
+    }
+    if !breakers.h1.allows(now) {
+        reconnect.http1_rejected = true;
+    }
+}
+
+fn live_idle_stall_message(
+    useful: bool,
+    saw_text: bool,
+    tools_advertised: bool,
+    pending_empty: bool,
+    since_progress: Duration,
+    setup_idle: Duration,
+    stream_idle: Duration,
+) -> Option<&'static str> {
+    if !useful && since_progress >= setup_idle {
+        return Some("Cursor stream produced no useful progress");
+    }
+    if useful && !saw_text && since_progress >= stream_idle && !tools_advertised {
+        return Some("Cursor stream stalled after partial progress");
+    }
+    if useful
+        && !saw_text
+        && tools_advertised
+        && pending_empty
+        && since_progress >= stream_idle.saturating_mul(2)
+    {
+        return Some("Cursor stream stalled after partial progress");
+    }
+    None
 }
 
 fn annotate_connect_end_error(session_id: &str, error: ConnectEndError) -> String {
@@ -1681,17 +1845,19 @@ fn live_reconnect_skip_reason(
     None
 }
 
-/// First ResumeAction is immediate; later attempts match CLI 1s×2^n + 20% jitter, cap 60s.
-/// Hollow (HTTP 200 then zero-byte RST) retries stay at 0ms — backoff was turning
-/// ten instant INTERNAL_ERRORs into a 5-minute 502.
-fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool) -> u64 {
-    if hollow || attempt <= 1 {
+/// First ResumeAction is immediate; later attempts 1s×2^n + 20% jitter, cap 8s.
+/// Hollow (HTTP 200 then zero-byte RST) retries stay at 0ms. Sleep never exceeds
+/// half the remaining recovery window — the old 60s cap made ten attempts a
+/// five-minute 502.
+fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool, remaining_ms: u64) -> u64 {
+    if hollow || attempt <= 1 || remaining_ms == 0 {
         return 0;
     }
-    let shift = (attempt - 2).min(6);
+    let shift = (attempt - 2).min(3);
     let base_ms = 1_000u64 << shift;
     let jitter = ((base_ms as f64) * 0.2 * ((attempt as f64 * 0.37) % 1.0)) as u64;
-    (base_ms + jitter).min(60_000)
+    let delay = (base_ms + jitter).min(LIVE_RECONNECT_BACKOFF_CAP_MS);
+    delay.min(remaining_ms / 2)
 }
 
 fn is_h2_stream_reset(message: &str) -> bool {
@@ -1835,12 +2001,24 @@ async fn try_live_reconnect(
 
     let mut closed_collecting = false;
     let mut last_fail: Option<String> = None;
-    let mut last_was_hollow = false;
+    reconnect.recovery.note_delayed_hollow_if_probation();
+    reconnect.recovery.begin(Instant::now());
     loop {
         if Instant::now() >= hard_deadline {
             let outcome = LiveReconnectOutcome::Failed(
                 last_fail.unwrap_or_else(|| "hard timeout during reconnect".into()),
             );
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+            );
+            return outcome;
+        }
+        if let Some(reason) = reconnect.recovery.skip_reason(Instant::now()) {
+            let outcome =
+                LiveReconnectOutcome::Failed(last_fail.unwrap_or_else(|| reason.to_string()));
             log_live_reconnect(
                 &outcome,
                 *reconnect_attempts,
@@ -1866,16 +2044,39 @@ async fn try_live_reconnect(
             );
             return outcome;
         }
+        apply_transport_breakers(reconnect, Instant::now());
+        if reconnect.force_http1 && reconnect.http1_rejected {
+            let outcome = LiveReconnectOutcome::Failed(
+                last_fail.unwrap_or_else(|| "both transports circuit-open".into()),
+            );
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+            );
+            return outcome;
+        }
         if !closed_collecting {
             let _ = control_close_collecting_natives(pending, outbound).await;
             closed_collecting = true;
         }
         *reconnect_attempts += 1;
-        let delay_ms = live_reconnect_backoff_ms_for(*reconnect_attempts, last_was_hollow);
+        reconnect.recovery.opens = reconnect.recovery.opens.saturating_add(1);
+        let remaining_ms = reconnect
+            .recovery
+            .remaining(Instant::now())
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let delay_ms = live_reconnect_backoff_ms_for(
+            *reconnect_attempts,
+            reconnect.recovery.last_was_hollow,
+            remaining_ms,
+        );
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        last_was_hollow = false;
+        reconnect.recovery.last_was_hollow = false;
         reconnect.http =
             CursorHttpClient::with_prefer_http1(reconnect_prefers_http1(reconnect.force_http1));
 
@@ -1907,11 +2108,14 @@ async fn try_live_reconnect(
             client_heartbeat: None,
         };
 
-        let open_wait =
-            live_reconnect_open_timeout(hard_deadline.saturating_duration_since(Instant::now()));
+        let open_wait = live_reconnect_open_timeout(
+            hard_deadline
+                .saturating_duration_since(Instant::now())
+                .min(reconnect.recovery.remaining(Instant::now())),
+        );
         if open_wait.is_zero() {
             let outcome = LiveReconnectOutcome::Failed(
-                last_fail.unwrap_or_else(|| "hard timeout during reconnect".into()),
+                last_fail.unwrap_or_else(|| "recovery deadline exhausted".into()),
             );
             log_live_reconnect(
                 &outcome,
@@ -1930,7 +2134,7 @@ async fn try_live_reconnect(
                 &first_message,
                 &reconnect.identity,
                 reconnect.force_http1,
-                /*allow_h1_fallback=*/ !reconnect.force_http1,
+                live_reconnect_allow_h1_fallback(reconnect.force_http1, reconnect.http1_rejected),
             ),
         )
         .await;
@@ -1938,7 +2142,8 @@ async fn try_live_reconnect(
         match opened {
             Err(_) => {
                 last_fail = Some("reconnect open timed out".into());
-                last_was_hollow = true;
+                reconnect.recovery.last_was_hollow = true;
+                record_transport_failure(reconnect.force_http1, Instant::now());
             }
             Ok(Ok((new_outbound, response))) => {
                 let stream = response.bytes_stream();
@@ -1950,6 +2155,7 @@ async fn try_live_reconnect(
                         *decoder = ConnectFrameDecoder::new();
                         *last_progress = Instant::now();
                         *resume_grace_until = Some(Instant::now() + resume_grace);
+                        reconnect.recovery.on_probation = true;
                         let outcome = LiveReconnectOutcome::Reconnected;
                         log_live_reconnect(
                             &outcome,
@@ -1961,7 +2167,8 @@ async fn try_live_reconnect(
                     }
                     Err(msg) => {
                         last_fail = Some(msg.clone());
-                        last_was_hollow = true;
+                        reconnect.recovery.last_was_hollow = true;
+                        record_transport_failure(reconnect.force_http1, Instant::now());
                         match live_reconnect_on_hollow_body(reconnect.http1_rejected) {
                             LiveReconnectTransportAction::GiveUp(reason) => {
                                 let outcome =
@@ -1993,6 +2200,7 @@ async fn try_live_reconnect(
             }
             Ok(Err(err)) => {
                 last_fail = Some(format!("{} ({})", err.message, err.status));
+                record_transport_failure(reconnect.force_http1, Instant::now());
                 if !is_retryable_live_transport_error(&err) {
                     let outcome = LiveReconnectOutcome::Failed(
                         last_fail.clone().unwrap_or_else(|| err.to_string()),
@@ -2455,6 +2663,8 @@ async fn drive_live_run(
                         if live_reconnect_should_reset_budget(&frames) {
                             got_chunk_since_reconnect = true;
                             reconnect_attempts = 0;
+                            record_transport_success(reconnect.force_http1);
+                            reconnect.recovery.reset();
                         }
                         for frame in frames {
                             let mut turn = LiveTurnCtx {
@@ -2737,25 +2947,16 @@ async fn drive_live_run(
                 {
                     emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End).await;
                     break 'driver;
-                } else if useful && !saw_text && last_progress.elapsed() >= stream_idle {
-                    // Thinking-only agent turns can stay quiet for a long time; only
-                    // treat as stalled when no tools were advertised for this run.
-                    if allowed_tool_names.is_none() {
-                        report_terminal_error(
-                            &mut sink,
-                            &terminal_error,
-                            "Cursor stream stalled after partial progress".into(),
-                        )
-                        .await;
-                        break 'driver;
-                    }
-                } else if !useful && last_progress.elapsed() >= setup_idle {
-                    report_terminal_error(
-                        &mut sink,
-                        &terminal_error,
-                        "Cursor stream produced no useful progress".into(),
-                    )
-                    .await;
+                } else if let Some(message) = live_idle_stall_message(
+                    useful,
+                    saw_text,
+                    allowed_tool_names.is_some(),
+                    pending.is_empty(),
+                    last_progress.elapsed(),
+                    setup_idle,
+                    stream_idle,
+                ) {
+                    report_terminal_error(&mut sink, &terminal_error, message.into()).await;
                     break 'driver;
                 }
             }
@@ -4545,11 +4746,15 @@ pub fn live_sse_response(
     );
     response.headers_mut().insert(
         http::header::CACHE_CONTROL,
-        http::HeaderValue::from_static("no-cache"),
+        http::HeaderValue::from_static("no-cache, no-transform"),
     );
     response.headers_mut().insert(
         http::header::CONNECTION,
         http::HeaderValue::from_static("keep-alive"),
+    );
+    response.headers_mut().insert(
+        http::HeaderName::from_static("x-accel-buffering"),
+        http::HeaderValue::from_static("no"),
     );
     response
 }
@@ -4593,6 +4798,7 @@ mod tests {
             http1_rejected: false,
             mcp_tools: None,
             opening_checkpoint: None,
+            recovery: LiveRecoveryEpisode::default(),
         }
     }
 
@@ -4685,15 +4891,106 @@ mod tests {
 
     #[test]
     fn first_reconnect_has_no_backoff() {
-        assert_eq!(live_reconnect_backoff_ms_for(1, false), 0);
-        assert!(live_reconnect_backoff_ms_for(2, false) >= 1_000);
-        assert!(live_reconnect_backoff_ms_for(2, false) <= 1_200);
-        assert!(live_reconnect_backoff_ms_for(3, false) >= 2_000);
-        assert_eq!(live_reconnect_backoff_ms_for(20, false), 60_000);
+        assert_eq!(live_reconnect_backoff_ms_for(1, false, u64::MAX), 0);
+        assert!(live_reconnect_backoff_ms_for(2, false, u64::MAX) >= 1_000);
+        assert!(live_reconnect_backoff_ms_for(2, false, u64::MAX) <= 1_200);
+        assert!(live_reconnect_backoff_ms_for(3, false, u64::MAX) >= 2_000);
+        assert!(
+            live_reconnect_backoff_ms_for(20, false, u64::MAX) <= LIVE_RECONNECT_BACKOFF_CAP_MS,
+            "backoff must not recreate the five-minute 502"
+        );
         assert_eq!(
-            live_reconnect_backoff_ms_for(10, true),
+            live_reconnect_backoff_ms_for(10, true, u64::MAX),
             0,
-            "zero-byte INTERNAL_ERROR must not wait 60s between attempts"
+            "zero-byte INTERNAL_ERROR must not wait between attempts"
+        );
+        assert_eq!(
+            live_reconnect_backoff_ms_for(3, false, 800),
+            400,
+            "sleep at most half the remaining recovery window"
+        );
+    }
+
+    #[test]
+    fn recovery_episode_caps_opens_and_wall_clock() {
+        let now = Instant::now();
+        let mut episode = LiveRecoveryEpisode::default();
+        episode.begin(now);
+        episode.opens = LIVE_RECOVERY_MAX_OPENS;
+        assert_eq!(
+            episode.skip_reason(now),
+            Some("recovery open budget exhausted")
+        );
+        episode.opens = 0;
+        episode.started = Some(now - LIVE_RECOVERY_DEADLINE);
+        assert_eq!(
+            episode.skip_reason(now),
+            Some("recovery deadline exhausted")
+        );
+        episode.started = Some(now);
+        assert!(episode.skip_reason(now).is_none());
+    }
+
+    #[test]
+    fn delayed_hollow_eof_keeps_hollow_flag_across_resume_attempts() {
+        let mut episode = LiveRecoveryEpisode {
+            on_probation: true,
+            ..LiveRecoveryEpisode::default()
+        };
+        episode.note_delayed_hollow_if_probation();
+        assert!(episode.last_was_hollow);
+        assert!(!episode.on_probation);
+        assert_eq!(
+            live_reconnect_backoff_ms_for(8, episode.last_was_hollow, u64::MAX),
+            0
+        );
+    }
+
+    #[test]
+    fn h1_fallback_is_skipped_when_http1_was_rejected() {
+        assert!(live_reconnect_allow_h1_fallback(false, false));
+        assert!(
+            !live_reconnect_allow_h1_fallback(false, true),
+            "464/421 must not retry HTTP/1 on the same incident"
+        );
+        assert!(!live_reconnect_allow_h1_fallback(true, false));
+    }
+
+    #[test]
+    fn transport_breaker_opens_after_repeated_failures_then_half_opens() {
+        let now = Instant::now();
+        let mut breaker = TransportBreaker::default();
+        breaker.on_failure(now);
+        breaker.on_failure(now);
+        assert!(breaker.allows(now), "two failures stay closed");
+        breaker.on_failure(now);
+        assert!(!breaker.allows(now), "third failure opens the breaker");
+        assert!(breaker.allows(now + TRANSPORT_BREAKER_COOLDOWN));
+        breaker.on_success();
+        assert!(breaker.allows(now));
+        assert_eq!(breaker.consecutive_fails, 0);
+    }
+
+    #[test]
+    fn tool_turn_stalls_after_double_stream_idle_without_text() {
+        let setup = Duration::from_secs(45);
+        let idle = Duration::from_secs(120);
+        assert!(live_idle_stall_message(false, false, true, true, setup, setup, idle).is_some());
+        assert!(
+            live_idle_stall_message(true, false, true, true, idle, setup, idle).is_none(),
+            "tools advertised: 120s of thinking-only is still allowed"
+        );
+        assert_eq!(
+            live_idle_stall_message(true, false, true, true, idle * 2, setup, idle),
+            Some("Cursor stream stalled after partial progress")
+        );
+        assert!(
+            live_idle_stall_message(true, true, true, true, idle * 2, setup, idle).is_none(),
+            "after visible text, keep the hard timeout for quiet Fable thinking"
+        );
+        assert!(
+            live_idle_stall_message(true, false, true, false, idle * 2, setup, idle).is_none(),
+            "do not stall while Claude still owes native tool_results"
         );
     }
 
@@ -4832,7 +5129,7 @@ mod tests {
     fn reconnect_open_timeout_is_capped_inside_hard_deadline() {
         assert_eq!(
             live_reconnect_open_timeout(Duration::from_secs(1800)),
-            Duration::from_secs(20)
+            Duration::from_secs(10)
         );
         assert_eq!(
             live_reconnect_open_timeout(Duration::from_secs(5)),

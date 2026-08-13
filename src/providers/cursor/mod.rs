@@ -231,12 +231,15 @@ async fn collect_live_events_to_json(
     estimated_input: u64,
 ) -> Result<serde_json::Value, String> {
     let mut acc = AnthropicJsonAcc::new(estimated_input);
+    let mut saw_end = false;
+    let mut tool_handoff = false;
     while let Some(item) = events.recv().await {
         match item {
             Ok(LiveRunEvent::Cursor(event)) => {
                 let ended = matches!(event, CursorStreamEvent::End);
                 acc.push(&event);
                 if ended {
+                    saw_end = true;
                     break;
                 }
             }
@@ -244,6 +247,7 @@ async fn collect_live_events_to_json(
                 for tool in tools {
                     acc.push_native_tool(tool.tool_use_id, tool.name, tool.input);
                 }
+                tool_handoff = true;
                 break;
             }
             Err(error) => return Err(error),
@@ -251,6 +255,9 @@ async fn collect_live_events_to_json(
     }
     if !acc.has_useful() {
         return Err("Cursor stream produced no useful progress".into());
+    }
+    if !saw_end && !tool_handoff {
+        return Err("Cursor stream ended without turn_ended".into());
     }
     Ok(acc.into_message_json(message_id, model))
 }
@@ -1373,6 +1380,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("no useful progress"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn collect_live_events_to_json_truncated_useful_is_error() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "partial".into(),
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+        let err = collect_live_events_to_json(rx, "msg_trunc", "claude-fable-5", 3)
+            .await
+            .unwrap_err();
+        assert!(err.contains("without turn_ended"), "{err}");
     }
 
     #[test]

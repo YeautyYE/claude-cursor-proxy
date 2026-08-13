@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.41 (2026-08-13)
+
+- Live reconnect is a 45s wall-clock recovery episode (at most four ResumeAction opens, 10s per open). Delayed hollow resumes (HTTP 200 then RST after the 1ms peek) stay hollow instead of restarting exponential backoff. Backoff is capped at 8s and never more than half the remaining window — that was the ~5-minute 502. Initial live open is capped at 20s. HTTP/1 fallback is skipped once 464/421 rejected it. H2/H1 circuit breakers open after three consecutive failures. Tool-advertised thinking-only turns stall at 2× stream idle (240s default) instead of the 1800s hard timeout; turns that already emitted text still wait for `turn_ended`. Non-streaming collect no longer treats a dropped channel with partial tokens as success. SSE sets `X-Accel-Buffering: no` and `Cache-Control: no-cache, no-transform`.
+
 ## v0.1.40 (2026-08-13)
 
 - Stop replaying historical Anthropic screenshots as new Cursor `selected_images`. Claude Code sends the full `messages` array; those old base64 blocks were given fresh UUIDs while `conversation_state` still held earlier image ids, so Cursor 502'd `Image not found [internal]` on text-only turns. Only the current user turn is attached, empty base64 is skipped, and image UUIDs are stable for the same bytes. A missing-image Connect END clears the poisoned checkpoint so the next retry is not doomed.
