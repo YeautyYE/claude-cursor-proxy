@@ -135,11 +135,13 @@ async fn healthz() -> Json<serde_json::Value> {
 /// Prefer a union of Cursor's live `GetUsableModels` catalog (when auth is
 /// available) and the registry so Codex/Kimi/Grok ids stay discoverable.
 ///
-/// Cursor fable-family ids are rewritten through [`anthropic_list_model_id`] so
-/// Claude Code sees a `[1m]` marker (1M context) on this surface.
+/// Known Cursor long-context ids are rewritten through
+/// [`anthropic_list_model_id`] so Claude Code sees a `[1m]` marker on this
+/// surface.
 async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     use crate::providers::cursor::model::{
         CURSOR_GROK_46_ALIAS, anthropic_list_model_id, cursor_anthropic_surface_models,
+        strip_anthropic_context_suffix,
     };
 
     let mut seen = std::collections::BTreeSet::new();
@@ -157,7 +159,10 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
                 "created": 0,
                 "owned_by": owned_by,
             });
-            if item["id"] == CURSOR_GROK_46_ALIAS {
+            if item["id"]
+                .as_str()
+                .is_some_and(|id| strip_anthropic_context_suffix(id) == CURSOR_GROK_46_ALIAS)
+            {
                 item["display_name"] = json!("Cursor Grok 4.6");
             }
             data.push(item);
@@ -1095,9 +1100,9 @@ mod tests {
 
     #[test]
     fn discovery_allowlist_only_filters_anthropic_shaped_ids() {
-        let allowlist = Some("claude-cursor-grok-4.6");
+        let allowlist = Some("claude-cursor-grok-4.6[1m]");
         assert!(model_allowed_by_discovery_filter(
-            "claude-cursor-grok-4.6",
+            "claude-cursor-grok-4.6[1m]",
             allowlist
         ));
         assert!(!model_allowed_by_discovery_filter(

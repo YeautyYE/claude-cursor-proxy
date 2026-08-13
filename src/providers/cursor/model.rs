@@ -9,6 +9,7 @@
 //! - `cursor-agent:` is also supported for agent mode routing.
 
 pub const CURSOR_GROK_46_ALIAS: &str = "claude-cursor-grok-4.6";
+pub const CURSOR_GROK_46_SURFACE: &str = "claude-cursor-grok-4.6[1m]";
 
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor",
@@ -205,13 +206,15 @@ pub fn anthropic_wire_model(request_model: &str) -> String {
 
 /// Id for Anthropic `/v1/models` (picker / gateway discovery).
 ///
-/// Unlike [`anthropic_wire_model`], preserves catalog specificity
-/// (`claude-fable-5-thinking-max[1m]`) so effort tiers remain selectable, while
-/// always attaching `[1m]` for Claude Code `PE` when the proxy host is not
-/// `api.anthropic.com`.
+/// Preserves catalog specificity (`claude-fable-5-thinking-max[1m]`) so effort
+/// tiers remain selectable, and marks known long-context aliases for Claude
+/// Code gateway discovery.
 pub fn anthropic_list_model_id(catalog_or_alias: &str) -> String {
     let raw = catalog_or_alias.trim();
     let base = strip_anthropic_context_suffix(raw);
+    if base == CURSOR_GROK_46_ALIAS {
+        return CURSOR_GROK_46_SURFACE.to_string();
+    }
     if is_fable_family(&base) || is_fable_family(raw) {
         let catalog = match base.as_str() {
             "fable" | "claude-fable-5" => "claude-fable-5",
@@ -481,6 +484,9 @@ mod tests {
 
         let r = resolve_cursor_model("claude-cursor-grok-4.6").unwrap();
         assert_eq!(r.model_id, "cursor-grok-4.6-high");
+
+        let r = resolve_cursor_model("claude-cursor-grok-4.6[1m]").unwrap();
+        assert_eq!(r.model_id, "cursor-grok-4.6-high");
     }
 
     #[test]
@@ -494,7 +500,7 @@ mod tests {
             "cursor:claude-opus-5-thinking-max"
         );
         assert_eq!(
-            apply_requested_effort("claude-cursor-grok-4.6", Some("xhigh")).unwrap(),
+            apply_requested_effort("claude-cursor-grok-4.6[1m]", Some("xhigh")).unwrap(),
             "cursor:cursor-grok-4.6-xhigh"
         );
         assert_eq!(
@@ -538,6 +544,14 @@ mod tests {
 
     #[test]
     fn anthropic_list_model_id_keeps_effort_tier_with_1m() {
+        assert_eq!(
+            anthropic_list_model_id("claude-cursor-grok-4.6"),
+            "claude-cursor-grok-4.6[1m]"
+        );
+        assert_eq!(
+            anthropic_list_model_id("claude-cursor-grok-4.6[1m]"),
+            "claude-cursor-grok-4.6[1m]"
+        );
         assert_eq!(anthropic_list_model_id("fable"), "claude-fable-5[1m]");
         assert_eq!(
             anthropic_list_model_id("claude-fable-5"),
