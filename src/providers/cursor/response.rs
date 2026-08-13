@@ -264,7 +264,15 @@ fn push_interaction_stream_events(
 /// tools JSON), which can cost tens–hundreds of ms on large Claude Code turns
 /// and delays TTFT. `turn_ended` usage replaces this seed when available.
 pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
-    let mut chars = 0usize;
+    let mut chars = req.extra.get("system").map_or(0, |system| match system {
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+            .map(str::len)
+            .sum(),
+        _ => 0,
+    });
     for message in &req.messages {
         chars += match &message.content {
             serde_json::Value::String(s) => s.len(),
@@ -287,6 +295,17 @@ pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
                             .sum(),
                         _ => 64,
                     },
+                    Some("tool_use") => block
+                        .get("input")
+                        .map(json_size_estimate)
+                        .unwrap_or(2)
+                        .saturating_add(
+                            block
+                                .get("name")
+                                .and_then(|name| name.as_str())
+                                .map_or(0, str::len),
+                        ),
+                    Some("image") => 8_000,
                     _ => 64,
                 })
                 .sum(),
@@ -299,7 +318,8 @@ pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
         // on every request and only delayed TTFT / burned CPU before first byte.
         chars = chars.saturating_add(json_size_estimate(tools));
     }
-    (chars / 4).max(1) as u64
+    let overhead = req.messages.len().saturating_mul(16);
+    (chars.saturating_add(overhead) / 4).max(1) as u64
 }
 
 /// Approximate serialized JSON size without allocating the full string.
@@ -719,5 +739,25 @@ mod tests {
             elapsed.as_millis() < 50,
             "tools size estimate too slow: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn estimate_request_input_tokens_includes_system_and_tool_input() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-cursor-grok-4.6",
+            "system": "system guidance",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Edit",
+                    "input": {"file_path": "/tmp/example", "new_string": "x".repeat(4000)}
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert!(estimate_request_input_tokens(&req) > 1_000);
     }
 }

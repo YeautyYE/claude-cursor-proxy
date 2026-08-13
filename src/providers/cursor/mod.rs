@@ -51,7 +51,7 @@ use crate::providers::cursor::model::{
 };
 use crate::providers::cursor::request::{
     CursorPromptOptions, claude_local_mcp_tools, cursor_request_context,
-    latest_user_is_only_tool_results, render_cursor_prompt, render_cursor_prompt_parts_with,
+    latest_user_is_only_tool_results, render_cursor_prompt_parts_with,
     request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
@@ -127,7 +127,7 @@ fn record_session_input_tokens(session_id: &str, input_tokens: u64) {
 }
 
 fn count_tokens_for_request(_session_id: Option<&str>, body: &MessagesRequest) -> u64 {
-    (render_cursor_prompt(body).len() / 4).max(1) as u64
+    estimate_request_input_tokens(body)
 }
 
 fn remember_input_tokens(session_id: Option<&str>, input_tokens: Option<u64>) {
@@ -1105,18 +1105,18 @@ mod tests {
         reset_session_usage_for_test();
         record_session_input_tokens("sess-count-last", 53_037);
         let body = hello_body();
-        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        let expected = estimate_request_input_tokens(&body);
         let tokens = count_tokens_for_request(Some("sess-count-last"), &body);
         assert_eq!(tokens, expected);
         assert_ne!(tokens, 53_037);
     }
 
     #[test]
-    fn count_tokens_estimates_rendered_prompt_when_session_has_no_usage() {
+    fn count_tokens_estimates_anthropic_request_when_session_has_no_usage() {
         let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
         reset_session_usage_for_test();
         let body = hello_body();
-        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        let expected = estimate_request_input_tokens(&body);
         let tokens = count_tokens_for_request(Some("sess-count-fresh"), &body);
         assert_eq!(tokens, expected);
         assert!(tokens >= 1);
@@ -1128,7 +1128,7 @@ mod tests {
         reset_session_usage_for_test();
         record_session_input_tokens("sess-other", 99_000);
         let body = hello_body();
-        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        let expected = estimate_request_input_tokens(&body);
         assert_eq!(
             count_tokens_for_request(Some("sess-count-isolated"), &body),
             expected
@@ -1207,7 +1207,7 @@ mod tests {
         reset_session_usage_for_test();
         record_session_input_tokens("sess-zero", 0);
         let body = hello_body();
-        let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
+        let expected = estimate_request_input_tokens(&body);
         assert_eq!(count_tokens_for_request(Some("sess-zero"), &body), expected);
     }
 }
