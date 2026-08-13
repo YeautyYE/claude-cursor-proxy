@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.44 (2026-08-14)
+
+- First-turn H2 `broken pipe` no longer dies with `reconnect skipped: no checkpoint`. ResumeAction can reattach with the session `conversation_id` and empty conversation state (not a second user message). `broken pipe` forces HTTP/1 on that reconnect, same as H2 `INTERNAL_ERROR`.
+
 ## v0.1.43 (2026-08-14)
 
 - Fable `high` thinking no longer dies at 45s with `Cursor stream produced no useful progress`. `setup_idle` only fires when the Cursor stream has gone silent (no frames, including heartbeats). Heartbeat-only thinking waits 2× stream idle (240s default), same budget as a thinking-only turn that already advertised tools.

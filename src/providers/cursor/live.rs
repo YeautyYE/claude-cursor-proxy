@@ -2196,19 +2196,35 @@ fn format_error_chain(err: &dyn Error) -> String {
     parts.join(": ")
 }
 
+fn live_reconnect_resume_state(
+    latest_checkpoint: &Option<Vec<u8>>,
+    opening_checkpoint: &Option<Vec<u8>>,
+    conversation_id: Option<&str>,
+) -> Option<Vec<u8>> {
+    if let Some(checkpoint) = latest_checkpoint.as_ref().filter(|c| !c.is_empty()) {
+        return Some(checkpoint.clone());
+    }
+    if let Some(checkpoint) = opening_checkpoint.as_ref().filter(|c| !c.is_empty()) {
+        return Some(checkpoint.clone());
+    }
+    // First turn: Cursor may RST H2 before conversation_checkpoint_update.
+    // ResumeAction with the same conversation_id and empty state reattaches;
+    // it is not a second UserMessageAction.
+    if conversation_id.is_some_and(|id| !id.is_empty()) {
+        return Some(Vec::new());
+    }
+    None
+}
+
 fn live_reconnect_skip_reason(
     latest_checkpoint: &Option<Vec<u8>>,
     opening_checkpoint: &Option<Vec<u8>>,
+    conversation_id: Option<&str>,
     reconnect_attempts: u32,
     max_reconnects: u32,
 ) -> Option<&'static str> {
-    let has_checkpoint = latest_checkpoint
-        .as_ref()
-        .is_some_and(|checkpoint| !checkpoint.is_empty())
-        || opening_checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| !checkpoint.is_empty());
-    if !has_checkpoint {
+    if live_reconnect_resume_state(latest_checkpoint, opening_checkpoint, conversation_id).is_none()
+    {
         return Some("no checkpoint");
     }
     if reconnect_attempts >= max_reconnects {
@@ -2235,6 +2251,7 @@ fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool, remaining_ms: u64) 
 fn is_h2_stream_reset(message: &str) -> bool {
     message.contains("unexpected internal error")
         || message.contains("stream error received")
+        || message.contains("broken pipe")
         || message.contains("HTTP2")
         || message.contains("http2")
 }
@@ -2354,15 +2371,11 @@ async fn try_live_reconnect(
     _resume_grace: Duration,
     hard_deadline: Instant,
 ) -> LiveReconnectOutcome {
-    let checkpoint = latest_checkpoint
-        .as_ref()
-        .filter(|c| !c.is_empty())
-        .or(reconnect
-            .opening_checkpoint
-            .as_ref()
-            .filter(|c| !c.is_empty()))
-        .cloned();
-    let Some(checkpoint) = checkpoint else {
+    let Some(checkpoint) = live_reconnect_resume_state(
+        latest_checkpoint,
+        &reconnect.opening_checkpoint,
+        reconnect.conversation_id.as_deref(),
+    ) else {
         let outcome = LiveReconnectOutcome::Skipped("no checkpoint");
         log_live_reconnect(
             &outcome,
@@ -2404,6 +2417,7 @@ async fn try_live_reconnect(
         if let Some(reason) = live_reconnect_skip_reason(
             latest_checkpoint,
             &reconnect.opening_checkpoint,
+            reconnect.conversation_id.as_deref(),
             *reconnect_attempts,
             max_reconnects,
         ) {
@@ -2477,7 +2491,7 @@ async fn try_live_reconnect(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            has_checkpoint: true,
+            has_checkpoint: !checkpoint.is_empty(),
         };
         let resolved = match super::model::resolve_cursor_model(&reconnect.model_id) {
             Ok(r) => r,
@@ -2994,14 +3008,13 @@ async fn drive_live_run(
             setup_idle,
             stream_idle,
         ) {
-            let has_checkpoint = latest_checkpoint
-                .as_ref()
-                .is_some_and(|checkpoint| !checkpoint.is_empty())
-                || reconnect
-                    .opening_checkpoint
-                    .as_ref()
-                    .is_some_and(|checkpoint| !checkpoint.is_empty());
-            if has_checkpoint {
+            let can_resume = live_reconnect_resume_state(
+                &latest_checkpoint,
+                &reconnect.opening_checkpoint,
+                reconnect.conversation_id.as_deref(),
+            )
+            .is_some();
+            if can_resume {
                 let reconnect_outcome = if live_should_resume_after_drop(
                     reconnect.recovery.on_probation,
                     got_chunk_since_reconnect,
@@ -5719,15 +5732,24 @@ mod tests {
     #[test]
     fn reconnect_skip_reason_requires_checkpoint() {
         assert_eq!(
-            live_reconnect_skip_reason(&None, &None, 0, 10),
+            live_reconnect_skip_reason(&None, &None, None, 0, 10),
             Some("no checkpoint")
         );
-        assert!(live_reconnect_skip_reason(&Some(vec![0x0a]), &None, 0, 10).is_none());
-        assert!(live_reconnect_skip_reason(&None, &Some(vec![0x0a]), 0, 10).is_none());
+        assert!(live_reconnect_skip_reason(&Some(vec![0x0a]), &None, None, 0, 10).is_none());
+        assert!(live_reconnect_skip_reason(&None, &Some(vec![0x0a]), None, 0, 10).is_none());
         assert_eq!(
-            live_reconnect_skip_reason(&Some(vec![0x0a]), &None, 10, 10),
+            live_reconnect_skip_reason(&Some(vec![0x0a]), &None, None, 10, 10),
             Some("reconnect budget exhausted")
         );
+        assert!(
+            live_reconnect_skip_reason(&None, &None, Some("conv-first-turn"), 0, 10).is_none(),
+            "first-turn ResumeAction uses conversation_id when Cursor has not sent a checkpoint yet"
+        );
+        assert_eq!(
+            live_reconnect_resume_state(&None, &None, Some("conv-first-turn")),
+            Some(Vec::new())
+        );
+        assert!(live_reconnect_resume_state(&None, &None, None).is_none());
     }
 
     #[test]
@@ -5746,7 +5768,7 @@ mod tests {
     #[test]
     fn reconnect_skip_reason_allows_pending_tools() {
         assert!(
-            live_reconnect_skip_reason(&Some(vec![0x01]), &None, 0, 10).is_none(),
+            live_reconnect_skip_reason(&Some(vec![0x01]), &None, None, 0, 10).is_none(),
             "Claude-owed tool_results must not block ResumeAction; the BiDi is still needed"
         );
     }
@@ -5910,6 +5932,12 @@ mod tests {
     fn h2_internal_error_is_a_stream_reset() {
         let msg = "error decoding response body: error reading a body from connection: stream error received: unexpected internal error encountered";
         assert!(is_h2_stream_reset(msg));
+        assert!(
+            is_h2_stream_reset(
+                "error decoding response body: error reading a body from connection: stream closed because of a broken pipe"
+            ),
+            "Clash/H2 broken pipe must force HTTP/1 ResumeAction, same as INTERNAL_ERROR"
+        );
         assert!(!is_h2_stream_reset("Connect error 429: quota"));
     }
 
