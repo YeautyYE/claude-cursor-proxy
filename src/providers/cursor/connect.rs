@@ -120,11 +120,20 @@ pub fn decode_gzip_frame(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 
 /// Map a live/Connect error string onto Anthropic SSE `error.type`.
 pub fn anthropic_error_type_from_live_error(error: &str) -> &'static str {
-    if error.contains("[resource_exhausted]") || error.contains("Connect error 429") {
+    if error.contains("[resource_exhausted]")
+        || error.contains("Connect error 429")
+        || error.contains("Cursor error 429")
+    {
         "rate_limit_error"
-    } else if error.contains("[unauthenticated]") || error.contains("Connect error 401") {
+    } else if error.contains("[unauthenticated]")
+        || error.contains("Connect error 401")
+        || error.contains("Cursor error 401")
+    {
         "authentication_error"
-    } else if error.contains("[permission_denied]") || error.contains("Connect error 403") {
+    } else if error.contains("[permission_denied]")
+        || error.contains("Connect error 403")
+        || error.contains("Cursor error 403")
+    {
         "permission_error"
     } else {
         "api_error"

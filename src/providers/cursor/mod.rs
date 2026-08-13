@@ -24,7 +24,7 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::anthropic::error::json_error;
@@ -43,8 +43,9 @@ use crate::providers::cursor::hosted_web_search::{
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
 use crate::providers::cursor::live::{
-    LiveEventResult, LiveRunEvent, LiveRunIdentity, LiveRunRegistry, live_run_key_for,
-    live_sse_response,
+    LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveConflictAction, LiveEventResult,
+    LiveRunEvent, LiveRunIdentity, LiveRunRegistry, LiveSlotClaim, live_run_key_for,
+    live_sse_response, live_start_error_seals_tombstone,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
@@ -622,10 +623,17 @@ impl Provider for CursorProvider {
                         );
                     }
                     LiveResumeOutcome::Conflict => {
-                        // Zombie / still-thinking BiDi after Claude Code idle
-                        // disconnect or a nested retry without matching tools.
-                        // Waiting then 409 cascaded retries; supersede instead.
-                        LiveRunRegistry::cancel_run(session_id, agent_id);
+                        match LiveRunRegistry::conflict_action(session_id, agent_id) {
+                            LiveConflictAction::Http409 => {
+                                return json_error(
+                                    StatusCode::CONFLICT,
+                                    "invalid_request_error",
+                                    "A Cursor live run is already active for this session",
+                                );
+                            }
+                            LiveConflictAction::CancelRunning(handle) => handle.cancel(),
+                            LiveConflictAction::SlotFree => {}
+                        }
                     }
                     LiveResumeOutcome::ResumeError(error) => {
                         return map_cursor_error_to_response(&error);
@@ -781,20 +789,29 @@ impl Provider for CursorProvider {
                 .clone()
                 .map(|handle| (handle, ctx.req_id.clone()));
 
-            // Concurrent same-session POSTs (Claude Code retry after idle / 409)
-            // race on Starting→Running. Retry supersede+start instead of 409.
-            // Nested agents reserve `(session, agent_id)` so they do not steal
-            // the parent that shares X-Claude-Code-Session-Id.
+            // Concurrent same-session POSTs race on Starting→Running.
+            // Never start a second Run while Starting (Cursor may already have
+            // accepted the first). After a Starting wait, 409 — do not kill the
+            // stream that just opened, and do not fall through to buffered `/Run`.
             let mut start_error: Option<CursorError> = None;
-            for attempt in 0..3_u8 {
-                let Some(reservation) = (if attempt == 0 {
-                    LiveRunRegistry::reserve_run(sid, identity.agent_id)
-                        .or_else(|| LiveRunRegistry::supersede_run(sid, identity.agent_id))
-                } else {
-                    LiveRunRegistry::supersede_run(sid, identity.agent_id)
-                }) else {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    continue;
+            let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
+            let mut waited_for_starting = false;
+            loop {
+                let reservation = match LiveRunRegistry::try_claim_run(
+                    sid,
+                    identity.agent_id,
+                    !waited_for_starting,
+                ) {
+                    LiveSlotClaim::Reserved(reservation) => reservation,
+                    LiveSlotClaim::Starting | LiveSlotClaim::Ambiguous => {
+                        waited_for_starting = true;
+                        if Instant::now() >= conflict_deadline {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    LiveSlotClaim::Running => break,
                 };
 
                 let start = match client
@@ -808,6 +825,7 @@ impl Provider for CursorProvider {
                         allowed.clone(),
                         mcp_tools.clone(),
                         cursor_request_context(&body),
+                        Some(reservation.cancelled()),
                     )
                     .await
                 {
@@ -827,6 +845,7 @@ impl Provider for CursorProvider {
                                         allowed.clone(),
                                         mcp_tools.clone(),
                                         cursor_request_context(&body),
+                                        Some(reservation.cancelled()),
                                     )
                                     .await
                             }
@@ -839,10 +858,9 @@ impl Provider for CursorProvider {
                 match start {
                     Ok(start) => {
                         if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
-                            // Another request stole the slot during upstream open.
+                            // Cursor already accepted this Run. Do not start another.
                             orphaned.cancel();
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                            continue;
+                            break;
                         }
                         return live_downstream_response(
                             want_stream,
@@ -856,7 +874,11 @@ impl Provider for CursorProvider {
                         .await;
                     }
                     Err(error) => {
-                        drop(reservation);
+                        if live_start_error_seals_tombstone(&error) {
+                            reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
+                        } else {
+                            drop(reservation);
+                        }
                         start_error = Some(error);
                         break;
                     }
@@ -864,22 +886,13 @@ impl Provider for CursorProvider {
             }
 
             if let Some(error) = start_error {
-                // Only fall through to buffered run_agent on transport failures.
-                // 400/401/403/429 are semantic — retrying wastes quota and can
-                // duplicate a request Cursor already accepted.
-                if bridge_eligible
-                    || !crate::providers::cursor::live::is_retryable_live_transport_error(&error)
-                {
-                    return map_cursor_error_to_response(&error);
-                }
-            } else if bridge_eligible {
-                // Exhausted takeover retries while tools require the live path.
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "invalid_request_error",
-                    "A Cursor live run is already active for this session",
-                );
+                return map_cursor_error_to_response(&error);
             }
+            return json_error(
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "A Cursor live run is already active for this session",
+            );
         }
 
         let upstream = match client

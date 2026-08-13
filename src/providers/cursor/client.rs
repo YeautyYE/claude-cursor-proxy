@@ -484,11 +484,24 @@ impl CursorHttpClient {
             }
         }
 
-        let resp = match req.body(body).send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            req.body(body).send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 drop(tx);
                 return Err(CursorError::from_reqwest(e, self.timeout_secs));
+            }
+            Err(_) => {
+                drop(tx);
+                return Err(CursorError::new(
+                    504,
+                    format!("Cursor Agent open timed out after {}s", self.timeout_secs),
+                    None,
+                ));
             }
         };
 
@@ -763,12 +776,16 @@ impl CursorHttpClient {
             let _ = std::fs::write(&dump, &body_bytes);
         }
 
-        // Partial success: if the stream dies/idles but we already have text/thinking
-        // frames, deliver them instead of discarding 100KB+ of agent output.
+        // Only accept a dropped stream when Cursor actually finished the turn.
+        // Useful tokens without turn_ended / Connect END are an error — otherwise
+        // Claude Code sees a successful end_turn and stops retrying.
         if let Some(ref msg) = read_err {
-            if status < 400 && (useful || body_has_useful_content(&body_bytes)) {
+            if status < 400
+                && buffered_stream_complete_enough_to_accept(saw_end, saw_turn_ended)
+                && (useful || body_has_useful_content(&body_bytes))
+            {
                 cursor_debug_log(
-                    &format!("accepting partial body despite: {msg}"),
+                    &format!("accepting body after stream close: {msg}"),
                     &body_bytes,
                 );
                 // fall through to Ok
@@ -822,6 +839,17 @@ impl CursorHttpClient {
                 status,
                 format!("Cursor upstream HTTP {status}"),
                 detail,
+            ));
+        }
+
+        if !buffered_finish_accepts_incomplete(finish_reason, saw_end, saw_turn_ended) {
+            return Err(CursorError::new(
+                502,
+                "Cursor stream ended without turn_ended",
+                Some(format!(
+                    "finish={finish_reason} frames={frame_count} bytes={}",
+                    body_bytes.len()
+                )),
             ));
         }
 
@@ -883,6 +911,21 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+fn buffered_stream_complete_enough_to_accept(saw_end: bool, saw_turn_ended: bool) -> bool {
+    saw_end || saw_turn_ended
+}
+
+fn buffered_finish_accepts_incomplete(
+    finish_reason: &str,
+    saw_end: bool,
+    saw_turn_ended: bool,
+) -> bool {
+    if buffered_stream_complete_enough_to_accept(saw_end, saw_turn_ended) {
+        return true;
+    }
+    finish_reason == "tool_call_ready"
 }
 
 /// `CCP_CURSOR_NO_PROXY=1` skips HTTP(S)_PROXY for Cursor API calls.
@@ -1471,12 +1514,12 @@ pub(crate) fn buffered_run_use_http1_sse(use_bidi: bool, client_prefers_http1: b
 }
 
 pub(crate) fn run_agent_should_retry_http1(
-    already_http1: bool,
-    finish_reason: &str,
-    useful: bool,
+    _already_http1: bool,
+    _finish_reason: &str,
+    _useful: bool,
     _body_empty: bool,
 ) -> bool {
-    !already_http1 && !useful && finish_reason == "setup_idle"
+    false
 }
 
 pub(crate) fn run_agent_empty_body_detail(msg: &str, frame_count: u32) -> String {
@@ -1554,19 +1597,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_idle_retries_http1_once() {
-        assert!(run_agent_should_retry_http1(
-            false,
-            "setup_idle",
+    fn buffered_run_rejects_useful_stream_without_turn_ended() {
+        assert!(!buffered_stream_complete_enough_to_accept(false, false));
+        assert!(buffered_stream_complete_enough_to_accept(true, false));
+        assert!(buffered_stream_complete_enough_to_accept(false, true));
+        assert!(
+            !buffered_finish_accepts_incomplete("stream_closed", false, false),
+            "clean EOF without turn_ended must not become end_turn"
+        );
+        assert!(buffered_finish_accepts_incomplete(
+            "stream_closed",
+            true,
+            false
+        ));
+        assert!(buffered_finish_accepts_incomplete(
+            "turn_ended",
             false,
             true
         ));
         assert!(
-            run_agent_should_retry_http1(false, "setup_idle", false, false),
-            "heartbeat-only / empty-useful setup idle should still flip to HTTP/1"
+            !buffered_finish_accepts_incomplete("complete_idle_after_text", false, false),
+            "silence after text is not turn_ended"
         );
+        assert!(buffered_finish_accepts_incomplete(
+            "tool_call_ready",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn setup_idle_does_not_start_a_second_http1_run() {
         assert!(!run_agent_should_retry_http1(
-            true,
+            false,
             "setup_idle",
             false,
             true
@@ -1574,8 +1637,14 @@ mod tests {
         assert!(!run_agent_should_retry_http1(
             false,
             "setup_idle",
-            true,
+            false,
             false
+        ));
+        assert!(!run_agent_should_retry_http1(
+            true,
+            "setup_idle",
+            false,
+            true
         ));
         assert!(!run_agent_should_retry_http1(
             false,

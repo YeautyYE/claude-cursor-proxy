@@ -128,8 +128,7 @@ impl BidiAppendSession {
                 format!("BidiAppend failed with HTTP {status}"),
                 Some(detail.chars().take(500).collect()),
             );
-            // Do not retry client errors (except 408/429).
-            if !matches!(status, 408 | 429 | 500..=599) {
+            if !bidi_append_retryable_status(status) {
                 return Err(err);
             }
             last_err = Some(err);
@@ -161,6 +160,10 @@ pub fn encode_run_sse_request(request_id: &str) -> Result<Bytes, CursorError> {
     msg.encode(&mut payload)
         .map_err(|e| CursorError::internal(format!("RunSSE encode: {e}")))?;
     Ok(encode_connect_frame(payload, 0))
+}
+
+fn bidi_append_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 500..=599)
 }
 
 /// Whether the agent transport should use HTTP/1 RunSSE + BidiAppend.
@@ -265,6 +268,15 @@ mod tests {
         let payload = strip_connect_frame(&frame).unwrap();
         let decoded = BidiRequestId::decode(payload).unwrap();
         assert_eq!(decoded.request_id, "req-123");
+    }
+
+    #[test]
+    fn bidi_append_does_not_retry_rate_limits() {
+        assert!(bidi_append_retryable_status(408));
+        assert!(bidi_append_retryable_status(502));
+        assert!(!bidi_append_retryable_status(429));
+        assert!(!bidi_append_retryable_status(400));
+        assert!(!bidi_append_retryable_status(401));
     }
 
     #[test]

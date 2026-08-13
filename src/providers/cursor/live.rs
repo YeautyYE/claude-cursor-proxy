@@ -18,14 +18,14 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use prost::Message;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
 };
 use super::connect::{
-    ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END,
-    anthropic_error_type_from_live_error, cursor_connect_error_is_missing_image,
+    ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
+    anthropic_error_type_from_live_error, cursor_connect_error_is_missing_image, decode_gzip_frame,
     encode_connect_frame, parse_connect_error,
 };
 use super::exec_results::{
@@ -61,10 +61,13 @@ enum ClientOutbound {
 }
 
 impl ClientOutbound {
-    async fn send_connect_frame(&self, frame: Bytes) -> bool {
+    async fn send_connect_frame(&self, frame: Bytes) -> Result<(), CursorError> {
         match self {
-            Self::Bidi(tx) => tx.send(Ok(frame)).await.is_ok(),
-            Self::Http1(session) => session.append_connect_or_raw(&frame).await.is_ok(),
+            Self::Bidi(tx) => tx
+                .send(Ok(frame))
+                .await
+                .map_err(|_| CursorError::internal("Cursor BiDi request stream closed")),
+            Self::Http1(session) => session.append_connect_or_raw(&frame).await,
         }
     }
 
@@ -191,7 +194,7 @@ enum RunCommand {
     ResumeBatch {
         tool_results: Vec<(String, serde_json::Value)>,
         sink: mpsc::Sender<LiveEventResult>,
-        ack: oneshot::Sender<Result<(), String>>,
+        ack: oneshot::Sender<Result<(), CursorError>>,
     },
     Cancel,
 }
@@ -279,8 +282,7 @@ impl CursorLiveRunHandle {
             .map_err(|_| CursorError::internal("Cursor live run already closed"))?;
         ready
             .await
-            .map_err(|_| CursorError::internal("Cursor live resume acknowledgement dropped"))?
-            .map_err(CursorError::internal)?;
+            .map_err(|_| CursorError::internal("Cursor live resume acknowledgement dropped"))??;
         Ok(events)
     }
 
@@ -702,8 +704,16 @@ impl LogicalToolTracker {
 }
 
 enum LiveRunEntry {
-    Starting { reservation_id: String },
+    Starting {
+        reservation_id: String,
+        cancel: watch::Sender<bool>,
+    },
     Running(Arc<CursorLiveRunHandle>),
+    /// Open `.send()` timed out: Cursor may already have the Run. Occupy the
+    /// slot so a concurrent POST cannot start a duplicate.
+    Ambiguous {
+        until: Instant,
+    },
 }
 
 struct LiveRunMap {
@@ -757,22 +767,51 @@ pub struct LiveRunReservation {
     session_id: String,
     reservation_id: String,
     committed: bool,
+    cancel: watch::Sender<bool>,
 }
 
 impl LiveRunReservation {
-    /// Atomically replace this reservation with the live handle. The returned
-    /// handle on failure lets the caller explicitly cancel the orphaned run.
+    pub fn cancelled(&self) -> watch::Receiver<bool> {
+        self.cancel.subscribe()
+    }
+
+    fn abort(&self) {
+        let _ = self.cancel.send_replace(true);
+    }
+
+    /// Keep the slot occupied after an ambiguous open timeout so another POST
+    /// cannot start a second Run.
+    pub fn seal_ambiguous(mut self, until: Instant) {
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let owns_reservation = matches!(
+            runs.runs.get(&self.session_id),
+            Some(LiveRunEntry::Starting { reservation_id, .. })
+                if reservation_id == &self.reservation_id
+        );
+        if owns_reservation {
+            runs.insert_key(self.session_id.clone(), LiveRunEntry::Ambiguous { until });
+        }
+        self.committed = true;
+    }
+}
+
+impl LiveRunReservation {
+    /// Atomically replace this reservation with the live handle. If Starting was
+    /// removed (cancel) but the slot is vacant, adopt it so the accepted Run is
+    /// not dropped and then replaced by a second `start_live`. Occupied slots
+    /// return the handle so the caller can cancel without opening another Run.
     pub fn insert(
         mut self,
         handle: Arc<CursorLiveRunHandle>,
     ) -> Result<(), Arc<CursorLiveRunHandle>> {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        LiveRunRegistry::prune_finished(&mut runs);
         let owns_reservation = matches!(
             runs.runs.get(&self.session_id),
-            Some(LiveRunEntry::Starting { reservation_id })
+            Some(LiveRunEntry::Starting { reservation_id, .. })
                 if reservation_id == &self.reservation_id
         );
-        if !owns_reservation {
+        if !owns_reservation && LiveRunRegistry::key_occupied(&runs, &self.session_id) {
             return Err(handle);
         }
         runs.insert_key(self.session_id.clone(), LiveRunEntry::Running(handle));
@@ -786,16 +825,30 @@ impl Drop for LiveRunReservation {
         if self.committed {
             return;
         }
+        self.abort();
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         let owns_reservation = matches!(
             runs.runs.get(&self.session_id),
-            Some(LiveRunEntry::Starting { reservation_id })
+            Some(LiveRunEntry::Starting { reservation_id, .. })
                 if reservation_id == &self.reservation_id
         );
         if owns_reservation {
             runs.remove_key(&self.session_id);
         }
     }
+}
+
+pub enum LiveSlotClaim {
+    Reserved(LiveRunReservation),
+    Starting,
+    Ambiguous,
+    Running,
+}
+
+pub enum LiveConflictAction {
+    Http409,
+    CancelRunning(Arc<CursorLiveRunHandle>),
+    SlotFree,
 }
 
 pub struct LiveRunRegistry;
@@ -818,27 +871,92 @@ impl LiveRunRegistry {
         Self::reserve_key(&mut runs, key)
     }
 
+    /// Classify and optionally reserve under one lock so Starting cannot become
+    /// Running between separate checks and then be superseded.
+    ///
+    /// `supersede_running`: replace an existing Running occupant in this same
+    /// lock. After waiting on Starting, pass `false` so the run that just opened
+    /// is not killed.
+    pub fn try_claim_run(
+        session_id: &str,
+        agent_id: Option<&str>,
+        supersede_running: bool,
+    ) -> LiveSlotClaim {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Starting { .. }) => LiveSlotClaim::Starting,
+            Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => {
+                LiveSlotClaim::Ambiguous
+            }
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+                if !supersede_running {
+                    return LiveSlotClaim::Running;
+                }
+                let handle = Arc::clone(handle);
+                runs.remove_key(&key);
+                match Self::reserve_key(&mut runs, key.clone()) {
+                    Some(reservation) => {
+                        drop(runs);
+                        handle.cancel();
+                        LiveSlotClaim::Reserved(reservation)
+                    }
+                    None => {
+                        runs.insert_key(key, LiveRunEntry::Running(handle));
+                        LiveSlotClaim::Running
+                    }
+                }
+            }
+            _ => match Self::reserve_key(&mut runs, key) {
+                Some(reservation) => LiveSlotClaim::Reserved(reservation),
+                None => LiveSlotClaim::Running,
+            },
+        }
+    }
+
+    pub fn conflict_action(session_id: &str, agent_id: Option<&str>) -> LiveConflictAction {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Starting { .. }) | Some(LiveRunEntry::Ambiguous { .. }) => {
+                LiveConflictAction::Http409
+            }
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+                let handle = Arc::clone(handle);
+                runs.remove_key(&key);
+                LiveConflictAction::CancelRunning(handle)
+            }
+            _ => LiveConflictAction::SlotFree,
+        }
+    }
+
     fn reserve_key(runs: &mut LiveRunMap, key: String) -> Option<LiveRunReservation> {
         if runs.runs.contains_key(&key) {
             return None;
         }
         let reservation_id = uuid::Uuid::new_v4().to_string();
+        let (cancel, _) = watch::channel(false);
         runs.insert_key(
             key.clone(),
             LiveRunEntry::Starting {
                 reservation_id: reservation_id.clone(),
+                cancel: cancel.clone(),
             },
         );
         Some(LiveRunReservation {
             session_id: key,
             reservation_id,
             committed: false,
+            cancel,
         })
     }
 
     fn key_occupied(runs: &LiveRunMap, key: &str) -> bool {
         match runs.runs.get(key) {
             Some(LiveRunEntry::Starting { .. }) => true,
+            Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => true,
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
             _ => false,
         }
@@ -855,6 +973,10 @@ impl LiveRunRegistry {
         let key = live_run_key(session_id, agent_id);
         let entry = {
             let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            Self::prune_finished(&mut runs);
+            if matches!(runs.runs.get(&key), Some(LiveRunEntry::Ambiguous { .. })) {
+                return true;
+            }
             runs.remove_key(&key)
         };
         match entry {
@@ -862,20 +984,65 @@ impl LiveRunRegistry {
                 handle.cancel();
                 true
             }
-            Some(LiveRunEntry::Starting { .. }) => true,
-            None => false,
+            Some(LiveRunEntry::Starting { cancel, .. }) => {
+                let _ = cancel.send_replace(true);
+                true
+            }
+            Some(LiveRunEntry::Ambiguous { .. }) | None => false,
         }
     }
 
-    /// Cancel any occupant of this slot, then reserve. Nested callers must use
-    /// [`Self::supersede_run`] with `agent_id` so the parent is not stolen.
+    /// Cancel a Running occupant only. Starting and Ambiguous slots stay put so
+    /// a Conflict retry cannot abort an in-flight `.send()` and start another Run.
+    pub fn cancel_running_only(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
+        let handle = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            Self::prune_finished(&mut runs);
+            match runs.runs.get(&key) {
+                Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+                    let handle = Arc::clone(handle);
+                    runs.remove_key(&key);
+                    Some(handle)
+                }
+                _ => None,
+            }
+        };
+        if let Some(handle) = handle {
+            handle.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancel a **Running** occupant of this slot, then reserve. An in-flight
+    /// Starting open is left alone — aborting `.send()` and opening another Run
+    /// duplicates a request Cursor may already have accepted.
     pub fn supersede(session_id: &str) -> Option<LiveRunReservation> {
         Self::supersede_run(session_id, None)
     }
 
     pub fn supersede_run(session_id: &str, agent_id: Option<&str>) -> Option<LiveRunReservation> {
-        Self::cancel_run(session_id, agent_id);
-        Self::reserve_run(session_id, agent_id)
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Starting { .. }) | Some(LiveRunEntry::Ambiguous { .. }) => {
+                return None;
+            }
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {}
+            Some(LiveRunEntry::Running(_)) | None => {
+                return Self::reserve_key(&mut runs, key);
+            }
+        }
+        let Some(LiveRunEntry::Running(handle)) = runs.remove_key(&key) else {
+            return Self::reserve_key(&mut runs, key);
+        };
+        let reservation = Self::reserve_key(&mut runs, key);
+        drop(runs);
+        handle.cancel();
+        reservation
     }
 
     pub fn get(session_id: &str) -> Option<Arc<CursorLiveRunHandle>> {
@@ -907,6 +1074,25 @@ impl LiveRunRegistry {
         Self::key_occupied(&runs, &key)
     }
 
+    /// True while this slot is reserved but the first `Run` has not been
+    /// inserted yet. Concurrent POSTs must wait or 409 — not start a second Run.
+    pub fn is_starting_run(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        matches!(runs.runs.get(&key), Some(LiveRunEntry::Starting { .. }))
+    }
+
+    pub fn is_ambiguous_run(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        matches!(
+            runs.runs.get(&key),
+            Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until
+        )
+    }
+
     pub fn take_terminal_error(session_id: &str) -> Option<String> {
         Self::take_terminal_error_run(session_id, None)
     }
@@ -917,10 +1103,24 @@ impl LiveRunRegistry {
         Self::prune_finished(&mut runs);
         let error = match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(handle)) => handle.take_terminal_error(),
-            Some(LiveRunEntry::Starting { .. }) | None => None,
+            Some(LiveRunEntry::Starting { .. }) | Some(LiveRunEntry::Ambiguous { .. }) | None => {
+                None
+            }
         };
         if error.is_some() {
-            runs.remove_key(&key);
+            if error
+                .as_deref()
+                .is_some_and(terminal_error_is_ambiguous_accept)
+            {
+                runs.insert_key(
+                    key,
+                    LiveRunEntry::Ambiguous {
+                        until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                    },
+                );
+            } else {
+                runs.remove_key(&key);
+            }
         }
         error
     }
@@ -931,6 +1131,8 @@ impl LiveRunRegistry {
             .iter()
             .filter_map(|(key, entry)| match entry {
                 LiveRunEntry::Starting { .. } => None,
+                LiveRunEntry::Ambiguous { until } if Instant::now() < *until => None,
+                LiveRunEntry::Ambiguous { .. } => Some(key.clone()),
                 LiveRunEntry::Running(handle)
                     if !handle.is_completed() || handle.has_terminal_error() =>
                 {
@@ -1011,6 +1213,7 @@ impl CursorHttpClient {
             allowed_tool_names,
             mcp_tools,
             super::proto::RequestContext::default(),
+            None,
         )
         .await
     }
@@ -1030,6 +1233,7 @@ impl CursorHttpClient {
         allowed_tool_names: Option<BTreeSet<String>>,
         mcp_tools: Option<super::proto::McpTools>,
         request_context: super::proto::RequestContext,
+        mut cancel: Option<watch::Receiver<bool>>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -1077,31 +1281,31 @@ impl CursorHttpClient {
         };
 
         let cursor_identity = LiveIdentityHeaders::build(token);
-        let opened = tokio::time::timeout(
-            LIVE_INITIAL_OPEN_CAP,
-            self.open_live_transport(
-                token,
-                &request_id,
-                &first_message,
-                &cursor_identity,
-                force_http1,
-                live_reconnect_allow_h1_fallback(force_http1, false),
-            ),
-        )
-        .await;
-        let (outbound, response) = match opened {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(CursorError::new(
-                    504,
-                    format!(
-                        "Cursor live open timed out after {}s",
-                        LIVE_INITIAL_OPEN_CAP.as_secs()
-                    ),
-                    None,
-                ));
+        let open = self.open_live_transport(
+            token,
+            &request_id,
+            &first_message,
+            &cursor_identity,
+            force_http1,
+            live_reconnect_allow_h1_fallback(force_http1, false),
+            live_h2_open_attempt_timeout(),
+            live_h1_open_attempt_timeout(),
+        );
+        let (outbound, response) = if let Some(rx) = cancel.as_mut() {
+            tokio::select! {
+                _ = rx.wait_for(|aborted| *aborted) => {
+                    return Err(CursorError::new(
+                        409,
+                        "Cursor live open superseded",
+                        None,
+                    ));
+                }
+                result = open => result?,
             }
+        } else {
+            open.await?
         };
+        let force_http1 = matches!(outbound, ClientOutbound::Http1(_));
 
         // Larger fan-out so token deltas don't block the BiDi read loop under
         // Claude Code backpressure (coalescing in live_sse_response).
@@ -1132,6 +1336,7 @@ impl CursorHttpClient {
             mcp_tools: mcp_tools.clone(),
             opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
             recovery: LiveRecoveryEpisode::default(),
+            breakers: TransportBreakers::default(),
         };
         // Match event fan-out: a tiny upstream queue stalls the reqwest body
         // pump (and Cursor's TCP window) during thinking bursts.
@@ -1161,6 +1366,9 @@ impl CursorHttpClient {
 
     /// Open BiDi `Run` or HTTP/1 `RunSSE`+`BidiAppend`. When BiDi fails with a
     /// transport-ish status (CLI: FORCE_BIDI_DISABLED / proxy 464), retry once via H1.
+    /// Each transport attempt has its own timeout so an H2 hang still leaves
+    /// budget for HTTP/1.
+    #[allow(clippy::too_many_arguments)]
     async fn open_live_transport(
         &self,
         token: &str,
@@ -1169,29 +1377,41 @@ impl CursorHttpClient {
         identity: &LiveIdentityHeaders,
         force_http1: bool,
         allow_h1_fallback: bool,
+        h2_timeout: Duration,
+        h1_timeout: Duration,
     ) -> Result<(ClientOutbound, reqwest::Response), CursorError> {
         if force_http1 {
-            return self
-                .open_http1_run_sse(token, request_id, first_message, identity)
-                .await;
+            return with_live_open_timeout(
+                h1_timeout,
+                self.open_http1_run_sse(token, request_id, first_message, identity),
+            )
+            .await;
         }
 
-        match self
-            .open_h2_bidi_run(token, request_id, first_message, identity)
-            .await
+        let started = Instant::now();
+        match with_live_open_timeout(
+            h2_timeout,
+            self.open_h2_bidi_run(token, request_id, first_message, identity),
+        )
+        .await
         {
             Ok(pair) => Ok(pair),
-            Err(err) if allow_h1_fallback && is_http1_fallback_error(&err) => {
+            Err(err) if allow_h1_fallback && is_explicit_http1_required(&err) => {
+                let Some(wait) = live_h1_fallback_budget(h1_timeout, started.elapsed()) else {
+                    return Err(err);
+                };
                 if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
                     eprintln!(
                         "[ccp-cursor] BiDi Run failed ({}); falling back to RunSSE+BidiAppend",
                         err.status
                     );
                 }
-                // Pin a real http1_only client. Reusing `self` still negotiates H2.
-                CursorHttpClient::with_prefer_http1(true)
-                    .open_http1_run_sse(token, request_id, first_message, identity)
-                    .await
+                let h1 = CursorHttpClient::with_prefer_http1(true);
+                with_live_open_timeout(
+                    wait,
+                    h1.open_http1_run_sse(token, request_id, first_message, identity),
+                )
+                .await
             }
             Err(err) => Err(err),
         }
@@ -1474,6 +1694,7 @@ struct LiveReconnectContext {
     mcp_tools: Option<super::proto::McpTools>,
     opening_checkpoint: Option<Vec<u8>>,
     recovery: LiveRecoveryEpisode,
+    breakers: TransportBreakers,
 }
 
 type LiveUpstream = mpsc::Receiver<Result<Option<Bytes>, String>>;
@@ -1537,22 +1758,23 @@ fn connect_frame_resets_reconnect_budget(frame: &ConnectFrame) -> bool {
     if frame.payload.is_empty() {
         return false;
     }
-    match proto::AgentServerMessage::decode(frame.payload.as_ref()) {
+    let decoded = if frame.flags & FLAG_GZIP != 0 {
+        match decode_gzip_frame(&frame.payload) {
+            Ok(bytes) => proto::AgentServerMessage::decode(bytes.as_slice()),
+            Err(_) => return false,
+        }
+    } else {
+        proto::AgentServerMessage::decode(frame.payload.as_ref())
+    };
+    match decoded {
         Ok(message) => server_message_resets_reconnect_budget(&message),
         Err(_) => false,
     }
 }
 
 fn server_message_resets_reconnect_budget(message: &proto::AgentServerMessage) -> bool {
-    if message.exec_server_message.is_some()
-        || message
-            .conversation_checkpoint_update
-            .as_ref()
-            .is_some_and(|checkpoint| !checkpoint.is_empty())
-        || message.kv_server_message.is_some()
-        || message.interaction_query.is_some()
-    {
-        return true;
+    if let Some(exec) = message.exec_server_message.as_ref() {
+        return exec.request_context_args.is_none();
     }
     let Some(update) = message.interaction_update.as_ref() else {
         return false;
@@ -1592,7 +1814,9 @@ fn reconnect_prefers_http1(force_http1: bool) -> bool {
 }
 
 const LIVE_RECONNECT_OPEN_CAP: Duration = Duration::from_secs(10);
-const LIVE_INITIAL_OPEN_CAP: Duration = Duration::from_secs(20);
+pub(crate) const LIVE_H2_OPEN_ATTEMPT: Duration = Duration::from_secs(20);
+const LIVE_H1_OPEN_ATTEMPT: Duration = Duration::from_secs(90);
+pub(crate) const LIVE_AMBIGUOUS_OPEN_TTL: Duration = Duration::from_secs(90);
 const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
 const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
@@ -1601,6 +1825,48 @@ const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn live_reconnect_open_timeout(remaining: Duration) -> Duration {
     remaining.min(LIVE_RECONNECT_OPEN_CAP)
+}
+
+fn live_h2_open_attempt_timeout() -> Duration {
+    Duration::from_secs(
+        env_u64(
+            "CCP_CURSOR_LIVE_H2_OPEN_SECS",
+            LIVE_H2_OPEN_ATTEMPT.as_secs(),
+        )
+        .clamp(10, 60),
+    )
+}
+
+fn live_h1_open_attempt_timeout() -> Duration {
+    Duration::from_secs(
+        env_u64("CCP_CURSOR_LIVE_OPEN_SECS", LIVE_H1_OPEN_ATTEMPT.as_secs()).clamp(30, 180),
+    )
+}
+
+fn live_hard_timeout_secs() -> u64 {
+    env_u64("CCP_CURSOR_LIVE_TIMEOUT_SECS", 1800).min(3600)
+}
+
+fn live_h1_fallback_budget(h1_timeout: Duration, elapsed: Duration) -> Option<Duration> {
+    let leftover = h1_timeout.saturating_sub(elapsed);
+    (!leftover.is_zero()).then_some(leftover)
+}
+
+async fn with_live_open_timeout<T>(
+    per_attempt: Duration,
+    fut: impl std::future::Future<Output = Result<T, CursorError>>,
+) -> Result<T, CursorError> {
+    match tokio::time::timeout(per_attempt, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(CursorError::new(
+            504,
+            format!(
+                "Cursor live open timed out after {}s",
+                per_attempt.as_secs()
+            ),
+            None,
+        )),
+    }
 }
 
 fn live_reconnect_allow_h1_fallback(force_http1: bool, http1_rejected: bool) -> bool {
@@ -1648,29 +1914,31 @@ fn breaker_for(breakers: &mut TransportBreakers, http1: bool) -> &mut TransportB
     }
 }
 
-static TRANSPORT_BREAKERS: LazyLock<Mutex<TransportBreakers>> =
-    LazyLock::new(|| Mutex::new(TransportBreakers::default()));
-
-fn lock_transport_breakers() -> std::sync::MutexGuard<'static, TransportBreakers> {
-    TRANSPORT_BREAKERS.lock().unwrap_or_else(|e| e.into_inner())
+fn record_transport_failure(reconnect: &mut LiveReconnectContext, now: Instant) {
+    breaker_for(&mut reconnect.breakers, reconnect.force_http1).on_failure(now);
 }
 
-fn record_transport_failure(http1: bool, now: Instant) {
-    breaker_for(&mut lock_transport_breakers(), http1).on_failure(now);
-}
-
-fn record_transport_success(http1: bool) {
-    breaker_for(&mut lock_transport_breakers(), http1).on_success();
+fn record_transport_success(reconnect: &mut LiveReconnectContext) {
+    breaker_for(&mut reconnect.breakers, reconnect.force_http1).on_success();
 }
 
 fn apply_transport_breakers(reconnect: &mut LiveReconnectContext, now: Instant) {
-    let breakers = lock_transport_breakers();
-    if !breakers.h2.allows(now) {
-        reconnect.force_http1 = true;
+    if reconnect.http1_rejected {
+        reconnect.force_http1 = false;
+        return;
     }
-    if !breakers.h1.allows(now) {
-        reconnect.http1_rejected = true;
+    let h2_ok = reconnect.breakers.h2.allows(now);
+    let h1_ok = reconnect.breakers.h1.allows(now);
+    if reconnect.force_http1 && !h1_ok && h2_ok {
+        reconnect.force_http1 = false;
     }
+}
+
+fn live_reconnect_open_allow_h1(_reconnect: &LiveReconnectContext, _now: Instant) -> bool {
+    // Transport switches belong to the reconnect state machine (`ForceHttp1` /
+    // `FlipToH2`). Falling back inside one `open_live_transport` hides which
+    // transport produced 464 and duplicates ResumeAction.
+    false
 }
 
 fn live_idle_stall_message(
@@ -1696,7 +1964,20 @@ fn live_idle_stall_message(
     {
         return Some("Cursor stream stalled after partial progress");
     }
+    if useful && saw_text && pending_empty && since_progress >= stream_idle.saturating_mul(2) {
+        return Some("Cursor stream stalled after partial progress");
+    }
     None
+}
+
+fn live_probation_expired(on_probation: bool, got_progress: bool, remaining: Duration) -> bool {
+    on_probation && !got_progress && remaining.is_zero()
+}
+
+/// After a ResumeAction HTTP 200, another ResumeAction is only safe once this
+/// stream has produced a body chunk. Delayed hollow EOF must fail closed.
+fn live_should_resume_after_drop(on_probation: bool, got_chunk_since_reconnect: bool) -> bool {
+    !on_probation || got_chunk_since_reconnect
 }
 
 fn annotate_connect_end_error(session_id: &str, error: ConnectEndError) -> String {
@@ -1739,34 +2020,55 @@ fn live_reconnect_on_open_error(
         }
         return LiveReconnectTransportAction::FlipToH2;
     }
-    if http1_rejected {
+    if force_http1 && http1_rejected {
         return LiveReconnectTransportAction::GiveUp(
             "HTTP/1 rejected by proxy and HTTP/2 still failing",
         );
     }
-    if !force_http1 && is_http1_fallback_error(err) {
+    if !force_http1 && is_explicit_http1_required(err) {
         return LiveReconnectTransportAction::ForceHttp1;
+    }
+    if err.status == 0 || is_response_less_send_error(err) {
+        return LiveReconnectTransportAction::GiveUp(
+            "response-less ResumeAction send is ambiguous",
+        );
+    }
+    if http1_rejected {
+        return LiveReconnectTransportAction::KeepTrying;
     }
     LiveReconnectTransportAction::KeepTrying
 }
 
-fn live_reconnect_on_hollow_body(http1_rejected: bool) -> LiveReconnectTransportAction {
-    if http1_rejected {
-        LiveReconnectTransportAction::GiveUp(
-            "HTTP/1 rejected by proxy and HTTP/2 resume was hollow",
-        )
-    } else {
-        LiveReconnectTransportAction::ForceHttp1
-    }
+fn live_reconnect_on_hollow_body(
+    _force_http1: bool,
+    _http1_rejected: bool,
+) -> LiveReconnectTransportAction {
+    LiveReconnectTransportAction::GiveUp(
+        "HTTP 200 resume had no body; another ResumeAction would duplicate it",
+    )
 }
 
+fn is_explicit_http1_required(err: &CursorError) -> bool {
+    if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
+    matches!(err.status, 421 | 464)
+        || err.message.contains("HTTP_1_1_REQUIRED")
+        || err.message.contains("FORCE_BIDI_DISABLED")
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("HTTP_1_1_REQUIRED") || d.contains("FORCE_BIDI_DISABLED"))
+}
+
+#[cfg(test)]
 fn is_http1_fallback_error(err: &CursorError) -> bool {
-    matches!(
-        err.status,
-        // Proxy/CDN HTTP version rejects (Surge/Clash 464), gateway blips, or
-        // Connect "unimplemented"/BiDi-disabled style failures.
-        408 | 421 | 464 | 502 | 503 | 504
-    ) || err.message.contains("error sending request")
+    if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
+    is_explicit_http1_required(err)
+        || matches!(err.status, 408 | 502 | 503 | 504)
+        || err.message.contains("error sending request")
         || err.message.contains("connection")
         || is_h2_stream_reset(&err.message)
         || err.detail.as_deref().is_some_and(|d| {
@@ -1774,9 +2076,72 @@ fn is_http1_fallback_error(err: &CursorError) -> bool {
         })
 }
 
+fn live_send_failure_is_terminal(err: &CursorError) -> bool {
+    !is_retryable_live_transport_error(err)
+}
+
+pub(crate) fn is_ambiguous_live_open_timeout(err: &CursorError) -> bool {
+    err.status == 504
+}
+
+fn is_pre_connect_failure(err: &CursorError) -> bool {
+    err.message.contains("connect failed")
+}
+
+fn is_response_less_send_error(err: &CursorError) -> bool {
+    if is_explicit_http1_required(err) {
+        return false;
+    }
+    if is_ambiguous_live_open_timeout(err) || err.status == 0 {
+        return true;
+    }
+    if is_pre_connect_failure(err) {
+        return false;
+    }
+    let blob = format!("{}{}", err.message, err.detail.as_deref().unwrap_or(""));
+    err.status == 502
+        && (blob.contains("error sending request")
+            || blob.contains("connection reset")
+            || blob.contains("connection closed")
+            || is_h2_stream_reset(&blob))
+}
+
+pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
+    if matches!(err.status, 400 | 401 | 403 | 404 | 409 | 421 | 429 | 464) {
+        return false;
+    }
+    if is_pre_connect_failure(err) {
+        return false;
+    }
+    matches!(err.status, 0 | 502 | 503 | 504)
+        || err.message.contains("timed out")
+        || err.message.contains("connection")
+        || err.message.contains("reset")
+}
+
+fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("no progress")
+        || lower.contains("ambiguous")
+        || lower.contains("had no body")
+        || lower.contains("ended before the first byte")
+}
+
+fn classify_outbound_send(result: Result<(), CursorError>) -> Result<bool, CursorError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(err) if live_send_failure_is_terminal(&err) => Err(err),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Semantic Cursor errors (400/401/403/429) must not be retried on another
 /// transport — that burns quota and can duplicate an already-accepted run.
 pub(crate) fn is_retryable_live_transport_error(err: &CursorError) -> bool {
+    if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
     matches!(err.status, 0 | 408 | 421 | 464 | 502 | 503 | 504)
         || err.message.contains("error sending request")
         || err.message.contains("connection")
@@ -1873,9 +2238,10 @@ fn live_reconnect_should_force_http1(
     got_chunk_since_reconnect: bool,
     reconnect_attempts: u32,
     already_http1: bool,
+    http1_rejected: bool,
     stream_error: Option<&str>,
 ) -> bool {
-    if already_http1 {
+    if already_http1 || http1_rejected {
         return false;
     }
     if stream_error.is_some_and(is_h2_stream_reset) {
@@ -1894,6 +2260,7 @@ fn prepare_live_reconnect(
         got_chunk_since_reconnect,
         reconnect_attempts,
         reconnect.force_http1,
+        reconnect.http1_rejected,
         stream_error,
     ) {
         reconnect.force_http1 = true;
@@ -1977,7 +2344,7 @@ async fn try_live_reconnect(
     max_reconnects: u32,
     last_progress: &mut Instant,
     resume_grace_until: &mut Option<Instant>,
-    resume_grace: Duration,
+    _resume_grace: Duration,
     hard_deadline: Instant,
 ) -> LiveReconnectOutcome {
     let checkpoint = latest_checkpoint
@@ -2058,8 +2425,24 @@ async fn try_live_reconnect(
             return outcome;
         }
         if !closed_collecting {
-            let _ = control_close_collecting_natives(pending, outbound).await;
-            closed_collecting = true;
+            match control_close_collecting_natives(pending, outbound).await {
+                Err(err) => {
+                    let outcome = LiveReconnectOutcome::Failed(format!(
+                        "Connect error {}: {}",
+                        err.status, err.message
+                    ));
+                    log_live_reconnect(
+                        &outcome,
+                        *reconnect_attempts,
+                        max_reconnects,
+                        &reconnect.http,
+                    );
+                    return outcome;
+                }
+                Ok(_) => {
+                    closed_collecting = true;
+                }
+            }
         }
         *reconnect_attempts += 1;
         reconnect.recovery.opens = reconnect.recovery.opens.saturating_add(1);
@@ -2126,81 +2509,36 @@ async fn try_live_reconnect(
             return outcome;
         }
 
-        let opened = tokio::time::timeout(
-            open_wait,
-            reconnect.http.open_live_transport(
+        let opened = reconnect
+            .http
+            .open_live_transport(
                 &reconnect.token,
                 &request_id,
                 &first_message,
                 &reconnect.identity,
                 reconnect.force_http1,
-                live_reconnect_allow_h1_fallback(reconnect.force_http1, reconnect.http1_rejected),
-            ),
-        )
-        .await;
+                live_reconnect_open_allow_h1(reconnect, Instant::now()),
+                open_wait,
+                open_wait,
+            )
+            .await;
 
         match opened {
-            Err(_) => {
-                last_fail = Some("reconnect open timed out".into());
-                reconnect.recovery.last_was_hollow = true;
-                record_transport_failure(reconnect.force_http1, Instant::now());
+            Err(err) if is_response_less_send_error(&err) => {
+                let outcome = LiveReconnectOutcome::Failed(format!(
+                    "{} (response-less ResumeAction send is ambiguous)",
+                    err.message
+                ));
+                log_live_reconnect(
+                    &outcome,
+                    *reconnect_attempts,
+                    max_reconnects,
+                    &reconnect.http,
+                );
+                return outcome;
             }
-            Ok(Ok((new_outbound, response))) => {
-                let stream = response.bytes_stream();
-                match take_immediate_resume_chunk(stream).await {
-                    Ok((prefix, rest)) => {
-                        *outbound = new_outbound;
-                        let pump_tx = fence_live_upstream(upstream, upstream_tx);
-                        spawn_upstream_pump_prefixed(prefix, rest, pump_tx);
-                        *decoder = ConnectFrameDecoder::new();
-                        *last_progress = Instant::now();
-                        *resume_grace_until = Some(Instant::now() + resume_grace);
-                        reconnect.recovery.on_probation = true;
-                        let outcome = LiveReconnectOutcome::Reconnected;
-                        log_live_reconnect(
-                            &outcome,
-                            *reconnect_attempts,
-                            max_reconnects,
-                            &reconnect.http,
-                        );
-                        return outcome;
-                    }
-                    Err(msg) => {
-                        last_fail = Some(msg.clone());
-                        reconnect.recovery.last_was_hollow = true;
-                        record_transport_failure(reconnect.force_http1, Instant::now());
-                        match live_reconnect_on_hollow_body(reconnect.http1_rejected) {
-                            LiveReconnectTransportAction::GiveUp(reason) => {
-                                let outcome =
-                                    LiveReconnectOutcome::Failed(format!("{msg} ({reason})"));
-                                log_live_reconnect(
-                                    &outcome,
-                                    *reconnect_attempts,
-                                    max_reconnects,
-                                    &reconnect.http,
-                                );
-                                return outcome;
-                            }
-                            LiveReconnectTransportAction::ForceHttp1 => {
-                                reconnect.force_http1 = true;
-                                let mut fields = serde_json::Map::new();
-                                fields.insert(
-                                    "attempts".into(),
-                                    serde_json::json!(*reconnect_attempts),
-                                );
-                                fields.insert("detail".into(), serde_json::json!(msg));
-                                crate::logging::create_logger("cursor")
-                                    .warn("live_reconnect_http1", Some(fields));
-                            }
-                            LiveReconnectTransportAction::FlipToH2
-                            | LiveReconnectTransportAction::KeepTrying => {}
-                        }
-                    }
-                }
-            }
-            Ok(Err(err)) => {
+            Err(err) => {
                 last_fail = Some(format!("{} ({})", err.message, err.status));
-                record_transport_failure(reconnect.force_http1, Instant::now());
                 if !is_retryable_live_transport_error(&err) {
                     let outcome = LiveReconnectOutcome::Failed(
                         last_fail.clone().unwrap_or_else(|| err.to_string()),
@@ -2213,6 +2551,7 @@ async fn try_live_reconnect(
                     );
                     return outcome;
                 }
+                record_transport_failure(reconnect, Instant::now());
                 match live_reconnect_on_open_error(
                     reconnect.force_http1,
                     reconnect.http1_rejected,
@@ -2239,6 +2578,64 @@ async fn try_live_reconnect(
                         reconnect.force_http1 = true;
                     }
                     LiveReconnectTransportAction::KeepTrying => {}
+                }
+            }
+            Ok((new_outbound, response)) => {
+                let stream = response.bytes_stream();
+                match take_immediate_resume_chunk(stream).await {
+                    Ok((prefix, rest)) => {
+                        *outbound = new_outbound;
+                        reconnect.force_http1 = matches!(*outbound, ClientOutbound::Http1(_));
+                        let pump_tx = fence_live_upstream(upstream, upstream_tx);
+                        spawn_upstream_pump_prefixed(prefix, rest, pump_tx);
+                        *decoder = ConnectFrameDecoder::new();
+                        *last_progress = Instant::now();
+                        // Probation is bounded by the 45s episode, not 120s tool-result grace.
+                        *resume_grace_until = None;
+                        reconnect.recovery.on_probation = true;
+                        let outcome = LiveReconnectOutcome::Reconnected;
+                        log_live_reconnect(
+                            &outcome,
+                            *reconnect_attempts,
+                            max_reconnects,
+                            &reconnect.http,
+                        );
+                        return outcome;
+                    }
+                    Err(msg) => {
+                        last_fail = Some(msg.clone());
+                        reconnect.recovery.last_was_hollow = true;
+                        record_transport_failure(reconnect, Instant::now());
+                        match live_reconnect_on_hollow_body(
+                            reconnect.force_http1,
+                            reconnect.http1_rejected,
+                        ) {
+                            LiveReconnectTransportAction::GiveUp(reason) => {
+                                let outcome =
+                                    LiveReconnectOutcome::Failed(format!("{msg} ({reason})"));
+                                log_live_reconnect(
+                                    &outcome,
+                                    *reconnect_attempts,
+                                    max_reconnects,
+                                    &reconnect.http,
+                                );
+                                return outcome;
+                            }
+                            LiveReconnectTransportAction::ForceHttp1 => {
+                                reconnect.force_http1 = true;
+                                let mut fields = serde_json::Map::new();
+                                fields.insert(
+                                    "attempts".into(),
+                                    serde_json::json!(*reconnect_attempts),
+                                );
+                                fields.insert("detail".into(), serde_json::json!(msg));
+                                crate::logging::create_logger("cursor")
+                                    .warn("live_reconnect_http1", Some(fields));
+                            }
+                            LiveReconnectTransportAction::FlipToH2
+                            | LiveReconnectTransportAction::KeepTrying => {}
+                        }
+                    }
                 }
             }
         }
@@ -2379,21 +2776,26 @@ async fn emit_live_delta(
     true
 }
 
-async fn control_close_natives(pending: &mut PendingExecState, outbound: &ClientOutbound) -> bool {
+async fn control_close_natives(
+    pending: &mut PendingExecState,
+    outbound: &ClientOutbound,
+) -> Result<bool, CursorError> {
     for exec in pending.drain_natives() {
         if let Ok(frame) = encode_control_close(exec.id) {
-            if !outbound.send_connect_frame(frame).await {
-                return false;
+            match classify_outbound_send(outbound.send_connect_frame(frame).await) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(err) => return Err(err),
             }
         }
     }
-    true
+    Ok(true)
 }
 
 async fn control_close_collecting_natives(
     pending: &mut PendingExecState,
     outbound: &ClientOutbound,
-) -> bool {
+) -> Result<bool, CursorError> {
     let natives = pending.drain_collecting_natives();
     let mut unsent = Vec::new();
     let mut iter = natives.into_iter();
@@ -2405,15 +2807,24 @@ async fn control_close_collecting_natives(
             unsent.extend(iter);
             break;
         };
-        if !outbound.send_connect_frame(frame).await {
-            all_ok = false;
-            unsent.push(exec);
-            unsent.extend(iter);
-            break;
+        match classify_outbound_send(outbound.send_connect_frame(frame).await) {
+            Ok(true) => {}
+            Ok(false) => {
+                all_ok = false;
+                unsent.push(exec);
+                unsent.extend(iter);
+                break;
+            }
+            Err(err) => {
+                unsent.push(exec);
+                unsent.extend(iter);
+                pending.restore_collecting_natives(unsent);
+                return Err(err);
+            }
         }
     }
     pending.restore_collecting_natives(unsent);
-    all_ok
+    Ok(all_ok)
 }
 
 struct LiveTurnCtx<'a> {
@@ -2497,7 +2908,7 @@ async fn drive_live_run(
         "CCP_CURSOR_COMPLETE_IDLE_MS",
         u64::MAX / 4, // disabled unless explicitly overridden
     ));
-    let hard = Duration::from_secs(env_u64("CCP_CURSOR_TIMEOUT_SECS", 1800));
+    let hard = Duration::from_secs(live_hard_timeout_secs());
     let hard_deadline = run_started + hard;
     let tool_ttl = Duration::from_secs(env_u64("CCP_CURSOR_TOOL_TTL_SECS", 600));
     // CLI transport/stall retries: 10 (prod). Keep Anthropic SSE open across
@@ -2519,6 +2930,116 @@ async fn drive_live_run(
                 break 'driver;
             }
             sink = None;
+        }
+        if run_started.elapsed() >= hard {
+            let message = if pending.is_empty() {
+                "Cursor live run hard timeout".into()
+            } else {
+                "Cursor live run hard timeout with pending native tools".into()
+            };
+            report_terminal_error(&mut sink, &terminal_error, message).await;
+            break 'driver;
+        }
+        if live_probation_expired(
+            reconnect.recovery.on_probation,
+            got_chunk_since_reconnect,
+            reconnect.recovery.remaining(Instant::now()),
+        ) {
+            report_terminal_error(
+                &mut sink,
+                &terminal_error,
+                "Cursor resume produced no progress before the recovery deadline".into(),
+            )
+            .await;
+            break 'driver;
+        }
+        if let Some(since) = pending.oldest_since() {
+            if since.elapsed() >= tool_ttl {
+                report_terminal_error(
+                    &mut sink,
+                    &terminal_error,
+                    "Cursor tool result wait expired".into(),
+                )
+                .await;
+                break 'driver;
+            }
+        } else if !reconnect.recovery.on_probation
+            && resume_grace_until.is_some_and(|until| Instant::now() < until)
+        {
+            // Post-tool-result grace: keep waiting for the next model delta.
+        } else if !logical_tools_waiting.is_empty() {
+            if logical_tools_waiting
+                .oldest_since()
+                .is_some_and(|since| since.elapsed() >= stream_idle)
+            {
+                logical_tools_waiting.clear();
+            }
+        } else if !wait_for_turn_ended && saw_text && last_progress.elapsed() >= complete_idle {
+            emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End).await;
+            break 'driver;
+        } else if let Some(message) = live_idle_stall_message(
+            useful,
+            saw_text,
+            allowed_tool_names.is_some(),
+            pending.is_empty(),
+            last_progress.elapsed(),
+            setup_idle,
+            stream_idle,
+        ) {
+            let has_checkpoint = latest_checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| !checkpoint.is_empty())
+                || reconnect
+                    .opening_checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| !checkpoint.is_empty());
+            if has_checkpoint {
+                let reconnect_outcome = if live_should_resume_after_drop(
+                    reconnect.recovery.on_probation,
+                    got_chunk_since_reconnect,
+                ) {
+                    prepare_live_reconnect(
+                        &mut reconnect,
+                        got_chunk_since_reconnect,
+                        reconnect_attempts,
+                        None,
+                    );
+                    try_live_reconnect(
+                        &mut reconnect,
+                        &mut outbound,
+                        &mut upstream,
+                        &mut upstream_tx,
+                        &mut decoder,
+                        &latest_checkpoint,
+                        &kv_blobs,
+                        &mut pending,
+                        &mut reconnect_attempts,
+                        max_reconnects,
+                        &mut last_progress,
+                        &mut resume_grace_until,
+                        resume_grace,
+                        hard_deadline,
+                    )
+                    .await
+                } else {
+                    LiveReconnectOutcome::Failed(
+                        "Cursor resume produced no progress before the stream stalled".into(),
+                    )
+                };
+                if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
+                    got_chunk_since_reconnect = false;
+                    continue 'driver;
+                }
+                report_terminal_error(
+                    &mut sink,
+                    &terminal_error,
+                    format!("{message}{}", reconnect_note(&reconnect_outcome)),
+                )
+                .await;
+            } else {
+                report_terminal_error(&mut sink, &terminal_error, message.into()).await;
+            }
+            break 'driver;
         }
         let batch_deadline = pending.collect_deadline();
         let coalesce_deadline = coalescer.deadline();
@@ -2551,42 +3072,70 @@ async fn drive_live_run(
                         let frames = match encode_tool_result_batch(pending.awaiting(), &tool_results) {
                             Ok(frames) => frames,
                             Err(error) => {
-                                let _ = ack.send(Err(error));
+                                let _ = ack.send(Err(CursorError::new(400, error, None)));
                                 continue;
                             }
                         };
 
                         let mut send_failed = false;
+                        let mut terminal_send: Option<CursorError> = None;
                         for frame in &frames {
-                            if !outbound.send_connect_frame(frame.clone()).await {
-                                send_failed = true;
-                                break;
+                            match outbound.send_connect_frame(frame.clone()).await {
+                                Ok(()) => {}
+                                Err(err) if live_send_failure_is_terminal(&err) => {
+                                    terminal_send = Some(err);
+                                    break;
+                                }
+                                Err(_) => {
+                                    send_failed = true;
+                                    break;
+                                }
                             }
                         }
-                        if send_failed {
-                            prepare_live_reconnect(
-                                &mut reconnect,
-                                got_chunk_since_reconnect,
-                                reconnect_attempts,
-                                None,
-                            );
-                            let reconnect_outcome = try_live_reconnect(
-                                &mut reconnect,
-                                &mut outbound,
-                                &mut upstream,
-                                &mut upstream_tx,
-                                &mut decoder,
-                                &latest_checkpoint,
-                                &kv_blobs,
-                                &mut pending,
-                                &mut reconnect_attempts,
-                                max_reconnects,
-                                &mut last_progress,
-                                &mut resume_grace_until,
-                                resume_grace,
-                                hard_deadline,
+                        if let Some(err) = terminal_send {
+                            report_terminal_error(
+                                &mut sink,
+                                &terminal_error,
+                                err.to_string(),
                             )
                             .await;
+                            let _ = ack.send(Err(err));
+                            break 'driver;
+                        }
+                        if send_failed {
+                            let reconnect_outcome = if live_should_resume_after_drop(
+                                reconnect.recovery.on_probation,
+                                got_chunk_since_reconnect,
+                            ) {
+                                prepare_live_reconnect(
+                                    &mut reconnect,
+                                    got_chunk_since_reconnect,
+                                    reconnect_attempts,
+                                    None,
+                                );
+                                try_live_reconnect(
+                                    &mut reconnect,
+                                    &mut outbound,
+                                    &mut upstream,
+                                    &mut upstream_tx,
+                                    &mut decoder,
+                                    &latest_checkpoint,
+                                    &kv_blobs,
+                                    &mut pending,
+                                    &mut reconnect_attempts,
+                                    max_reconnects,
+                                    &mut last_progress,
+                                    &mut resume_grace_until,
+                                    resume_grace,
+                                    hard_deadline,
+                                )
+                                .await
+                            } else {
+                                LiveReconnectOutcome::Failed(
+                                    "Cursor resume produced no progress before tool-result send failed"
+                                        .into(),
+                                )
+                            };
                             send_failed = !matches!(
                                 reconnect_outcome,
                                 LiveReconnectOutcome::Reconnected
@@ -2594,17 +3143,37 @@ async fn drive_live_run(
                             if !send_failed {
                                 got_chunk_since_reconnect = false;
                                 for frame in &frames {
-                                    if !outbound.send_connect_frame(frame.clone()).await {
-                                        send_failed = true;
-                                        break;
+                                    match outbound.send_connect_frame(frame.clone()).await {
+                                        Ok(()) => {}
+                                        Err(err) if live_send_failure_is_terminal(&err) => {
+                                            report_terminal_error(
+                                                &mut sink,
+                                                &terminal_error,
+                                                err.to_string(),
+                                            )
+                                            .await;
+                                            let _ = ack.send(Err(err));
+                                            break 'driver;
+                                        }
+                                        Err(_) => {
+                                            send_failed = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                             if send_failed {
-                                let _ = ack.send(Err(format!(
+                                let message = format!(
                                     "Cursor request stream closed during tool resume{}",
                                     reconnect_note(&reconnect_outcome)
-                                )));
+                                );
+                                report_terminal_error(
+                                    &mut sink,
+                                    &terminal_error,
+                                    message.clone(),
+                                )
+                                .await;
+                                let _ = ack.send(Err(CursorError::internal(message)));
                                 break 'driver;
                             }
                         }
@@ -2663,7 +3232,7 @@ async fn drive_live_run(
                         if live_reconnect_should_reset_budget(&frames) {
                             got_chunk_since_reconnect = true;
                             reconnect_attempts = 0;
-                            record_transport_success(reconnect.force_http1);
+                            record_transport_success(&mut reconnect);
                             reconnect.recovery.reset();
                         }
                         for frame in frames {
@@ -2728,30 +3297,41 @@ async fn drive_live_run(
                     }
                     Some(Ok(None)) | None => {
                         // Abrupt EOF without Connect END / turn_ended — try
-                        // ResumeAction reconnect (CLI stall recovery).
-                        prepare_live_reconnect(
-                            &mut reconnect,
+                        // ResumeAction reconnect (CLI stall recovery) unless this
+                        // is a delayed hollow after HTTP 200 with no body.
+                        let reconnect_outcome = if live_should_resume_after_drop(
+                            reconnect.recovery.on_probation,
                             got_chunk_since_reconnect,
-                            reconnect_attempts,
-                            None,
-                        );
-                        let reconnect_outcome = try_live_reconnect(
-                            &mut reconnect,
-                            &mut outbound,
-                            &mut upstream,
-                            &mut upstream_tx,
-                            &mut decoder,
-                            &latest_checkpoint,
-                            &kv_blobs,
-                            &mut pending,
-                            &mut reconnect_attempts,
-                            max_reconnects,
-                            &mut last_progress,
-                            &mut resume_grace_until,
-                            resume_grace,
-                            hard_deadline,
-                        )
-                        .await;
+                        ) {
+                            prepare_live_reconnect(
+                                &mut reconnect,
+                                got_chunk_since_reconnect,
+                                reconnect_attempts,
+                                None,
+                            );
+                            try_live_reconnect(
+                                &mut reconnect,
+                                &mut outbound,
+                                &mut upstream,
+                                &mut upstream_tx,
+                                &mut decoder,
+                                &latest_checkpoint,
+                                &kv_blobs,
+                                &mut pending,
+                                &mut reconnect_attempts,
+                                max_reconnects,
+                                &mut last_progress,
+                                &mut resume_grace_until,
+                                resume_grace,
+                                hard_deadline,
+                            )
+                            .await
+                        } else {
+                            LiveReconnectOutcome::Failed(
+                                "Cursor resume produced no progress before the stream ended"
+                                    .into(),
+                            )
+                        };
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                             got_chunk_since_reconnect = false;
                             continue 'driver;
@@ -2782,7 +3362,18 @@ async fn drive_live_run(
                                     )
                                 })
                             {
-                                let _ = control_close_natives(&mut pending, &outbound).await;
+                                match control_close_natives(&mut pending, &outbound).await {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        report_terminal_error(
+                                            &mut sink,
+                                            &terminal_error,
+                                            err.to_string(),
+                                        )
+                                        .await;
+                                        break 'driver;
+                                    }
+                                }
                             }
                             if pending.all_client_only() {
                                 let _ = flush_coalescer(&mut sink, &mut deferred, &mut coalescer)
@@ -2821,29 +3412,38 @@ async fn drive_live_run(
                         break 'driver;
                     }
                     Some(Err(error)) => {
-                        prepare_live_reconnect(
-                            &mut reconnect,
+                        let reconnect_outcome = if live_should_resume_after_drop(
+                            reconnect.recovery.on_probation,
                             got_chunk_since_reconnect,
-                            reconnect_attempts,
-                            Some(error.as_str()),
-                        );
-                        let reconnect_outcome = try_live_reconnect(
-                            &mut reconnect,
-                            &mut outbound,
-                            &mut upstream,
-                            &mut upstream_tx,
-                            &mut decoder,
-                            &latest_checkpoint,
-                            &kv_blobs,
-                            &mut pending,
-                            &mut reconnect_attempts,
-                            max_reconnects,
-                            &mut last_progress,
-                            &mut resume_grace_until,
-                            resume_grace,
-                            hard_deadline,
-                        )
-                        .await;
+                        ) {
+                            prepare_live_reconnect(
+                                &mut reconnect,
+                                got_chunk_since_reconnect,
+                                reconnect_attempts,
+                                Some(error.as_str()),
+                            );
+                            try_live_reconnect(
+                                &mut reconnect,
+                                &mut outbound,
+                                &mut upstream,
+                                &mut upstream_tx,
+                                &mut decoder,
+                                &latest_checkpoint,
+                                &kv_blobs,
+                                &mut pending,
+                                &mut reconnect_attempts,
+                                max_reconnects,
+                                &mut last_progress,
+                                &mut resume_grace_until,
+                                resume_grace,
+                                hard_deadline,
+                            )
+                            .await
+                        } else {
+                            LiveReconnectOutcome::Failed(format!(
+                                "Cursor resume produced no progress ({error})"
+                            ))
+                        };
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
                             got_chunk_since_reconnect = false;
                             continue 'driver;
@@ -2905,60 +3505,8 @@ async fn drive_live_run(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                // Agent/tool runs must wait for Cursor `turn_ended` (or a native
-                // exec). Fable often emits a short plan text then thinks quietly
-                // for many minutes — inventing End after a few minutes truncates
-                // real work and also races Claude Code's ≥5m stream idle watchdog.
-                if run_started.elapsed() >= hard {
-                    let message = if pending.is_empty() {
-                        "Cursor live run hard timeout".into()
-                    } else {
-                        "Cursor live run hard timeout with pending native tools".into()
-                    };
-                    report_terminal_error(&mut sink, &terminal_error, message).await;
-                    break 'driver;
-                }
-                if let Some(since) = pending.oldest_since() {
-                    if since.elapsed() >= tool_ttl {
-                        report_terminal_error(
-                            &mut sink,
-                            &terminal_error,
-                            "Cursor tool result wait expired".into(),
-                        )
-                        .await;
-                        break 'driver;
-                    }
-                } else if resume_grace_until.is_some_and(|until| Instant::now() < until) {
-                    // Post-tool-result grace: keep waiting for the next model delta.
-                } else if !logical_tools_waiting.is_empty() {
-                    // A UI tool_call_started is not executable by itself. Wait for the
-                    // authoritative ExecServerMessage instead of falsely ending the turn.
-                    // Use oldest_since (ignores heartbeats) — last_progress used to stall
-                    // forever under InteractionUpdate.heartbeat floods (~1–2m empty turns).
-                    if logical_tools_waiting
-                        .oldest_since()
-                        .is_some_and(|since| since.elapsed() >= stream_idle)
-                    {
-                        logical_tools_waiting.clear();
-                    }
-                } else if !wait_for_turn_ended
-                    && saw_text
-                    && last_progress.elapsed() >= complete_idle
-                {
-                    emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End).await;
-                    break 'driver;
-                } else if let Some(message) = live_idle_stall_message(
-                    useful,
-                    saw_text,
-                    allowed_tool_names.is_some(),
-                    pending.is_empty(),
-                    last_progress.elapsed(),
-                    setup_idle,
-                    stream_idle,
-                ) {
-                    report_terminal_error(&mut sink, &terminal_error, message.into()).await;
-                    break 'driver;
-                }
+                // Wake so top-of-loop deadline checks cannot be starved by
+                // heartbeat/KV frames on the biased upstream arm.
             }
         }
     }
@@ -2973,7 +3521,9 @@ async fn drive_live_run(
         .iter()
         .any(|exec| matches!(exec.kind, CursorExecKind::ClientOnly));
     if client_only_teardown && pending.has_outstanding_native() {
-        let _ = control_close_natives(&mut pending, &outbound).await;
+        if let Err(err) = control_close_natives(&mut pending, &outbound).await {
+            report_terminal_error(&mut sink, &terminal_error, err.to_string()).await;
+        }
     }
     if client_only_teardown {
         super::conversation::clear_checkpoint(&session_id);
@@ -3041,9 +3591,15 @@ async fn process_live_frame(
                 && pending.all().any(|exec| {
                     matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
                 })
-                && !control_close_natives(pending, outbound).await
             {
-                return false;
+                match control_close_natives(pending, outbound).await {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(err) => {
+                        report_terminal_error(sink, terminal_error, err.to_string()).await;
+                        return false;
+                    }
+                }
             }
             if pending.all_client_only() {
                 return expose_collected_tools(pending, pending_shared, sink).await;
@@ -3131,8 +3687,6 @@ async fn process_live_frame(
     if let Some(checkpoint) = message.conversation_checkpoint_update {
         if !checkpoint.is_empty() {
             *latest_checkpoint = Some(checkpoint);
-            *useful = true;
-            *last_progress = Instant::now();
         }
         return true;
     }
@@ -3185,8 +3739,6 @@ async fn process_live_frame(
                 return false;
             }
         }
-        *last_progress = Instant::now();
-        *useful = true;
         return true;
     }
 
@@ -3216,7 +3768,6 @@ async fn process_live_frame(
                     return false;
                 }
             }
-            *last_progress = Instant::now();
             return true;
         }
 
@@ -3579,9 +4130,15 @@ async fn process_interaction_update(
                 && pending.all().any(|exec| {
                     matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly)
                 })
-                && !control_close_natives(pending, outbound).await
             {
-                return false;
+                match control_close_natives(pending, outbound).await {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(err) => {
+                        report_terminal_error(sink, terminal_error, err.to_string()).await;
+                        return false;
+                    }
+                }
             }
             if pending.all_client_only() {
                 // Workflow/Skill: expose Anthropic tool_use and end BiDi
@@ -3717,7 +4274,7 @@ async fn send_frame_or_fail(
     frame: Bytes,
     what: &str,
 ) -> bool {
-    if outbound.send_connect_frame(frame).await {
+    if outbound.send_connect_frame(frame).await.is_ok() {
         return true;
     }
     report_terminal_error(sink, terminal_error, format!("Cursor {what} send failed")).await;
@@ -4553,6 +5110,22 @@ fn publish_live_usage(
     }
 }
 
+fn live_sse_on_driver_drop(encoder: &CursorSseEncoder) -> Option<Vec<u8>> {
+    if encoder.is_finalized() {
+        return None;
+    }
+    Some(format_sse_event_bytes(
+        EVENT_ERROR,
+        &serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "Cursor stream ended without turn_ended"
+            }
+        }),
+    ))
+}
+
 pub fn live_sse_response(
     events: mpsc::Receiver<LiveEventResult>,
     message_id: String,
@@ -4694,8 +5267,17 @@ pub fn live_sse_response(
                                 ));
                             }
                             None => {
-                                state.encoder.finalize();
                                 state.done = true;
+                                if let Some(error_bytes) = live_sse_on_driver_drop(&state.encoder) {
+                                    if let Some((ref handle, ref req_id)) = state.monitor {
+                                        handle.request_failed(
+                                            req_id,
+                                            Some(502),
+                                            "Cursor stream ended without turn_ended",
+                                        );
+                                    }
+                                    return Some((Ok(Bytes::from(error_bytes)), state));
+                                }
                                 let bytes = state.encoder.take_bytes();
                                 if !bytes.is_empty() || state.pending_monitor_bytes > 0 {
                                     publish_live_usage(
@@ -4766,6 +5348,7 @@ mod tests {
         RequestContextEnv, TextDelta, TurnEnded,
     };
     use super::*;
+    use prost::Message;
 
     fn pending_exec(id: u32, tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
@@ -4799,6 +5382,7 @@ mod tests {
             mcp_tools: None,
             opening_checkpoint: None,
             recovery: LiveRecoveryEpisode::default(),
+            breakers: TransportBreakers::default(),
         }
     }
 
@@ -4843,6 +5427,271 @@ mod tests {
         }
         let transport = CursorError::new(502, "error sending request", None);
         assert!(is_retryable_live_transport_error(&transport));
+        let rate_limit_with_connection = CursorError::new(
+            429,
+            "Connect error 429: connection closed: rate limit exceeded",
+            None,
+        );
+        assert!(
+            !is_retryable_live_transport_error(&rate_limit_with_connection),
+            "429 mentioning connection must still not retry"
+        );
+    }
+
+    #[test]
+    fn initial_h2_open_fails_fast_http1_keeps_upload_budget() {
+        assert_eq!(LIVE_H2_OPEN_ATTEMPT.as_secs(), 20);
+        assert_eq!(LIVE_H1_OPEN_ATTEMPT.as_secs(), 90);
+    }
+
+    #[test]
+    fn ambiguous_open_timeout_does_not_start_http1() {
+        let timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
+        assert!(
+            !is_explicit_http1_required(&timeout),
+            "H2 send() timeout may already have delivered Run; HTTP/1 would duplicate it"
+        );
+        let rst = CursorError::new(0, "error sending request: connection reset", None);
+        assert!(!is_explicit_http1_required(&rst));
+        let clash = CursorError::new(464, "incompatible version", None);
+        assert!(is_explicit_http1_required(&clash));
+        let required = CursorError::new(421, "HTTP_1_1_REQUIRED", Some("HTTP_1_1_REQUIRED".into()));
+        assert!(is_explicit_http1_required(&required));
+    }
+
+    #[test]
+    fn semantic_status_is_never_an_http1_fallback() {
+        for status in [400, 401, 403, 404, 429] {
+            let err = CursorError::new(
+                status,
+                "connection closed: bidi disabled",
+                Some("bidi".into()),
+            );
+            assert!(
+                !is_http1_fallback_error(&err),
+                "HTTP {status} must not flip to HTTP/1"
+            );
+            assert!(!is_explicit_http1_required(&err));
+        }
+    }
+
+    #[test]
+    fn h1_fallback_budget_is_shared_wall_clock() {
+        let h1 = Duration::from_secs(90);
+        assert_eq!(
+            live_h1_fallback_budget(h1, Duration::from_millis(100))
+                .unwrap()
+                .as_secs(),
+            89
+        );
+        assert!(live_h1_fallback_budget(h1, h1).is_none());
+        assert!(live_h1_fallback_budget(h1, h1 + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn live_open_timeout_is_an_http1_fallback() {
+        let err = CursorError::new(504, "Cursor live open timed out after 90s", None);
+        assert!(
+            is_http1_fallback_error(&err),
+            "reconnect may retry the same episode after a 504"
+        );
+        assert!(
+            !is_explicit_http1_required(&err),
+            "initial open must not H1-fallback a timed-out H2 send"
+        );
+    }
+
+    #[test]
+    fn kv_checkpoint_and_query_do_not_reset_reconnect_budget() {
+        let checkpoint = proto::AgentServerMessage {
+            conversation_checkpoint_update: Some(vec![1, 2, 3]),
+            ..proto::AgentServerMessage::default()
+        };
+        assert!(
+            !server_message_resets_reconnect_budget(&checkpoint),
+            "checkpoint loops must not replenish ResumeAction forever"
+        );
+
+        let kv = proto::AgentServerMessage {
+            kv_server_message: Some(proto::KvServerMessage {
+                id: 1,
+                get_blob_args: None,
+                set_blob_args: None,
+                span_context: None,
+            }),
+            ..proto::AgentServerMessage::default()
+        };
+        assert!(!server_message_resets_reconnect_budget(&kv));
+
+        let query = proto::AgentServerMessage {
+            interaction_query: Some(proto::InteractionQuery {
+                id: 1,
+                ..proto::InteractionQuery::default()
+            }),
+            ..proto::AgentServerMessage::default()
+        };
+        assert!(!server_message_resets_reconnect_budget(&query));
+
+        let request_context = proto::AgentServerMessage {
+            exec_server_message: Some(proto::ExecServerMessage {
+                request_context_args: Some(proto::RequestContextArgs::default()),
+                ..proto::ExecServerMessage::default()
+            }),
+            ..proto::AgentServerMessage::default()
+        };
+        assert!(
+            !server_message_resets_reconnect_budget(&request_context),
+            "handshake request_context must not replenish ResumeAction"
+        );
+        let native_exec = proto::AgentServerMessage {
+            exec_server_message: Some(proto::ExecServerMessage::default()),
+            ..proto::AgentServerMessage::default()
+        };
+        assert!(server_message_resets_reconnect_budget(&native_exec));
+
+        let raw = native_exec.encode_to_vec();
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast());
+            encoder.write_all(&raw).unwrap();
+            encoder.finish().unwrap();
+        }
+        let gzip_frame = ConnectFrame {
+            flags: super::super::connect::FLAG_GZIP,
+            payload: Bytes::from(compressed),
+        };
+        assert!(
+            connect_frame_resets_reconnect_budget(&gzip_frame),
+            "gzip-wrapped native exec must still reset the reconnect budget"
+        );
+    }
+
+    #[test]
+    fn probation_expires_only_without_progress_at_deadline() {
+        assert!(!live_probation_expired(false, false, Duration::ZERO));
+        assert!(!live_probation_expired(true, true, Duration::ZERO));
+        assert!(!live_probation_expired(true, false, Duration::from_secs(1)));
+        assert!(live_probation_expired(true, false, Duration::ZERO));
+        assert!(
+            !live_should_resume_after_drop(true, false),
+            "delayed hollow after HTTP 200 must not ResumeAction again"
+        );
+        assert!(live_should_resume_after_drop(true, true));
+        assert!(
+            live_should_resume_after_drop(false, false),
+            "first stream drop of an already-accepted Run may ResumeAction"
+        );
+    }
+
+    #[test]
+    fn h2_breaker_does_not_force_http1() {
+        let mut ctx = test_reconnect_context();
+        let now = Instant::now();
+        for _ in 0..TRANSPORT_BREAKER_THRESHOLD {
+            record_transport_failure(&mut ctx, now);
+        }
+        apply_transport_breakers(&mut ctx, now);
+        assert!(
+            !ctx.force_http1,
+            "H2 timeouts must not pin HTTP/1 — that would duplicate an accepted Run"
+        );
+        assert!(
+            !ctx.http1_rejected,
+            "circuit-open must not poison HTTP/1 as 464-rejected"
+        );
+        assert!(!ctx.breakers.h2.allows(now));
+    }
+
+    #[test]
+    fn open_h1_breaker_returns_to_h2_when_h2_allows() {
+        let mut ctx = test_reconnect_context();
+        ctx.force_http1 = true;
+        let now = Instant::now();
+        for _ in 0..TRANSPORT_BREAKER_THRESHOLD {
+            record_transport_failure(&mut ctx, now);
+        }
+        apply_transport_breakers(&mut ctx, now);
+        assert!(
+            !ctx.force_http1,
+            "open HTTP/1 breaker must not pin a rejected-looking H1 forever"
+        );
+    }
+
+    #[test]
+    fn semantic_send_failure_is_terminal_not_reconnect() {
+        let rate = CursorError::new(429, "BidiAppend failed with HTTP 429", None);
+        assert!(live_send_failure_is_terminal(&rate));
+        let reset = CursorError::new(0, "error sending request: connection reset", None);
+        assert!(!live_send_failure_is_terminal(&reset));
+        assert!(
+            classify_outbound_send(Err(rate.clone())).is_err(),
+            "control_close/BidiAppend 429 must fail the turn, not ResumeAction"
+        );
+        assert!(!classify_outbound_send(Err(reset)).unwrap());
+        assert!(classify_outbound_send(Ok(())).unwrap());
+        let timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
+        assert!(is_ambiguous_live_open_timeout(&timeout));
+        let gateway = CursorError::new(504, "Gateway Timeout", None);
+        assert!(
+            is_ambiguous_live_open_timeout(&gateway),
+            "any HTTP 504 is an ambiguous accept"
+        );
+        assert!(!is_ambiguous_live_open_timeout(&rate));
+        let mapped_reset = CursorError::new(
+            502,
+            "error sending request: connection reset",
+            Some("error sending request: connection reset".into()),
+        );
+        assert!(
+            is_response_less_send_error(&mapped_reset),
+            "reqwest maps no-status reset to 502; that is still an ambiguous send"
+        );
+        assert!(!is_response_less_send_error(&CursorError::new(
+            502,
+            "Cursor upstream connect failed",
+            None
+        )));
+        assert!(live_start_error_seals_tombstone(&timeout));
+        assert!(live_start_error_seals_tombstone(&mapped_reset));
+        assert!(!live_start_error_seals_tombstone(&rate));
+        assert!(!live_start_error_seals_tombstone(&CursorError::new(
+            502,
+            "Cursor upstream connect failed",
+            None
+        )));
+        assert!(!live_start_error_seals_tombstone(&CursorError::new(
+            464,
+            "incompatible version",
+            None
+        )));
+    }
+
+    #[test]
+    fn reconnect_open_does_not_h1_fallback_inside_one_send() {
+        let ctx = test_reconnect_context();
+        assert!(
+            !live_reconnect_open_allow_h1(&ctx, Instant::now()),
+            "reconnect must switch transports in the loop, not inside open_live_transport"
+        );
+    }
+
+    #[test]
+    fn dropped_sse_channel_is_an_error_not_end_turn() {
+        let mut encoder = CursorSseEncoder::new("msg_drop", "claude-fable-5");
+        encoder.begin();
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "partial".into(),
+        });
+        let bytes = live_sse_on_driver_drop(&encoder).expect("incomplete stream must error");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("without turn_ended"), "{text}");
+        assert!(!text.contains("end_turn"), "{text}");
+
+        encoder.finalize();
+        assert!(live_sse_on_driver_drop(&encoder).is_none());
     }
 
     #[test]
@@ -4984,9 +5833,14 @@ mod tests {
             live_idle_stall_message(true, false, true, true, idle * 2, setup, idle),
             Some("Cursor stream stalled after partial progress")
         );
+        assert_eq!(
+            live_idle_stall_message(true, true, true, true, idle * 2, setup, idle),
+            Some("Cursor stream stalled after partial progress"),
+            "heartbeat-only silence after text must ResumeAction or error, not wait 1800s"
+        );
         assert!(
-            live_idle_stall_message(true, true, true, true, idle * 2, setup, idle).is_none(),
-            "after visible text, keep the hard timeout for quiet Fable thinking"
+            live_idle_stall_message(true, true, true, true, idle, setup, idle).is_none(),
+            "one stream-idle window of quiet thinking after text is still allowed"
         );
         assert!(
             live_idle_stall_message(true, false, true, false, idle * 2, setup, idle).is_none(),
@@ -4998,21 +5852,30 @@ mod tests {
     fn hollow_h2_reconnect_forces_http1() {
         let rst = "error decoding response body: error reading a body from connection: stream error received: unexpected internal error encountered";
         assert!(
-            live_reconnect_should_force_http1(true, 0, false, Some(rst)),
+            live_reconnect_should_force_http1(true, 0, false, false, Some(rst)),
             "H2 INTERNAL_ERROR must switch to real HTTP/1.1 immediately — ResumeAction on H2 is always hollow"
         );
         assert!(
-            !live_reconnect_should_force_http1(true, 0, false, Some("upstream ended")),
+            !live_reconnect_should_force_http1(true, 0, false, false, Some("upstream ended")),
             "clean EOF after progress may retry H2 on a fresh client"
         );
-        assert!(live_reconnect_should_force_http1(false, 1, false, None));
+        assert!(live_reconnect_should_force_http1(
+            false, 1, false, false, None
+        ));
         assert!(!live_reconnect_should_force_http1(
             false,
             1,
             true,
+            false,
             Some(rst)
         ));
-        assert!(!live_reconnect_should_force_http1(true, 3, false, None));
+        assert!(!live_reconnect_should_force_http1(
+            true, 3, false, false, None
+        ));
+        assert!(
+            !live_reconnect_should_force_http1(true, 0, false, true, Some(rst)),
+            "464-rejected HTTP/1 must not be forced back, or the next loop GiveUps remaining H2"
+        );
     }
 
     #[test]
@@ -5077,14 +5940,32 @@ mod tests {
             )
         );
         assert_eq!(
-            live_reconnect_on_hollow_body(true),
+            live_reconnect_on_open_error(false, false, &clash),
+            LiveReconnectTransportAction::ForceHttp1
+        );
+        let timeout = CursorError::new(504, "Cursor live open timed out after 10s", None);
+        assert_eq!(
+            live_reconnect_on_open_error(false, false, &timeout),
+            LiveReconnectTransportAction::GiveUp("response-less ResumeAction send is ambiguous"),
+            "timed-out ResumeAction send must not open another transport"
+        );
+        assert_eq!(
+            live_reconnect_on_hollow_body(true, true),
             LiveReconnectTransportAction::GiveUp(
-                "HTTP/1 rejected by proxy and HTTP/2 resume was hollow"
+                "HTTP 200 resume had no body; another ResumeAction would duplicate it"
             )
         );
         assert_eq!(
-            live_reconnect_on_hollow_body(false),
-            LiveReconnectTransportAction::ForceHttp1
+            live_reconnect_on_hollow_body(false, false),
+            LiveReconnectTransportAction::GiveUp(
+                "HTTP 200 resume had no body; another ResumeAction would duplicate it"
+            )
+        );
+        assert_eq!(
+            live_reconnect_on_hollow_body(false, true),
+            LiveReconnectTransportAction::GiveUp(
+                "HTTP 200 resume had no body; another ResumeAction would duplicate it"
+            )
         );
         let h2_reset = CursorError::new(
             0,
@@ -5093,9 +5974,8 @@ mod tests {
         );
         assert_eq!(
             live_reconnect_on_open_error(false, true, &h2_reset),
-            LiveReconnectTransportAction::GiveUp(
-                "HTTP/1 rejected by proxy and HTTP/2 still failing"
-            )
+            LiveReconnectTransportAction::GiveUp("response-less ResumeAction send is ambiguous"),
+            "response-less H2 reset after send is an ambiguous accept"
         );
     }
 
@@ -5184,7 +6064,10 @@ mod tests {
         pending.queue(pending_exec(2, "read-2"), Duration::from_millis(50));
         assert_eq!(pending.collecting.len(), 1);
         let ok = control_close_collecting_natives(&mut pending, &outbound).await;
-        assert!(!ok);
+        assert!(
+            matches!(ok, Ok(false)),
+            "transport send fail is Ok(false), not terminal: {ok:?}"
+        );
         assert_eq!(
             pending.collecting.len(),
             1,
@@ -5270,6 +6153,10 @@ mod tests {
         assert_eq!(
             anthropic_error_type_from_live_error("Connect error 403: no [permission_denied]"),
             "permission_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Cursor error 429: BidiAppend failed"),
+            "rate_limit_error"
         );
         assert_eq!(
             anthropic_error_type_from_live_error("Cursor stream stalled"),
@@ -5473,6 +6360,11 @@ mod tests {
         })
     }
 
+    fn lock_live_registry_for_test() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn pending_exec_state_exposes_client_only_without_flushing_native() {
         let mut state = PendingExecState::default();
@@ -5529,6 +6421,7 @@ mod tests {
 
     #[test]
     fn starting_reservation_is_occupied_without_a_handle() {
+        let _registry = lock_live_registry_for_test();
         let session = format!("starting-session-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
@@ -5546,7 +6439,225 @@ mod tests {
     }
 
     #[test]
+    fn supersede_does_not_replace_a_starting_open() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("starting-supersede-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        assert!(
+            LiveRunRegistry::supersede(&session).is_none(),
+            "aborting Starting and opening another Run duplicates a maybe-accepted request"
+        );
+        assert!(LiveRunRegistry::is_occupied(&session));
+        drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn try_claim_classifies_starting_without_a_second_lock() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("try-claim-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run(&session, None, false),
+            LiveSlotClaim::Starting
+        ));
+        assert!(matches!(
+            LiveRunRegistry::conflict_action(&session, None),
+            LiveConflictAction::Http409
+        ));
+        drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn try_claim_classifies_ambiguous_without_reserving() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("try-claim-amb-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run(&session, None, false),
+            LiveSlotClaim::Ambiguous
+        ));
+        assert!(matches!(
+            LiveRunRegistry::conflict_action(&session, None),
+            LiveConflictAction::Http409
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn insert_adopts_a_vacant_slot_after_starting_was_removed() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("insert-adopt-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        let handle = dummy_handle("adopted-run");
+        assert!(LiveRunRegistry::cancel(&session));
+        reservation
+            .insert(Arc::clone(&handle))
+            .expect("accepted Run must occupy a vacant slot instead of starting another");
+        assert!(LiveRunRegistry::get(&session).is_some());
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn insert_does_not_overwrite_an_ambiguous_tombstone() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("insert-tombstone-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
+        let (cancel, _) = watch::channel(false);
+        let stale = LiveRunReservation {
+            session_id: session.clone(),
+            reservation_id: "stale".into(),
+            committed: false,
+            cancel,
+        };
+        assert!(
+            stale.insert(dummy_handle("must-not-overwrite")).is_err(),
+            "adopt-if-vacant must not clobber an Ambiguous tombstone"
+        );
+        assert!(LiveRunRegistry::is_ambiguous_run(&session, None));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn try_claim_classifies_running_without_reserving() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("try-claim-run-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation
+            .insert(dummy_handle("already-running"))
+            .expect("insert running");
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run(&session, None, false),
+            LiveSlotClaim::Running
+        ));
+        assert!(LiveRunRegistry::get(&session).is_some());
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn try_claim_supersedes_running_under_one_lock() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("try-claim-supersede-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation
+            .insert(dummy_handle("to-supersede"))
+            .expect("insert running");
+        let claimed = LiveRunRegistry::try_claim_run(&session, None, true);
+        assert!(
+            matches!(claimed, LiveSlotClaim::Reserved(_)),
+            "Running occupant is cancelled and reserved in the same lock"
+        );
+        assert!(
+            LiveRunRegistry::is_starting_run(&session, None),
+            "supersede must reserve in the same lock, not leave a gap"
+        );
+        drop(claimed);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn conflict_action_cancels_running_not_starting() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("conflict-running-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation
+            .insert(dummy_handle("conflict-target"))
+            .expect("insert running");
+        assert!(matches!(
+            LiveRunRegistry::conflict_action(&session, None),
+            LiveConflictAction::CancelRunning(_)
+        ));
+        assert!(
+            !LiveRunRegistry::is_occupied(&session),
+            "Running occupant is removed so the same POST can start one replacement Run"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn cancel_is_visible_to_a_late_watch_subscriber() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("cancel-watch-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        assert!(LiveRunRegistry::cancel(&session));
+        let rx = reservation.cancelled();
+        assert!(
+            *rx.borrow(),
+            "send_replace must persist cancel even if no receiver existed yet"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn cancel_running_only_leaves_starting_alone() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("cancel-running-only-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        assert!(!LiveRunRegistry::cancel_running_only(&session, None));
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn ambiguous_open_tombstone_blocks_a_second_run() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("ambiguous-tombstone-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
+        assert!(LiveRunRegistry::is_ambiguous_run(&session, None));
+        assert!(LiveRunRegistry::is_occupied(&session));
+        assert!(
+            LiveRunRegistry::reserve(&session).is_none(),
+            "tombstone must not allow a duplicate Run"
+        );
+        assert!(LiveRunRegistry::supersede(&session).is_none());
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn expired_ambiguous_tombstone_is_pruned() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("ambiguous-expired-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.seal_ambiguous(Instant::now() - Duration::from_secs(1));
+        assert!(!LiveRunRegistry::is_occupied(&session));
+        assert!(LiveRunRegistry::reserve(&session).is_some());
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn ambiguous_terminal_error_leaves_a_tombstone() {
+        assert!(terminal_error_is_ambiguous_accept(
+            "Cursor resume produced no progress before the stream ended"
+        ));
+        assert!(terminal_error_is_ambiguous_accept(
+            "Cursor live open timed out after 20s"
+        ));
+        assert!(!terminal_error_is_ambiguous_accept(
+            "Cursor live run hard timeout"
+        ));
+    }
+
+    #[test]
     fn nested_agent_run_does_not_supersede_parent() {
+        let _registry = lock_live_registry_for_test();
         LiveRunRegistry::clear();
         let session = format!("nested-session-{}", uuid::Uuid::new_v4());
         let parent_res = LiveRunRegistry::reserve(&session).expect("parent reserve");
@@ -5598,6 +6709,7 @@ mod tests {
     fn live_run_identity_from_mod_headers_keys_separate_slot() {
         // Mirrors `mod.rs` `live_run_identity`: nested POSTs keep the parent
         // `X-Claude-Code-Session-Id` and add URL-encoded agent headers.
+        let _registry = lock_live_registry_for_test();
         LiveRunRegistry::clear();
         let session = "parent-session";
         let parent = LiveRunIdentity::parent(session);
@@ -7175,6 +8287,7 @@ mod tests {
 
     #[test]
     fn completed_terminal_failure_does_not_look_generating() {
+        let _registry = lock_live_registry_for_test();
         let session = format!("fail-session-{}", uuid::Uuid::new_v4());
         let (command_tx, _command_rx) = mpsc::channel(1);
         let handle = Arc::new(CursorLiveRunHandle {
@@ -7324,6 +8437,7 @@ mod tests {
 
     #[test]
     fn terminal_error_is_atomically_consumed_with_registry_entry() {
+        let _registry = lock_live_registry_for_test();
         LiveRunRegistry::clear();
         let (command_tx, _command_rx) = mpsc::channel(1);
         let handle = Arc::new(CursorLiveRunHandle {
@@ -7701,6 +8815,7 @@ mod tests {
 
     #[test]
     fn cancel_removes_running_entry_so_reserve_succeeds() {
+        let _registry = lock_live_registry_for_test();
         let session = format!("cancel-session-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let (command_tx, mut command_rx) = mpsc::channel(1);
@@ -7728,6 +8843,7 @@ mod tests {
 
     #[test]
     fn supersede_replaces_occupant_with_fresh_reservation() {
+        let _registry = lock_live_registry_for_test();
         let session = format!("supersede-session-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let (command_tx, _command_rx) = mpsc::channel(1);
