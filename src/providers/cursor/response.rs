@@ -96,6 +96,125 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
     Ok(events)
 }
 
+/// Fold live/buffered Cursor events into one Anthropic Messages JSON body.
+///
+/// Claude Code's non-streaming fallback (`stream=false`) still needs this shape
+/// after we drive the live BiDi path (SSE would fail JSON parse).
+#[derive(Debug)]
+pub struct AnthropicJsonAcc {
+    text: String,
+    tools: Vec<(String, String, serde_json::Value)>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_write: u64,
+    estimated_input: u64,
+}
+
+impl AnthropicJsonAcc {
+    pub fn new(estimated_input: u64) -> Self {
+        Self {
+            text: String::new(),
+            tools: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+            estimated_input,
+        }
+    }
+
+    pub fn push(&mut self, event: &CursorStreamEvent) {
+        match event {
+            CursorStreamEvent::TextDelta { text } => self.text.push_str(text),
+            CursorStreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => {
+                self.input_tokens = *input_tokens;
+                self.output_tokens = *output_tokens;
+                self.cache_read = *cache_read_tokens;
+                self.cache_write = *cache_write_tokens;
+            }
+            CursorStreamEvent::OutputTokenDelta { tokens } => {
+                self.output_tokens = self.output_tokens.saturating_add(*tokens);
+            }
+            CursorStreamEvent::NativeTool {
+                tool_use_id,
+                name,
+                input,
+            } => self.push_native_tool(tool_use_id.clone(), name.clone(), input.clone()),
+            CursorStreamEvent::ThinkingDelta { .. }
+            | CursorStreamEvent::Session { .. }
+            | CursorStreamEvent::End => {}
+        }
+    }
+
+    pub fn push_native_tool(&mut self, id: String, name: String, input: serde_json::Value) {
+        self.tools.push((id, name, input));
+    }
+
+    pub fn has_useful(&self) -> bool {
+        !self.text.is_empty() || !self.tools.is_empty()
+    }
+
+    pub fn usage_pair(&self) -> (u64, u64) {
+        let (input, output, _, _) = self.normalized_usage();
+        (input, output)
+    }
+
+    fn normalized_usage(&self) -> (u64, u64, u64, u64) {
+        crate::providers::cursor::sse::normalize_cursor_usage_for_anthropic(
+            self.input_tokens.max(self.estimated_input.max(1)),
+            self.output_tokens,
+            self.cache_read,
+            self.cache_write,
+        )
+    }
+
+    pub fn into_message_json(self, message_id: &str, model: &str) -> serde_json::Value {
+        let mut content = Vec::new();
+        if !self.text.is_empty() || self.tools.is_empty() {
+            content.push(serde_json::json!({
+                "type": "text",
+                "text": self.text,
+            }));
+        }
+        for (id, name, input) in &self.tools {
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+        let stop_reason = if self.tools.is_empty() {
+            "end_turn"
+        } else {
+            "tool_use"
+        };
+        let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
+            self.normalized_usage();
+        serde_json::json!({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": model,
+            "stop_reason": stop_reason,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_write_tokens,
+                "cache_read_input_tokens": cache_read_tokens
+            }
+        })
+    }
+}
+
 /// Build an accumulated Anthropic response JSON from upstream bytes for
 /// non-streaming mode.
 pub fn decode_cursor_upstream(
@@ -428,6 +547,44 @@ mod tests {
         );
         assert_eq!(json["usage"]["cache_read_input_tokens"].as_u64(), Some(0));
         assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn json_acc_collects_text_usage_and_end_turn() {
+        let mut acc = AnthropicJsonAcc::new(9);
+        acc.push(&CursorStreamEvent::TextDelta {
+            text: "Hello".into(),
+        });
+        acc.push(&CursorStreamEvent::Usage {
+            input_tokens: 12,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        });
+        acc.push(&CursorStreamEvent::End);
+        let json = acc.into_message_json("msg_json", "claude-fable-5");
+        assert_eq!(json["id"], "msg_json");
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "Hello");
+        assert_eq!(json["stop_reason"], "end_turn");
+        assert_eq!(json["usage"]["input_tokens"].as_u64(), Some(12));
+        assert_eq!(json["usage"]["output_tokens"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn json_acc_tool_batch_is_tool_use_stop() {
+        let mut acc = AnthropicJsonAcc::new(4);
+        acc.push_native_tool(
+            "toolu_1".into(),
+            "Read".into(),
+            serde_json::json!({"file_path": "/tmp/a"}),
+        );
+        let json = acc.into_message_json("msg_tools", "claude-fable-5");
+        assert_eq!(json["stop_reason"], "tool_use");
+        assert_eq!(json["content"][0]["type"], "tool_use");
+        assert_eq!(json["content"][0]["id"], "toolu_1");
+        assert_eq!(json["content"][0]["name"], "Read");
+        assert_eq!(json["content"][0]["input"]["file_path"], "/tmp/a");
     }
 
     #[test]

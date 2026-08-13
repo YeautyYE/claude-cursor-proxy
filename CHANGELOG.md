@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.39 (2026-08-13)
+
+- Claude Code `stream=false` (non-streaming fallback after a 502) now uses the same live BiDi path as streaming, then collects events into one Anthropic JSON body. That path was the 45s `idle timeout` / `0 response bytes` 502: buffered H2 `/Run` never saw request_context. Live continuation no longer 400s when the retry is non-streaming.
+- If live is skipped, log `live_skipped` with `{stream, hasSession, bidiEnabled, reason}`. Buffered `/Run` pins HTTP/1 from the client (not a second env read), retries setup-idle once over HTTP/1, and includes Connect frame count in the empty-body 502.
+
 ## v0.1.38 (2026-08-13)
 
 - Live reconnect no longer false-aborts quiet Fable resumes (3s first-byte gate) or replenishes the retry budget on heartbeats / partial bytes. Retired pumps are fenced so a stale EOF cannot kill a healthy HTTP/1 replacement. H2 hollow + Clash 464 fail fast instead of oscillating; 464 flip-back rebuilds a real H2 client even when `CCP_CURSOR_HTTP1=1`. Failed `control_close` keeps collecting natives. `/healthz` reports the running version and start time.

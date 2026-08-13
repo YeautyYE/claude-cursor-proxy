@@ -336,8 +336,8 @@ impl CursorHttpClient {
 
         // HTTPS → BiDi duplex (heartbeats). Cleartext mock servers are unary and
         // deadlock if the request stream never ends — send a finite body there.
-        // When CCP_CURSOR_HTTP1 is set, use RunSSE + BidiAppend instead of H2 BiDi.
-        let prefer_http1 = super::http1::prefer_http1_agent();
+        // HTTP/1 pinning follows this client (`with_prefer_http1`), not a second
+        // read of `CCP_CURSOR_HTTP1` (that made 0.1.36 retries stay on H2).
         let use_bidi = !self.base_url.starts_with("http://")
             && !matches!(
                 std::env::var("CCP_CURSOR_BIDI")
@@ -347,7 +347,7 @@ impl CursorHttpClient {
                     .as_str(),
                 "0" | "false" | "no" | "off"
             );
-        let use_http1_sse = use_bidi && prefer_http1;
+        let use_http1_sse = buffered_run_use_http1_sse(use_bidi, self.prefers_http1());
 
         let (tx, body, url) = if use_http1_sse {
             let run_url = format!(
@@ -774,13 +774,36 @@ impl CursorHttpClient {
                 // fall through to Ok
             } else {
                 let detail = if body_bytes.is_empty() {
-                    format!("{msg} (0 response bytes — check Surge node / auth / CCP_CURSOR_HTTP1)")
+                    run_agent_empty_body_detail(msg, frame_count)
                 } else {
                     format!(
                         "{msg} (got {frame_count} Connect frames / {} bytes; no decodable text/thinking yet. May still be waiting for more exec tools.)",
                         body_bytes.len(),
                     )
                 };
+                if run_agent_should_retry_http1(
+                    self.prefers_http1(),
+                    finish_reason,
+                    useful,
+                    body_bytes.is_empty(),
+                ) {
+                    let mut fields = serde_json::Map::new();
+                    fields.insert("finish".into(), json!(finish_reason));
+                    fields.insert("frames".into(), json!(frame_count));
+                    fields.insert("elapsedMs".into(), json!(elapsed_ms as u64));
+                    create_logger("cursor").warn("run_agent_retry_http1", Some(fields));
+                    return Box::pin(
+                        CursorHttpClient::with_prefer_http1(true).run_agent_with_session(
+                            token,
+                            prompt,
+                            model,
+                            images,
+                            custom_system_prompt,
+                            session_id,
+                        ),
+                    )
+                    .await;
+                }
                 return Err(CursorError::new(502, msg.clone(), Some(detail)));
             }
         }
@@ -1440,6 +1463,28 @@ pub fn decode_frame_payload(
 // Error type
 // ---------------------------------------------------------------------------
 
+/// Buffered `/Run` uses HTTP/1 RunSSE when *this client* is pinned, not when
+/// the process env happens to say so. `CursorHttpClient::new()` already applied
+/// `CCP_CURSOR_HTTP1`; retry clients pass `with_prefer_http1(true)`.
+pub(crate) fn buffered_run_use_http1_sse(use_bidi: bool, client_prefers_http1: bool) -> bool {
+    use_bidi && client_prefers_http1
+}
+
+pub(crate) fn run_agent_should_retry_http1(
+    already_http1: bool,
+    finish_reason: &str,
+    useful: bool,
+    _body_empty: bool,
+) -> bool {
+    !already_http1 && !useful && finish_reason == "setup_idle"
+}
+
+pub(crate) fn run_agent_empty_body_detail(msg: &str, frame_count: u32) -> String {
+    format!(
+        "{msg} (0 response bytes, {frame_count} Connect frames — check Surge node / auth / CCP_CURSOR_HTTP1)"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct CursorError {
     pub status: u16,
@@ -1507,6 +1552,58 @@ impl std::error::Error for CursorError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_idle_retries_http1_once() {
+        assert!(run_agent_should_retry_http1(
+            false,
+            "setup_idle",
+            false,
+            true
+        ));
+        assert!(
+            run_agent_should_retry_http1(false, "setup_idle", false, false),
+            "heartbeat-only / empty-useful setup idle should still flip to HTTP/1"
+        );
+        assert!(!run_agent_should_retry_http1(
+            true,
+            "setup_idle",
+            false,
+            true
+        ));
+        assert!(!run_agent_should_retry_http1(
+            false,
+            "setup_idle",
+            true,
+            false
+        ));
+        assert!(!run_agent_should_retry_http1(
+            false,
+            "hard_timeout",
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn buffered_run_http1_follows_client_pin_not_process_env() {
+        assert!(buffered_run_use_http1_sse(true, true));
+        assert!(
+            !buffered_run_use_http1_sse(true, false),
+            "an H2 client must not take RunSSE just because CCP_CURSOR_HTTP1 might be set elsewhere"
+        );
+        assert!(!buffered_run_use_http1_sse(false, true));
+    }
+
+    #[test]
+    fn empty_setup_idle_detail_includes_frame_count() {
+        let zero = run_agent_empty_body_detail("idle timeout after 45s with no useful progress", 0);
+        assert!(zero.contains("0 Connect frames"), "{zero}");
+        assert!(zero.contains("CCP_CURSOR_HTTP1"), "{zero}");
+        let heartbeats =
+            run_agent_empty_body_detail("idle timeout after 45s with no useful progress", 4);
+        assert!(heartbeats.contains("4 Connect frames"), "{heartbeats}");
+    }
 
     #[test]
     fn parse_usable_models_json_camel_case() {

@@ -53,8 +53,8 @@ use crate::providers::cursor::request::{
     request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
-    CursorDecodeError, CursorStreamEvent, decode_cursor_upstream, decode_upstream_response,
-    estimate_request_input_tokens,
+    AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream,
+    decode_upstream_response, estimate_request_input_tokens,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
@@ -158,6 +158,24 @@ fn tap_session_usage(
     rx
 }
 
+fn live_path_eligible(_want_stream: bool, has_session: bool, bidi_enabled: bool) -> bool {
+    has_session && bidi_enabled
+}
+
+fn live_path_skip_reason(
+    _want_stream: bool,
+    has_session: bool,
+    bidi_enabled: bool,
+) -> Option<&'static str> {
+    if !bidi_enabled {
+        return Some("bidi_disabled");
+    }
+    if !has_session {
+        return Some("no_session");
+    }
+    None
+}
+
 fn live_sse_recording_usage(
     session_id: &str,
     events: mpsc::Receiver<LiveEventResult>,
@@ -173,6 +191,101 @@ fn live_sse_recording_usage(
         estimated_input,
         monitor,
     )
+}
+
+async fn live_downstream_response(
+    want_stream: bool,
+    session_id: &str,
+    events: mpsc::Receiver<LiveEventResult>,
+    message_id: String,
+    wire_model: String,
+    estimated_input: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+) -> Response {
+    if want_stream {
+        live_sse_recording_usage(
+            session_id,
+            events,
+            message_id,
+            wire_model,
+            estimated_input,
+            monitor,
+        )
+    } else {
+        live_json_recording_usage(
+            session_id,
+            events,
+            message_id,
+            wire_model,
+            estimated_input,
+            monitor,
+        )
+        .await
+    }
+}
+
+async fn collect_live_events_to_json(
+    mut events: mpsc::Receiver<LiveEventResult>,
+    message_id: &str,
+    model: &str,
+    estimated_input: u64,
+) -> Result<serde_json::Value, String> {
+    let mut acc = AnthropicJsonAcc::new(estimated_input);
+    while let Some(item) = events.recv().await {
+        match item {
+            Ok(LiveRunEvent::Cursor(event)) => {
+                let ended = matches!(event, CursorStreamEvent::End);
+                acc.push(&event);
+                if ended {
+                    break;
+                }
+            }
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                for tool in tools {
+                    acc.push_native_tool(tool.tool_use_id, tool.name, tool.input);
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !acc.has_useful() {
+        return Err("Cursor stream produced no useful progress".into());
+    }
+    Ok(acc.into_message_json(message_id, model))
+}
+
+async fn live_json_recording_usage(
+    session_id: &str,
+    events: mpsc::Receiver<LiveEventResult>,
+    message_id: String,
+    wire_model: String,
+    estimated_input: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+) -> Response {
+    match collect_live_events_to_json(
+        tap_session_usage(session_id.to_string(), events),
+        &message_id,
+        &wire_model,
+        estimated_input,
+    )
+    .await
+    {
+        Ok(json) => {
+            let input_tokens = json.pointer("/usage/input_tokens").and_then(|v| v.as_u64());
+            remember_input_tokens(Some(session_id), input_tokens);
+            if let Some((handle, req_id)) = monitor.as_ref() {
+                handle.usage_updated(
+                    req_id,
+                    input_tokens,
+                    json.pointer("/usage/output_tokens")
+                        .and_then(|v| v.as_u64()),
+                );
+            }
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, "api_error", error),
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +371,7 @@ enum LiveResumeOutcome {
 
 /// Wait for an in-flight BiDi run to expose pending tools (and resume), finish,
 /// or fail — instead of immediately 409'ing concurrent same-session POSTs.
+#[allow(clippy::too_many_arguments)]
 async fn await_live_run_resume(
     session_id: &str,
     agent_id: Option<&str>,
@@ -266,6 +380,7 @@ async fn await_live_run_resume(
     wire_model: String,
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    want_stream: bool,
 ) -> LiveResumeOutcome {
     let has_tool_results = request_has_any_tool_result(body);
     // Tool-result resumes: wait for pending tools to appear (race with expose).
@@ -297,14 +412,18 @@ async fn await_live_run_resume(
             match collect_live_tool_results(body, &pending) {
                 Ok(tool_results) => match run.resume_batch(tool_results).await {
                     Ok(events) => {
-                        return LiveResumeOutcome::Resumed(live_sse_recording_usage(
-                            session_id,
-                            events,
-                            message_id,
-                            wire_model,
-                            estimated_input,
-                            monitor,
-                        ));
+                        return LiveResumeOutcome::Resumed(
+                            live_downstream_response(
+                                want_stream,
+                                session_id,
+                                events,
+                                message_id,
+                                wire_model,
+                                estimated_input,
+                                monitor,
+                            )
+                            .await,
+                        );
                     }
                     Err(error) => return LiveResumeOutcome::ResumeError(error),
                 },
@@ -340,14 +459,18 @@ async fn await_live_run_resume(
         match collect_live_tool_results(body, &pending) {
             Ok(tool_results) => match run.resume_batch(tool_results).await {
                 Ok(events) => {
-                    return LiveResumeOutcome::Resumed(live_sse_recording_usage(
-                        session_id,
-                        events,
-                        message_id,
-                        wire_model,
-                        estimated_input,
-                        monitor,
-                    ));
+                    return LiveResumeOutcome::Resumed(
+                        live_downstream_response(
+                            want_stream,
+                            session_id,
+                            events,
+                            message_id,
+                            wire_model,
+                            estimated_input,
+                            monitor,
+                        )
+                        .await,
+                    );
                 }
                 Err(error) => return LiveResumeOutcome::ResumeError(error),
             },
@@ -460,13 +583,6 @@ impl Provider for CursorProvider {
                 return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
             }
             if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
-                if !want_stream {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "Cursor live-run continuation requires stream=true",
-                    );
-                }
                 let estimated_input = estimate_request_input_tokens(&body);
                 let monitor = ctx
                     .monitor
@@ -480,6 +596,7 @@ impl Provider for CursorProvider {
                     wire_model.clone(),
                     estimated_input,
                     monitor.clone(),
+                    want_stream,
                 )
                 .await
                 {
@@ -609,11 +726,30 @@ impl Provider for CursorProvider {
         }
         let mut token = auth.access_token.clone();
 
-        // Prefer long-lived BiDi/RunSSE whenever we have a session + streaming.
-        // Tools are optional — tool-less turns still need live heartbeats, Anthropic
-        // ping, and turn_ended (buffered run_agent truncates TTFT and long thinking).
+        // Prefer long-lived BiDi/RunSSE whenever we have a session. Claude Code's
+        // non-streaming fallback (`stream=false`) still uses live; we collect the
+        // same events into one JSON body instead of SSE.
+        let has_session = session_id.is_some_and(|s| !s.is_empty());
         let live_eligible =
-            want_stream && session_id.is_some_and(|s| !s.is_empty()) && client.live_bidi_enabled();
+            live_path_eligible(want_stream, has_session, client.live_bidi_enabled());
+        if !live_eligible {
+            let mut fields = serde_json::Map::new();
+            fields.insert("stream".into(), serde_json::json!(want_stream));
+            fields.insert("hasSession".into(), serde_json::json!(has_session));
+            fields.insert(
+                "bidiEnabled".into(),
+                serde_json::json!(client.live_bidi_enabled()),
+            );
+            fields.insert(
+                "reason".into(),
+                serde_json::json!(live_path_skip_reason(
+                    want_stream,
+                    has_session,
+                    client.live_bidi_enabled()
+                )),
+            );
+            create_logger("cursor").info("live_skipped", Some(fields));
+        }
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
             let identity = live_run_identity(sid, &ctx);
@@ -689,14 +825,16 @@ impl Provider for CursorProvider {
                             tokio::time::sleep(Duration::from_millis(25)).await;
                             continue;
                         }
-                        return live_sse_recording_usage(
+                        return live_downstream_response(
+                            want_stream,
                             sid,
                             start.events,
                             message_id,
                             wire_model,
                             estimated_input,
                             monitor,
-                        );
+                        )
+                        .await;
                     }
                     Err(error) => {
                         drop(reservation);
@@ -1175,6 +1313,54 @@ mod tests {
         let parent_cont = continuation_for_request(Some(&session), &parent);
         assert!(parent_cont.has_checkpoint);
         assert_eq!(parent_cont.conversation_state, vec![0x0a, 0x02, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn live_path_stays_eligible_when_claude_code_disables_stream() {
+        assert!(live_path_eligible(false, true, true));
+        assert!(live_path_eligible(true, true, true));
+        assert!(!live_path_eligible(true, false, true));
+        assert!(!live_path_eligible(true, true, false));
+        assert_eq!(live_path_skip_reason(false, true, true), None);
+        assert_eq!(live_path_skip_reason(true, false, true), Some("no_session"));
+        assert_eq!(
+            live_path_skip_reason(false, true, false),
+            Some("bidi_disabled")
+        );
+        assert_ne!(
+            live_path_skip_reason(false, true, true),
+            Some("stream_false"),
+            "Claude Code non-streaming fallback must still use live BiDi"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_live_events_to_json_text_end() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "hi".into(),
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+            .await
+            .unwrap();
+        drop(tx);
+        let json = collect_live_events_to_json(rx, "msg_live", "claude-fable-5", 3)
+            .await
+            .unwrap();
+        assert_eq!(json["content"][0]["text"], "hi");
+        assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn collect_live_events_to_json_empty_is_error() {
+        let (tx, rx) = mpsc::channel::<LiveEventResult>(1);
+        drop(tx);
+        let err = collect_live_events_to_json(rx, "msg_empty", "claude-fable-5", 1)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no useful progress"), "{err}");
     }
 
     #[test]

@@ -168,9 +168,9 @@ pub enum LiveRunEvent {
 
 #[derive(Debug, Clone)]
 pub struct LiveNativeTool {
-    tool_use_id: String,
-    name: String,
-    input: serde_json::Value,
+    pub(crate) tool_use_id: String,
+    pub(crate) name: String,
+    pub(crate) input: serde_json::Value,
 }
 
 pub type LiveEventResult = Result<LiveRunEvent, String>;
