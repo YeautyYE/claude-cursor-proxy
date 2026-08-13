@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn estimate_request_input_tokens_includes_system_and_tool_input() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-cursor-grok-4.6",
+            "model": "cursor-grok-4.6",
             "system": "system guidance",
             "messages": [{
                 "role": "assistant",

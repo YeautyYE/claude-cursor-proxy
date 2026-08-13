@@ -8,7 +8,8 @@
 //!   `composer-2.5-fast` are recognized.
 //! - `cursor-agent:` is also supported for agent mode routing.
 
-pub const CURSOR_GROK_46_ALIAS: &str = "claude-cursor-grok-4.6";
+pub const CURSOR_GROK_46_ALIAS: &str = "cursor-grok-4.6";
+const CURSOR_GROK_46_LEGACY_ALIAS: &str = "claude-cursor-grok-4.6";
 
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor",
@@ -20,6 +21,7 @@ pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "composer-2.5",
     "composer-2.5-fast",
     CURSOR_GROK_46_ALIAS,
+    CURSOR_GROK_46_LEGACY_ALIAS,
 ];
 
 /// Agent mode derived from model prefix or name.
@@ -128,8 +130,10 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             model_id: "claude-opus-4-8-high".to_string(),
             mode: CursorAgentMode::Agent,
         }),
-        // Anthropic-shaped alias so Claude Code gateway discovery exposes Grok.
-        CURSOR_GROK_46_ALIAS => Ok(CursorModelResolution {
+        // The non-Claude-shaped alias lets Claude Code apply
+        // CLAUDE_CODE_MAX_CONTEXT_TOKENS to this 256K gateway model. Keep the
+        // previous alias resolvable so existing sessions can still resume.
+        CURSOR_GROK_46_ALIAS | CURSOR_GROK_46_LEGACY_ALIAS => Ok(CursorModelResolution {
             model_id: "cursor-grok-4.6-high".to_string(),
             mode: CursorAgentMode::Agent,
         }),
@@ -479,6 +483,9 @@ mod tests {
         let r = resolve_cursor_model("haiku").unwrap();
         assert_eq!(r.model_id, "claude-haiku-4-5");
 
+        let r = resolve_cursor_model("cursor-grok-4.6").unwrap();
+        assert_eq!(r.model_id, "cursor-grok-4.6-high");
+
         let r = resolve_cursor_model("claude-cursor-grok-4.6").unwrap();
         assert_eq!(r.model_id, "cursor-grok-4.6-high");
     }
@@ -494,11 +501,11 @@ mod tests {
             "cursor:claude-opus-5-thinking-max"
         );
         assert_eq!(
-            apply_requested_effort("claude-cursor-grok-4.6", Some("xhigh")).unwrap(),
+            apply_requested_effort("cursor-grok-4.6", Some("xhigh")).unwrap(),
             "cursor:cursor-grok-4.6-xhigh"
         );
         assert_eq!(
-            apply_requested_effort("claude-cursor-grok-4.6", Some("max")).unwrap(),
+            apply_requested_effort("cursor-grok-4.6", Some("max")).unwrap(),
             "cursor:cursor-grok-4.6-xhigh"
         );
         assert_eq!(

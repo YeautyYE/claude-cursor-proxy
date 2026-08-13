@@ -1095,9 +1095,9 @@ mod tests {
 
     #[test]
     fn discovery_allowlist_only_filters_anthropic_shaped_ids() {
-        let allowlist = Some("claude-cursor-grok-4.6");
+        let allowlist = Some("cursor-grok-4.6");
         assert!(model_allowed_by_discovery_filter(
-            "claude-cursor-grok-4.6",
+            "cursor-grok-4.6",
             allowlist
         ));
         assert!(!model_allowed_by_discovery_filter(
