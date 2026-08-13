@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.36 (2026-08-13)
+
+- Do not spend the ResumeAction budget on HTTP/2 `INTERNAL_ERROR` after a 200: drop the poisoned connection pool, and if a reconnect returns zero body bytes, switch that run to HTTP/1 `RunSSE` (Clash 464 falls back to a fresh H2 client).
+
 ## v0.1.35 (2026-08-13)
 
 - Live stream decode failures include the reqwest/hyper/h2 source chain (so TUI shows `connection reset` / `unexpected EOF`, not just `error decoding response body`).

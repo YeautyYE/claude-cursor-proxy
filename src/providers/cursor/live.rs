@@ -1432,10 +1432,10 @@ fn is_http1_fallback_error(err: &CursorError) -> bool {
         408 | 421 | 464 | 502 | 503 | 504
     ) || err.message.contains("error sending request")
         || err.message.contains("connection")
-        || err
-            .detail
-            .as_deref()
-            .is_some_and(|d| d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi"))
+        || is_h2_stream_reset(&err.message)
+        || err.detail.as_deref().is_some_and(|d| {
+            d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi") || is_h2_stream_reset(d)
+        })
 }
 
 /// Semantic Cursor errors (400/401/403/429) must not be retried on another
@@ -1444,10 +1444,10 @@ pub(crate) fn is_retryable_live_transport_error(err: &CursorError) -> bool {
     matches!(err.status, 0 | 408 | 421 | 464 | 502 | 503 | 504)
         || err.message.contains("error sending request")
         || err.message.contains("connection")
-        || err
-            .detail
-            .as_deref()
-            .is_some_and(|d| d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi"))
+        || is_h2_stream_reset(&err.message)
+        || err.detail.as_deref().is_some_and(|d| {
+            d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi") || is_h2_stream_reset(d)
+        })
 }
 
 /// Server keep-alives must not reset setup/stream idle clocks.
@@ -1518,6 +1518,42 @@ fn live_reconnect_backoff_ms(attempt: u32) -> u64 {
     let base_ms = 1_000u64 << shift;
     let jitter = ((base_ms as f64) * 0.2 * ((attempt as f64 * 0.37) % 1.0)) as u64;
     (base_ms + jitter).min(60_000)
+}
+
+fn is_h2_stream_reset(message: &str) -> bool {
+    message.contains("unexpected internal error")
+        || message.contains("stream error received")
+        || message.contains("HTTP2")
+        || message.contains("http2")
+}
+
+/// A ResumeAction that returns HTTP 200 then RSTs with zero body bytes is a
+/// poisoned H2 connection (or a proxy killing BiDi). Flip to RunSSE before the
+/// reconnect budget is burned on the same pool.
+fn live_reconnect_should_force_http1(
+    got_chunk_since_reconnect: bool,
+    reconnect_attempts: u32,
+    already_http1: bool,
+) -> bool {
+    !already_http1 && !got_chunk_since_reconnect && reconnect_attempts > 0
+}
+
+fn prepare_live_reconnect(
+    reconnect: &mut LiveReconnectContext,
+    got_chunk_since_reconnect: bool,
+    reconnect_attempts: u32,
+) {
+    if live_reconnect_should_force_http1(
+        got_chunk_since_reconnect,
+        reconnect_attempts,
+        reconnect.force_http1,
+    ) {
+        reconnect.force_http1 = true;
+        let mut fields = serde_json::Map::new();
+        fields.insert("attempts".into(), serde_json::json!(reconnect_attempts));
+        fields.insert("reason".into(), serde_json::json!("hollow_h2_reconnect"));
+        crate::logging::create_logger("cursor").warn("live_reconnect_http1", Some(fields));
+    }
 }
 
 fn reconnect_note(outcome: &LiveReconnectOutcome) -> String {
@@ -1609,6 +1645,9 @@ async fn try_live_reconnect(
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
+        // Drop the reqwest H2 pool: a RST INTERNAL_ERROR leaves a connection
+        // that still looks idle, so the next ResumeAction 200s then dies instantly.
+        reconnect.http = CursorHttpClient::new();
 
         let cont = super::conversation::RunContinuation {
             conversation_id: reconnect.conversation_id.clone(),
@@ -1669,7 +1708,9 @@ async fn try_live_reconnect(
                     log_live_reconnect(&outcome, *reconnect_attempts, max_reconnects);
                     return outcome;
                 }
-                if !reconnect.force_http1 && is_http1_fallback_error(&err) {
+                if reconnect.force_http1 && matches!(err.status, 421 | 464) {
+                    reconnect.force_http1 = false;
+                } else if !reconnect.force_http1 && is_http1_fallback_error(&err) {
                     reconnect.force_http1 = true;
                 }
             }
@@ -1922,6 +1963,7 @@ async fn drive_live_run(
     // brief Cursor disconnects when we have a checkpoint to ResumeAction.
     let max_reconnects = env_u64("CCP_CURSOR_RECONNECT_MAX", 10) as u32;
     let mut reconnect_attempts: u32 = 0;
+    let mut got_chunk_since_reconnect = false;
 
     'driver: loop {
         // Check before select: Cursor InteractionUpdate.heartbeat / client
@@ -1981,6 +2023,11 @@ async fn drive_live_run(
                             }
                         }
                         if send_failed {
+                            prepare_live_reconnect(
+                                &mut reconnect,
+                                got_chunk_since_reconnect,
+                                reconnect_attempts,
+                            );
                             let reconnect_outcome = try_live_reconnect(
                                 &mut reconnect,
                                 &mut outbound,
@@ -2001,6 +2048,7 @@ async fn drive_live_run(
                                 LiveReconnectOutcome::Reconnected
                             );
                             if !send_failed {
+                                got_chunk_since_reconnect = false;
                                 for frame in &frames {
                                     if !outbound.send_connect_frame(frame.clone()).await {
                                         send_failed = true;
@@ -2057,7 +2105,10 @@ async fn drive_live_run(
             item = upstream.recv() => {
                 match item {
                     Some(Ok(Some(chunk))) => {
-                        reconnect_attempts = 0;
+                        if !chunk.is_empty() {
+                            got_chunk_since_reconnect = true;
+                            reconnect_attempts = 0;
+                        }
                         let checkpoint_before = latest_checkpoint
                             .as_ref()
                             .map(|checkpoint| (checkpoint.as_ptr() as usize, checkpoint.len()));
@@ -2131,6 +2182,11 @@ async fn drive_live_run(
                     Some(Ok(None)) | None => {
                         // Abrupt EOF without Connect END / turn_ended — try
                         // ResumeAction reconnect (CLI stall recovery).
+                        prepare_live_reconnect(
+                            &mut reconnect,
+                            got_chunk_since_reconnect,
+                            reconnect_attempts,
+                        );
                         let reconnect_outcome = try_live_reconnect(
                             &mut reconnect,
                             &mut outbound,
@@ -2147,6 +2203,7 @@ async fn drive_live_run(
                         )
                         .await;
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
+                            got_chunk_since_reconnect = false;
                             continue 'driver;
                         }
                         // Same empty-turn recovery as FLAG_END: flush trailing
@@ -2214,6 +2271,11 @@ async fn drive_live_run(
                         break 'driver;
                     }
                     Some(Err(error)) => {
+                        prepare_live_reconnect(
+                            &mut reconnect,
+                            got_chunk_since_reconnect,
+                            reconnect_attempts,
+                        );
                         let reconnect_outcome = try_live_reconnect(
                             &mut reconnect,
                             &mut outbound,
@@ -2230,6 +2292,7 @@ async fn drive_live_run(
                         )
                         .await;
                         if matches!(reconnect_outcome, LiveReconnectOutcome::Reconnected) {
+                            got_chunk_since_reconnect = false;
                             continue 'driver;
                         }
                         let message = format!(
@@ -4279,6 +4342,30 @@ mod tests {
         assert!(live_reconnect_backoff_ms(2) <= 1_200);
         assert!(live_reconnect_backoff_ms(3) >= 2_000);
         assert_eq!(live_reconnect_backoff_ms(20), 60_000);
+    }
+
+    #[test]
+    fn hollow_h2_reconnect_forces_http1() {
+        assert!(
+            !live_reconnect_should_force_http1(true, 0, false),
+            "a healthy stream that later RSTs should retry H2 on a fresh client first"
+        );
+        assert!(
+            live_reconnect_should_force_http1(false, 1, false),
+            "open-200 then immediate INTERNAL_ERROR must not burn the budget on H2"
+        );
+        assert!(
+            !live_reconnect_should_force_http1(false, 1, true),
+            "already on HTTP/1"
+        );
+        assert!(!live_reconnect_should_force_http1(true, 3, false));
+    }
+
+    #[test]
+    fn h2_internal_error_is_a_stream_reset() {
+        let msg = "error decoding response body: error reading a body from connection: stream error received: unexpected internal error encountered";
+        assert!(is_h2_stream_reset(msg));
+        assert!(!is_h2_stream_reset("Connect error 429: quota"));
     }
 
     #[test]
