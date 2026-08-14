@@ -4646,7 +4646,8 @@ async fn process_live_frame(
                     "KV reply",
                     frame_session_id,
                 )
-                .await {
+                .await
+                {
                     return false;
                 }
             }
@@ -4692,7 +4693,7 @@ async fn process_live_frame(
                     "interaction reply",
                     frame_session_id,
                 )
-                    .await
+                .await
                 {
                     return false;
                 }
@@ -4779,7 +4780,7 @@ async fn process_live_frame(
                         "exec throw",
                         frame_session_id,
                     )
-                        .await
+                    .await
                     {
                         return false;
                     }
@@ -6692,9 +6693,7 @@ mod tests {
         );
         let reset_open = CursorError::new(
             502,
-            format!(
-                "Cursor RunSSE HTTP 502 ({CONVERSATION_RESET_RETRY_NOTE})"
-            ),
+            format!("Cursor RunSSE HTTP 502 ({CONVERSATION_RESET_RETRY_NOTE})"),
             Some("Conversation data missing".into()),
         );
         assert!(
