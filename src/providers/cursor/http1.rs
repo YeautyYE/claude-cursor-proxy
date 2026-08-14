@@ -20,9 +20,6 @@ use super::proto::{AgentClientMessage, BidiRequestId};
 /// Max in-flight BidiAppend calls (CLI uses 16).
 const MAX_IN_FLIGHT: usize = 16;
 
-/// Transient BidiAppend retries (CLI turn-runner: transport ≤10, server ≥3 throws).
-const APPEND_MAX_ATTEMPTS: u32 = 4;
-
 /// Whole-request cap so a stalled unary append cannot freeze the live driver.
 const APPEND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -63,9 +60,9 @@ impl BidiAppendSession {
 
     /// Append a raw `AgentClientMessage` protobuf payload (not Connect-framed).
     ///
-    /// Retries transient transport / 5xx failures with CLI-like exponential
-    /// backoff + ~20% jitter (base 200ms, cap 4s) so a blip does not kill the
-    /// open RunSSE session.
+    /// Each append is attempted exactly once. A transport error, timeout, or
+    /// 5xx can arrive after Cursor accepted the payload; replaying it with a
+    /// new attempt can duplicate tool results and control messages.
     pub async fn append_raw(&self, payload: &[u8]) -> Result<(), CursorError> {
         let _permit = self
             .in_flight
@@ -84,56 +81,36 @@ impl BidiAppendSession {
             "appendSeqno": seq.to_string(),
         });
 
-        let mut last_err = None;
-        for attempt in 0..APPEND_MAX_ATTEMPTS {
-            if attempt > 0 {
-                let base_ms = 200u64 << (attempt - 1).min(4);
-                let jitter = (base_ms as f64 * 0.2 * fastrand_unit()).round() as u64;
-                tokio::time::sleep(Duration::from_millis((base_ms + jitter).min(4_000))).await;
-            }
+        let mut req = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("content-type", "application/json")
+            .header("connect-protocol-version", "1")
+            .header("user-agent", "connect-es/1.6.1")
+            .header("x-request-id", &self.request_id)
+            .header("x-original-request-id", &self.request_id)
+            .json(&body);
 
-            let mut req = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.token)
-                .header("content-type", "application/json")
-                .header("connect-protocol-version", "1")
-                .header("user-agent", "connect-es/1.6.1")
-                .header("x-request-id", &self.request_id)
-                .header("x-original-request-id", &self.request_id)
-                .json(&body);
-
-            for (name, value) in self.identity_headers.iter() {
-                req = req.header(name.as_str(), value.as_str());
-            }
-
-            let resp = match tokio::time::timeout(APPEND_TIMEOUT, req.send()).await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
-                    last_err = Some(CursorError::from_reqwest(e, 30));
-                    continue;
-                }
-                Err(_) => {
-                    last_err = Some(CursorError::new(408, "BidiAppend timed out", None));
-                    continue;
-                }
-            };
-            let status = resp.status().as_u16();
-            if (200..300).contains(&status) {
-                return Ok(());
-            }
-            let detail = resp.text().await.unwrap_or_default();
-            let err = CursorError::new(
-                status,
-                format!("BidiAppend failed with HTTP {status}"),
-                Some(detail.chars().take(500).collect()),
-            );
-            if !bidi_append_retryable_status(status) {
-                return Err(err);
-            }
-            last_err = Some(err);
+        for (name, value) in self.identity_headers.iter() {
+            req = req.header(name.as_str(), value.as_str());
         }
-        Err(last_err.unwrap_or_else(|| CursorError::internal("BidiAppend retries exhausted")))
+
+        let resp = match tokio::time::timeout(APPEND_TIMEOUT, req.send()).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(error)) => return Err(CursorError::from_reqwest(error, 30)),
+            Err(_) => return Err(CursorError::new(408, "BidiAppend timed out", None)),
+        };
+        let status = resp.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        let detail = resp.text().await.unwrap_or_default();
+        Err(CursorError::new(
+            status,
+            format!("BidiAppend failed with HTTP {status}"),
+            Some(detail.chars().take(500).collect()),
+        ))
     }
 
     pub async fn append_message(&self, message: &AgentClientMessage) -> Result<(), CursorError> {
@@ -162,10 +139,6 @@ pub fn encode_run_sse_request(request_id: &str) -> Result<Bytes, CursorError> {
     Ok(encode_connect_frame(payload, 0))
 }
 
-fn bidi_append_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 500..=599)
-}
-
 /// Whether the agent transport should use HTTP/1 RunSSE + BidiAppend.
 pub fn prefer_http1_agent() -> bool {
     std::env::var("CCP_CURSOR_HTTP1")
@@ -176,21 +149,6 @@ pub fn prefer_http1_agent() -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-/// Cheap [0,1) unit without pulling `rand` — jitter only, not crypto.
-fn fastrand_unit() -> f64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut h = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos()
-        .hash(&mut h);
-    std::thread::current().id().hash(&mut h);
-    (h.finish() % 10_000) as f64 / 10_000.0
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -246,6 +204,8 @@ pub fn strip_connect_frame(data: &[u8]) -> Option<&[u8]> {
 mod tests {
     use super::*;
     use prost::Message;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn hex_roundtrip() {
@@ -270,13 +230,47 @@ mod tests {
         assert_eq!(decoded.request_id, "req-123");
     }
 
-    #[test]
-    fn bidi_append_does_not_retry_rate_limits() {
-        assert!(bidi_append_retryable_status(408));
-        assert!(bidi_append_retryable_status(502));
-        assert!(!bidi_append_retryable_status(429));
-        assert!(!bidi_append_retryable_status(400));
-        assert!(!bidi_append_retryable_status(401));
+    #[tokio::test]
+    async fn bidi_append_does_not_retry_ambiguous_server_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock BidiAppend server");
+        let address = listener.local_addr().expect("mock server address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                if socket.read(&mut request).await.is_err() {
+                    continue;
+                }
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let session = BidiAppendSession::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "token".into(),
+            "request-id".into(),
+            vec![],
+        );
+
+        assert!(session.append_raw(b"\x3a\x00").await.is_err());
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an acknowledged-or-ambiguous append failure must never be replayed"
+        );
     }
 
     #[test]

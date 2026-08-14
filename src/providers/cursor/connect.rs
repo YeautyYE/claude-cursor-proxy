@@ -145,6 +145,13 @@ pub fn cursor_connect_error_is_missing_image(message: &str) -> bool {
     lower.contains("image not found") || lower.contains("imagenotfound")
 }
 
+pub fn cursor_connect_error_is_missing_conversation_data(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("conversation data missing")
+        || lower.contains("conversation's data is missing")
+        || lower.contains("conversation’s data is missing")
+}
+
 /// Parse a Connect end-frame JSON error payload into a structured error.
 ///
 /// Returns `None` if the payload is empty or not valid Connect error JSON.
@@ -404,6 +411,19 @@ mod tests {
         ));
         assert!(!cursor_connect_error_is_missing_image(
             "unexpected internal error"
+        ));
+    }
+
+    #[test]
+    fn missing_conversation_data_connect_error_is_detected() {
+        assert!(cursor_connect_error_is_missing_conversation_data(
+            "ERROR_CUSTOM_MESSAGE: Conversation data missing"
+        ));
+        assert!(cursor_connect_error_is_missing_conversation_data(
+            "This conversation’s data is missing and can’t be restored"
+        ));
+        assert!(!cursor_connect_error_is_missing_conversation_data(
+            "temporary connection failure"
         ));
     }
 

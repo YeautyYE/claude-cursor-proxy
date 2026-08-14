@@ -43,15 +43,16 @@ use crate::providers::cursor::hosted_web_search::{
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
 use crate::providers::cursor::live::{
-    LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveConflictAction, LiveEventResult,
-    LiveRunEvent, LiveRunIdentity, LiveRunRegistry, LiveSlotClaim, live_run_key_for,
-    live_sse_response, live_start_error_seals_tombstone,
+    LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim,
+    LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveSlotClaim,
+    live_request_fingerprint, live_run_key_for, live_sse_response,
+    live_start_error_seals_tombstone,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
     CursorPromptOptions, claude_local_mcp_tools, cursor_request_context,
     latest_user_is_only_tool_results, render_cursor_prompt, render_cursor_prompt_parts_with,
-    request_has_client_only_tool_results,
+    request_has_client_only_tool_results, request_has_orphaned_native_live_results,
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream,
@@ -373,8 +374,23 @@ enum LiveResumeOutcome {
     TerminalError(String),
     MissingTools(Vec<String>),
     ResumeError(CursorError),
+    SupersedeRunning(String),
     Conflict,
     Free,
+}
+
+fn unresolved_live_tools_outcome(
+    has_current_tool_results: bool,
+    missing: Vec<String>,
+    observed_run_id: Option<&str>,
+) -> LiveResumeOutcome {
+    if has_current_tool_results {
+        LiveResumeOutcome::MissingTools(missing)
+    } else if let Some(run_id) = observed_run_id {
+        LiveResumeOutcome::SupersedeRunning(run_id.to_string())
+    } else {
+        LiveResumeOutcome::Conflict
+    }
 }
 
 /// Wait for an in-flight BiDi run to expose pending tools (and resume), finish,
@@ -390,33 +406,61 @@ async fn await_live_run_resume(
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
     want_stream: bool,
 ) -> LiveResumeOutcome {
-    let has_tool_results = request_has_any_tool_result(body);
+    let has_tool_results = request_has_current_tool_result(body);
     // Tool-result resumes: wait for pending tools to appear (race with expose).
-    // Nested turns without tool_results: brief queue, then supersede — a long
-    // wait (was 15s) just delayed Claude Code retries after idle disconnect.
+    // Keep this below downstream stream-idle: no Anthropic response exists yet,
+    // so SSE pings cannot protect this pre-response window.
     let wait_ms = if has_tool_results {
-        env_u64_millis("CCP_CURSOR_LIVE_RESUME_WAIT_MS", 30_000)
+        env_u64_millis("CCP_CURSOR_LIVE_RESUME_WAIT_MS", 5_000)
     } else {
         env_u64_millis("CCP_CURSOR_LIVE_NESTED_WAIT_MS", 1_500)
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
-    let mut last_missing: Option<Vec<String>> = None;
+    let mut observed_run_id: Option<String> = None;
+    let mut observed_non_running_slot = false;
 
     while tokio::time::Instant::now() < deadline {
-        if let Some(error) = LiveRunRegistry::take_terminal_error_run(session_id, agent_id) {
+        let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
+            match LiveRunRegistry::probe_run(session_id, agent_id) {
+                LiveRunProbe::TerminalError(error) => {
+                    return LiveResumeOutcome::TerminalError(error);
+                }
+                LiveRunProbe::Occupied => {
+                    // Starting reservation or a concurrently replaced handle:
+                    // wait instead of treating the session as free.
+                    observed_non_running_slot = true;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                LiveRunProbe::Free => return LiveResumeOutcome::Free,
+            }
+        };
+        if observed_non_running_slot {
+            // This waiter never owned the generation that just transitioned
+            // from Starting/Ambiguous to Running.
+            return LiveResumeOutcome::Conflict;
+        }
+        match observed_run_id.as_deref() {
+            Some(observed) if observed != run.run_id() => {
+                return LiveResumeOutcome::Conflict;
+            }
+            None => observed_run_id = Some(run.run_id().to_string()),
+            _ => {}
+        }
+        if let Some(error) =
+            LiveRunRegistry::take_terminal_error_for_run(session_id, agent_id, run.run_id())
+        {
             return LiveResumeOutcome::TerminalError(error);
         }
-        let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
-            if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
-                // Starting reservation: wait for Running instead of treating
-                // the session as free (which opened a second Cursor run).
+        let pending = run.pending_tools();
+        if !pending.is_empty() {
+            if !has_tool_results {
+                // This is a fresh/steering request, not a result for the
+                // exposed batch. Give the owning request a short chance to
+                // resume, then supersede it below.
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 continue;
             }
-            return LiveResumeOutcome::Free;
-        };
-        let pending = run.pending_tools();
-        if !pending.is_empty() {
             match collect_live_tool_results(body, &pending) {
                 Ok(tool_results) => match run.resume_batch(tool_results).await {
                     Ok(events) => {
@@ -436,16 +480,10 @@ async fn await_live_run_resume(
                     Err(error) => return LiveResumeOutcome::ResumeError(error),
                 },
                 Err(missing) => {
-                    last_missing = Some(missing);
-                    if !has_tool_results {
-                        // Another agent's tool turn owns the pending set — keep
-                        // queuing until those results land and the run frees.
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                        continue;
-                    }
-                    // Partial/mismatched tool_results: brief grace then 400.
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    continue;
+                    // The request body is immutable and the exposed pending
+                    // batch is atomic; waiting cannot repair a partial,
+                    // mismatched, extra, or duplicate current result batch.
+                    return LiveResumeOutcome::MissingTools(missing);
                 }
             }
         }
@@ -453,17 +491,37 @@ async fn await_live_run_resume(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    if let Some(error) = LiveRunRegistry::take_terminal_error_run(session_id, agent_id) {
-        return LiveResumeOutcome::TerminalError(error);
-    }
     let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
-        if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
+        return match LiveRunRegistry::probe_run(session_id, agent_id) {
+            LiveRunProbe::TerminalError(error) => LiveResumeOutcome::TerminalError(error),
+            LiveRunProbe::Occupied => LiveResumeOutcome::Conflict,
+            LiveRunProbe::Free => LiveResumeOutcome::Free,
+        };
+    };
+    if observed_non_running_slot {
+        return LiveResumeOutcome::Conflict;
+    }
+    match observed_run_id.as_deref() {
+        Some(observed) if observed != run.run_id() => {
             return LiveResumeOutcome::Conflict;
         }
-        return LiveResumeOutcome::Free;
-    };
+        None => observed_run_id = Some(run.run_id().to_string()),
+        _ => {}
+    }
+    if let Some(error) =
+        LiveRunRegistry::take_terminal_error_for_run(session_id, agent_id, run.run_id())
+    {
+        return LiveResumeOutcome::TerminalError(error);
+    }
     let pending = run.pending_tools();
     if !pending.is_empty() {
+        if !has_tool_results {
+            let missing = pending
+                .iter()
+                .map(|exec| exec.tool_use_id.clone())
+                .collect();
+            return unresolved_live_tools_outcome(false, missing, observed_run_id.as_deref());
+        }
         match collect_live_tool_results(body, &pending) {
             Ok(tool_results) => match run.resume_batch(tool_results).await {
                 Ok(events) => {
@@ -482,13 +540,22 @@ async fn await_live_run_resume(
                 }
                 Err(error) => return LiveResumeOutcome::ResumeError(error),
             },
-            Err(missing) => return LiveResumeOutcome::MissingTools(missing),
+            Err(missing) => {
+                return unresolved_live_tools_outcome(
+                    has_tool_results,
+                    missing,
+                    observed_run_id.as_deref(),
+                );
+            }
         }
     }
-    if let Some(missing) = last_missing {
-        return LiveResumeOutcome::MissingTools(missing);
+    if has_tool_results {
+        LiveResumeOutcome::Conflict
+    } else {
+        LiveResumeOutcome::SupersedeRunning(
+            observed_run_id.expect("a live handle established the observed generation"),
+        )
     }
-    LiveResumeOutcome::Conflict
 }
 
 fn env_u64_millis(name: &str, default: u64) -> u64 {
@@ -503,39 +570,74 @@ fn collect_live_tool_results(
     body: &MessagesRequest,
     pending: &[PendingCursorExec],
 ) -> Result<Vec<(String, serde_json::Value)>, Vec<String>> {
-    let tool_results: Vec<(String, serde_json::Value)> = pending
+    let pending_ids: std::collections::HashSet<&str> = pending
         .iter()
-        .filter_map(|exec| {
-            find_tool_result(body, &exec.tool_use_id)
-                .cloned()
-                .map(|result| (exec.tool_use_id.clone(), result))
-        })
+        .map(|exec| exec.tool_use_id.as_str())
         .collect();
-    if tool_results.len() == pending.len() {
-        return Ok(tool_results);
+    let mut results_by_id = std::collections::HashMap::<&str, &serde_json::Value>::new();
+    let mut invalid_current = Vec::new();
+
+    for block in current_user_blocks(body) {
+        if block.get("type").and_then(|value| value.as_str()) != Some("tool_result") {
+            invalid_current.push("<non-tool_result content>".to_string());
+            continue;
+        }
+        let Some(tool_use_id) = block.get("tool_use_id").and_then(|value| value.as_str()) else {
+            invalid_current.push("<missing tool_use_id>".to_string());
+            continue;
+        };
+        if !pending_ids.contains(tool_use_id) || results_by_id.insert(tool_use_id, block).is_some()
+        {
+            invalid_current.push(tool_use_id.to_string());
+        }
     }
 
-    let returned: std::collections::HashSet<&str> = tool_results
+    let missing: Vec<String> = pending
         .iter()
-        .map(|(tool_use_id, _)| tool_use_id.as_str())
-        .collect();
-    Err(pending
-        .iter()
+        .filter(|exec| !results_by_id.contains_key(exec.tool_use_id.as_str()))
         .map(|exec| exec.tool_use_id.clone())
-        .filter(|tool_use_id| !returned.contains(tool_use_id.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    if !invalid_current.is_empty() {
+        return Err(invalid_current);
+    }
+
+    Ok(pending
+        .iter()
+        .map(|exec| {
+            (
+                exec.tool_use_id.clone(),
+                (*results_by_id
+                    .get(exec.tool_use_id.as_str())
+                    .expect("validated current tool result"))
+                .clone(),
+            )
+        })
         .collect())
 }
 
-fn request_has_any_tool_result(body: &MessagesRequest) -> bool {
-    body.messages
+fn current_user_blocks(body: &MessagesRequest) -> Vec<&serde_json::Value> {
+    for message in body.messages.iter().rev() {
+        if message.role == "assistant" {
+            break;
+        }
+        if message.role != "user" {
+            continue;
+        }
+        let serde_json::Value::Array(blocks) = &message.content else {
+            return Vec::new();
+        };
+        return blocks.iter().collect();
+    }
+    Vec::new()
+}
+
+fn request_has_current_tool_result(body: &MessagesRequest) -> bool {
+    current_user_blocks(body)
         .iter()
-        .rev()
-        .any(|message| match &message.content {
-            serde_json::Value::Array(blocks) => blocks.iter().any(|block| {
-                block.get("type").and_then(|value| value.as_str()) == Some("tool_result")
-            }),
-            _ => false,
-        })
+        .any(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_result"))
 }
 
 pub struct CursorProvider;
@@ -585,60 +687,106 @@ impl Provider for CursorProvider {
         // at tool_use, but the upstream AgentService/Run stream is still alive.
         // Route the matching tool_result back onto that exact request stream
         // instead of replaying the whole conversation as a fresh Cursor run.
+        let mut preclaimed_live_reservation = None;
         if let Some(session_id) = ctx.session_id.as_deref() {
             let agent_id = claude_agent_id(&ctx);
-            if let Some(error) = LiveRunRegistry::take_terminal_error_run(session_id, agent_id) {
-                return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
-            }
-            if LiveRunRegistry::is_occupied_run(session_id, agent_id) {
-                let estimated_input = estimate_request_input_tokens(&body);
-                let monitor = ctx
-                    .monitor
-                    .clone()
-                    .map(|handle| (handle, ctx.req_id.clone()));
-                match await_live_run_resume(
-                    session_id,
-                    agent_id,
-                    &body,
-                    message_id.clone(),
-                    wire_model.clone(),
-                    estimated_input,
-                    monitor.clone(),
-                    want_stream,
-                )
-                .await
-                {
-                    LiveResumeOutcome::Resumed(response) => return response,
-                    LiveResumeOutcome::TerminalError(error) => {
-                        return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
-                    }
-                    LiveResumeOutcome::MissingTools(missing) => {
+            let fingerprint =
+                live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+            LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
+            match LiveRunRegistry::probe_run(session_id, agent_id) {
+                LiveRunProbe::TerminalError(error) => {
+                    return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
+                }
+                LiveRunProbe::Free => {
+                    if request_has_orphaned_native_live_results(&body) {
                         return json_error(
-                            StatusCode::BAD_REQUEST,
+                            StatusCode::CONFLICT,
                             "invalid_request_error",
-                            format!(
-                                "Missing tool_result blocks for pending tools: {}",
-                                missing.join(", ")
-                            ),
+                            "Stale Cursor tool_result cannot start a new live run",
                         );
                     }
-                    LiveResumeOutcome::Conflict => {
-                        match LiveRunRegistry::conflict_action(session_id, agent_id) {
-                            LiveConflictAction::Http409 => {
+                }
+                LiveRunProbe::Occupied => {
+                    let estimated_input = estimate_request_input_tokens(&body);
+                    let monitor = ctx
+                        .monitor
+                        .clone()
+                        .map(|handle| (handle, ctx.req_id.clone()));
+                    match await_live_run_resume(
+                        session_id,
+                        agent_id,
+                        &body,
+                        message_id.clone(),
+                        wire_model.clone(),
+                        estimated_input,
+                        monitor.clone(),
+                        want_stream,
+                    )
+                    .await
+                    {
+                        LiveResumeOutcome::Resumed(response) => return response,
+                        LiveResumeOutcome::TerminalError(error) => {
+                            return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
+                        }
+                        LiveResumeOutcome::MissingTools(missing) => {
+                            return json_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request_error",
+                                format!(
+                                    "Missing tool_result blocks for pending tools: {}",
+                                    missing.join(", ")
+                                ),
+                            );
+                        }
+                        LiveResumeOutcome::SupersedeRunning(run_id) => {
+                            match LiveRunRegistry::claim_replacement_for_run(
+                                session_id, agent_id, &run_id,
+                            ) {
+                                LiveReplacementClaim::Conflict => {
+                                    return json_error(
+                                        StatusCode::CONFLICT,
+                                        "invalid_request_error",
+                                        "A Cursor live run is already active for this session",
+                                    );
+                                }
+                                LiveReplacementClaim::Reserved {
+                                    mut reservation,
+                                    superseded,
+                                } => {
+                                    if let Some(handle) = superseded {
+                                        reservation.protect_on_drop();
+                                        if let Err(error) = handle.cancel_and_wait().await {
+                                            // Keep the old generation registered if
+                                            // cancellation was not acknowledged; a
+                                            // free slot could start a duplicate.
+                                            let _ = reservation.insert(handle);
+                                            return map_cursor_error_to_response(&error);
+                                        }
+                                    }
+                                    preclaimed_live_reservation = Some(reservation);
+                                }
+                            }
+                        }
+                        LiveResumeOutcome::Conflict => {
+                            return json_error(
+                                StatusCode::CONFLICT,
+                                "invalid_request_error",
+                                "A Cursor live run is already active for this session",
+                            );
+                        }
+                        LiveResumeOutcome::ResumeError(error) => {
+                            return map_cursor_error_to_response(&error);
+                        }
+                        LiveResumeOutcome::Free => {
+                            if request_has_orphaned_native_live_results(&body) {
                                 return json_error(
                                     StatusCode::CONFLICT,
                                     "invalid_request_error",
-                                    "A Cursor live run is already active for this session",
+                                    "Stale Cursor tool_result cannot start a new live run",
                                 );
                             }
-                            LiveConflictAction::CancelRunning(handle) => handle.cancel(),
-                            LiveConflictAction::SlotFree => {}
                         }
                     }
-                    LiveResumeOutcome::ResumeError(error) => {
-                        return map_cursor_error_to_response(&error);
-                    }
-                    LiveResumeOutcome::Free => {}
                 }
             }
         }
@@ -789,31 +937,31 @@ impl Provider for CursorProvider {
                 .clone()
                 .map(|handle| (handle, ctx.req_id.clone()));
 
-            // Concurrent same-session POSTs race on Starting→Running.
-            // Never start a second Run while Starting (Cursor may already have
-            // accepted the first). After a Starting wait, 409 — do not kill the
-            // stream that just opened, and do not fall through to buffered `/Run`.
+            // Concurrent same-session POSTs race on Starting→Running. A request
+            // may supersede only the exact generation it observed above, where
+            // replacement was atomically preclaimed. Never blindly replace a
+            // Running/Starting slot discovered here.
             let mut start_error: Option<CursorError> = None;
             let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
-            let mut waited_for_starting = false;
+            let mut initial_reservation = preclaimed_live_reservation.take();
             loop {
-                let reservation = match LiveRunRegistry::try_claim_run(
-                    sid,
-                    identity.agent_id,
-                    !waited_for_starting,
-                ) {
-                    LiveSlotClaim::Reserved(reservation) => reservation,
-                    LiveSlotClaim::Starting | LiveSlotClaim::Ambiguous => {
-                        waited_for_starting = true;
-                        if Instant::now() >= conflict_deadline {
-                            break;
+                let mut reservation = if let Some(reservation) = initial_reservation.take() {
+                    reservation
+                } else {
+                    match LiveRunRegistry::try_claim_run(sid, identity.agent_id) {
+                        LiveSlotClaim::Reserved(reservation) => reservation,
+                        LiveSlotClaim::Starting | LiveSlotClaim::Ambiguous => {
+                            if Instant::now() >= conflict_deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
                         }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        continue;
+                        LiveSlotClaim::Running => break,
                     }
-                    LiveSlotClaim::Running => break,
                 };
 
+                reservation.protect_on_drop();
                 let start = match client
                     .start_live_agent_with_identity(
                         &token,
@@ -857,9 +1005,14 @@ impl Provider for CursorProvider {
 
                 match start {
                     Ok(start) => {
+                        start
+                            .handle
+                            .set_request_fingerprint(live_request_fingerprint(
+                                &serde_json::to_vec(&body.messages).unwrap_or_default(),
+                            ));
                         if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
                             // Cursor already accepted this Run. Do not start another.
-                            orphaned.cancel();
+                            let _ = orphaned.cancel_and_wait().await;
                             break;
                         }
                         return live_downstream_response(
@@ -877,7 +1030,7 @@ impl Provider for CursorProvider {
                         if live_start_error_seals_tombstone(&error) {
                             reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
                         } else {
-                            drop(reservation);
+                            reservation.release();
                         }
                         start_error = Some(error);
                         break;
@@ -1076,6 +1229,7 @@ cli-* version (e.g. cli-2026.07.16-899851b)."
 Re-running `cursor auth login` usually will not help."
             ),
         ),
+        409 => json_error(StatusCode::CONFLICT, "invalid_request_error", detail),
         429 => {
             let retry_after = err.retry_after.as_deref().unwrap_or("5");
             let resp = json_error(
@@ -1228,6 +1382,106 @@ mod tests {
         .unwrap();
         let missing = collect_live_tool_results(&body, &[pending("expected-id")]).unwrap_err();
         assert_eq!(missing, ["expected-id"]);
+    }
+
+    #[test]
+    fn live_continuation_rejects_extra_and_duplicate_current_tool_results() {
+        let extra: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "expected-id", "content": "ok"},
+                {"type": "tool_result", "tool_use_id": "unexpected-id", "content": "wrong batch"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            collect_live_tool_results(&extra, &[pending("expected-id")]).is_err(),
+            "an extra current tool_result must not be silently dropped"
+        );
+
+        let duplicate: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "expected-id", "content": "first"},
+                {"type": "tool_result", "tool_use_id": "expected-id", "content": "second"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            collect_live_tool_results(&duplicate, &[pending("expected-id")]).is_err(),
+            "a duplicate current tool_result must not be collapsed to one"
+        );
+
+        let mixed: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "expected-id", "content": "ok"},
+                {"type": "text", "text": "also start unrelated work"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            collect_live_tool_results(&mixed, &[pending("expected-id")]).is_err(),
+            "fresh user content must not be discarded by treating a mixed turn as result-only"
+        );
+    }
+
+    #[test]
+    fn live_resume_ignores_historical_tool_results_on_a_new_user_turn() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [
+                {"role": "user", "content": "old request"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "old-tool",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/old"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "old-tool",
+                    "content": "old result"
+                }]},
+                {"role": "user", "content": "new request after interrupt"}
+            ]
+        }))
+        .unwrap();
+
+        assert!(
+            !request_has_current_tool_result(&body),
+            "historical results must not turn a new request into a live resume"
+        );
+        let missing = collect_live_tool_results(&body, &[pending("old-tool")]).unwrap_err();
+        assert_eq!(
+            missing,
+            ["old-tool"],
+            "a historical result must never satisfy the current pending batch"
+        );
+    }
+
+    #[test]
+    fn live_resume_without_current_results_supersedes_pending_instead_of_400() {
+        match unresolved_live_tools_outcome(
+            false,
+            vec!["abandoned-tool".into()],
+            Some("observed-generation"),
+        ) {
+            LiveResumeOutcome::SupersedeRunning(run_id) => {
+                assert_eq!(run_id, "observed-generation");
+            }
+            _ => panic!("an abandoned tool turn should supersede only its observed generation"),
+        }
+        match unresolved_live_tools_outcome(
+            true,
+            vec!["still-required".into()],
+            Some("observed-generation"),
+        ) {
+            LiveResumeOutcome::MissingTools(missing) => {
+                assert_eq!(missing, ["still-required"]);
+            }
+            _ => panic!("a partial current tool-result batch must remain a 400"),
+        }
     }
 
     #[test]

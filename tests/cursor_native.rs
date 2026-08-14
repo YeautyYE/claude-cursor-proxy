@@ -1764,7 +1764,11 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
         .find(|(n, d)| n == "content_block_start" && d["content_block"]["type"] == "tool_use")
         .map(|(_, d)| d)
         .expect("tool_use content_block_start");
-    assert_eq!(tool_start["content_block"]["id"], "call-read-1");
+    let tool_use_id = tool_start["content_block"]["id"]
+        .as_str()
+        .expect("tool_use id")
+        .to_string();
+    assert!(tool_use_id.starts_with("call-read-1__cursor_run_"));
     assert_eq!(tool_start["content_block"]["name"], "Read");
     let input_delta = first_events
         .iter()
@@ -1800,13 +1804,13 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                 {"role": "user", "content": "Read README.md"},
                 {"role": "assistant", "content": [{
                     "type": "tool_use",
-                    "id": "call-read-1",
+                    "id": tool_use_id,
                     "name": "Read",
                     "input": {"file_path": "README.md"}
                 }]},
                 {"role": "user", "content": [{
                     "type": "tool_result",
-                    "tool_use_id": "call-read-1",
+                    "tool_use_id": tool_use_id,
                     "content": "line one\nline two"
                 }]}
             ]
@@ -2246,10 +2250,18 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
         })
         .collect();
     assert_eq!(tool_starts.len(), 2);
+    let tool_a_id = tool_starts[0]["content_block"]["id"]
+        .as_str()
+        .expect("first tool id")
+        .to_string();
+    let tool_b_id = tool_starts[1]["content_block"]["id"]
+        .as_str()
+        .expect("second tool id")
+        .to_string();
     assert_eq!(tool_starts[0]["index"], 0);
-    assert_eq!(tool_starts[0]["content_block"]["id"], "call-read-a");
+    assert!(tool_a_id.starts_with("call-read-a__cursor_run_"));
     assert_eq!(tool_starts[1]["index"], 1);
-    assert_eq!(tool_starts[1]["content_block"]["id"], "call-read-b");
+    assert!(tool_b_id.starts_with("call-read-b__cursor_run_"));
     assert_eq!(
         final_message_delta(&first_events)["delta"]["stop_reason"],
         "tool_use"
@@ -2268,12 +2280,12 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
             "messages": [
                 {"role": "user", "content": "Read both files"},
                 {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "call-read-a", "name": "Read", "input": {"file_path": "README.md"}},
-                    {"type": "tool_use", "id": "call-read-b", "name": "Read", "input": {"file_path": "Cargo.toml"}}
+                    {"type": "tool_use", "id": tool_a_id, "name": "Read", "input": {"file_path": "README.md"}},
+                    {"type": "tool_use", "id": tool_b_id, "name": "Read", "input": {"file_path": "Cargo.toml"}}
                 ]},
                 {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "call-read-b", "content": "Cargo result"},
-                    {"type": "tool_result", "tool_use_id": "call-read-a", "content": "README result"}
+                    {"type": "tool_result", "tool_use_id": tool_b_id, "content": "Cargo result"},
+                    {"type": "tool_result", "tool_use_id": tool_a_id, "content": "README result"}
                 ]}
             ]
         }))

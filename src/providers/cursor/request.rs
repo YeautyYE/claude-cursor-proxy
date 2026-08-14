@@ -605,6 +605,25 @@ pub(crate) fn request_has_client_only_tool_results(req: &MessagesRequest) -> boo
         .any(|id| assistant_tool_name_for_id(req, id).is_some_and(is_claude_local_tool_name))
 }
 
+/// True when a Free registry slot is being asked to replay native tool results
+/// that were bound to a previous live Run generation. Those results must not
+/// open a second Cursor Run.
+pub(crate) fn request_has_orphaned_native_live_results(req: &MessagesRequest) -> bool {
+    let Some(user) = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return false;
+    };
+    let ids = tool_result_ids(user);
+    ids.iter().any(|id| {
+        id.contains("__cursor_run_")
+            && !assistant_tool_name_for_id(req, id).is_some_and(is_claude_local_tool_name)
+    })
+}
+
 /// Strip packaging banners and Fable injection-defense monologues so multi-turn
 /// re-runs don't keep burning minutes on identity / "prompt injection" theater.
 fn scrub_injection_noise(role: &str, content: &str) -> String {
@@ -1348,6 +1367,7 @@ mod tests {
         .unwrap();
         assert!(latest_user_is_only_tool_results(&req));
         assert!(request_has_client_only_tool_results(&req));
+        assert!(!request_has_orphaned_native_live_results(&req));
         let parts = render_cursor_prompt_parts_with(
             &req,
             CursorPromptOptions {
@@ -1376,6 +1396,38 @@ mod tests {
             parts.user_text.contains("\"name\":\"Workflow\""),
             "checkpoint delta must still advertise Workflow"
         );
+    }
+
+    #[test]
+    fn generation_tagged_native_tool_result_is_orphaned_when_free() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "r1__cursor_run_old", "name": "Read", "input": {"file_path": "a.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "r1__cursor_run_old", "content": "fn main() {}"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(request_has_orphaned_native_live_results(&req));
+        let workflow: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "research"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "wf1__cursor_run_old", "name": "Workflow", "input": {"name": "deep-research"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "wf1__cursor_run_old", "content": "done"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(!request_has_orphaned_native_live_results(&workflow));
     }
 
     #[test]

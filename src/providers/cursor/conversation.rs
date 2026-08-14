@@ -321,6 +321,28 @@ pub fn clear_checkpoint(session_id: &str) {
     persist_conversation(session_id, &snapshot);
 }
 
+/// Forget an unrecoverable Cursor conversation binding.
+///
+/// The next request for this Claude session gets a new Cursor conversation id
+/// and replays its full Anthropic history instead of reusing poisoned state.
+pub fn reset(session_id: &str) {
+    let now = now_millis();
+    let fresh = CursorConversation {
+        conversation_id: uuid::Uuid::new_v4().to_string(),
+        checkpoint: None,
+        blobs: HashMap::new(),
+        last_seen: now,
+    };
+    {
+        let mut store = store_lock();
+        if !store.order.iter().any(|item| item == session_id) {
+            store.order.push_back(session_id.to_string());
+        }
+        store.map.insert(session_id.to_string(), fresh.clone());
+    }
+    persist_conversation(session_id, &fresh);
+}
+
 /// Merge KV blobs into the conversation store (set_blob wins).
 pub fn merge_blobs(session_id: &str, blobs: &HashMap<Vec<u8>, Vec<u8>>) {
     if blobs.is_empty() {
@@ -488,6 +510,38 @@ mod tests {
         let cont = continuation_for(Some("sess-persist"));
         assert!(cont.has_checkpoint, "checkpoint must reload from disk");
         assert_eq!(cont.conversation_state, vec![0x0a, 0x03]);
+    }
+
+    #[test]
+    fn reset_overwrites_poisoned_binding_instead_of_only_deleting() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+        save_checkpoint("sess-reset", vec![0xaa]);
+        merge_blobs("sess-reset", &HashMap::from([(vec![0x01], vec![0x02])]));
+        let original = continuation_for(Some("sess-reset")).conversation_id.clone();
+        reset("sess-reset");
+        {
+            let mut store = store_lock();
+            store.map.clear();
+            store.order.clear();
+        }
+        let recovered = continuation_for(Some("sess-reset"));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
     }
 
     #[cfg(unix)]

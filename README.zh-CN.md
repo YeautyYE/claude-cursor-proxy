@@ -220,7 +220,10 @@ claude-cursor-proxy cursor auth status
 | `/deep-research` 只用 Bash/curl | 升级代理；transcript 应有 `Workflow`；必要时 `enableWorkflows: true` |
 | 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
+| 后台工具结果恢复前出现 `Stream idle timeout - no chunks received` | 升级到 ≥0.1.45 并重启 serve。live 工具结果在 HTTP 响应前的分类等待由 30 秒缩短到最多 5 秒；HTTP SSE 建立后仍会每 15 秒发送 Anthropic ping，保护长时间静默思考。 |
 | 纯文本回合却 502 `Image not found [internal]` | 升级到 ≥0.1.40 并重启 serve，然后把同一条消息再发一次（该错误会清掉带过期图片 id 的 conversation checkpoint）。新开一个 Claude Code session 也可以。 |
+| 502 `Conversation data missing` / `missing blobs`，且当前 session 无法恢复 | 升级到 ≥0.1.45 并重启 serve，然后重试同一条消息。失败回合会清除不可恢复的 Cursor conversation id、checkpoint 和 blob 缓存；第一次重试会在新的 Cursor conversation 中重放完整历史，无需新开 Claude Code chat。 |
+| 中断回合后或仍有后台 shell 时 400 `Missing tool_result blocks for pending tools` | 升级到 ≥0.1.45 并重启 serve。当前回合没有工具结果的新请求会接管已放弃的 live 回合；真正缺项的工具结果批次仍会被拒绝。 |
 | 约 25 秒 502 `broken pipe (reconnect skipped: no checkpoint)`（第一条消息） | 升级到 ≥0.1.44 并重启 serve。首轮在收到 checkpoint 前也可用 `conversation_id` 做 ResumeAction，H2 broken pipe 会切 HTTP/1。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 约 46 秒 502 `Cursor stream produced no useful progress`（Fable high） | 升级到 ≥0.1.43 并重启 serve。仅心跳的思考会等到 240 秒；完全无帧仍 45 秒失败。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 502 `Cursor live open timed out after 20s`，随后又 90 秒 buffered 502 | 升级到 ≥0.1.42 并重启 serve。H2 首次打开 20 秒；HTTP/1 90 秒且仅在 464/421 后尝试。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；H2 黑洞可设 `CCP_CURSOR_HTTP1=1` |

@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.45 (2026-08-14)
+
+- Fix the 400 `Missing tool_result blocks for pending tools` after a Claude Code tool turn is interrupted or abandoned (often while background shells are still running). A fresh request with no current-turn `tool_result` now briefly queues, then supersedes the stale live run instead of demanding an impossible result. Supersession and downstream tool ids are bound to the observed Run generation; replacement atomically reserves the slot and waits for the old transport/pump to tear down, so a delayed waiter cannot cancel a newer Run, overlap two Runs, or inject an old result into its replacement. Historical `tool_result` blocks no longer misclassify a new user turn as a resume; partial, mismatched, extra, duplicate, and mixed result-plus-user-content batches remain a strict 400.
+- Recover the same Claude Code session after Cursor reports `Conversation data missing` / missing blobs. The unrecoverable Cursor conversation id, checkpoint, and blob cache are discarded without being re-persisted during driver teardown; after the explicit failed turn, the first retry starts one fresh Run with full Anthropic history instead of replaying the 502 or requiring a new Claude chat. The same reset applies to HTTP open, ResumeAction, and BidiAppend errors that carry the missing-conversation detail, not only Connect END. Tool-result requests no longer sit in a 30-second pre-response wait (where no SSE ping is possible); the default is 5 seconds, preventing Claude Code's `Stream idle timeout - no chunks received` during stale-run classification.
+- Fail closed on live delivery ambiguity: HTTP/1 `BidiAppend` is attempted once; a Starting open that times out or is dropped occupies the session for 90s; a successful turn leaves a same-prompt fingerprint tombstone so a retried POST cannot start a second Cursor Run; cancel/disconnect after an accepted but unconfirmed resume is ambiguous instead of success.
+
 ## v0.1.44 (2026-08-14)
 
 - First-turn H2 `broken pipe` no longer dies with `reconnect skipped: no checkpoint`. ResumeAction can reattach with the session `conversation_id` and empty conversation state (not a second user message). `broken pipe` forces HTTP/1 on that reconnect, same as H2 `INTERNAL_ERROR`.

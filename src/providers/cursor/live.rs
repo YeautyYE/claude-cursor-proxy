@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,9 @@ use super::client::{
 };
 use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
-    anthropic_error_type_from_live_error, cursor_connect_error_is_missing_image, decode_gzip_frame,
-    encode_connect_frame, parse_connect_error,
+    anthropic_error_type_from_live_error, cursor_connect_error_is_missing_conversation_data,
+    cursor_connect_error_is_missing_image, decode_gzip_frame, encode_connect_frame,
+    parse_connect_error,
 };
 use super::exec_results::{
     CursorExecKind, PendingCursorExec, encode_control_close, encode_control_throw,
@@ -60,14 +61,45 @@ enum ClientOutbound {
     Http1(BidiAppendSession),
 }
 
+fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorError {
+    CursorError::new(
+        error.status,
+        format!(
+            "Cursor BidiAppend {operation} failed; acceptance is ambiguous: {}",
+            error.message
+        ),
+        error.detail,
+    )
+}
+
 impl ClientOutbound {
     async fn send_connect_frame(&self, frame: Bytes) -> Result<(), CursorError> {
+        let timeout = Duration::from_secs(env_u64("CCP_CURSOR_SEND_TIMEOUT_SECS", 5));
         match self {
-            Self::Bidi(tx) => tx
-                .send(Ok(frame))
-                .await
-                .map_err(|_| CursorError::internal("Cursor BiDi request stream closed")),
-            Self::Http1(session) => session.append_connect_or_raw(&frame).await,
+            Self::Bidi(tx) => match tokio::time::timeout(timeout, tx.send(Ok(frame))).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(CursorError::internal("Cursor BiDi request stream closed")),
+                // Tokio's bounded-channel send is cancellation-safe: if this
+                // times out, the frame was not queued and may be retried.
+                Err(_) => Err(CursorError::new(
+                    504,
+                    "Cursor BiDi request stream send timed out",
+                    None,
+                )),
+            },
+            Self::Http1(session) => {
+                match tokio::time::timeout(timeout, session.append_connect_or_raw(&frame)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(ambiguous_http1_append_error(error, "send")),
+                    // Dropping a unary HTTP request future cannot prove that
+                    // Cursor did not accept it. Never reconnect and replay it.
+                    Err(_) => Err(CursorError::new(
+                        504,
+                        "Cursor BidiAppend timed out; acceptance is ambiguous",
+                        None,
+                    )),
+                }
+            }
         }
     }
 
@@ -185,9 +217,48 @@ struct TerminalOutcome {
     created_at: Instant,
 }
 
+fn terminal_outcome_is_fresh(outcome: &TerminalOutcome) -> bool {
+    let configured = Duration::from_secs(env_u64("CCP_CURSOR_TERMINAL_TTL_SECS", 60));
+    let ttl = if terminal_error_is_ambiguous_accept(&outcome.message) {
+        configured.max(LIVE_AMBIGUOUS_OPEN_TTL)
+    } else {
+        configured
+    };
+    outcome.created_at.elapsed() < ttl
+}
+
 pub struct LiveRunStart {
     pub handle: Arc<CursorLiveRunHandle>,
     pub events: mpsc::Receiver<LiveEventResult>,
+}
+
+struct LiveResumePermit {
+    in_flight: Arc<AtomicBool>,
+}
+
+impl Drop for LiveResumePermit {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
+
+const RESUME_DISPATCH_WAITING: u8 = 0;
+const RESUME_DISPATCH_STARTED: u8 = 1;
+const RESUME_DISPATCH_CANCELLED: u8 = 2;
+
+struct LiveResumeWaitGuard {
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for LiveResumeWaitGuard {
+    fn drop(&mut self) {
+        let _ = self.state.compare_exchange(
+            RESUME_DISPATCH_WAITING,
+            RESUME_DISPATCH_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 enum RunCommand {
@@ -195,8 +266,12 @@ enum RunCommand {
         tool_results: Vec<(String, serde_json::Value)>,
         sink: mpsc::Sender<LiveEventResult>,
         ack: oneshot::Sender<Result<(), CursorError>>,
+        permit: LiveResumePermit,
+        dispatch_state: Arc<AtomicU8>,
     },
-    Cancel,
+    Cancel {
+        ack: Option<oneshot::Sender<()>>,
+    },
 }
 
 #[derive(Debug)]
@@ -206,9 +281,25 @@ pub struct CursorLiveRunHandle {
     pending: Arc<Mutex<Vec<PendingCursorExec>>>,
     terminal_error: Arc<Mutex<Option<TerminalOutcome>>>,
     completed: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
+    resume_in_flight: Arc<AtomicBool>,
+    request_fingerprint: AtomicU64,
 }
 
 impl CursorLiveRunHandle {
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn set_request_fingerprint(&self, fingerprint: u64) {
+        self.request_fingerprint
+            .store(fingerprint, Ordering::Release);
+    }
+
+    fn request_fingerprint(&self) -> u64 {
+        self.request_fingerprint.load(Ordering::Acquire)
+    }
+
     /// Return the first exposed exec for compatibility with the original
     /// single-tool bridge API.
     pub fn pending(&self) -> Option<PendingCursorExec> {
@@ -227,15 +318,16 @@ impl CursorLiveRunHandle {
         self.completed.load(Ordering::Acquire)
     }
 
+    fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::Acquire)
+    }
+
     fn take_terminal_error(&self) -> Option<String> {
         self.terminal_error
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .filter(|outcome| {
-                outcome.created_at.elapsed()
-                    < Duration::from_secs(env_u64("CCP_CURSOR_TERMINAL_TTL_SECS", 60))
-            })
+            .filter(terminal_outcome_is_fresh)
             .map(|outcome| outcome.message)
     }
 
@@ -244,10 +336,30 @@ impl CursorLiveRunHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|outcome| {
-                outcome.created_at.elapsed()
-                    < Duration::from_secs(env_u64("CCP_CURSOR_TERMINAL_TTL_SECS", 60))
+            .is_some_and(terminal_outcome_is_fresh)
+    }
+
+    fn ensure_replacement_is_safe(&self) -> Result<(), CursorError> {
+        let ambiguous = self
+            .terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|outcome| {
+                terminal_outcome_is_fresh(outcome)
+                    && terminal_error_is_ambiguous_accept(&outcome.message)
             })
+            .map(|outcome| outcome.message.clone());
+        match ambiguous {
+            Some(message) => Err(CursorError::new(
+                409,
+                format!(
+                    "Cursor live run ended in an ambiguous upstream state; replacement blocked: {message}"
+                ),
+                None,
+            )),
+            None => Ok(()),
+        }
     }
 
     pub async fn resume(
@@ -268,26 +380,110 @@ impl CursorLiveRunHandle {
         let pending = self.pending_tools();
         validate_tool_result_batch(&pending, &tool_results)
             .map_err(|message| CursorError::new(400, message, None))?;
-        // Match start_live_agent capacity — post-tool thinking bursts must not
-        // trip the old 64-slot ceiling (silent drop under try_send timeout).
-        let (sink, events) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
-        let (ack, ready) = oneshot::channel();
-        self.command_tx
-            .send(RunCommand::ResumeBatch {
-                tool_results,
-                sink,
-                ack,
-            })
-            .await
-            .map_err(|_| CursorError::internal("Cursor live run already closed"))?;
-        ready
-            .await
-            .map_err(|_| CursorError::internal("Cursor live resume acknowledgement dropped"))??;
-        Ok(events)
+        self.resume_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                CursorError::new(
+                    409,
+                    "Another tool-result resume is already in flight for this Cursor run",
+                    None,
+                )
+            })?;
+        let permit = LiveResumePermit {
+            in_flight: Arc::clone(&self.resume_in_flight),
+        };
+        let dispatch_state = Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING));
+        let _wait_guard = LiveResumeWaitGuard {
+            state: Arc::clone(&dispatch_state),
+        };
+        let command_tx = self.command_tx.clone();
+        let command_dispatch_state = Arc::clone(&dispatch_state);
+        let dispatch = async move {
+            // Match start_live_agent capacity — post-tool thinking bursts must not
+            // trip the old 64-slot ceiling (silent drop under try_send timeout).
+            let (sink, events) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
+            let (ack, ready) = oneshot::channel();
+            command_tx
+                .send(RunCommand::ResumeBatch {
+                    tool_results,
+                    sink,
+                    ack,
+                    permit,
+                    dispatch_state: command_dispatch_state,
+                })
+                .await
+                .map_err(|_| CursorError::internal("Cursor live run already closed"))?;
+            ready.await.map_err(|_| {
+                CursorError::internal("Cursor live resume acknowledgement dropped")
+            })??;
+            Ok(events)
+        };
+        tokio::pin!(dispatch);
+        let dispatch_timeout =
+            Duration::from_millis(env_u64("CCP_CURSOR_LIVE_RESUME_DISPATCH_MS", 2_000));
+        match tokio::time::timeout(dispatch_timeout, &mut dispatch).await {
+            Ok(result) => result,
+            Err(_) => match dispatch_state.compare_exchange(
+                RESUME_DISPATCH_WAITING,
+                RESUME_DISPATCH_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Err(CursorError::new(
+                    409,
+                    "Cursor live resume dispatch timed out before driver acceptance; retry this tool result",
+                    None,
+                )),
+                Err(RESUME_DISPATCH_STARTED) => dispatch.await,
+                Err(_) => Err(CursorError::new(
+                    409,
+                    "Cursor live resume dispatch was cancelled before driver acceptance",
+                    None,
+                )),
+            },
+        }
     }
 
     pub fn cancel(&self) {
-        let _ = self.command_tx.try_send(RunCommand::Cancel);
+        self.cancel_requested.store(true, Ordering::Release);
+        let _ = self.command_tx.try_send(RunCommand::Cancel { ack: None });
+    }
+
+    /// Deliver cancellation and wait until the old driver has dropped its
+    /// upstream request before a replacement Run may open.
+    pub async fn cancel_and_wait(&self) -> Result<(), CursorError> {
+        self.cancel_requested.store(true, Ordering::Release);
+        if self.is_completed() {
+            return self.ensure_replacement_is_safe();
+        }
+        let (ack, ready) = oneshot::channel();
+        match tokio::time::timeout(
+            Duration::from_secs(env_u64("CCP_CURSOR_CANCEL_WAIT_SECS", 10)),
+            async {
+                self.command_tx
+                    .send(RunCommand::Cancel { ack: Some(ack) })
+                    .await
+                    .map_err(|_| "cancellation channel closed")?;
+                ready
+                    .await
+                    .map_err(|_| "cancellation acknowledgement dropped")
+            },
+        )
+        .await
+        {
+            Ok(Ok(())) => self.ensure_replacement_is_safe(),
+            Ok(Err(_)) if self.is_completed() => self.ensure_replacement_is_safe(),
+            Ok(Err(reason)) => Err(CursorError::new(
+                409,
+                format!("Cursor live run {reason}"),
+                None,
+            )),
+            Err(_) => Err(CursorError::new(
+                409,
+                "Cursor live run cancellation timed out before replacement",
+                None,
+            )),
+        }
     }
 }
 
@@ -363,12 +559,20 @@ struct PendingExecState {
     collecting: Vec<PendingCursorExec>,
     seen_execs: HashSet<(u32, String)>,
     emitted_tool_use_ids: HashSet<String>,
+    run_generation: Option<String>,
     awaiting_since: Option<Instant>,
     collecting_since: Option<Instant>,
     collect_deadline: Option<tokio::time::Instant>,
 }
 
 impl PendingExecState {
+    fn for_run(run_id: &str) -> Self {
+        Self {
+            run_generation: Some(run_id.to_string()),
+            ..Self::default()
+        }
+    }
+
     fn queue(&mut self, mut exec: PendingCursorExec, quiet: Duration) -> bool {
         let discriminator = exec
             .exec_id
@@ -378,6 +582,14 @@ impl PendingExecState {
             .unwrap_or_else(|| format!("tool:{}", exec.tool_use_id));
         if !self.seen_execs.insert((exec.id, discriminator)) {
             return false;
+        }
+
+        // Bind every downstream id to this live Run. Cursor ids (including
+        // fallback `exec_N` ids) may repeat after a replacement Run starts;
+        // without this suffix, a delayed result from the old Run could resume
+        // a same-named exec in the replacement.
+        if let Some(generation) = self.run_generation.as_deref() {
+            exec.tool_use_id = format!("{}__cursor_run_{generation}", exec.tool_use_id);
         }
 
         // Anthropic requires sibling tool_use ids to be unique. Cursor normally
@@ -407,8 +619,14 @@ impl PendingExecState {
         self.awaiting.is_empty() && !self.collecting.is_empty()
     }
 
-    fn collect_deadline(&self) -> Option<tokio::time::Instant> {
-        self.can_expose().then_some(self.collect_deadline).flatten()
+    fn native_collect_deadline(&self) -> Option<tokio::time::Instant> {
+        (self.can_expose()
+            && self
+                .collecting
+                .iter()
+                .any(|exec| !matches!(exec.kind, CursorExecKind::ClientOnly)))
+        .then_some(self.collect_deadline)
+        .flatten()
     }
 
     fn expose(&mut self) -> Vec<PendingCursorExec> {
@@ -446,6 +664,39 @@ impl PendingExecState {
             .collecting_since
             .take()
             .or_else(|| Some(Instant::now()));
+        self.collect_deadline = None;
+        self.awaiting.clone()
+    }
+
+    /// Expose only tools that Cursor is blocked waiting for. Claude-local
+    /// tools stay queued until an authoritative turn boundary has been
+    /// drained, because a later Connect END can invalidate the whole turn.
+    fn expose_native(&mut self) -> Vec<PendingCursorExec> {
+        if !self.can_expose() {
+            return Vec::new();
+        }
+        let mut native = Vec::new();
+        let mut client_only = Vec::new();
+        for exec in self.collecting.drain(..) {
+            if matches!(exec.kind, CursorExecKind::ClientOnly) {
+                client_only.push(exec);
+            } else {
+                native.push(exec);
+            }
+        }
+        self.collecting = client_only;
+        if native.is_empty() {
+            self.collect_deadline = None;
+            return Vec::new();
+        }
+        self.awaiting = native;
+        self.awaiting_since = self
+            .collecting_since
+            .take()
+            .or_else(|| Some(Instant::now()));
+        if !self.collecting.is_empty() {
+            self.collecting_since = Some(Instant::now());
+        }
         self.collect_deadline = None;
         self.awaiting.clone()
     }
@@ -714,6 +965,12 @@ enum LiveRunEntry {
     Ambiguous {
         until: Instant,
     },
+    /// The previous Run completed successfully. Identical request retries must
+    /// not start a second Run before the client could have observed `message_end`.
+    Succeeded {
+        fingerprint: u64,
+        until: Instant,
+    },
 }
 
 struct LiveRunMap {
@@ -767,6 +1024,7 @@ pub struct LiveRunReservation {
     session_id: String,
     reservation_id: String,
     committed: bool,
+    seal_on_drop: bool,
     cancel: watch::Sender<bool>,
 }
 
@@ -777,6 +1035,28 @@ impl LiveRunReservation {
 
     fn abort(&self) {
         let _ = self.cancel.send_replace(true);
+    }
+
+    /// Once an upstream open or replacement teardown has started, dropping
+    /// the owning request future cannot prove that no Cursor Run survived.
+    /// Keep the slot tombstoned instead of making it available to a retry.
+    pub fn protect_on_drop(&mut self) {
+        self.seal_on_drop = true;
+    }
+
+    /// Release a reservation after a definitive pre-acceptance failure.
+    pub fn release(mut self) {
+        self.abort();
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let owns_reservation = matches!(
+            runs.runs.get(&self.session_id),
+            Some(LiveRunEntry::Starting { reservation_id, .. })
+                if reservation_id == &self.reservation_id
+        );
+        if owns_reservation {
+            runs.remove_key(&self.session_id);
+        }
+        self.committed = true;
     }
 
     /// Keep the slot occupied after an ambiguous open timeout so another POST
@@ -814,7 +1094,21 @@ impl LiveRunReservation {
         if !owns_reservation && LiveRunRegistry::key_occupied(&runs, &self.session_id) {
             return Err(handle);
         }
-        runs.insert_key(self.session_id.clone(), LiveRunEntry::Running(handle));
+        // The worker can finish (and set `completed`) before this reservation
+        // is published. A completed success must become a fingerprint tombstone
+        // here — `seal_success_if` only sees Running entries, and prune would
+        // otherwise drop the handle and allow a same-prompt retry to duplicate.
+        if handle.is_completed() && !handle.has_terminal_error() {
+            runs.insert_key(
+                self.session_id.clone(),
+                LiveRunEntry::Succeeded {
+                    fingerprint: handle.request_fingerprint(),
+                    until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                },
+            );
+        } else {
+            runs.insert_key(self.session_id.clone(), LiveRunEntry::Running(handle));
+        }
         self.committed = true;
         Ok(())
     }
@@ -833,7 +1127,16 @@ impl Drop for LiveRunReservation {
                 if reservation_id == &self.reservation_id
         );
         if owns_reservation {
-            runs.remove_key(&self.session_id);
+            if self.seal_on_drop {
+                runs.insert_key(
+                    self.session_id.clone(),
+                    LiveRunEntry::Ambiguous {
+                        until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                    },
+                );
+            } else {
+                runs.remove_key(&self.session_id);
+            }
         }
     }
 }
@@ -847,8 +1150,21 @@ pub enum LiveSlotClaim {
 
 pub enum LiveConflictAction {
     Http409,
-    CancelRunning(Arc<CursorLiveRunHandle>),
     SlotFree,
+}
+
+pub enum LiveReplacementClaim {
+    Reserved {
+        reservation: LiveRunReservation,
+        superseded: Option<Arc<CursorLiveRunHandle>>,
+    },
+    Conflict,
+}
+
+pub enum LiveRunProbe {
+    TerminalError(String),
+    Occupied,
+    Free,
 }
 
 pub struct LiveRunRegistry;
@@ -871,17 +1187,10 @@ impl LiveRunRegistry {
         Self::reserve_key(&mut runs, key)
     }
 
-    /// Classify and optionally reserve under one lock so Starting cannot become
-    /// Running between separate checks and then be superseded.
-    ///
-    /// `supersede_running`: replace an existing Running occupant in this same
-    /// lock. After waiting on Starting, pass `false` so the run that just opened
-    /// is not killed.
-    pub fn try_claim_run(
-        session_id: &str,
-        agent_id: Option<&str>,
-        supersede_running: bool,
-    ) -> LiveSlotClaim {
+    /// Classify and optionally reserve under one lock. An unbound caller never
+    /// supersedes an occupied slot; replacement requires an observed run id via
+    /// `claim_replacement_for_run`.
+    pub fn try_claim_run(session_id: &str, agent_id: Option<&str>) -> LiveSlotClaim {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
@@ -890,24 +1199,10 @@ impl LiveRunRegistry {
             Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => {
                 LiveSlotClaim::Ambiguous
             }
-            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
-                if !supersede_running {
-                    return LiveSlotClaim::Running;
-                }
-                let handle = Arc::clone(handle);
-                runs.remove_key(&key);
-                match Self::reserve_key(&mut runs, key.clone()) {
-                    Some(reservation) => {
-                        drop(runs);
-                        handle.cancel();
-                        LiveSlotClaim::Reserved(reservation)
-                    }
-                    None => {
-                        runs.insert_key(key, LiveRunEntry::Running(handle));
-                        LiveSlotClaim::Running
-                    }
-                }
+            Some(LiveRunEntry::Succeeded { until, .. }) if Instant::now() < *until => {
+                LiveSlotClaim::Ambiguous
             }
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => LiveSlotClaim::Running,
             _ => match Self::reserve_key(&mut runs, key) {
                 Some(reservation) => LiveSlotClaim::Reserved(reservation),
                 None => LiveSlotClaim::Running,
@@ -920,15 +1215,62 @@ impl LiveRunRegistry {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         match runs.runs.get(&key) {
-            Some(LiveRunEntry::Starting { .. }) | Some(LiveRunEntry::Ambiguous { .. }) => {
-                LiveConflictAction::Http409
-            }
-            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+            Some(
+                LiveRunEntry::Starting { .. }
+                | LiveRunEntry::Ambiguous { .. }
+                | LiveRunEntry::Succeeded { .. }
+                | LiveRunEntry::Running(_),
+            ) => LiveConflictAction::Http409,
+            None => LiveConflictAction::SlotFree,
+        }
+    }
+
+    /// Replace only the exact Running generation observed by the waiter and
+    /// reserve its slot in the same lock acquisition.
+    ///
+    /// A stale waiter must never cancel a newer replacement, and no third
+    /// request may claim the gap between cancellation and replacement.
+    pub fn claim_replacement_for_run(
+        session_id: &str,
+        agent_id: Option<&str>,
+        expected_run_id: &str,
+    ) -> LiveReplacementClaim {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(handle))
+                if !handle.is_completed()
+                    && !handle.is_cancel_requested()
+                    && !handle.has_terminal_error()
+                    && handle.run_id() == expected_run_id =>
+            {
                 let handle = Arc::clone(handle);
                 runs.remove_key(&key);
-                LiveConflictAction::CancelRunning(handle)
+                match Self::reserve_key(&mut runs, key.clone()) {
+                    Some(reservation) => LiveReplacementClaim::Reserved {
+                        reservation,
+                        superseded: Some(handle),
+                    },
+                    None => {
+                        runs.insert_key(key, LiveRunEntry::Running(handle));
+                        LiveReplacementClaim::Conflict
+                    }
+                }
             }
-            _ => LiveConflictAction::SlotFree,
+            Some(
+                LiveRunEntry::Starting { .. }
+                | LiveRunEntry::Ambiguous { .. }
+                | LiveRunEntry::Succeeded { .. }
+                | LiveRunEntry::Running(_),
+            ) => LiveReplacementClaim::Conflict,
+            None => match Self::reserve_key(&mut runs, key) {
+                Some(reservation) => LiveReplacementClaim::Reserved {
+                    reservation,
+                    superseded: None,
+                },
+                None => LiveReplacementClaim::Conflict,
+            },
         }
     }
 
@@ -949,6 +1291,7 @@ impl LiveRunRegistry {
             session_id: key,
             reservation_id,
             committed: false,
+            seal_on_drop: true,
             cancel,
         })
     }
@@ -957,6 +1300,7 @@ impl LiveRunRegistry {
         match runs.runs.get(key) {
             Some(LiveRunEntry::Starting { .. }) => true,
             Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => true,
+            Some(LiveRunEntry::Succeeded { until, .. }) if Instant::now() < *until => true,
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
             _ => false,
         }
@@ -974,7 +1318,10 @@ impl LiveRunRegistry {
         let entry = {
             let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
             Self::prune_finished(&mut runs);
-            if matches!(runs.runs.get(&key), Some(LiveRunEntry::Ambiguous { .. })) {
+            if matches!(
+                runs.runs.get(&key),
+                Some(LiveRunEntry::Ambiguous { .. } | LiveRunEntry::Succeeded { .. })
+            ) {
                 return true;
             }
             runs.remove_key(&key)
@@ -988,7 +1335,7 @@ impl LiveRunRegistry {
                 let _ = cancel.send_replace(true);
                 true
             }
-            Some(LiveRunEntry::Ambiguous { .. }) | None => false,
+            Some(LiveRunEntry::Ambiguous { .. } | LiveRunEntry::Succeeded { .. }) | None => false,
         }
     }
 
@@ -1028,7 +1375,9 @@ impl LiveRunRegistry {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         match runs.runs.get(&key) {
-            Some(LiveRunEntry::Starting { .. }) | Some(LiveRunEntry::Ambiguous { .. }) => {
+            Some(LiveRunEntry::Starting { .. })
+            | Some(LiveRunEntry::Ambiguous { .. })
+            | Some(LiveRunEntry::Succeeded { .. }) => {
                 return None;
             }
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {}
@@ -1054,7 +1403,11 @@ impl LiveRunRegistry {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         match runs.runs.get(&key) {
-            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+            Some(LiveRunEntry::Running(handle))
+                if !handle.is_completed()
+                    && !handle.is_cancel_requested()
+                    && !handle.has_terminal_error() =>
+            {
                 Some(Arc::clone(handle))
             }
             _ => None,
@@ -1072,6 +1425,45 @@ impl LiveRunRegistry {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         Self::key_occupied(&runs, &key)
+    }
+
+    /// Atomically consume a terminal outcome or classify the current slot.
+    pub fn probe_run(session_id: &str, agent_id: Option<&str>) -> LiveRunProbe {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        let error = match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(handle)) if handle.is_completed() => {
+                handle.take_terminal_error()
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            if terminal_error_allows_fresh_retry(&error) {
+                runs.remove_key(&key);
+                return LiveRunProbe::Free;
+            }
+            if terminal_error_is_ambiguous_accept(&error) {
+                runs.insert_key(
+                    key,
+                    LiveRunEntry::Ambiguous {
+                        until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                    },
+                );
+            } else {
+                runs.remove_key(&key);
+            }
+            return LiveRunProbe::TerminalError(error);
+        }
+        match runs.runs.get(&key) {
+            Some(
+                LiveRunEntry::Starting { .. }
+                | LiveRunEntry::Ambiguous { .. }
+                | LiveRunEntry::Succeeded { .. }
+                | LiveRunEntry::Running(_),
+            ) => LiveRunProbe::Occupied,
+            None => LiveRunProbe::Free,
+        }
     }
 
     /// True while this slot is reserved but the first `Run` has not been
@@ -1098,15 +1490,41 @@ impl LiveRunRegistry {
     }
 
     pub fn take_terminal_error_run(session_id: &str, agent_id: Option<&str>) -> Option<String> {
+        Self::take_terminal_error_matching_run(session_id, agent_id, None)
+    }
+
+    pub fn take_terminal_error_for_run(
+        session_id: &str,
+        agent_id: Option<&str>,
+        expected_run_id: &str,
+    ) -> Option<String> {
+        Self::take_terminal_error_matching_run(session_id, agent_id, Some(expected_run_id))
+    }
+
+    fn take_terminal_error_matching_run(
+        session_id: &str,
+        agent_id: Option<&str>,
+        expected_run_id: Option<&str>,
+    ) -> Option<String> {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         let error = match runs.runs.get(&key) {
-            Some(LiveRunEntry::Running(handle)) => handle.take_terminal_error(),
-            Some(LiveRunEntry::Starting { .. }) | Some(LiveRunEntry::Ambiguous { .. }) | None => {
-                None
+            Some(LiveRunEntry::Running(handle))
+                if handle.is_completed()
+                    && expected_run_id.is_none_or(|expected| handle.run_id() == expected) =>
+            {
+                handle.take_terminal_error()
             }
+            Some(LiveRunEntry::Starting { .. })
+            | Some(LiveRunEntry::Ambiguous { .. })
+            | Some(LiveRunEntry::Succeeded { .. })
+            | None => None,
+            Some(LiveRunEntry::Running(_)) => None,
         };
+        let allows_fresh_retry = error
+            .as_deref()
+            .is_some_and(terminal_error_allows_fresh_retry);
         if error.is_some() {
             if error
                 .as_deref()
@@ -1122,7 +1540,7 @@ impl LiveRunRegistry {
                 runs.remove_key(&key);
             }
         }
-        error
+        if allows_fresh_retry { None } else { error }
     }
 
     fn prune_finished(runs: &mut LiveRunMap) {
@@ -1133,6 +1551,8 @@ impl LiveRunRegistry {
                 LiveRunEntry::Starting { .. } => None,
                 LiveRunEntry::Ambiguous { until } if Instant::now() < *until => None,
                 LiveRunEntry::Ambiguous { .. } => Some(key.clone()),
+                LiveRunEntry::Succeeded { until, .. } if Instant::now() < *until => None,
+                LiveRunEntry::Succeeded { .. } => Some(key.clone()),
                 LiveRunEntry::Running(handle)
                     if !handle.is_completed() || handle.has_terminal_error() =>
                 {
@@ -1146,7 +1566,7 @@ impl LiveRunRegistry {
         }
     }
 
-    fn remove_if(session_id: &str, run_id: &str) {
+    fn seal_success_if(session_id: &str, run_id: &str) {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         let keys = runs.keys_for(claude_session_of(session_id));
         let mut extra = Vec::new();
@@ -1154,13 +1574,42 @@ impl LiveRunRegistry {
             extra.push(session_id.to_string());
         }
         for key in keys.into_iter().chain(extra) {
-            if matches!(
-                runs.runs.get(&key),
-                Some(LiveRunEntry::Running(handle)) if handle.run_id == run_id
-            ) {
-                runs.remove_key(&key);
+            let fingerprint = match runs.runs.get(&key) {
+                Some(LiveRunEntry::Running(handle)) if handle.run_id == run_id => {
+                    Some(handle.request_fingerprint())
+                }
+                _ => None,
+            };
+            if let Some(fingerprint) = fingerprint {
+                runs.insert_key(
+                    key,
+                    LiveRunEntry::Succeeded {
+                        fingerprint,
+                        until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                    },
+                );
                 return;
             }
+        }
+    }
+
+    pub fn release_success_if_new_request(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Succeeded {
+                fingerprint: stored,
+                until,
+            }) if Instant::now() < *until && *stored == fingerprint => {}
+            Some(LiveRunEntry::Succeeded { .. }) => {
+                runs.remove_key(&key);
+            }
+            _ => {}
         }
     }
 
@@ -1291,19 +1740,23 @@ impl CursorHttpClient {
             live_h2_open_attempt_timeout(),
             live_h1_open_attempt_timeout(),
         );
-        let (outbound, response) = if let Some(rx) = cancel.as_mut() {
+        let opened = if let Some(rx) = cancel.as_mut() {
             tokio::select! {
                 _ = rx.wait_for(|aborted| *aborted) => {
-                    return Err(CursorError::new(
+                    Err(CursorError::new(
                         409,
-                        "Cursor live open superseded",
+                        "Cursor live open superseded; acceptance is ambiguous",
                         None,
-                    ));
+                    ))
                 }
-                result = open => result?,
+                result = open => result,
             }
         } else {
-            open.await?
+            open.await
+        };
+        let (outbound, response) = match opened {
+            Ok(pair) => pair,
+            Err(err) => return Err(annotate_live_cursor_error(&worker_session, err)),
         };
         let force_http1 = matches!(outbound, ClientOutbound::Http1(_));
 
@@ -1314,6 +1767,7 @@ impl CursorHttpClient {
         let pending = Arc::new(Mutex::new(Vec::new()));
         let terminal_error = Arc::new(Mutex::new(None));
         let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
         let run_id = uuid::Uuid::new_v4().to_string();
         let handle = Arc::new(CursorLiveRunHandle {
             run_id: run_id.clone(),
@@ -1321,6 +1775,9 @@ impl CursorHttpClient {
             pending: Arc::clone(&pending),
             terminal_error: Arc::clone(&terminal_error),
             completed: Arc::clone(&completed),
+            cancel_requested: Arc::clone(&cancel_requested),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         });
 
         let seeded_blobs: HashMap<Vec<u8>, Vec<u8>> =
@@ -1329,6 +1786,7 @@ impl CursorHttpClient {
             http: self.clone(),
             token: token.to_string(),
             identity: cursor_identity,
+            session_id: worker_session.clone(),
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
@@ -1342,16 +1800,18 @@ impl CursorHttpClient {
         // pump (and Cursor's TCP window) during thinking bursts.
         let (upstream_tx, upstream_rx) =
             mpsc::channel::<Result<Option<Bytes>, String>>(LIVE_EVENT_CHANNEL_CAP);
-        spawn_upstream_pump(response.bytes_stream(), upstream_tx.clone());
+        let upstream_pump = spawn_upstream_pump(response.bytes_stream(), upstream_tx.clone());
         tokio::spawn(drive_live_run(
             upstream_rx,
             upstream_tx,
+            upstream_pump,
             outbound,
             command_rx,
             event_tx,
             pending,
             terminal_error,
             completed,
+            cancel_requested,
             allowed_tool_names,
             worker_session,
             run_id,
@@ -1479,7 +1939,10 @@ impl CursorHttpClient {
             request_id.to_string(),
             identity.headers.clone(),
         );
-        append.append_message(first_message).await?;
+        append
+            .append_message(first_message)
+            .await
+            .map_err(|error| ambiguous_http1_append_error(error, "initial Run"))?;
         Ok((ClientOutbound::Http1(append), response))
     }
 
@@ -1686,6 +2149,7 @@ struct LiveReconnectContext {
     http: CursorHttpClient,
     token: String,
     identity: LiveIdentityHeaders,
+    session_id: String,
     model_id: String,
     conversation_id: Option<String>,
     force_http1: bool,
@@ -1704,18 +2168,22 @@ type LiveUpstream = mpsc::Receiver<Result<Option<Bytes>, String>>;
 ///
 /// Sends `Ok(None)` exactly once when the HTTP body ends so the driver sees EOF
 /// even while it still holds a clone of the sender for reconnect pumps.
-fn spawn_upstream_pump<S>(stream: S, tx: mpsc::Sender<Result<Option<Bytes>, String>>)
+fn spawn_upstream_pump<S>(
+    stream: S,
+    tx: mpsc::Sender<Result<Option<Bytes>, String>>,
+) -> tokio::task::JoinHandle<()>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
-    spawn_upstream_pump_prefixed(None, stream, tx);
+    spawn_upstream_pump_prefixed(None, stream, tx)
 }
 
 fn spawn_upstream_pump_prefixed<S>(
     prefix: Option<Bytes>,
     stream: S,
     tx: mpsc::Sender<Result<Option<Bytes>, String>>,
-) where
+) -> tokio::task::JoinHandle<()>
+where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
@@ -1735,7 +2203,7 @@ fn spawn_upstream_pump_prefixed<S>(
             }
         }
         let _ = tx.send(Ok(None)).await;
-    });
+    })
 }
 
 /// Drop the previous generation's receiver so a retired pump's `Ok(None)` cannot
@@ -1770,6 +2238,25 @@ fn connect_frame_resets_reconnect_budget(frame: &ConnectFrame) -> bool {
         Ok(message) => server_message_resets_reconnect_budget(&message),
         Err(_) => false,
     }
+}
+
+fn connect_frame_has_top_level_turn_ended(frame: &ConnectFrame) -> bool {
+    if frame.flags & FLAG_END != 0 || frame.payload.is_empty() {
+        return false;
+    }
+    let decoded = if frame.flags & FLAG_GZIP != 0 {
+        match decode_gzip_frame(&frame.payload) {
+            Ok(bytes) => proto::AgentServerMessage::decode(bytes.as_slice()),
+            Err(_) => return false,
+        }
+    } else {
+        proto::AgentServerMessage::decode(frame.payload.as_ref())
+    };
+    decoded
+        .ok()
+        .and_then(|message| message.interaction_update)
+        .and_then(|update| update.turn_ended)
+        .is_some()
 }
 
 fn server_message_resets_reconnect_budget(message: &proto::AgentServerMessage) -> bool {
@@ -1987,16 +2474,37 @@ fn live_should_resume_after_drop(on_probation: bool, got_chunk_since_reconnect: 
     !on_probation || got_chunk_since_reconnect
 }
 
-fn annotate_connect_end_error(session_id: &str, error: ConnectEndError) -> String {
+const CONVERSATION_RESET_RETRY_NOTE: &str =
+    "stale Cursor conversation reset; retry this message to continue";
+type LiveContinuationState<'a> = (&'a mut Option<Vec<u8>>, &'a mut HashMap<Vec<u8>, Vec<u8>>);
+
+fn annotate_connect_end_error(
+    session_id: &str,
+    error: ConnectEndError,
+    continuation_state: Option<LiveContinuationState<'_>>,
+) -> String {
     let mut fields = serde_json::Map::new();
     fields.insert("status".into(), serde_json::json!(error.status));
     fields.insert("code".into(), serde_json::json!(error.code));
     fields.insert("message".into(), serde_json::json!(error.message));
     let mut text = error.to_string();
-    if cursor_connect_error_is_missing_image(&error.message)
+    if cursor_connect_error_is_missing_conversation_data(&error.message)
+        || cursor_connect_error_is_missing_conversation_data(&error.detail)
+    {
+        super::conversation::reset(session_id);
+        if let Some((latest_checkpoint, kv_blobs)) = continuation_state {
+            *latest_checkpoint = None;
+            kv_blobs.clear();
+        }
+        fields.insert("conversationReset".into(), serde_json::json!(true));
+        text = format!("{text} ({CONVERSATION_RESET_RETRY_NOTE})");
+    } else if cursor_connect_error_is_missing_image(&error.message)
         || cursor_connect_error_is_missing_image(&text)
     {
         super::conversation::clear_checkpoint(session_id);
+        if let Some((latest_checkpoint, _)) = continuation_state {
+            *latest_checkpoint = None;
+        }
         fields.insert("checkpointCleared".into(), serde_json::json!(true));
         text = format!(
             "{text} (this turn had no new image; a stale Cursor image id was in the conversation checkpoint — checkpoint cleared, retry the message)"
@@ -2004,6 +2512,33 @@ fn annotate_connect_end_error(session_id: &str, error: ConnectEndError) -> Strin
     }
     crate::logging::create_logger("cursor").warn("connect_end_error", Some(fields));
     text
+}
+
+fn cursor_error_is_missing_conversation_data(err: &CursorError) -> bool {
+    cursor_connect_error_is_missing_conversation_data(&err.message)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(cursor_connect_error_is_missing_conversation_data)
+}
+
+fn annotate_live_cursor_error(session_id: &str, err: CursorError) -> CursorError {
+    if !cursor_error_is_missing_conversation_data(&err) {
+        return err;
+    }
+    super::conversation::reset(session_id);
+    CursorError::new(
+        err.status,
+        format!("{} ({CONVERSATION_RESET_RETRY_NOTE})", err.message),
+        err.detail,
+    )
+}
+
+pub(crate) fn live_request_fingerprint(payload: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2084,7 +2619,36 @@ fn is_http1_fallback_error(err: &CursorError) -> bool {
 }
 
 fn live_send_failure_is_terminal(err: &CursorError) -> bool {
-    !is_retryable_live_transport_error(err)
+    cursor_error_is_missing_conversation_data(err)
+        || err.message.contains("acceptance is ambiguous")
+        || !is_retryable_live_transport_error(err)
+}
+
+fn live_reconnect_open_error_is_fatal(err: &CursorError) -> bool {
+    cursor_error_is_missing_conversation_data(err)
+        || terminal_error_allows_fresh_retry(&err.message)
+        || live_send_failure_is_terminal(err)
+        || is_response_less_send_error(err)
+}
+
+fn live_should_persist_continuation_message(message: Option<&str>) -> bool {
+    !message.is_some_and(terminal_error_allows_fresh_retry)
+}
+
+fn live_acceptance_unresolved(
+    held_turn_end: bool,
+    accepted_resume_unconfirmed: bool,
+    unconfirmed_probation: bool,
+) -> bool {
+    held_turn_end || accepted_resume_unconfirmed || unconfirmed_probation
+}
+
+fn live_control_close_message(unresolved: bool) -> &'static str {
+    if unresolved {
+        "Cursor live run control channel closed after an unresolved operation; completion is ambiguous"
+    } else {
+        "Cursor live run control channel closed"
+    }
 }
 
 pub(crate) fn is_ambiguous_live_open_timeout(err: &CursorError) -> bool {
@@ -2114,7 +2678,13 @@ fn is_response_less_send_error(err: &CursorError) -> bool {
 }
 
 pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
-    if matches!(err.status, 400 | 401 | 403 | 404 | 409 | 421 | 429 | 464) {
+    if terminal_error_allows_fresh_retry(&err.message) {
+        return false;
+    }
+    if terminal_error_is_ambiguous_accept(&err.message) {
+        return true;
+    }
+    if matches!(err.status, 400 | 401 | 403 | 404 | 421 | 429 | 464) {
         return false;
     }
     if is_pre_connect_failure(err) {
@@ -2135,12 +2705,31 @@ fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
         || lower.contains("ended before the first byte")
 }
 
+fn terminal_error_allows_fresh_retry(message: &str) -> bool {
+    message.contains(CONVERSATION_RESET_RETRY_NOTE)
+}
+
 fn classify_outbound_send(result: Result<(), CursorError>) -> Result<bool, CursorError> {
     match result {
         Ok(()) => Ok(true),
         Err(err) if live_send_failure_is_terminal(&err) => Err(err),
         Err(_) => Ok(false),
     }
+}
+
+fn partial_tool_result_send_error(
+    error: CursorError,
+    sent_frames: usize,
+    total_frames: usize,
+) -> CursorError {
+    CursorError::new(
+        error.status,
+        format!(
+            "Cursor tool-result batch partially sent ({sent_frames}/{total_frames}); acceptance is ambiguous: {}",
+            error.message
+        ),
+        error.detail,
+    )
 }
 
 /// Semantic Cursor errors (400/401/403/429) must not be retried on another
@@ -2354,12 +2943,30 @@ fn log_live_reconnect(
 
 /// Re-open AgentService/Run with `ResumeAction` after a transport stall.
 /// Retries retryable open failures up to `max_reconnects` (first attempt has no delay).
+async fn wait_for_live_cancel(cancel_requested: &AtomicBool) {
+    while !cancel_requested.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn reconnect_cancelled_ambiguous(
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    detail: &str,
+) -> LiveReconnectOutcome {
+    let message = format!("Cursor live cancellation interrupted {detail}; acceptance is ambiguous");
+    store_terminal_error(terminal_error, &message);
+    LiveReconnectOutcome::Failed(message)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_live_reconnect(
     reconnect: &mut LiveReconnectContext,
     outbound: &mut ClientOutbound,
     upstream: &mut LiveUpstream,
     upstream_tx: &mut mpsc::Sender<Result<Option<Bytes>, String>>,
+    upstream_pump: &mut tokio::task::JoinHandle<()>,
+    cancel_requested: &AtomicBool,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     decoder: &mut ConnectFrameDecoder,
     latest_checkpoint: &Option<Vec<u8>>,
     kv_blobs: &HashMap<Vec<u8>, Vec<u8>>,
@@ -2371,6 +2978,12 @@ async fn try_live_reconnect(
     _resume_grace: Duration,
     hard_deadline: Instant,
 ) -> LiveReconnectOutcome {
+    if cancel_requested.load(Ordering::Acquire) {
+        return reconnect_cancelled_ambiguous(
+            terminal_error,
+            "recovery before a replacement ResumeAction",
+        );
+    }
     let Some(checkpoint) = live_reconnect_resume_state(
         latest_checkpoint,
         &reconnect.opening_checkpoint,
@@ -2391,6 +3004,9 @@ async fn try_live_reconnect(
     reconnect.recovery.note_delayed_hollow_if_probation();
     reconnect.recovery.begin(Instant::now());
     loop {
+        if cancel_requested.load(Ordering::Acquire) {
+            return reconnect_cancelled_ambiguous(terminal_error, "an unresolved recovery episode");
+        }
         if Instant::now() >= hard_deadline {
             let outcome = LiveReconnectOutcome::Failed(
                 last_fail.unwrap_or_else(|| "hard timeout during reconnect".into()),
@@ -2446,7 +3062,23 @@ async fn try_live_reconnect(
             return outcome;
         }
         if !closed_collecting {
-            match control_close_collecting_natives(pending, outbound).await {
+            let cancelling_http1_append_is_ambiguous = matches!(outbound, ClientOutbound::Http1(_));
+            let close_result = tokio::select! {
+                _ = wait_for_live_cancel(cancel_requested) => {
+                    if cancelling_http1_append_is_ambiguous {
+                        let message =
+                            "Cursor live cancellation interrupted an in-flight HTTP/1 control append; acceptance is ambiguous";
+                        store_terminal_error(terminal_error, message);
+                        return LiveReconnectOutcome::Failed(message.into());
+                    }
+                    return reconnect_cancelled_ambiguous(
+                        terminal_error,
+                        "an in-flight control close",
+                    );
+                }
+                result = control_close_collecting_natives(pending, outbound) => result,
+            };
+            match close_result {
                 Err(err) => {
                     let outcome = LiveReconnectOutcome::Failed(format!(
                         "Connect error {}: {}",
@@ -2478,7 +3110,15 @@ async fn try_live_reconnect(
             remaining_ms,
         );
         if delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            tokio::select! {
+                _ = wait_for_live_cancel(cancel_requested) => {
+                    return reconnect_cancelled_ambiguous(
+                        terminal_error,
+                        "recovery backoff",
+                    );
+                }
+                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+            }
         }
         reconnect.recovery.last_was_hollow = false;
         reconnect.http =
@@ -2530,40 +3170,42 @@ async fn try_live_reconnect(
             return outcome;
         }
 
-        let opened = reconnect
-            .http
-            .open_live_transport(
-                &reconnect.token,
-                &request_id,
-                &first_message,
-                &reconnect.identity,
-                reconnect.force_http1,
-                live_reconnect_open_allow_h1(reconnect, Instant::now()),
-                open_wait,
-                open_wait,
-            )
-            .await;
+        let open = reconnect.http.open_live_transport(
+            &reconnect.token,
+            &request_id,
+            &first_message,
+            &reconnect.identity,
+            reconnect.force_http1,
+            live_reconnect_open_allow_h1(reconnect, Instant::now()),
+            open_wait,
+            open_wait,
+        );
+        let opened = tokio::select! {
+            _ = wait_for_live_cancel(cancel_requested) => {
+                let message =
+                    "Cursor live cancellation interrupted an in-flight ResumeAction; acceptance is ambiguous";
+                store_terminal_error(terminal_error, message);
+                return LiveReconnectOutcome::Failed(message.into());
+            }
+            result = open => result,
+        };
 
         match opened {
-            Err(err) if is_response_less_send_error(&err) => {
-                let outcome = LiveReconnectOutcome::Failed(format!(
-                    "{} (response-less ResumeAction send is ambiguous)",
-                    err.message
-                ));
-                log_live_reconnect(
-                    &outcome,
-                    *reconnect_attempts,
-                    max_reconnects,
-                    &reconnect.http,
-                );
-                return outcome;
-            }
             Err(err) => {
-                last_fail = Some(format!("{} ({})", err.message, err.status));
-                if !is_retryable_live_transport_error(&err) {
-                    let outcome = LiveReconnectOutcome::Failed(
-                        last_fail.clone().unwrap_or_else(|| err.to_string()),
-                    );
+                let err = annotate_live_cursor_error(&reconnect.session_id, err);
+                if live_reconnect_open_error_is_fatal(&err) {
+                    let message = if is_response_less_send_error(&err)
+                        && !cursor_error_is_missing_conversation_data(&err)
+                        && !terminal_error_allows_fresh_retry(&err.message)
+                    {
+                        format!(
+                            "{} (response-less ResumeAction send is ambiguous)",
+                            err.message
+                        )
+                    } else {
+                        err.message.clone()
+                    };
+                    let outcome = LiveReconnectOutcome::Failed(message);
                     log_live_reconnect(
                         &outcome,
                         *reconnect_attempts,
@@ -2572,6 +3214,7 @@ async fn try_live_reconnect(
                     );
                     return outcome;
                 }
+                last_fail = Some(format!("{} ({})", err.message, err.status));
                 record_transport_failure(reconnect, Instant::now());
                 match live_reconnect_on_open_error(
                     reconnect.force_http1,
@@ -2603,12 +3246,23 @@ async fn try_live_reconnect(
             }
             Ok((new_outbound, response)) => {
                 let stream = response.bytes_stream();
-                match take_immediate_resume_chunk(stream).await {
+                let immediate = tokio::select! {
+                    _ = wait_for_live_cancel(cancel_requested) => {
+                        let message =
+                            "Cursor live cancellation interrupted an accepted ResumeAction before its first response chunk; acceptance is ambiguous";
+                        store_terminal_error(terminal_error, message);
+                        return LiveReconnectOutcome::Failed(message.into());
+                    }
+                    result = take_immediate_resume_chunk(stream) => result,
+                };
+                match immediate {
                     Ok((prefix, rest)) => {
+                        upstream_pump.abort();
+                        let _ = (&mut *upstream_pump).await;
                         *outbound = new_outbound;
                         reconnect.force_http1 = matches!(*outbound, ClientOutbound::Http1(_));
                         let pump_tx = fence_live_upstream(upstream, upstream_tx);
-                        spawn_upstream_pump_prefixed(prefix, rest, pump_tx);
+                        *upstream_pump = spawn_upstream_pump_prefixed(prefix, rest, pump_tx);
                         *decoder = ConnectFrameDecoder::new();
                         *last_progress = Instant::now();
                         // Probation is bounded by the 45s episode, not 120s tool-result grace.
@@ -2860,12 +3514,14 @@ struct LiveTurnCtx<'a> {
 async fn drive_live_run(
     mut upstream: LiveUpstream,
     mut upstream_tx: mpsc::Sender<Result<Option<Bytes>, String>>,
+    mut upstream_pump: tokio::task::JoinHandle<()>,
     mut outbound: ClientOutbound,
     mut command_rx: mpsc::Receiver<RunCommand>,
     initial_sink: mpsc::Sender<LiveEventResult>,
     pending_shared: Arc<Mutex<Vec<PendingCursorExec>>>,
     terminal_error: Arc<Mutex<Option<TerminalOutcome>>>,
     completed: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
     allowed_tool_names: Option<BTreeSet<String>>,
     session_id: String,
     run_id: String,
@@ -2875,11 +3531,13 @@ async fn drive_live_run(
     mut reconnect: LiveReconnectContext,
 ) {
     let mut sink = Some(initial_sink);
-    let mut pending = PendingExecState::default();
+    let mut pending = PendingExecState::for_run(&run_id);
     let mut deferred = VecDeque::<LiveEventResult>::new();
     let mut decoder = ConnectFrameDecoder::new();
     let mut kv_blobs = seeded_blobs;
     let mut latest_checkpoint = reconnect.opening_checkpoint.clone();
+    let mut cancel_ack = None;
+    let mut was_cancelled = false;
     let mut saw_text = false;
     let mut useful = false;
     let mut logical_tools_waiting = LogicalToolTracker::default();
@@ -2937,8 +3595,66 @@ async fn drive_live_run(
     let max_reconnects = env_u64("CCP_CURSOR_RECONNECT_MAX", 10) as u32;
     let mut reconnect_attempts: u32 = 0;
     let mut got_chunk_since_reconnect = false;
+    let mut accepted_resume_unconfirmed = false;
+    // A normal turn_ended is not authoritative until Connect END/EOF. Holding
+    // it prevents a later, separately chunked END error from being masked by a
+    // fabricated successful Anthropic end_turn.
+    let mut held_turn_end_frames = Vec::<ConnectFrame>::new();
+
+    macro_rules! process_driver_frames {
+        ($frames:expr) => {{
+            let mut keep_running = true;
+            for frame in $frames {
+                let mut turn = LiveTurnCtx {
+                    session_id: &session_id,
+                    user_prompt: &user_prompt,
+                    request_context: &request_context,
+                    decode_failures: &mut decode_failures,
+                    coalescer: &mut coalescer,
+                };
+                if !process_live_frame(
+                    frame,
+                    &outbound,
+                    &mut sink,
+                    &mut deferred,
+                    &mut pending,
+                    &pending_shared,
+                    &mut kv_blobs,
+                    &mut latest_checkpoint,
+                    &terminal_error,
+                    allowed_tool_names.as_ref(),
+                    &mut saw_text,
+                    &mut useful,
+                    &mut logical_tools_waiting,
+                    &mut last_progress,
+                    tool_batch_quiet,
+                    &mut xml_parser,
+                    Some(&mut turn),
+                )
+                .await
+                {
+                    keep_running = false;
+                    break;
+                }
+            }
+            keep_running
+        }};
+    }
 
     'driver: loop {
+        if cancel_requested.load(Ordering::Acquire) {
+            was_cancelled = true;
+            mark_live_cancelled(
+                &mut sink,
+                &terminal_error,
+                live_acceptance_unresolved(
+                    !held_turn_end_frames.is_empty(),
+                    accepted_resume_unconfirmed,
+                    reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                ),
+            );
+            break 'driver;
+        }
         // Check before select: Cursor InteractionUpdate.heartbeat / client
         // heartbeats keep the biased upstream/heartbeat arms ready and would
         // otherwise starve the 250ms closed-sink poll for minutes — leaving a
@@ -2948,12 +3664,27 @@ async fn drive_live_run(
             // logical_tools_waiting alone must not pin the session: those are
             // UI hints, not Anthropic-exposed pending tools.
             if pending.is_empty() {
+                if live_acceptance_unresolved(
+                    !held_turn_end_frames.is_empty(),
+                    accepted_resume_unconfirmed,
+                    reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                ) {
+                    report_terminal_error(
+                        &mut sink,
+                        &terminal_error,
+                        "Cursor downstream disconnected while upstream completion was unresolved; acceptance is ambiguous".into(),
+                    )
+                    .await;
+                }
                 break 'driver;
             }
             sink = None;
         }
         if run_started.elapsed() >= hard {
-            let message = if pending.is_empty() {
+            let message = if !held_turn_end_frames.is_empty() {
+                "Cursor live run timed out after an uncommitted turn_ended frame; completion is ambiguous"
+                    .into()
+            } else if pending.is_empty() {
                 "Cursor live run hard timeout".into()
             } else {
                 "Cursor live run hard timeout with pending native tools".into()
@@ -2974,7 +3705,10 @@ async fn drive_live_run(
             .await;
             break 'driver;
         }
-        if let Some(since) = pending.oldest_since() {
+        if !held_turn_end_frames.is_empty() {
+            // Wait for the authoritative Connect END (which may be delivered
+            // in a later HTTP body chunk) before exposing success.
+        } else if let Some(since) = pending.oldest_since() {
             if since.elapsed() >= tool_ttl {
                 report_terminal_error(
                     &mut sink,
@@ -3030,6 +3764,9 @@ async fn drive_live_run(
                         &mut outbound,
                         &mut upstream,
                         &mut upstream_tx,
+                        &mut upstream_pump,
+                        cancel_requested.as_ref(),
+                        &terminal_error,
                         &mut decoder,
                         &latest_checkpoint,
                         &kv_blobs,
@@ -3063,34 +3800,61 @@ async fn drive_live_run(
             }
             break 'driver;
         }
-        let batch_deadline = pending.collect_deadline();
+        let batch_deadline = pending.native_collect_deadline();
         let coalesce_deadline = coalescer.deadline();
         tokio::select! {
             biased;
 
             command = command_rx.recv() => {
                 match command {
-                    Some(RunCommand::Cancel) => {
+                    Some(RunCommand::Cancel { ack }) => {
+                        cancel_ack = ack;
+                        was_cancelled = true;
                         // Registry may already have removed us via supersede;
                         // still mark completed so prune/get stay consistent.
-                        report_terminal_error(
+                        mark_live_cancelled(
                             &mut sink,
                             &terminal_error,
-                            "Cursor live run cancelled".into(),
-                        )
-                        .await;
+                            live_acceptance_unresolved(
+                                !held_turn_end_frames.is_empty(),
+                                accepted_resume_unconfirmed,
+                                reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                            ),
+                        );
                         break 'driver;
                     }
                     None => {
+                        let message = live_control_close_message(live_acceptance_unresolved(
+                            !held_turn_end_frames.is_empty(),
+                            accepted_resume_unconfirmed,
+                            reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                        ));
                         report_terminal_error(
                             &mut sink,
                             &terminal_error,
-                            "Cursor live run control channel closed".into(),
+                            message.into(),
                         )
                         .await;
                         break 'driver;
                     }
-                    Some(RunCommand::ResumeBatch { tool_results, sink: next_sink, ack }) => {
+                    Some(RunCommand::ResumeBatch {
+                        tool_results,
+                        sink: next_sink,
+                        ack,
+                        permit: _resume_permit,
+                        dispatch_state,
+                    }) => {
+                        if dispatch_state
+                            .compare_exchange(
+                                RESUME_DISPATCH_WAITING,
+                                RESUME_DISPATCH_STARTED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            continue;
+                        }
                         let frames = match encode_tool_result_batch(pending.awaiting(), &tool_results) {
                             Ok(frames) => frames,
                             Err(error) => {
@@ -3098,12 +3862,36 @@ async fn drive_live_run(
                                 continue;
                             }
                         };
+                        // Establish the Anthropic response before any bounded
+                        // transport/reconnect work. Send failures are delivered
+                        // on this event stream instead of leaving the POST
+                        // silent while the driver recovers.
+                        if ack.send(Ok(())).is_err() {
+                            continue;
+                        }
+                        sink = Some(next_sink);
+                        saw_text = false;
+                        useful = false;
+                        logical_tools_waiting.clear();
+                        last_progress = Instant::now();
+                        last_liveness = last_progress;
 
                         let mut send_failed = false;
                         let mut terminal_send: Option<CursorError> = None;
+                        let mut sent_frames = 0usize;
                         for frame in &frames {
                             match outbound.send_connect_frame(frame.clone()).await {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    sent_frames += 1;
+                                }
+                                Err(err) if sent_frames > 0 => {
+                                    terminal_send = Some(partial_tool_result_send_error(
+                                        err,
+                                        sent_frames,
+                                        frames.len(),
+                                    ));
+                                    break;
+                                }
                                 Err(err) if live_send_failure_is_terminal(&err) => {
                                     terminal_send = Some(err);
                                     break;
@@ -3118,10 +3906,24 @@ async fn drive_live_run(
                             report_terminal_error(
                                 &mut sink,
                                 &terminal_error,
-                                err.to_string(),
+                                annotate_live_cursor_error(&session_id, err).to_string(),
                             )
                             .await;
-                            let _ = ack.send(Err(err));
+                            break 'driver;
+                        }
+                        if cancel_requested.load(Ordering::Acquire) {
+                            was_cancelled = true;
+                            mark_live_cancelled(
+                                &mut sink,
+                                &terminal_error,
+                                sent_frames > 0
+                                    || live_acceptance_unresolved(
+                                        !held_turn_end_frames.is_empty(),
+                                        accepted_resume_unconfirmed,
+                                        reconnect.recovery.on_probation
+                                            && !got_chunk_since_reconnect,
+                                    ),
+                            );
                             break 'driver;
                         }
                         if send_failed {
@@ -3140,6 +3942,9 @@ async fn drive_live_run(
                                     &mut outbound,
                                     &mut upstream,
                                     &mut upstream_tx,
+                                    &mut upstream_pump,
+                                    cancel_requested.as_ref(),
+                                    &terminal_error,
                                     &mut decoder,
                                     &latest_checkpoint,
                                     &kv_blobs,
@@ -3164,17 +3969,37 @@ async fn drive_live_run(
                             );
                             if !send_failed {
                                 got_chunk_since_reconnect = false;
+                                let mut resent_frames = 0usize;
                                 for frame in &frames {
                                     match outbound.send_connect_frame(frame.clone()).await {
-                                        Ok(()) => {}
-                                        Err(err) if live_send_failure_is_terminal(&err) => {
+                                        Ok(()) => {
+                                            resent_frames += 1;
+                                        }
+                                        Err(err) if resent_frames > 0 => {
+                                            let err = annotate_live_cursor_error(
+                                                &session_id,
+                                                partial_tool_result_send_error(
+                                                    err,
+                                                    resent_frames,
+                                                    frames.len(),
+                                                ),
+                                            );
                                             report_terminal_error(
                                                 &mut sink,
                                                 &terminal_error,
                                                 err.to_string(),
                                             )
                                             .await;
-                                            let _ = ack.send(Err(err));
+                                            break 'driver;
+                                        }
+                                        Err(err) if live_send_failure_is_terminal(&err) => {
+                                            report_terminal_error(
+                                                &mut sink,
+                                                &terminal_error,
+                                                annotate_live_cursor_error(&session_id, err)
+                                                    .to_string(),
+                                            )
+                                            .await;
                                             break 'driver;
                                         }
                                         Err(_) => {
@@ -3183,6 +4008,20 @@ async fn drive_live_run(
                                         }
                                     }
                                 }
+                            }
+                            if cancel_requested.load(Ordering::Acquire) {
+                                was_cancelled = true;
+                                mark_live_cancelled(
+                                    &mut sink,
+                                    &terminal_error,
+                                    live_acceptance_unresolved(
+                                        !held_turn_end_frames.is_empty(),
+                                        accepted_resume_unconfirmed,
+                                        reconnect.recovery.on_probation
+                                            && !got_chunk_since_reconnect,
+                                    ),
+                                );
+                                break 'driver;
                             }
                             if send_failed {
                                 let message = format!(
@@ -3195,32 +4034,19 @@ async fn drive_live_run(
                                     message.clone(),
                                 )
                                 .await;
-                                let _ = ack.send(Err(CursorError::internal(message)));
                                 break 'driver;
                             }
                         }
                         pending.complete_awaiting();
+                        accepted_resume_unconfirmed = true;
                         pending_shared
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clear();
-                        sink = Some(next_sink);
-                        saw_text = false;
-                        useful = false;
-                        logical_tools_waiting.clear();
-                        last_progress = Instant::now();
-                        last_liveness = last_progress;
                         // After tool results, Cursor often thinks quietly before the
                         // next text/tool delta. Don't trip setup_idle during that gap
                         // (was the "no useful progress" hang after a healthy tool_use).
                         resume_grace_until = Some(Instant::now() + resume_grace);
-                        // Wake the HTTP handler before replaying buffered events.
-                        // The caller only starts polling `next_sink` after this ack;
-                        // filling its bounded channel first would deadlock at 65+
-                        // deferred events.
-                        if ack.send(Ok(())).is_err() {
-                            break 'driver;
-                        }
                         while let Some(event) = deferred.pop_front() {
                             record_segment_progress(
                                 &event,
@@ -3229,6 +4055,12 @@ async fn drive_live_run(
                                 &mut last_progress,
                             );
                             if !send_live_event(&mut sink, event).await {
+                                report_terminal_error(
+                                    &mut sink,
+                                    &terminal_error,
+                                    "Cursor downstream disconnected after an accepted tool resume; acceptance is ambiguous".into(),
+                                )
+                                .await;
                                 break 'driver;
                             }
                         }
@@ -3253,43 +4085,58 @@ async fn drive_live_run(
                                 break 'driver;
                             }
                         };
+                        // A decoded batch can contain turn_ended/client-only
+                        // events followed by an authoritative Connect END
+                        // error. Pre-scan before any earlier frame can emit a
+                        // successful End or tear down the driver.
+                        if let Some(error) = frames.iter().find_map(|frame| {
+                            (frame.flags & FLAG_END != 0)
+                                .then(|| parse_connect_error(&frame.payload))
+                                .flatten()
+                        }) {
+                            let message = annotate_connect_end_error(
+                                &session_id,
+                                error,
+                                Some((&mut latest_checkpoint, &mut kv_blobs)),
+                            );
+                            report_terminal_error(&mut sink, &terminal_error, message).await;
+                            break 'driver;
+                        }
                         if live_reconnect_should_reset_budget(&frames) {
                             got_chunk_since_reconnect = true;
+                            accepted_resume_unconfirmed = false;
                             reconnect_attempts = 0;
                             record_transport_success(&mut reconnect);
                             reconnect.recovery.reset();
                         }
-                        for frame in frames {
-                            let mut turn = LiveTurnCtx {
-                                session_id: &session_id,
-                                user_prompt: &user_prompt,
-                                request_context: &request_context,
-                                decode_failures: &mut decode_failures,
-                                coalescer: &mut coalescer,
-                            };
-                            if !process_live_frame(
-                                frame,
-                                &outbound,
-                                &mut sink,
-                                &mut deferred,
-                                &mut pending,
-                                &pending_shared,
-                                &mut kv_blobs,
-                                &mut latest_checkpoint,
-                                &terminal_error,
-                                allowed_tool_names.as_ref(),
-                                &mut saw_text,
-                                &mut useful,
-                                &mut logical_tools_waiting,
-                                &mut last_progress,
-                                tool_batch_quiet,
-                                &mut xml_parser,
-                                Some(&mut turn),
-                            )
-                            .await
+                        let mut frames = frames;
+                        let mut holding_turn_end = false;
+                        if !held_turn_end_frames.is_empty() {
+                            held_turn_end_frames.append(&mut frames);
+                            if held_turn_end_frames
+                                .iter()
+                                .any(|frame| frame.flags & FLAG_END != 0)
                             {
-                                break 'driver;
+                                frames = std::mem::take(&mut held_turn_end_frames);
+                            } else {
+                                continue 'driver;
                             }
+                        } else if let Some(index) = frames
+                            .iter()
+                            .position(connect_frame_has_top_level_turn_ended)
+                        {
+                            held_turn_end_frames = frames.split_off(index);
+                            if held_turn_end_frames
+                                .iter()
+                                .any(|frame| frame.flags & FLAG_END != 0)
+                            {
+                                frames.extend(std::mem::take(&mut held_turn_end_frames));
+                            } else {
+                                holding_turn_end = true;
+                            }
+                        }
+                        if !process_driver_frames!(frames) {
+                            break 'driver;
                         }
                         if latest_checkpoint.as_ref().map(|checkpoint| {
                             (checkpoint.as_ptr() as usize, checkpoint.len())
@@ -3302,17 +4149,24 @@ async fn drive_live_run(
                                 );
                             }
                         }
+                        if holding_turn_end {
+                            continue 'driver;
+                        }
                         // Quiet window already elapsed (incl. TOOL_BATCH_MS=0):
                         // expose in this iteration so we do not wait for the
                         // next select pass behind heartbeats / idle sleep.
                         if pending
-                            .collect_deadline()
+                            .native_collect_deadline()
                             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                         {
                             if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
                                 break 'driver;
                             }
-                            if !expose_collected_tools(&mut pending, &pending_shared, &mut sink)
+                            if !expose_collected_native_tools(
+                                &mut pending,
+                                &pending_shared,
+                                &mut sink,
+                            )
                                 .await
                             {
                                 break 'driver;
@@ -3320,6 +4174,34 @@ async fn drive_live_run(
                         }
                     }
                     Some(Ok(None)) | None => {
+                        if decoder.buffered() != 0 {
+                            report_terminal_error(
+                                &mut sink,
+                                &terminal_error,
+                                format!(
+                                    "Cursor upstream ended with {} bytes of an incomplete Connect frame; completion is ambiguous",
+                                    decoder.buffered()
+                                ),
+                            )
+                            .await;
+                            break 'driver;
+                        }
+                        if !held_turn_end_frames.is_empty() {
+                            if !process_driver_frames!(std::mem::take(
+                                &mut held_turn_end_frames
+                            )) {
+                                break 'driver;
+                            }
+                            // Defensive fallback if a malformed candidate did
+                            // not actually terminate when decoded.
+                            if !process_driver_frames!(std::iter::once(ConnectFrame {
+                                flags: FLAG_END,
+                                payload: Bytes::new(),
+                            })) {
+                                break 'driver;
+                            }
+                            break 'driver;
+                        }
                         // Abrupt EOF without Connect END / turn_ended — try
                         // ResumeAction reconnect (CLI stall recovery) unless this
                         // is a delayed hollow after HTTP 200 with no body.
@@ -3338,6 +4220,9 @@ async fn drive_live_run(
                                 &mut outbound,
                                 &mut upstream,
                                 &mut upstream_tx,
+                                &mut upstream_pump,
+                                cancel_requested.as_ref(),
+                                &terminal_error,
                                 &mut decoder,
                                 &latest_checkpoint,
                                 &kv_blobs,
@@ -3437,6 +4322,17 @@ async fn drive_live_run(
                         break 'driver;
                     }
                     Some(Err(error)) => {
+                        if !held_turn_end_frames.is_empty() {
+                            report_terminal_error(
+                                &mut sink,
+                                &terminal_error,
+                                format!(
+                                    "Cursor transport failed after an uncommitted turn_ended frame ({error}); completion is ambiguous"
+                                ),
+                            )
+                            .await;
+                            break 'driver;
+                        }
                         let reconnect_outcome = if live_should_resume_after_drop(
                             reconnect.recovery.on_probation,
                             got_chunk_since_reconnect,
@@ -3452,6 +4348,9 @@ async fn drive_live_run(
                                 &mut outbound,
                                 &mut upstream,
                                 &mut upstream_tx,
+                                &mut upstream_pump,
+                                cancel_requested.as_ref(),
+                                &terminal_error,
                                 &mut decoder,
                                 &latest_checkpoint,
                                 &kv_blobs,
@@ -3517,7 +4416,7 @@ async fn drive_live_run(
                 if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
                     break 'driver;
                 }
-                if !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await {
+                if !expose_collected_native_tools(&mut pending, &pending_shared, &mut sink).await {
                     break 'driver;
                 }
             }
@@ -3537,7 +4436,6 @@ async fn drive_live_run(
         }
     }
 
-    completed.store(true, Ordering::Release);
     // Persist checkpoint + KV blobs so the next Claude turn can resume Cursor state.
     // ClientOnly (Workflow/Skill) teardown must not keep an in-flight MCP
     // checkpoint — the next POST is a fresh turn that includes tool_results.
@@ -3546,29 +4444,48 @@ async fn drive_live_run(
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .any(|exec| matches!(exec.kind, CursorExecKind::ClientOnly));
-    if client_only_teardown && pending.has_outstanding_native() {
+    if !was_cancelled && client_only_teardown && pending.has_outstanding_native() {
         if let Err(err) = control_close_natives(&mut pending, &outbound).await {
             report_terminal_error(&mut sink, &terminal_error, err.to_string()).await;
         }
     }
-    if client_only_teardown {
-        super::conversation::clear_checkpoint(&session_id);
-    } else if let Some(checkpoint) = latest_checkpoint.take() {
-        super::conversation::save_checkpoint(&session_id, checkpoint);
+    upstream_pump.abort();
+    let _ = upstream_pump.await;
+    drop(sink);
+    drop(outbound);
+    drop(upstream);
+    drop(upstream_tx);
+    let persist_continuation = live_should_persist_continuation_message(
+        terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.as_str()),
+    );
+    if persist_continuation {
+        if client_only_teardown {
+            super::conversation::clear_checkpoint(&session_id);
+        } else if let Some(checkpoint) = latest_checkpoint.take() {
+            super::conversation::save_checkpoint(&session_id, checkpoint);
+        }
+        super::conversation::merge_blobs(&session_id, &kv_blobs);
     }
-    super::conversation::merge_blobs(&session_id, &kv_blobs);
     pending_shared
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    drop(sink);
-    drop(outbound);
     if terminal_error
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_none()
     {
-        LiveRunRegistry::remove_if(&session_id, &run_id);
+        // Seal before `completed` so prune_finished cannot drop a successful
+        // Running handle in the gap and lose the retry fingerprint.
+        LiveRunRegistry::seal_success_if(&session_id, &run_id);
+    }
+    completed.store(true, Ordering::Release);
+    if let Some(ack) = cancel_ack {
+        let _ = ack.send(());
     }
 }
 
@@ -3592,7 +4509,20 @@ async fn process_live_frame(
     xml_parser: &mut CursorToolUseXmlParser,
     mut turn_ctx: Option<&mut LiveTurnCtx<'_>>,
 ) -> bool {
+    let frame_session_id = turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or("");
     if frame.flags & FLAG_END != 0 {
+        // END errors are authoritative. Handle them before flushing buffered
+        // XML or exposing any client-only tools, or a poisoned conversation
+        // can bypass the reset and leave later requests bound to missing blobs.
+        if let Some(error) = parse_connect_error(&frame.payload) {
+            let message = annotate_connect_end_error(
+                turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
+                error,
+                Some((latest_checkpoint, kv_blobs)),
+            );
+            report_terminal_error(sink, terminal_error, message).await;
+            return false;
+        }
         // Trailing Workflow/Skill XML may still be buffered when Connect END arrives.
         if !flush_xml_tool_uses(
             xml_parser,
@@ -3630,44 +4560,32 @@ async fn process_live_frame(
             if pending.all_client_only() {
                 return expose_collected_tools(pending, pending_shared, sink).await;
             }
-            let message = parse_connect_error(&frame.payload)
-                .map(|error| {
-                    annotate_connect_end_error(
-                        turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
-                        error,
-                    )
-                })
-                .unwrap_or_else(|| "Cursor upstream ended with pending native tools".to_string());
-            report_terminal_error(sink, terminal_error, message).await;
-            return false;
-        }
-        if let Some(error) = parse_connect_error(&frame.payload) {
-            let message = annotate_connect_end_error(
-                turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
-                error,
-            );
-            report_terminal_error(sink, terminal_error, message).await;
-            return false;
-        } else {
-            // Connect END without turn_ended used to emit bare End → silent
-            // Anthropic Out:0. Mirror the turn_ended empty-note recovery.
-            if !emit_empty_turn_note_if_needed(
-                saw_text,
-                useful,
+            report_terminal_error(
                 sink,
-                deferred,
-                pending,
-                pending_shared,
-                allowed_tool_names,
-                turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
-                "flag_end",
+                terminal_error,
+                "Cursor upstream ended with pending native tools".to_string(),
             )
-            .await
-            {
-                return false;
-            }
-            let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
+            .await;
+            return false;
         }
+        // Connect END without turn_ended used to emit bare End → silent
+        // Anthropic Out:0. Mirror the turn_ended empty-note recovery.
+        if !emit_empty_turn_note_if_needed(
+            saw_text,
+            useful,
+            sink,
+            deferred,
+            pending,
+            pending_shared,
+            allowed_tool_names,
+            turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
+            "flag_end",
+        )
+        .await
+        {
+            return false;
+        }
+        let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
         return false;
     }
     let message = match super::client::decode_frame_payload(&frame) {
@@ -3720,7 +4638,15 @@ async fn process_live_frame(
     if let Some(kv) = message.kv_server_message {
         match encode_kv_reply(&kv, kv_blobs) {
             Ok(Some(reply)) => {
-                if !send_frame_or_fail(outbound, sink, terminal_error, reply, "KV reply").await {
+                if !send_frame_or_fail(
+                    outbound,
+                    sink,
+                    terminal_error,
+                    reply,
+                    "KV reply",
+                    frame_session_id,
+                )
+                .await {
                     return false;
                 }
             }
@@ -3749,11 +4675,23 @@ async fn process_live_frame(
             // Do not auto-reject: expose ClientOnly AskUserQuestion and tear
             // down like Workflow. Cursor AskQuestionResult has no answer tags
             // in proto.rs, so the Claude tool_result path is ClientOnly.
+            // The live driver must first drain the authoritative END frame:
+            // it can carry a trailing error that invalidates this tool call.
+            if turn_ctx.is_some() {
+                return true;
+            }
             return expose_collected_tools(pending, pending_shared, sink).await;
         }
         match encode_interaction_auto_response(&query) {
             Ok(Some(reply)) => {
-                if !send_frame_or_fail(outbound, sink, terminal_error, reply, "interaction reply")
+                if !send_frame_or_fail(
+                    outbound,
+                    sink,
+                    terminal_error,
+                    reply,
+                    "interaction reply",
+                    frame_session_id,
+                )
                     .await
                 {
                     return false;
@@ -3783,6 +4721,7 @@ async fn process_live_frame(
                         terminal_error,
                         reply,
                         "request_context reply",
+                        frame_session_id,
                     )
                     .await
                     {
@@ -3812,6 +4751,7 @@ async fn process_live_frame(
                         terminal_error,
                         frame,
                         "exec throw",
+                        frame_session_id,
                     )
                     .await
                     {
@@ -3831,7 +4771,14 @@ async fn process_live_frame(
                 format!("Tool {} is not advertised", native.claude_name),
             ) {
                 for frame in frames {
-                    if !send_frame_or_fail(outbound, sink, terminal_error, frame, "exec throw")
+                    if !send_frame_or_fail(
+                        outbound,
+                        sink,
+                        terminal_error,
+                        frame,
+                        "exec throw",
+                        frame_session_id,
+                    )
                         .await
                     {
                         return false;
@@ -3891,6 +4838,7 @@ async fn process_interaction_update(
     turn_ctx: &mut Option<&mut LiveTurnCtx<'_>>,
     task_nest_depth: u8,
 ) -> bool {
+    let defer_client_only_exposure = turn_ctx.is_some();
     if let Some(partial) = update.partial_tool_call {
         logical_tools_waiting.remember_partial_args(
             &partial.call_id,
@@ -3978,7 +4926,9 @@ async fn process_interaction_update(
                 let mut exec = mcp_client_only_pending_exec(&mapped);
                 exec.claude_name = emit_name;
                 pending.queue(exec, Duration::ZERO);
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                if !defer_client_only_exposure {
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
             }
             if mapped.name == "AskUserQuestion"
                 && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
@@ -3992,7 +4942,9 @@ async fn process_interaction_update(
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                if !defer_client_only_exposure {
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
             }
             if mapped.name == "Glob"
                 && let Some(emit_name) = resolve_advertised_name("Glob", allowed_tool_names)
@@ -4007,7 +4959,9 @@ async fn process_interaction_update(
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                if !defer_client_only_exposure {
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
             }
         }
         // Native UI transcript only. Execution is driven by ExecServerMessage,
@@ -4073,14 +5027,16 @@ async fn process_interaction_update(
                     {
                         let mut exec = client_only_pending_exec(&tool_use);
                         exec.claude_name = emit_name;
-                        // Expose immediately — Cursor may turn_ended right
-                        // after the XML in the same chunk; waiting for the
-                        // outer select would race into "pending native tools".
+                        // Direct frame tests expose immediately. The live
+                        // driver defers until turn_ended/END/EOF so a trailing
+                        // END error cannot be bypassed by closing the sink.
                         pending.queue(exec, Duration::ZERO);
                         if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
                             return false;
                         }
-                        if !expose_collected_tools(pending, pending_shared, sink).await {
+                        if !defer_client_only_exposure
+                            && !expose_collected_tools(pending, pending_shared, sink).await
+                        {
                             return false;
                         }
                     } else if !tool_use.name.is_empty() {
@@ -4299,12 +5255,21 @@ async fn send_frame_or_fail(
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     frame: Bytes,
     what: &str,
+    session_id: &str,
 ) -> bool {
-    if outbound.send_connect_frame(frame).await.is_ok() {
-        return true;
+    match outbound.send_connect_frame(frame).await {
+        Ok(()) => true,
+        Err(error) => {
+            let error = annotate_live_cursor_error(session_id, error);
+            report_terminal_error(
+                sink,
+                terminal_error,
+                format!("Cursor {what} send failed: {error}"),
+            )
+            .await;
+            false
+        }
     }
-    report_terminal_error(sink, terminal_error, format!("Cursor {what} send failed")).await;
-    false
 }
 
 async fn report_terminal_error(
@@ -4316,17 +5281,39 @@ async fn report_terminal_error(
     // None (between Anthropic segments). Idle/timeouts with a live SSE sink
     // therefore left the registry entry looking "still generating" -> cascade
     // of 409s for concurrent same-session POSTs.
-    {
-        let mut slot = terminal_error.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
-            *slot = Some(TerminalOutcome {
-                message: message.clone(),
-                created_at: Instant::now(),
-            });
-        }
+    store_terminal_error(terminal_error, &message);
+    // Terminal reporting must never block teardown behind a full downstream
+    // channel. If the error cannot be queued, dropping the sender makes the SSE
+    // layer emit its explicit "ended without turn_ended" error.
+    if let Some(tx) = sink.take() {
+        let _ = tx.try_send(Err(message));
     }
-    if sink.is_some() {
-        let _ = send_live_event(sink, Err(message)).await;
+}
+
+fn store_terminal_error(terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>, message: &str) {
+    let mut slot = terminal_error.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(TerminalOutcome {
+            message: message.to_string(),
+            created_at: Instant::now(),
+        });
+    }
+}
+
+fn mark_live_cancelled(
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    completion_ambiguous: bool,
+) {
+    let message = if completion_ambiguous {
+        "Cursor live cancellation interrupted an operation whose completion is unresolved; acceptance is ambiguous"
+    } else {
+        "Cursor live run cancelled"
+    }
+    .to_string();
+    store_terminal_error(terminal_error, &message);
+    if let Some(tx) = sink.take() {
+        let _ = tx.try_send(Err(message));
     }
 }
 
@@ -4336,6 +5323,23 @@ async fn expose_collected_tools(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
 ) -> bool {
     let exposed = pending.expose();
+    publish_exposed_tools(exposed, pending_shared, sink).await
+}
+
+async fn expose_collected_native_tools(
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+) -> bool {
+    let exposed = pending.expose_native();
+    publish_exposed_tools(exposed, pending_shared, sink).await
+}
+
+async fn publish_exposed_tools(
+    exposed: Vec<PendingCursorExec>,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+) -> bool {
     if exposed.is_empty() {
         return true;
     }
@@ -4831,15 +5835,31 @@ async fn send_live_event(
                 tokio::task::yield_now().await;
                 match tx.try_send(event) {
                     Ok(()) => true,
-                    Err(mpsc::error::TrySendError::Full(event)) => tx.send(event).await.is_ok(),
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        send_live_event_bounded(tx, event).await
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => false,
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     } else {
-        tx.send(event).await.is_ok()
+        send_live_event_bounded(tx, event).await
     }
+}
+
+async fn send_live_event_bounded(
+    tx: &mpsc::Sender<LiveEventResult>,
+    event: LiveEventResult,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(env_u64("CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_SECS", 5)),
+            tx.send(event),
+        )
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 fn apply_live_run_event(encoder: &mut CursorSseEncoder, event: LiveRunEvent) {
@@ -5401,6 +6421,7 @@ mod tests {
                 ide_profile: false,
                 headers: vec![],
             },
+            session_id: "sess-test".into(),
             model_id: "composer-2.5".into(),
             conversation_id: Some("conv-test".into()),
             force_http1: false,
@@ -5651,6 +6672,78 @@ mod tests {
         assert!(live_send_failure_is_terminal(&rate));
         let reset = CursorError::new(0, "error sending request: connection reset", None);
         assert!(!live_send_failure_is_terminal(&reset));
+        let append_timeout = CursorError::new(
+            504,
+            "Cursor BidiAppend timed out; acceptance is ambiguous",
+            None,
+        );
+        assert!(
+            live_send_failure_is_terminal(&append_timeout),
+            "a timed-out HTTP/1 append must never be replayed"
+        );
+        let ambiguous_initial_append = ambiguous_http1_append_error(
+            CursorError::new(500, "BidiAppend failed with HTTP 500", None),
+            "initial Run",
+        );
+        assert!(live_send_failure_is_terminal(&ambiguous_initial_append));
+        assert!(
+            live_start_error_seals_tombstone(&ambiguous_initial_append),
+            "an HTTP/1 open whose initial append may have landed must seal Starting"
+        );
+        let reset_open = CursorError::new(
+            502,
+            format!(
+                "Cursor RunSSE HTTP 502 ({CONVERSATION_RESET_RETRY_NOTE})"
+            ),
+            Some("Conversation data missing".into()),
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&reset_open),
+            "a reset conversation must be retryable immediately"
+        );
+        let retryable_missing = CursorError::new(
+            502,
+            "Cursor RunSSE HTTP 502",
+            Some("Conversation data missing (1 missing blob: abc)".into()),
+        );
+        assert!(
+            is_retryable_live_transport_error(&retryable_missing),
+            "HTTP 502 is otherwise a reconnect candidate"
+        );
+        assert!(
+            live_send_failure_is_terminal(&retryable_missing),
+            "missing conversation must not ResumeAction or replay a send"
+        );
+        assert!(
+            live_reconnect_open_error_is_fatal(&retryable_missing),
+            "ResumeAction must not retry a missing-conversation 502"
+        );
+        let annotated_missing = CursorError::new(
+            502,
+            format!("Cursor RunSSE HTTP 502 ({CONVERSATION_RESET_RETRY_NOTE})"),
+            Some("Conversation data missing (1 missing blob: abc)".into()),
+        );
+        assert!(live_reconnect_open_error_is_fatal(&annotated_missing));
+        assert!(
+            !live_should_persist_continuation_message(Some(&annotated_missing.message)),
+            "driver teardown must not re-bind the poisoned checkpoint after reset"
+        );
+        assert!(live_should_persist_continuation_message(None));
+        assert!(live_should_persist_continuation_message(Some(
+            "Cursor live run hard timeout"
+        )));
+        assert!(live_acceptance_unresolved(false, true, false));
+        assert!(
+            live_control_close_message(true).contains("ambiguous"),
+            "an unconfirmed resume plus a dropped control channel must not free the slot"
+        );
+        assert!(!live_control_close_message(false).contains("ambiguous"));
+        let partial_batch =
+            partial_tool_result_send_error(CursorError::new(502, "connection reset", None), 1, 2);
+        assert!(
+            live_send_failure_is_terminal(&partial_batch),
+            "a partially queued result batch must fail closed"
+        );
         assert!(
             classify_outbound_send(Err(rate.clone())).is_err(),
             "control_close/BidiAppend 429 must fail the turn, not ResumeAction"
@@ -5692,6 +6785,127 @@ mod tests {
             "incompatible version",
             None
         )));
+    }
+
+    #[tokio::test]
+    async fn auxiliary_http1_send_preserves_ambiguous_append_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve closed test port");
+        let address = listener.local_addr().expect("test port");
+        drop(listener);
+        let outbound = ClientOutbound::Http1(BidiAppendSession::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "token".into(),
+            "request-id".into(),
+            vec![],
+        ));
+        let (event_tx, _events) = mpsc::channel(1);
+        let mut sink = Some(event_tx);
+        let terminal_error = Arc::new(Mutex::new(None));
+
+        assert!(
+            !send_frame_or_fail(
+                &outbound,
+                &mut sink,
+                &terminal_error,
+                Bytes::from_static(b"frame"),
+                "KV response",
+                "sess-test",
+            )
+            .await
+        );
+        let message = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("terminal error");
+        assert!(message.contains("acceptance is ambiguous"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_in_flight_http1_control_close_preserves_ambiguity() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled BidiAppend server");
+        let address = listener.local_addr().expect("server address");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept BidiAppend");
+            let mut request = [0u8; 4096];
+            let bytes_read = socket.read(&mut request).await.expect("read BidiAppend");
+            assert!(bytes_read > 0, "empty BidiAppend request");
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let mut outbound = ClientOutbound::Http1(BidiAppendSession::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "token".into(),
+            "request-id".into(),
+            vec![],
+        ));
+        let (upstream_tx, mut upstream) = mpsc::channel(1);
+        let mut driver_upstream_tx = upstream_tx;
+        let mut upstream_pump = tokio::spawn(std::future::pending::<()>());
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let cancel_signal = Arc::clone(&cancel_requested);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut reconnect = test_reconnect_context();
+        let mut decoder = ConnectFrameDecoder::new();
+        let latest_checkpoint = Some(vec![0x08, 0x01]);
+        let kv_blobs = HashMap::new();
+        let mut pending = PendingExecState::default();
+        assert!(pending.queue(
+            pending_exec(1, "control-close-tool"),
+            Duration::from_secs(1)
+        ));
+        let mut reconnect_attempts = 0;
+        let mut last_progress = Instant::now();
+        let mut resume_grace_until = None;
+
+        let cancel = async move {
+            accepted_rx.await.expect("BidiAppend accepted by mock");
+            cancel_signal.store(true, Ordering::Release);
+        };
+        let reconnecting = try_live_reconnect(
+            &mut reconnect,
+            &mut outbound,
+            &mut upstream,
+            &mut driver_upstream_tx,
+            &mut upstream_pump,
+            cancel_requested.as_ref(),
+            &terminal_error,
+            &mut decoder,
+            &latest_checkpoint,
+            &kv_blobs,
+            &mut pending,
+            &mut reconnect_attempts,
+            10,
+            &mut last_progress,
+            &mut resume_grace_until,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (outcome, ()) = tokio::join!(reconnecting, cancel);
+        server.abort();
+        let _ = server.await;
+
+        let LiveReconnectOutcome::Failed(detail) = outcome else {
+            panic!("expected failed reconnect");
+        };
+        assert!(detail.contains("ambiguous"), "{detail}");
+        let stored = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("ambiguous terminal outcome");
+        assert!(stored.contains("ambiguous"), "{stored}");
     }
 
     #[test]
@@ -6051,6 +7265,7 @@ mod tests {
                 message: "Image not found".into(),
                 detail: String::new(),
             },
+            None,
         );
         assert!(
             text.contains("checkpoint cleared"),
@@ -6059,6 +7274,493 @@ mod tests {
         assert!(
             !super::super::conversation::continuation_for(Some("sess-img-missing")).has_checkpoint
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn missing_conversation_connect_end_rotates_binding_without_teardown_repoisoning() {
+        let _registry = lock_live_registry_for_test();
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        LiveRunRegistry::clear();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-conversation-missing";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        let stale_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        super::super::conversation::merge_blobs(session_id, &stale_blobs);
+
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let client_only = PendingCursorExec {
+            id: 7,
+            exec_id: Some("workflow-7".into()),
+            tool_use_id: "workflow-tool-7".into(),
+            claude_name: "Workflow".into(),
+            claude_input: serde_json::json!({"name":"deep-research"}),
+            kind: CursorExecKind::ClientOnly,
+        };
+        assert!(pending.queue(client_only, Duration::ZERO));
+        let exposed = pending.expose();
+        let pending_shared = Arc::new(Mutex::new(exposed));
+        let mut kv_blobs = stale_blobs;
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id,
+            user_prompt: "continue",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+        let frame = ConnectFrame {
+            flags: FLAG_END,
+            payload: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "error": {
+                        "code": "internal",
+                        "message": "ERROR_CUSTOM_MESSAGE: Conversation data missing – This conversation’s data is missing and can’t be restored. Start a new chat to continue. (14 missing blobs: abc)",
+                        "details": [{
+                            "debug": {
+                                "error": "ERROR_CUSTOM_MESSAGE",
+                                "details": {
+                                    "title": "Internal error",
+                                    "detail": "Unable to resume"
+                                }
+                            }
+                        }]
+                    }
+                }))
+                .unwrap(),
+            ),
+        };
+
+        assert!(
+            !process_live_frame(
+                frame,
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut latest_checkpoint,
+                &terminal_error,
+                None,
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::from_millis(50),
+                &mut xml_parser,
+                Some(&mut turn),
+            )
+            .await
+        );
+
+        // Mirror driver teardown: stale local state must not recreate the
+        // invalid binding after the Connect error reset it.
+        if let Some(checkpoint) = latest_checkpoint.take() {
+            super::super::conversation::save_checkpoint(session_id, checkpoint);
+        }
+        super::super::conversation::merge_blobs(session_id, &kv_blobs);
+
+        let error = event_rx.recv().await.unwrap().unwrap_err();
+        assert!(error.contains("conversation reset"), "{error}");
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
+
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "missing-conversation-run".into(),
+            command_tx,
+            pending: pending_shared,
+            terminal_error,
+            completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        LiveRunRegistry::reserve(session_id)
+            .expect("fresh registry slot")
+            .insert(handle)
+            .expect("insert failed run");
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(session_id, None),
+                LiveRunProbe::Free
+            ),
+            "the first retry must start fresh instead of replaying the terminal error"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn trailing_missing_conversation_end_overrides_prior_chunk_turn_ended() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-trailing-conversation-missing";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        let checkpoint = vec![0x08, 0x01];
+        let stale_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        super::super::conversation::save_checkpoint(session_id, checkpoint.clone());
+        super::super::conversation::merge_blobs(session_id, &stale_blobs);
+
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _events) = mpsc::channel(8);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let mut reconnect = test_reconnect_context();
+        reconnect.conversation_id = original.clone();
+        reconnect.opening_checkpoint = Some(checkpoint);
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&terminal_error),
+            Arc::clone(&completed),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            session_id.into(),
+            "trailing-end-run".into(),
+            stale_blobs,
+            "continue".into(),
+            RequestContext::default(),
+            reconnect,
+        ));
+
+        let mut turn_payload = Vec::new();
+        proto::AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                turn_ended: Some(TurnEnded {
+                    output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut turn_payload)
+        .expect("encode turn_ended");
+        let turn_ended = encode_connect_frame(turn_payload, 0);
+        let missing_end = encode_connect_frame(
+            serde_json::to_vec(&serde_json::json!({
+                "error": {
+                    "code": "internal",
+                    "message": "ERROR_CUSTOM_MESSAGE: Internal error",
+                    "details": [{
+                        "debug": {
+                            "error": "ERROR_CUSTOM_MESSAGE",
+                            "details": {
+                                "title": "Internal error",
+                                "detail": "Conversation data missing (14 missing blobs: abc)"
+                            }
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+            FLAG_END,
+        );
+        upstream_tx
+            .send(Ok(Some(turn_ended)))
+            .await
+            .expect("send turn_ended chunk");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        upstream_tx
+            .send(Ok(Some(missing_end)))
+            .await
+            .expect("send trailing END chunk");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver timeout")
+            .expect("driver");
+
+        let error = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("trailing END must be terminal");
+        assert!(error.contains("conversation reset"), "{error}");
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn trailing_missing_conversation_end_overrides_prior_client_only_chunk() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-client-only-conversation-missing";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        let checkpoint = vec![0x08, 0x01];
+        let stale_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        super::super::conversation::save_checkpoint(session_id, checkpoint.clone());
+        super::super::conversation::merge_blobs(session_id, &stale_blobs);
+
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _events) = mpsc::channel(8);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut reconnect = test_reconnect_context();
+        reconnect.conversation_id = original.clone();
+        reconnect.opening_checkpoint = Some(checkpoint);
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&terminal_error),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Some(BTreeSet::from(["Workflow".into()])),
+            session_id.into(),
+            "client-only-end-run".into(),
+            stale_blobs,
+            "continue".into(),
+            RequestContext::default(),
+            reconnect,
+        ));
+
+        let mut workflow_payload = Vec::new();
+        proto::AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(proto::ToolCallStarted {
+                    call_id: "workflow-call".into(),
+                    model_call_id: "model-call".into(),
+                    tool_call: Some(proto::ToolCall {
+                        mcp_tool_call: Some(proto::McpToolCall {
+                            args: Some(proto::McpArgs {
+                                name: "Workflow".into(),
+                                tool_name: "Workflow".into(),
+                                tool_call_id: "workflow-call".into(),
+                                provider_identifier: "claude-local".into(),
+                                args: HashMap::from([(
+                                    "name".into(),
+                                    br#""deep-research""#.to_vec(),
+                                )]),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut workflow_payload)
+        .expect("encode Workflow");
+        upstream_tx
+            .send(Ok(Some(encode_connect_frame(workflow_payload, 0))))
+            .await
+            .expect("send Workflow chunk");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let missing_end = encode_connect_frame(
+            serde_json::to_vec(&serde_json::json!({
+                "error": {
+                    "code": "internal",
+                    "message": "ERROR_CUSTOM_MESSAGE: Internal error",
+                    "details": [{
+                        "debug": {
+                            "error": "ERROR_CUSTOM_MESSAGE",
+                            "details": {
+                                "title": "Internal error",
+                                "detail": "Conversation data missing (14 missing blobs: abc)"
+                            }
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+            FLAG_END,
+        );
+        upstream_tx
+            .send(Ok(Some(missing_end)))
+            .await
+            .expect("send trailing END chunk");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver timeout")
+            .expect("driver");
+
+        let error = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("trailing END must be terminal");
+        assert!(error.contains("conversation reset"), "{error}");
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transport_error_after_held_turn_end_fails_ambiguous_without_reconnect() {
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _events) = mpsc::channel(8);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut reconnect = test_reconnect_context();
+        reconnect.conversation_id = None;
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&terminal_error),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            "held-error-session".into(),
+            "held-error-run".into(),
+            HashMap::new(),
+            "continue".into(),
+            RequestContext::default(),
+            reconnect,
+        ));
+        let mut turn_payload = Vec::new();
+        proto::AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                turn_ended: Some(TurnEnded {
+                    output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut turn_payload)
+        .expect("encode turn_ended");
+        upstream_tx
+            .send(Ok(Some(encode_connect_frame(turn_payload, 0))))
+            .await
+            .expect("send turn_ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        upstream_tx
+            .send(Err("broken pipe".into()))
+            .await
+            .expect("send transport error");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver timeout")
+            .expect("driver");
+
+        let error = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("held terminal transport error");
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn partial_end_frame_at_eof_cannot_commit_held_turn_end() {
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _events) = mpsc::channel(8);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&terminal_error),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            "partial-end-session".into(),
+            "partial-end-run".into(),
+            HashMap::new(),
+            "continue".into(),
+            RequestContext::default(),
+            test_reconnect_context(),
+        ));
+        let mut turn_payload = Vec::new();
+        proto::AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                turn_ended: Some(TurnEnded {
+                    output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut turn_payload)
+        .expect("encode turn_ended");
+        let turn_frame = encode_connect_frame(turn_payload, 0);
+        let missing_end = encode_connect_frame(
+            serde_json::to_vec(&serde_json::json!({
+                "error": {
+                    "code": "internal",
+                    "message": "Conversation data missing (1 missing blob: abc)"
+                }
+            }))
+            .unwrap(),
+            FLAG_END,
+        );
+        let mut chunk = Vec::from(turn_frame.as_ref());
+        chunk.extend_from_slice(&missing_end[..8]);
+        upstream_tx
+            .send(Ok(Some(Bytes::from(chunk))))
+            .await
+            .expect("send turn plus partial END");
+        upstream_tx
+            .send(Ok(None))
+            .await
+            .expect("send EOF after partial END");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver timeout")
+            .expect("driver");
+
+        let error = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("partial terminal frame must fail closed");
+        assert!(error.contains("ambiguous"), "{error}");
     }
 
     #[test]
@@ -6394,6 +8096,23 @@ mod tests {
         assert_eq!(exposed[1].tool_use_id, "shared-id__cursor_2");
     }
 
+    #[test]
+    fn pending_tool_ids_are_bound_to_the_live_run_generation() {
+        let mut old = PendingExecState::for_run("old-generation");
+        let mut replacement = PendingExecState::for_run("new-generation");
+        assert!(old.queue(pending_exec(1, "recycled-id"), Duration::ZERO));
+        assert!(replacement.queue(pending_exec(1, "recycled-id"), Duration::ZERO));
+
+        let old_exposed = old.expose();
+        let replacement_exposed = replacement.expose();
+        let old_id = &old_exposed[0].tool_use_id;
+        let replacement_id = &replacement_exposed[0].tool_use_id;
+        assert_ne!(
+            old_id, replacement_id,
+            "a stale result id must not match a replacement Run's pending exec"
+        );
+    }
+
     fn pending_client_only(id: u32, tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
             id,
@@ -6413,6 +8132,9 @@ mod tests {
             pending: Arc::new(Mutex::new(Vec::new())),
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         })
     }
 
@@ -6489,8 +8211,81 @@ mod tests {
             LiveRunRegistry::is_occupied(&session),
             "Starting must look occupied to concurrent POSTs"
         );
-        drop(reservation);
+        reservation.release();
         assert!(!LiveRunRegistry::is_occupied(&session));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn dropping_an_uncommitted_reservation_seals_ambiguous() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("drop-seal-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        drop(reservation);
+        assert!(
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "dropping a Starting reservation must not free the slot"
+        );
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run(&session, None),
+            LiveSlotClaim::Ambiguous
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn success_tombstone_blocks_identical_retry_but_allows_a_new_prompt() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("success-tombstone-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("ok-run");
+        handle.set_request_fingerprint(42);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert");
+        LiveRunRegistry::seal_success_if(&session, "ok-run");
+        assert!(LiveRunRegistry::is_occupied(&session));
+        LiveRunRegistry::release_success_if_new_request(&session, None, 42);
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "retrying the same request must not start another Run"
+        );
+        LiveRunRegistry::release_success_if_new_request(&session, None, 99);
+        assert!(
+            !LiveRunRegistry::is_occupied(&session),
+            "a new prompt may start a fresh Run after success"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn insert_of_already_completed_success_seals_fingerprint_tombstone() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("fast-success-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("fast-run");
+        handle.set_request_fingerprint(7);
+        handle.completed.store(true, Ordering::Release);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert");
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "a Run that finished before insert must not be pruned as a free slot"
+        );
+        LiveRunRegistry::release_success_if_new_request(&session, None, 7);
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "retrying the same request after a fast success must not start another Run"
+        );
+        LiveRunRegistry::release_success_if_new_request(&session, None, 8);
+        assert!(
+            !LiveRunRegistry::is_occupied(&session),
+            "a new prompt may start a fresh Run after fast success"
+        );
         LiveRunRegistry::clear();
     }
 
@@ -6511,13 +8306,39 @@ mod tests {
     }
 
     #[test]
+    fn http_open_missing_conversation_resets_binding() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-open-conversation-missing";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        let annotated = annotate_live_cursor_error(
+            session_id,
+            CursorError::new(
+                400,
+                "Cursor RunSSE HTTP 400",
+                Some("Conversation data missing (1 missing blob: abc)".into()),
+            ),
+        );
+        assert!(
+            annotated.message.contains("conversation reset"),
+            "{}",
+            annotated.message
+        );
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+    }
+
+    #[test]
     fn try_claim_classifies_starting_without_a_second_lock() {
         let _registry = lock_live_registry_for_test();
         let session = format!("try-claim-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         assert!(matches!(
-            LiveRunRegistry::try_claim_run(&session, None, false),
+            LiveRunRegistry::try_claim_run(&session, None),
             LiveSlotClaim::Starting
         ));
         assert!(matches!(
@@ -6536,7 +8357,7 @@ mod tests {
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
         assert!(matches!(
-            LiveRunRegistry::try_claim_run(&session, None, false),
+            LiveRunRegistry::try_claim_run(&session, None),
             LiveSlotClaim::Ambiguous
         ));
         assert!(matches!(
@@ -6573,6 +8394,7 @@ mod tests {
             session_id: session.clone(),
             reservation_id: "stale".into(),
             committed: false,
+            seal_on_drop: false,
             cancel,
         };
         assert!(
@@ -6593,7 +8415,7 @@ mod tests {
             .insert(dummy_handle("already-running"))
             .expect("insert running");
         assert!(matches!(
-            LiveRunRegistry::try_claim_run(&session, None, false),
+            LiveRunRegistry::try_claim_run(&session, None),
             LiveSlotClaim::Running
         ));
         assert!(LiveRunRegistry::get(&session).is_some());
@@ -6601,7 +8423,7 @@ mod tests {
     }
 
     #[test]
-    fn try_claim_supersedes_running_under_one_lock() {
+    fn unbound_try_claim_never_supersedes_a_running_generation() {
         let _registry = lock_live_registry_for_test();
         let session = format!("try-claim-supersede-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -6609,21 +8431,24 @@ mod tests {
         reservation
             .insert(dummy_handle("to-supersede"))
             .expect("insert running");
-        let claimed = LiveRunRegistry::try_claim_run(&session, None, true);
         assert!(
-            matches!(claimed, LiveSlotClaim::Reserved(_)),
-            "Running occupant is cancelled and reserved in the same lock"
+            matches!(
+                LiveRunRegistry::try_claim_run(&session, None),
+                LiveSlotClaim::Running
+            ),
+            "an unbound caller must 409 rather than cancel whichever Run is current"
         );
-        assert!(
-            LiveRunRegistry::is_starting_run(&session, None),
-            "supersede must reserve in the same lock, not leave a gap"
+        assert_eq!(
+            LiveRunRegistry::get(&session)
+                .expect("running generation remains")
+                .run_id(),
+            "to-supersede"
         );
-        drop(claimed);
         LiveRunRegistry::clear();
     }
 
     #[test]
-    fn conflict_action_cancels_running_not_starting() {
+    fn generation_bound_replacement_reserves_the_matching_running_slot_atomically() {
         let _registry = lock_live_registry_for_test();
         let session = format!("conflict-running-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -6631,14 +8456,273 @@ mod tests {
         reservation
             .insert(dummy_handle("conflict-target"))
             .expect("insert running");
-        assert!(matches!(
-            LiveRunRegistry::conflict_action(&session, None),
-            LiveConflictAction::CancelRunning(_)
-        ));
+        let LiveReplacementClaim::Reserved {
+            reservation,
+            superseded: Some(superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, "conflict-target")
+        else {
+            panic!("the matching generation should be claimed");
+        };
+        assert_eq!(superseded.run_id(), "conflict-target");
         assert!(
-            !LiveRunRegistry::is_occupied(&session),
-            "Running occupant is removed so the same POST can start one replacement Run"
+            LiveRunRegistry::is_starting_run(&session, None),
+            "the replacement must reserve atomically without exposing a free gap"
         );
+        superseded.cancel();
+        reservation.release();
+        assert!(!LiveRunRegistry::is_occupied(&session));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn generic_conflict_does_not_cancel_an_unbound_running_generation() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("stale-conflict-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(dummy_handle("newer-generation"))
+            .expect("insert newer run");
+
+        assert!(
+            matches!(
+                LiveRunRegistry::conflict_action(&session, None),
+                LiveConflictAction::Http409
+            ),
+            "a generic/stale conflict must not cancel whichever Run is current"
+        );
+        assert!(matches!(
+            LiveRunRegistry::claim_replacement_for_run(&session, None, "older-generation"),
+            LiveReplacementClaim::Conflict
+        ));
+        assert!(LiveRunRegistry::get(&session).is_some());
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tool_result_waiter_does_not_attach_to_a_replacement_run() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("result-generation-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve old")
+            .insert(dummy_handle("old-generation"))
+            .expect("insert old");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "recycled-id",
+                    "content": "belongs to old generation"
+                }]}]
+            }))
+            .unwrap();
+
+        let replacement = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let LiveReplacementClaim::Reserved {
+                reservation,
+                superseded: Some(superseded),
+            } = LiveRunRegistry::claim_replacement_for_run(&session, None, "old-generation")
+            else {
+                panic!("replace old running slot");
+            };
+            superseded.cancel();
+            let replacement = dummy_handle("new-generation");
+            replacement
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(pending_exec(2, "recycled-id"));
+            reservation.insert(replacement).expect("insert replacement");
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_old_result".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, replacement);
+
+        assert!(
+            matches!(outcome, super::super::LiveResumeOutcome::Conflict),
+            "an old result waiter must 409 when the registry generation changes"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tool_result_waiter_does_not_leave_http_silent_for_thirty_seconds() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("bounded-result-wait-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(dummy_handle("bounded-wait-generation"))
+            .expect("insert running handle");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "stale-tool-result",
+                    "content": "done"
+                }]}]
+            }))
+            .unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(6),
+            super::super::await_live_run_resume(
+                &session,
+                None,
+                &body,
+                "msg_bounded_wait".into(),
+                "claude-fable-5".into(),
+                1,
+                None,
+                true,
+            ),
+        )
+        .await
+        .expect("tool-result classification must finish before downstream stream-idle");
+
+        assert!(matches!(outcome, super::super::LiveResumeOutcome::Conflict));
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn partial_tool_result_stays_invalid_if_the_running_slot_disappears() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("partial-disappears-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("partial-generation");
+        {
+            let mut pending = handle
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending.push(pending_exec(1, "tool-a"));
+            pending.push(pending_exec(2, "tool-b"));
+        }
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert partial run");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-a",
+                    "content": "only one result"
+                }]}]
+            }))
+            .unwrap();
+
+        let remove = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(LiveRunRegistry::cancel(&session));
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_partial".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, remove);
+
+        match outcome {
+            super::super::LiveResumeOutcome::MissingTools(missing) => {
+                assert_eq!(missing, ["tool-b"]);
+            }
+            _ => panic!("a partial current batch must remain a 400 after the slot disappears"),
+        }
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn fresh_request_supersedes_abandoned_pending_generation_without_a_400() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("abandoned-pending-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let completed = Arc::new(AtomicBool::new(false));
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "abandoned-generation".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "abandoned-tool")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::clone(&completed),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert abandoned run");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": "continue with new work"}]
+            }))
+            .unwrap();
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_fresh".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        let super::super::LiveResumeOutcome::SupersedeRunning(run_id) = outcome else {
+            panic!("fresh request must supersede, not report missing tool results");
+        };
+        assert_eq!(run_id, "abandoned-generation");
+
+        let LiveReplacementClaim::Reserved {
+            reservation,
+            superseded: Some(superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, &run_id)
+        else {
+            panic!("observed generation must be atomically claimed");
+        };
+        let driver = tokio::spawn(async move {
+            let Some(RunCommand::Cancel { ack: Some(ack) }) = command_rx.recv().await else {
+                panic!("replacement must request acknowledged cancellation");
+            };
+            completed.store(true, Ordering::Release);
+            let _ = ack.send(());
+        });
+        superseded
+            .cancel_and_wait()
+            .await
+            .expect("old generation cancellation");
+        driver.await.expect("mock old driver");
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        drop(reservation);
         LiveRunRegistry::clear();
     }
 
@@ -8355,6 +10439,9 @@ mod tests {
                 created_at: Instant::now(),
             }))),
             completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -8505,6 +10592,9 @@ mod tests {
                 created_at: Instant::now(),
             }))),
             completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         });
         let reservation = LiveRunRegistry::reserve("terminal-session").expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -8516,6 +10606,39 @@ mod tests {
             Some("upstream ended with pending tools")
         );
         assert!(LiveRunRegistry::get("terminal-session").is_none());
+    }
+
+    #[test]
+    fn stale_generation_cannot_consume_a_replacement_terminal_error() {
+        let _registry = lock_live_registry_for_test();
+        LiveRunRegistry::clear();
+        let session = format!("terminal-generation-{}", uuid::Uuid::new_v4());
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "replacement-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: "replacement failed".into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert replacement");
+
+        assert!(LiveRunRegistry::take_terminal_error_for_run(&session, None, "old-run").is_none());
+        assert_eq!(
+            LiveRunRegistry::take_terminal_error_for_run(&session, None, "replacement-run")
+                .as_deref(),
+            Some("replacement failed")
+        );
+        LiveRunRegistry::clear();
     }
 
     #[test]
@@ -8643,15 +10766,19 @@ mod tests {
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let terminal_error = Arc::new(Mutex::new(None));
         let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let upstream_pump = tokio::spawn(std::future::pending::<()>());
         let driver = tokio::spawn(drive_live_run(
             upstream_rx,
             upstream_tx.clone(),
+            upstream_pump,
             ClientOutbound::Bidi(request_tx),
             command_rx,
             initial_sink,
             Arc::clone(&pending_shared),
             Arc::clone(&terminal_error),
             Arc::clone(&completed),
+            Arc::clone(&cancel_requested),
             Some(BTreeSet::from(["Read".into()])),
             "multi-test-session".into(),
             "multi-test-run".into(),
@@ -8666,6 +10793,9 @@ mod tests {
             pending: Arc::clone(&pending_shared),
             terminal_error,
             completed,
+            cancel_requested,
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         };
 
         upstream_tx
@@ -8686,12 +10816,13 @@ mod tests {
         let LiveRunEvent::NativeToolBatch(tools) = batch else {
             panic!("expected native tool batch");
         };
+        let tool_ids: Vec<String> = tools.iter().map(|tool| tool.tool_use_id.clone()).collect();
         assert_eq!(
-            tools
-                .iter()
-                .map(|tool| tool.tool_use_id.as_str())
-                .collect::<Vec<_>>(),
-            ["tool-11", "tool-12"]
+            tool_ids,
+            [
+                "tool-11__cursor_run_multi-test-run",
+                "tool-12__cursor_run_multi-test-run"
+            ]
         );
         assert_eq!(handle.pending_tools().len(), 2);
 
@@ -8750,11 +10881,11 @@ mod tests {
             Duration::from_secs(1),
             handle.resume_batch(vec![
                 (
-                    "tool-12".into(),
+                    tool_ids[1].clone(),
                     serde_json::json!({"type":"tool_result","content":"two"}),
                 ),
                 (
-                    "tool-11".into(),
+                    tool_ids[0].clone(),
                     serde_json::json!({"type":"tool_result","content":"one"}),
                 ),
             ]),
@@ -8849,6 +10980,7 @@ mod tests {
             }))))
             .await
             .unwrap();
+        upstream_tx.send(Ok(None)).await.unwrap();
 
         assert!(matches!(
             second_events.recv().await.unwrap().unwrap(),
@@ -8869,6 +11001,448 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn acknowledged_cancel_waits_for_a_full_driver_channel() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        command_tx
+            .try_send(RunCommand::Cancel { ack: None })
+            .expect("prefill command channel");
+        let completed = Arc::new(AtomicBool::new(false));
+        let handle = CursorLiveRunHandle {
+            run_id: "cancel-ack-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::clone(&completed),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+        let driver = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(matches!(
+                command_rx.recv().await,
+                Some(RunCommand::Cancel { ack: None })
+            ));
+            let Some(RunCommand::Cancel { ack: Some(ack) }) = command_rx.recv().await else {
+                panic!("expected acknowledged cancellation");
+            };
+            completed.store(true, Ordering::Release);
+            let _ = ack.send(());
+        });
+
+        handle
+            .cancel_and_wait()
+            .await
+            .expect("cancellation should wait for delivery and acknowledgement");
+        driver.await.expect("mock driver");
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_authorize_replacement_after_ambiguous_resume_send() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = CursorLiveRunHandle {
+            run_id: "ambiguous-cancel-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message:
+                    "Cursor live open timed out (response-less ResumeAction send is ambiguous)"
+                        .into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+
+        let error = handle
+            .cancel_and_wait()
+            .await
+            .expect_err("ambiguous ResumeAction acceptance must block replacement");
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("ambiguous"), "{}", error.message);
+    }
+
+    #[test]
+    fn ambiguous_terminal_outcome_survives_the_short_terminal_ttl() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = CursorLiveRunHandle {
+            run_id: "aged-ambiguous-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: "response-less ResumeAction acceptance is ambiguous".into(),
+                created_at: Instant::now() - Duration::from_secs(70),
+            }))),
+            completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+
+        assert!(
+            handle.has_terminal_error(),
+            "ambiguity must remain registered for the full ambiguity window"
+        );
+        assert!(
+            handle.ensure_replacement_is_safe().is_err(),
+            "an aged ambiguous result must still block a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_disconnect_during_resume_probation_is_ambiguous() {
+        let (upstream_tx, upstream_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (initial_sink, initial_events) = mpsc::channel(1);
+        drop(initial_events);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let mut reconnect = test_reconnect_context();
+        reconnect.recovery.on_probation = true;
+        reconnect.recovery.started = Some(Instant::now());
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx,
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            initial_sink,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&terminal_error),
+            Arc::clone(&completed),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            "probation-disconnect-session".into(),
+            "probation-disconnect-run".into(),
+            HashMap::new(),
+            String::new(),
+            RequestContext::default(),
+            reconnect,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver timeout")
+            .expect("driver");
+        let message = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("probation disconnect must be terminal");
+        assert!(message.contains("ambiguous"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_resume_probation_blocks_replacement() {
+        let (upstream_tx, upstream_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (initial_sink, _initial_events) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let upstream_pump = tokio::spawn(std::future::pending::<()>());
+        let mut reconnect = test_reconnect_context();
+        reconnect.recovery.on_probation = true;
+        reconnect.recovery.started = Some(Instant::now());
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx,
+            upstream_pump,
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            initial_sink,
+            Arc::clone(&pending),
+            Arc::clone(&terminal_error),
+            Arc::clone(&completed),
+            Arc::clone(&cancel_requested),
+            None,
+            "probation-cancel-session".into(),
+            "probation-cancel-run".into(),
+            HashMap::new(),
+            String::new(),
+            RequestContext::default(),
+            reconnect,
+        ));
+        let handle = CursorLiveRunHandle {
+            run_id: "probation-cancel-run".into(),
+            command_tx,
+            pending,
+            terminal_error,
+            completed,
+            cancel_requested,
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+
+        let error = handle
+            .cancel_and_wait()
+            .await
+            .expect_err("accepted ResumeAction probation must block replacement");
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("ambiguous"), "{}", error.message);
+        driver.await.expect("probation driver");
+    }
+
+    #[tokio::test]
+    async fn cancelled_resume_guard_lives_until_the_queued_command_is_dropped() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "cancelled-resume-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        let resume_handle = Arc::clone(&handle);
+        let resume = tokio::spawn(async move {
+            resume_handle
+                .resume_batch(vec![(
+                    "tool-1".into(),
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )])
+                .await
+        });
+        let queued = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("resume command timeout")
+            .expect("resume command");
+
+        resume.abort();
+        let _ = resume.await;
+        assert!(
+            handle.resume_in_flight.load(Ordering::Acquire),
+            "a delivered command still owns the exact-once resume guard"
+        );
+        drop(queued);
+        assert!(
+            !handle.resume_in_flight.load(Ordering::Acquire),
+            "dropping the unprocessed command must release the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_resume_dispatch_is_bounded_before_http_response() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let handle = CursorLiveRunHandle {
+            run_id: "bounded-resume-dispatch".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.resume_batch(vec![(
+                "tool-1".into(),
+                serde_json::json!({"type":"tool_result","content":"done"}),
+            )]),
+        )
+        .await
+        .expect("resume dispatch must finish before downstream stream-idle")
+        .expect_err("an unprocessed command must return a bounded retryable error");
+        assert_eq!(error.status, 409);
+        let queued = command_rx.recv().await.expect("cancelled queued command");
+        let RunCommand::ResumeBatch { dispatch_state, .. } = &queued else {
+            panic!("expected queued resume");
+        };
+        assert_eq!(
+            dispatch_state.load(Ordering::Acquire),
+            RESUME_DISPATCH_CANCELLED,
+            "the driver must not execute a command after its HTTP waiter timed out"
+        );
+        drop(queued);
+        assert!(
+            !handle.resume_in_flight.load(Ordering::Acquire),
+            "discarding the cancelled command releases the resume generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_ack_fences_the_upstream_pump_and_driver_teardown() {
+        struct DropSignal(Option<oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (upstream_tx, upstream_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (initial_sink, _initial_events) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let (pump_dropped_tx, mut pump_dropped_rx) = oneshot::channel();
+        let upstream_pump = tokio::spawn(async move {
+            let _signal = DropSignal(Some(pump_dropped_tx));
+            std::future::pending::<()>().await;
+        });
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx,
+            upstream_pump,
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            initial_sink,
+            Arc::clone(&pending),
+            Arc::clone(&terminal_error),
+            Arc::clone(&completed),
+            Arc::clone(&cancel_requested),
+            None,
+            "cancel-fence-session".into(),
+            "cancel-fence-run".into(),
+            HashMap::new(),
+            String::new(),
+            RequestContext::default(),
+            test_reconnect_context(),
+        ));
+        let handle = CursorLiveRunHandle {
+            run_id: "cancel-fence-run".into(),
+            command_tx,
+            pending,
+            terminal_error,
+            completed: Arc::clone(&completed),
+            cancel_requested,
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+
+        handle
+            .cancel_and_wait()
+            .await
+            .expect("driver cancellation should be acknowledged");
+        assert!(
+            pump_dropped_rx.try_recv().is_ok(),
+            "ack must follow upstream pump destruction"
+        );
+        assert!(
+            completed.load(Ordering::Acquire),
+            "completed must mean teardown and persistence have finished"
+        );
+        driver.await.expect("live driver");
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_a_backpressured_tool_result_send() {
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let (request_tx, _request_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        request_tx
+            .try_send(Ok(Bytes::from_static(b"fill-request-channel")))
+            .expect("prefill outbound request channel");
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (initial_sink, mut events) = mpsc::channel(4);
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let upstream_pump = tokio::spawn(std::future::pending::<()>());
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            upstream_pump,
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            initial_sink,
+            Arc::clone(&pending),
+            Arc::clone(&terminal_error),
+            Arc::clone(&completed),
+            Arc::clone(&cancel_requested),
+            Some(BTreeSet::from(["Read".into()])),
+            "blocked-send-session".into(),
+            "blocked-send-run".into(),
+            HashMap::new(),
+            String::new(),
+            RequestContext::default(),
+            test_reconnect_context(),
+        ));
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "blocked-send-run".into(),
+            command_tx,
+            pending,
+            terminal_error,
+            completed: Arc::clone(&completed),
+            cancel_requested,
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+
+        let mut payload = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_message: Some(ExecServerMessage {
+                id: 7,
+                exec_id: Some("blocked-read".into()),
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/blocked".into(),
+                    tool_call_id: "blocked-tool".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode blocked exec");
+        upstream_tx
+            .send(Ok(Some(encode_connect_frame(payload, 0))))
+            .await
+            .expect("send blocked exec");
+        let batch = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("tool exposure timeout")
+            .expect("tool exposure channel")
+            .expect("tool exposure event");
+        let LiveRunEvent::NativeToolBatch(tools) = batch else {
+            panic!("expected native tool batch");
+        };
+        let tool_use_id = tools[0].tool_use_id.clone();
+        let resume_handle = Arc::clone(&handle);
+        let resume = tokio::spawn(async move {
+            resume_handle
+                .resume_batch(vec![(
+                    tool_use_id,
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )])
+                .await
+        });
+        let mut resumed_events = tokio::time::timeout(Duration::from_secs(1), resume)
+            .await
+            .expect("resume dispatch must establish the response before the blocked send")
+            .expect("resume task")
+            .expect("resume dispatch");
+
+        tokio::time::timeout(Duration::from_secs(8), handle.cancel_and_wait())
+            .await
+            .expect("cancellation must not inherit an unbounded H2 send")
+            .expect("cancellation should complete after bounded send teardown");
+        assert!(completed.load(Ordering::Acquire));
+        let error = tokio::time::timeout(Duration::from_secs(1), resumed_events.recv())
+            .await
+            .expect("cancel error event timeout")
+            .expect("cancel error event")
+            .expect_err("the preempted resume stream must report cancellation");
+        assert!(error.contains("cancelled"), "{error}");
+        driver.await.expect("blocked-send driver");
+    }
+
     #[test]
     fn cancel_removes_running_entry_so_reserve_succeeds() {
         let _registry = lock_live_registry_for_test();
@@ -8881,6 +11455,9 @@ mod tests {
             pending: Arc::new(Mutex::new(Vec::new())),
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(Arc::clone(&handle)).is_err() {
@@ -8891,7 +11468,10 @@ mod tests {
         assert!(LiveRunRegistry::cancel(&session));
         assert!(LiveRunRegistry::get(&session).is_none());
         // Cancel command must be delivered so the driver can exit.
-        assert!(matches!(command_rx.try_recv(), Ok(RunCommand::Cancel)));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(RunCommand::Cancel { ack: None })
+        ));
         // Slot is free for a new turn (Claude Code retry after idle timeout).
         assert!(LiveRunRegistry::reserve(&session).is_some());
         LiveRunRegistry::clear();
@@ -8909,6 +11489,9 @@ mod tests {
             pending: Arc::new(Mutex::new(Vec::new())),
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -8934,16 +11517,19 @@ mod tests {
         drop(initial_events);
         let completed = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
+        let upstream_pump = tokio::spawn(std::future::pending::<()>());
 
         let driver = tokio::spawn(drive_live_run(
             upstream_rx,
             upstream_tx.clone(),
+            upstream_pump,
             ClientOutbound::Bidi(request_tx),
             command_rx,
             initial_sink,
             Arc::new(Mutex::new(Vec::new())),
             terminal_error,
             Arc::clone(&completed),
+            Arc::new(AtomicBool::new(false)),
             Some(BTreeSet::from(["Read".to_string()])),
             "heartbeat-drop-session".into(),
             "heartbeat-drop-run".into(),
@@ -8990,15 +11576,18 @@ mod tests {
         drop(initial_events);
         let completed = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
+        let upstream_pump = tokio::spawn(std::future::pending::<()>());
         let driver = tokio::spawn(drive_live_run(
             upstream_rx,
             upstream_tx.clone(),
+            upstream_pump,
             ClientOutbound::Bidi(request_tx),
             command_rx,
             initial_sink,
             Arc::new(Mutex::new(Vec::new())),
             terminal_error,
             Arc::clone(&completed),
+            Arc::new(AtomicBool::new(false)),
             None,
             "drop-test-session".into(),
             "drop-test-run".into(),
