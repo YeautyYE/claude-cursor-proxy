@@ -167,7 +167,7 @@ fn set_mode(path: &Path, mode: u32) {
 
 fn now_iso8601() -> String {
     let now = time::OffsetDateTime::now_utc();
-    let format = time::format_description::parse_borrowed::<3>(
+    let format = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day]T[hour]:[minute]:[second]Z",
     )
     .unwrap();
@@ -231,6 +231,25 @@ mod tests {
     use std::sync::Mutex;
 
     static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn now_iso8601_is_utc_second_precision() {
+        let stamp = now_iso8601();
+        let bytes = stamp.as_bytes();
+        assert_eq!(stamp.len(), 20, "{stamp}");
+        assert_eq!(&bytes[4..5], b"-");
+        assert_eq!(&bytes[7..8], b"-");
+        assert_eq!(&bytes[10..11], b"T");
+        assert_eq!(&bytes[13..14], b":");
+        assert_eq!(&bytes[16..17], b":");
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert!(
+            bytes
+                .iter()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'T' | b':' | b'Z')),
+            "{stamp}"
+        );
+    }
 
     #[test]
     fn stderr_suppression_disables_level_mirroring() {
