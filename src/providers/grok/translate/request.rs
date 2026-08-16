@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use serde::Serialize;
+use serde::ser::SerializeMap;
 use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
@@ -19,6 +20,15 @@ pub struct GrokResponsesRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<GrokReasoning>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GrokReasoning {
+    pub effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,13 +49,46 @@ pub enum GrokInputItem {
     FunctionCallOutput { call_id: String, output: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
+const INPUT_IMAGE_SENTINEL: &str = "ccp:input_image:";
+
+#[derive(Debug, Clone)]
 pub enum GrokContentPart {
-    #[serde(rename = "input_text")]
     InputText { text: String },
-    #[serde(rename = "output_text")]
     OutputText { text: String },
+}
+
+impl GrokContentPart {
+    fn input_image(image_url: String) -> Self {
+        Self::InputText {
+            text: format!("{INPUT_IMAGE_SENTINEL}{image_url}"),
+        }
+    }
+}
+
+impl Serialize for GrokContentPart {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::InputText { text } => {
+                if let Some(url) = text.strip_prefix(INPUT_IMAGE_SENTINEL) {
+                    let mut map = serializer.serialize_map(Some(2))?;
+                    map.serialize_entry("type", "input_image")?;
+                    map.serialize_entry("image_url", url)?;
+                    map.end()
+                } else {
+                    let mut map = serializer.serialize_map(Some(2))?;
+                    map.serialize_entry("type", "input_text")?;
+                    map.serialize_entry("text", text)?;
+                    map.end()
+                }
+            }
+            Self::OutputText { text } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "output_text")?;
+                map.serialize_entry("text", text)?;
+                map.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,11 +168,6 @@ pub fn translate_request(
         tools = Some(vec![GrokTool::hosted("x_search")]);
     } else if force_web_search {
         tools = Some(vec![GrokTool::hosted("web_search")]);
-    } else {
-        let tools = tools.get_or_insert_default();
-        if !tools.iter().any(|tool| tool.kind == "x_search") {
-            tools.push(GrokTool::hosted("x_search"));
-        }
     }
     if hosted_web_search {
         append_guidance(
@@ -151,6 +189,15 @@ pub fn translate_request(
     for message in &req.messages {
         parse_message(message, &mut input, &mut call_ids)?;
     }
+    let reasoning =
+        crate::providers::translate_shared::read_effort(req)?.map(|effort| GrokReasoning {
+            effort: if matches!(effort, "fast" | "minimal") {
+                "low".to_string()
+            } else {
+                effort.to_string()
+            },
+            summary: Some("concise".into()),
+        });
     Ok(GrokResponsesRequest {
         model,
         instructions,
@@ -160,6 +207,7 @@ pub fn translate_request(
         store: false,
         stream: true,
         max_output_tokens: req.max_tokens,
+        reasoning,
     })
 }
 
@@ -225,27 +273,6 @@ fn requests_web_search(req: &MessagesRequest) -> bool {
 }
 
 fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
-    for key in req.extra.keys() {
-        if ![
-            "system",
-            "tools",
-            "tool_choice",
-            "context_management",
-            "diagnostics",
-            "metadata",
-            "output_config",
-            "thinking",
-            "temperature",
-            "top_p",
-            "top_k",
-            "stop_sequences",
-            "service_tier",
-        ]
-        .contains(&key.as_str())
-        {
-            anyhow::bail!("unsupported Grok request field: {key}");
-        }
-    }
     if !valid_diagnostics(req.extra.get("diagnostics")) {
         anyhow::bail!("unsupported diagnostics");
     }
@@ -420,6 +447,10 @@ fn parse_message(
             .ok_or_else(|| anyhow::anyhow!("content block type is invalid"))?;
         match (message.role.as_str(), typ) {
             (_, "thinking") | (_, "redacted_thinking") => {}
+            (_, "image") => {
+                let image_url = image_url_from_block(object)?;
+                content.push(GrokContentPart::input_image(image_url));
+            }
             (_, "text") => {
                 if object
                     .keys()
@@ -573,6 +604,35 @@ fn valid_cache_control(value: Option<&Value>) -> bool {
         && object
             .get("scope")
             .is_none_or(|scope| matches!(scope.as_str(), Some("global")))
+}
+
+fn image_url_from_block(object: &serde_json::Map<String, Value>) -> anyhow::Result<String> {
+    if let Some(url) = object
+        .get("source")
+        .and_then(|source| source.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+    {
+        return Ok(url.to_string());
+    }
+    let source = object
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("image block source is invalid"))?;
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        anyhow::bail!("unsupported image source");
+    }
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("image/"))
+        .ok_or_else(|| anyhow::anyhow!("image media type is invalid"))?;
+    let data = source
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("image data is invalid"))?;
+    Ok(format!("data:{media_type};base64,{data}"))
 }
 
 fn flush_message(role: &str, content: &mut Vec<GrokContentPart>, out: &mut Vec<GrokInputItem>) {
@@ -851,12 +911,33 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_rejects_unknown_fields() {
+    fn grok_translation_serializes_images_as_input_image() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"look"},
+                {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}
+            ]}]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(translated["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            translated["input"][0]["content"][1]["image_url"],
+            "https://example.com/a.png"
+        );
+        assert!(!translated.to_string().contains("ccp:input_image:"));
+    }
+
+    #[test]
+    fn grok_translation_ignores_unknown_fields() {
         let request: MessagesRequest = serde_json::from_value(
-            serde_json::json!({"model":"grok-4.5","messages":[],"unknown_field":true}),
+            serde_json::json!({"model":"grok-4.5","messages":[{"role":"user","content":"hi"}],"unknown_field":true}),
         )
         .unwrap();
-        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        assert!(translate_request(&request, "grok-4.5".into()).is_ok());
     }
 
     #[test]

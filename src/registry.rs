@@ -38,7 +38,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
-pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
+pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6"];
 
 pub struct Registry {
     alias_provider: AliasProvider,

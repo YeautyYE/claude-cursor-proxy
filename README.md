@@ -14,7 +14,7 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 
 ```
 Claude Code ──Anthropic /v1/messages──► claude-cursor-proxy (:18765)
-                                              │
+grok-build  ──Responses / Messages ──►        │
                                               ├── Cursor (Fable 5)   ← primary
                                               ├── Codex             ← additional
                                               ├── Kimi
@@ -118,6 +118,60 @@ claude-cursor-proxy kimi auth login   # or: grok auth login
 
 </details>
 
+### Point grok-build at the proxy
+
+Do **not** set `GROK_CLI_CHAT_PROXY_BASE_URL` to this process. That env is for xAI’s official chat-proxy. grok-build talks to this proxy as a normal custom `base_url`.
+
+**1. Log in (once) and start the proxy**
+
+```bash
+claude-cursor-proxy grok auth login      # required for grok-4.5 / grok-4.6 chat
+claude-cursor-proxy cursor auth login    # only if you also route Fable / Composer
+claude-cursor-proxy serve                # 127.0.0.1:18765
+```
+
+**2. Edit `~/.grok/config.toml`** — override the official ids so Fast + effort menus stay enabled. Fast is `reasoning.effort = "low"`.
+
+```toml
+# ~/.grok/config.toml
+
+[model.grok-4.6]
+base_url = "http://127.0.0.1:18765/v1"
+api_key = "unused"
+
+[model.grok-4.5]
+base_url = "http://127.0.0.1:18765/v1"
+api_key = "unused"
+
+# Optional: Cursor / Claude via Anthropic Messages
+[model.via-ccp]
+model = "claude-fable-5[1m]"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "messages"
+context_window = 1000000
+api_key = "unused"
+supports_reasoning_effort = true
+reasoning_effort = "high"
+
+# Optional: image / video tools (global URL, not the model base_url)
+[endpoints]
+xai_api_base_url = "http://127.0.0.1:18765/v1"
+```
+
+**3. Run grok-build**
+
+```bash
+grok --model grok-4.6
+# or: grok --model grok-4.5
+# or: grok --model via-ccp
+```
+
+Inbound `api_key` is accepted (`Authorization: Bearer …` or `x-api-key`; `unused`, other placeholders, and JWT-looking session tokens are treated as empty) and is **not** used as a user/tenant id. Grok `/v1/responses` passthrough forwards conversation, compaction (`x-compaction-at`, `x-compactions-remaining`), doom-loop, and a charset-limited `x-grok-model-override` — never `Authorization`, `Cookie`, or `x-grok-user-id`.
+
+`GET /v1/models` advertises `model`, `context_window`, `api_backend` (`responses` for `grok-*`, `messages` otherwise), `supports_reasoning_effort`, and `reasoning_efforts` (grok-4.6 includes `xhigh` / `high` / `medium` / `low`). A `GROK_MODELS_BASE_URL=http://127.0.0.1:18765/v1` catalog fetch will not fall back to Chat Completions. This proxy does not implement `/v1/chat/completions`.
+
+Media routes (`/v1/images/*`, `/v1/videos/*`) proxy to `https://api.x.ai/v1` (override with `CCP_GROK_MEDIA_BASE_URL`). A real client key is forwarded; placeholders and grok-build session JWTs fall back to the stored Grok OAuth token.
+
 ---
 
 ## Models
@@ -143,6 +197,7 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 ## Features
 
 - Anthropic surface: `POST /v1/messages`, `count_tokens`, `/healthz`, `/v1/models`
+- grok-build surface: `POST /v1/responses`, `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/videos/generations`, `GET /v1/videos/{id}`
 - Cursor Agent Connect (BiDi `Run`); optional HTTP/1 via `CCP_CURSOR_HTTP1=1`
 - SSE keep-alive (`ping`) so quiet thinking does not look stalled
 - Model routing by `ANTHROPIC_MODEL`

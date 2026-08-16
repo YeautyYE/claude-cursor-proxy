@@ -69,7 +69,6 @@ impl GrokClient {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(120))
                 .build()?,
         );
         let auth = Arc::new(GrokAuthManager::new(file_store())?);
@@ -100,13 +99,32 @@ impl GrokClient {
         body: &GrokResponsesRequest,
         traffic: Option<Arc<TrafficCapture>>,
     ) -> Result<GrokResponse, GrokError> {
+        let bytes = serde_json::to_vec(body).unwrap_or_default();
+        self.post_bytes(&bytes, traffic).await
+    }
+
+    pub async fn post_bytes(
+        &self,
+        body: &[u8],
+        traffic: Option<Arc<TrafficCapture>>,
+    ) -> Result<GrokResponse, GrokError> {
+        self.post_bytes_with_headers(body, traffic, &[]).await
+    }
+
+    pub async fn post_bytes_with_headers(
+        &self,
+        body: &[u8],
+        traffic: Option<Arc<TrafficCapture>>,
+        extra_headers: &[(String, String)],
+    ) -> Result<GrokResponse, GrokError> {
         if let Some(capture) = traffic.as_ref() {
-            let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
+            let body_value = serde_json::from_slice::<serde_json::Value>(body)
+                .unwrap_or(serde_json::Value::Null);
             capture.write_json("020-upstream-request", &body_value);
             capture.write_json("021-upstream-request-metadata", &serde_json::json!({
                 "method": "POST", "url": safe_url(&self.url), "provider": "grok", "transport": "http",
                 "headers": {"accept":"text/event-stream", "content-type":"application/json", "authorization":"[redacted]", "x-xai-token-auth":"[redacted]"},
-                "body_bytes": serde_json::to_vec(body).map(|v| v.len()).unwrap_or(0),
+                "body_bytes": body.len(),
             }));
         }
         let auth = match self.auth.get_auth().await {
@@ -117,7 +135,7 @@ impl GrokClient {
             }
         };
         let response = self
-            .attempt(&auth.access, body, 1, traffic.as_deref())
+            .attempt(&auth.access, body, 1, traffic.as_deref(), extra_headers)
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             let refreshed = self
@@ -129,7 +147,13 @@ impl GrokClient {
                     auth_error(error)
                 })?;
             let replay = self
-                .attempt(&refreshed.access, body, 2, traffic.as_deref())
+                .attempt(
+                    &refreshed.access,
+                    body,
+                    2,
+                    traffic.as_deref(),
+                    extra_headers,
+                )
                 .await?;
             if replay.status() == StatusCode::UNAUTHORIZED {
                 capture_failure(traffic.as_deref(), "auth", "unauthorized", 2);
@@ -156,12 +180,13 @@ impl GrokClient {
     async fn attempt(
         &self,
         access: &str,
-        body: &GrokResponsesRequest,
+        body: &[u8],
         attempt: u8,
         traffic: Option<&TrafficCapture>,
+        extra_headers: &[(String, String)],
     ) -> Result<reqwest::Response, GrokError> {
         let started = Instant::now();
-        let response = self
+        let mut request = self
             .client
             .post(&self.url)
             .header("accept", "text/event-stream")
@@ -169,18 +194,20 @@ impl GrokClient {
             .header("authorization", format!("Bearer {access}"))
             .header("x-xai-token-auth", "xai-grok-cli")
             .header("x-grok-client-identifier", "grok-shell")
-            .header("x-grok-client-version", &self.client_version)
-            .json(body)
-            .send()
-            .await
-            .map_err(|_| {
-                capture_failure(traffic, "transport", "transport", attempt);
-                GrokError {
-                    status: StatusCode::BAD_GATEWAY,
-                    retry_after: None,
-                    message: "Grok upstream request failed".into(),
-                }
-            })?;
+            .header("x-grok-client-version", &self.client_version);
+        for (name, value) in extra_headers {
+            if super::is_passthrough_request_header(name) {
+                request = request.header(name.as_str(), value.as_str());
+            }
+        }
+        let response = request.body(body.to_vec()).send().await.map_err(|_| {
+            capture_failure(traffic, "transport", "transport", attempt);
+            GrokError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "Grok upstream request failed".into(),
+            }
+        })?;
         let status = response.status();
         if let Some(capture) = traffic {
             capture.write_json("022-upstream-attempt", &serde_json::json!({"attempt":attempt,"status":status.as_u16(),"elapsed_ms":started.elapsed().as_millis(),"headers":safe_headers(response.headers())}));
@@ -191,8 +218,8 @@ impl GrokClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
+            let (body, truncated) = read_rejected_body(response, 64 * 1024).await;
             if let Some(capture) = traffic {
-                let (body, truncated) = read_rejected_body(response, 64 * 1024).await;
                 let detail = serde_json::from_slice::<serde_json::Value>(&body)
                     .unwrap_or_else(|_| serde_json::json!({"body_bytes": body.len()}));
                 capture.write_json(
@@ -203,11 +230,73 @@ impl GrokClient {
             return Err(GrokError {
                 status,
                 retry_after,
-                message: "Grok upstream rejected the request".into(),
+                message: extract_upstream_error_message(
+                    &body,
+                    "Grok upstream rejected the request",
+                ),
             });
         }
         Ok(response)
     }
+}
+
+pub fn extract_upstream_error_message(body: &[u8], fallback: &str) -> String {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let raw = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or(fallback);
+    sanitize_error_message(raw)
+}
+
+fn sanitize_error_message(raw: &str) -> String {
+    let truncated: String = raw.chars().take(512).collect();
+    let mut out = String::new();
+    let mut words = truncated.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if word.eq_ignore_ascii_case("bearer") {
+            if let Some(next) = words.peek()
+                && looks_like_secret(next)
+            {
+                out.push_str("Bearer [redacted]");
+                words.next();
+                continue;
+            }
+        }
+        if looks_like_secret(word) {
+            out.push_str("[redacted]");
+            continue;
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() {
+        "Grok upstream rejected the request".into()
+    } else {
+        out
+    }
+}
+
+fn looks_like_secret(token: &str) -> bool {
+    let trimmed =
+        token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+    (trimmed.starts_with("sk-") && trimmed.len() > 8)
+        || (trimmed.starts_with("xai-") && trimmed.len() > 12)
+        || {
+            let mut parts = token.split('.');
+            matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(header), Some(payload), Some(signature), None)
+                    if header.starts_with("eyJ") && !payload.is_empty() && !signature.is_empty()
+            )
+        }
 }
 
 async fn read_rejected_body(response: reqwest::Response, limit: usize) -> (Vec<u8>, bool) {

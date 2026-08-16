@@ -363,7 +363,7 @@ impl Reducer {
                 Ok(out)
             }
             "error" | "response.failed" => anyhow::bail!("upstream Grok stream failed"),
-            _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
+            _ => Ok(vec![]),
         }
     }
     fn delta(&mut self, kind: &str, delta: &str) -> anyhow::Result<Vec<ReducerEvent>> {

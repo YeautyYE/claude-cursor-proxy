@@ -671,8 +671,21 @@ impl Provider for CursorProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("cursor");
-        let wire_model = anthropic_wire_model(model);
+        let requested_model = body.model.as_deref().unwrap_or("cursor");
+        let wire_model = anthropic_wire_model(requested_model);
+        let effort = match crate::providers::translate_shared::read_effort(&body) {
+            Ok(effort) => effort,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
+        let routed_model =
+            crate::providers::cursor::model::apply_effort_to_cursor_model(requested_model, effort);
+        let model = routed_model.as_str();
 
         let resolved = resolve_cursor_model(model);
         if let Err(e) = resolved {

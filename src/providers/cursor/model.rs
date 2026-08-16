@@ -46,6 +46,42 @@ impl CursorAgentMode {
     }
 }
 
+/// Apply grok-build / Anthropic `output_config.effort` onto a Cursor model id.
+///
+/// Bare Fable aliases otherwise always resolve to `thinking-max`. Fast in
+/// grok-build is `low`.
+pub fn apply_effort_to_cursor_model(model: &str, effort: Option<&str>) -> String {
+    let Some(effort) = effort else {
+        return model.to_string();
+    };
+    let stripped = strip_anthropic_context_suffix(model);
+    let marker = if model.contains("[1m]") || model.contains("[1M]") {
+        "[1m]"
+    } else if model.contains("[2m]") || model.contains("[2M]") {
+        "[2m]"
+    } else {
+        ""
+    };
+    if is_fable_family(&stripped) {
+        let tier = match effort {
+            "low" | "fast" | "minimal" => "claude-fable-5-thinking-low",
+            "medium" => "claude-fable-5-thinking-medium",
+            "high" => "claude-fable-5-thinking-high",
+            "xhigh" | "max" => "claude-fable-5-thinking-max",
+            _ => return model.to_string(),
+        };
+        return format!("{tier}{marker}");
+    }
+    if matches!(
+        stripped.as_str(),
+        "composer-2.5" | "cursor-composer" | "cursor" | "cursor-agent"
+    ) && matches!(effort, "low" | "fast")
+    {
+        return "composer-2.5-fast".into();
+    }
+    model.to_string()
+}
+
 /// Resolve a model string into a (model_id, mode) pair.
 ///
 /// Returns an error if the model is not recognized.
@@ -428,6 +464,24 @@ mod tests {
         let r = resolve_cursor_model("cursor:gpt-5.5").unwrap();
         assert_eq!(r.model_id, "gpt-5.5");
         assert_eq!(r.mode, CursorAgentMode::Agent);
+    }
+
+    #[test]
+    fn apply_effort_remaps_fable_alias_for_grok_build_fast() {
+        assert_eq!(
+            apply_effort_to_cursor_model("claude-fable-5[1m]", Some("low")),
+            "claude-fable-5-thinking-low[1m]"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("claude-fable-5[1m]", Some("fast")),
+            "claude-fable-5-thinking-low[1m]"
+        );
+        let resolved = resolve_cursor_model(&apply_effort_to_cursor_model(
+            "claude-fable-5[1m]",
+            Some("low"),
+        ))
+        .unwrap();
+        assert_eq!(resolved.model_id, "claude-fable-5-thinking-low");
     }
 
     #[test]

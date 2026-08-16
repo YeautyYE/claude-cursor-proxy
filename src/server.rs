@@ -12,9 +12,10 @@ use crate::{
 use axum::{
     Json, Router,
     body::Body,
+    extract::Path as PathParam,
     extract::State,
-    http::{Request, StatusCode},
-    response::Response,
+    http::{Method, Request, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     serve::ListenerExt,
 };
@@ -120,6 +121,11 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
         .route("/v1/models", get(handler_models))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
+        .route("/v1/responses", post(handler_responses))
+        .route("/v1/images/generations", post(handler_image_generations))
+        .route("/v1/images/edits", post(handler_image_edits))
+        .route("/v1/videos/generations", post(handler_video_generations))
+        .route("/v1/videos/{id}", get(handler_video_status))
         .fallback(fallback_handler)
         .with_state(state)
 }
@@ -158,12 +164,7 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
                 id: String,
                 owned_by: &str| {
         if seen.insert(id.clone()) {
-            data.push(json!({
-                "id": id,
-                "object": "model",
-                "created": 0,
-                "owned_by": owned_by,
-            }));
+            data.push(crate::openai::catalog_model(&id, owned_by));
         }
     };
 
@@ -212,6 +213,283 @@ async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>
 
 async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     dispatch_request(state, req, true).await
+}
+
+async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    dispatch_responses(state, req).await
+}
+
+async fn handler_image_generations(req: Request<Body>) -> Response {
+    dispatch_media(Method::POST, "/images/generations", req).await
+}
+
+async fn handler_image_edits(req: Request<Body>) -> Response {
+    dispatch_media(Method::POST, "/images/edits", req).await
+}
+
+async fn handler_video_generations(req: Request<Body>) -> Response {
+    dispatch_media(Method::POST, "/videos/generations", req).await
+}
+
+async fn handler_video_status(PathParam(id): PathParam<String>, req: Request<Body>) -> Response {
+    if !crate::media::valid_video_id(&id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid video id",
+        );
+    }
+    dispatch_media(Method::GET, &format!("/videos/{id}"), req).await
+}
+
+async fn dispatch_media(method: Method, upstream_path: &str, req: Request<Body>) -> Response {
+    let headers = req.headers().clone();
+    let body = match axum::body::to_bytes(req.into_body(), crate::media::MEDIA_MAX_BODY_BYTES).await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "media request exceeds the 20MiB limit",
+            );
+        }
+    };
+    crate::media::proxy_media(method, upstream_path, &headers, body).await
+}
+
+async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Response {
+    let started_at = Instant::now();
+    let log = create_logger("server");
+    let req_id = Uuid::new_v4().to_string();
+    let headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid JSON: {err}"),
+            );
+        }
+    };
+    let value: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Invalid JSON",
+            );
+        }
+    };
+    let Some(model) = crate::openai::responses_model(&value) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "Missing \"model\" in request body. {}",
+                state.registry.unknown_model_message()
+            ),
+        );
+    };
+    let normalized_model = normalize_incoming_model(&model);
+    let provider = match state.registry.provider_for_model(&normalized_model, None) {
+        Some(provider) => provider,
+        None => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!(
+                    "Unknown model \"{normalized_model}\". {}",
+                    state.registry.unknown_model_message()
+                ),
+            );
+        }
+    };
+    let session_id = session_id_from_headers(&headers).or_else(|| {
+        headers
+            .get("x-grok-session-id")
+            .or_else(|| headers.get("x-grok-conv-id"))
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    start_request_monitor(
+        state.monitor.as_ref(),
+        &req_id,
+        session_id.clone(),
+        EndpointKind::Messages,
+    );
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.provider_selected(&req_id, provider.name(), &normalized_model, None);
+    }
+    let traffic = create_traffic_capture(TrafficCaptureOptions {
+        req_id: req_id.clone(),
+        session_id: session_id.clone(),
+        session_seq: None,
+        provider: Some(provider.name().to_string()),
+        state_dir_override: None,
+    })
+    .map(Arc::new);
+    let context = RequestContext {
+        req_id: req_id.clone(),
+        session_id,
+        session_seq: None,
+        provider: provider.name().to_string(),
+        traffic,
+        monitor: state.monitor.clone(),
+        claude_code: claude_code_headers_from(&headers),
+    };
+    let mut request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    let response = if provider.name() == "grok" {
+        shared_grok_provider()
+            .handle_responses_raw(&body_bytes, normalized_model.clone(), context, &headers)
+            .await
+    } else {
+        let mut messages = match crate::openai::responses_to_messages(&value) {
+            Ok(messages) => messages,
+            Err(error) => {
+                let response = json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+                request_guard.failed(response.status(), error.to_string());
+                return response;
+            }
+        };
+        messages.model = Some(normalized_model.clone());
+        wrap_anthropic_as_responses(
+            provider.handle_messages(messages, context).await,
+            &normalized_model,
+        )
+        .await
+    };
+    log_request_completed(
+        &log,
+        RequestLogContext {
+            req_id: &req_id,
+            provider: Some(provider.name()),
+            model: Some(&normalized_model),
+            count_tokens: false,
+            status: response.status(),
+            started_at,
+        },
+    );
+    if response.status().is_success() {
+        return monitor_response_body(response, request_guard);
+    }
+    let status = response.status();
+    let (response, details) = record_failed_response(
+        &log,
+        FailedResponseLogContext {
+            req_id: &req_id,
+            provider: Some(provider.name()),
+            model: Some(&normalized_model),
+            count_tokens: false,
+            started_at,
+        },
+        response,
+    )
+    .await;
+    request_guard.failed(
+        status,
+        details
+            .map(|details| details.message)
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
+    );
+    response
+}
+
+fn shared_grok_provider() -> &'static crate::providers::grok::GrokProvider {
+    static PROVIDER: LazyLock<crate::providers::grok::GrokProvider> =
+        LazyLock::new(crate::providers::grok::GrokProvider::new);
+    &PROVIDER
+}
+
+async fn wrap_anthropic_as_responses(response: Response, model: &str) -> Response {
+    if !response.status().is_success() {
+        return response;
+    }
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !content_type.contains("text/event-stream") {
+        let bytes = match axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "upstream response exceeds the size limit",
+                );
+            }
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "upstream response is not JSON",
+                );
+            }
+        };
+        let id = format!("resp_{}", Uuid::new_v4().simple());
+        return (
+            StatusCode::OK,
+            Json(crate::openai::messages_json_to_responses(
+                &value, &id, model,
+            )),
+        )
+            .into_response();
+    }
+    let id = format!("resp_{}", Uuid::new_v4().simple());
+    let model = model.to_string();
+    let (parts, body) = response.into_parts();
+    let translator = crate::openai::AnthropicToResponses::new(id, model);
+    let stream = futures_util::stream::unfold(
+        (body, translator, false),
+        |(mut body, mut translator, done)| async move {
+            if done {
+                return None;
+            }
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    let data = frame.into_data().ok().unwrap_or_else(bytes::Bytes::new);
+                    let out = translator.push(&data);
+                    Some((
+                        Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(out)),
+                        (body, translator, false),
+                    ))
+                }
+                Some(Err(_)) => {
+                    let out = translator.fail("upstream stream failed");
+                    Some((
+                        Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(out)),
+                        (body, translator, true),
+                    ))
+                }
+                None => {
+                    let out = translator.finish();
+                    Some((
+                        Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(out)),
+                        (body, translator, true),
+                    ))
+                }
+            }
+        },
+    );
+    let mut response = Response::from_parts(parts, Body::from_stream(stream));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    response
 }
 
 async fn dispatch_request(

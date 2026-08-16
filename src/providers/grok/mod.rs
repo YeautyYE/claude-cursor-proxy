@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use axum::{
     Json,
     body::Body,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -53,6 +53,36 @@ impl GrokProvider {
         Self {
             client: Arc::new(client),
         }
+    }
+
+    pub async fn handle_responses_raw(
+        &self,
+        body: &[u8],
+        model: String,
+        ctx: RequestContext,
+        inbound_headers: &HeaderMap,
+    ) -> Response {
+        if let Err(error) = assert_allowed_model(&resolve_model(&model)) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
+        if let Some(monitor) = &ctx.monitor {
+            monitor.model_resolved(&ctx.req_id, &model);
+            monitor.upstream_started(&ctx.req_id);
+        }
+        let extra_headers = grok_passthrough_request_headers(inbound_headers);
+        let upstream = match self
+            .client
+            .post_bytes_with_headers(body, ctx.traffic.clone(), &extra_headers)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return map_error(error),
+        };
+        passthrough_stream(upstream, ctx.monitor.clone(), ctx.req_id.clone(), model)
     }
 }
 impl Default for GrokProvider {
@@ -154,6 +184,7 @@ impl Provider for GrokProvider {
             }
         }
     }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
         let resolved = resolve_model(&requested);
@@ -186,6 +217,143 @@ impl Provider for GrokProvider {
         )
             .into_response()
     }
+}
+
+const PASSTHROUGH_REQUEST_HEADERS: &[&str] = &[
+    "x-grok-conv-id",
+    "x-grok-req-id",
+    "x-grok-session-id",
+    "x-grok-agent-id",
+    "x-grok-turn-idx",
+    "x-grok-doom-loop-check",
+    "x-compaction-at",
+    "x-compactions-remaining",
+    "x-grok-model-override",
+];
+
+const PASSTHROUGH_RESPONSE_HEADERS: &[&str] = &[
+    "x-grok-context-window",
+    "x-grok-max-completion-tokens",
+    "x-should-retry",
+    "retry-after",
+    "x-request-id",
+];
+
+pub use self::client::extract_upstream_error_message;
+
+pub fn is_passthrough_request_header(name: &str) -> bool {
+    PASSTHROUGH_REQUEST_HEADERS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+}
+
+pub fn grok_passthrough_request_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for name in PASSTHROUGH_REQUEST_HEADERS {
+        let Some(value) = headers.get(*name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let value = value.trim();
+        if !passthrough_header_value_ok(name, value) {
+            continue;
+        }
+        out.push(((*name).to_string(), value.to_string()));
+    }
+    out
+}
+
+fn passthrough_header_value_ok(name: &str, value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii() && !ch.is_ascii_control())
+    {
+        return false;
+    }
+    match name {
+        "x-compactions-remaining" => {
+            value.len() <= 8 && value.chars().all(|ch| ch.is_ascii_digit())
+        }
+        "x-grok-model-override" => {
+            value.len() <= 128
+                && !value.contains("..")
+                && !value.contains('/')
+                && value.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '[' | ']')
+                })
+        }
+        _ => true,
+    }
+}
+
+pub fn grok_passthrough_failed_event(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_upstream",
+            "object": "response",
+            "created_at": 0,
+            "model": model,
+            "status": "failed",
+            "output": [],
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens_details": { "reasoning_tokens": 0 }
+            },
+            "error": {
+                "code": "server_error",
+                "message": "Grok upstream stream failed"
+            }
+        }
+    })
+}
+
+fn grok_passthrough_failed_sse(model: &str) -> Bytes {
+    let event = grok_passthrough_failed_event(model);
+    Bytes::from(format!("data: {event}\n\n"))
+}
+
+fn passthrough_stream(
+    response: client::GrokResponse,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    model: String,
+) -> Response {
+    let upstream = response.into_response();
+    let mut builder = Response::builder()
+        .header(http::header::CONTENT_TYPE, "text/event-stream")
+        .header(http::header::CACHE_CONTROL, "no-cache");
+    for name in PASSTHROUGH_RESPONSE_HEADERS {
+        if let Some(value) = upstream.headers().get(*name) {
+            builder = builder.header(*name, value);
+        }
+    }
+    let stream = upstream.bytes_stream().map(move |item| match item {
+        Ok(chunk) => {
+            if let Some(monitor) = monitor.as_ref() {
+                monitor.stream_progress(&req_id, chunk.len() as u64, 1, None, None);
+            }
+            Ok::<Bytes, Infallible>(chunk)
+        }
+        Err(_) => Ok(grok_passthrough_failed_sse(&model)),
+    });
+    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+        (
+            [
+                (http::header::CONTENT_TYPE, "text/event-stream"),
+                (http::header::CACHE_CONTROL, "no-cache"),
+            ],
+            Body::from_stream(futures_util::stream::once(async {
+                Ok::<Bytes, Infallible>(grok_passthrough_failed_sse("grok"))
+            })),
+        )
+            .into_response()
+    })
 }
 
 fn stream_response(
@@ -275,10 +443,21 @@ where
             return None;
         }
         loop {
-            let chunk = match self.upstream.next().await {
-                Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
-                None => {
+            let chunk = match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                self.upstream.next(),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Some(crate::anthropic::sse::encode_sse_event(
+                        Some("ping"),
+                        r#"{"type":"ping"}"#,
+                    ));
+                }
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(_))) => return Some(self.fail_at("transport", "upstream_stream")),
+                Ok(None) => {
                     if self.decoder.finish().is_err() || !self.reducer.finished() {
                         return Some(self.fail_at("decoder", "incomplete_stream"));
                     }
@@ -433,8 +612,17 @@ fn write_error(traffic: Option<&crate::traffic::TrafficCapture>, stage: &str, ki
     }
 }
 
+pub fn mapped_upstream_status(status: StatusCode) -> StatusCode {
+    if status.is_client_error() {
+        status
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 fn map_error(error: client::GrokError) -> Response {
-    match error.status {
+    let status = mapped_upstream_status(error.status);
+    match status {
         StatusCode::UNAUTHORIZED => json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -453,8 +641,10 @@ fn map_error(error: client::GrokError) -> Response {
             }
         }
         StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN => {
-            json_error(error.status, "permission_error", error.message)
+            json_error(status, "permission_error", error.message)
         }
+        StatusCode::BAD_REQUEST => json_error(status, "invalid_request_error", error.message),
+        status if status.is_client_error() => json_error(status, "api_error", error.message),
         _ => json_error(StatusCode::BAD_GATEWAY, "api_error", error.message),
     }
 }

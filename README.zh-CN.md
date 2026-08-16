@@ -14,7 +14,7 @@
 
 ```
 Claude Code ──Anthropic /v1/messages──► claude-cursor-proxy (:18765)
-                                              │
+grok-build  ──Responses / Messages ──►        │
                                               ├── Cursor (Fable 5)   ← 主路径
                                               ├── Codex             ← 额外后端
                                               ├── Kimi
@@ -121,6 +121,60 @@ claude-cursor-proxy kimi auth login   # 或：grok auth login
 
 </details>
 
+### 让 grok-build 走本代理
+
+**不要**把 `GROK_CLI_CHAT_PROXY_BASE_URL` 设成本代理。那个环境变量是给 xAI 官方 chat-proxy 用的。grok-build 把本代理当成普通自定义 `base_url` 即可。
+
+**1. 登录（一次）并启动代理**
+
+```bash
+claude-cursor-proxy grok auth login      # grok-4.5 / grok-4.6 聊天必需
+claude-cursor-proxy cursor auth login    # 只有还要走 Fable / Composer 时才需要
+claude-cursor-proxy serve                # 127.0.0.1:18765
+```
+
+**2. 改 `~/.grok/config.toml`** — 覆盖官方 id，Fast 和 effort 菜单还在。Fast 就是 `reasoning.effort = "low"`。
+
+```toml
+# ~/.grok/config.toml
+
+[model.grok-4.6]
+base_url = "http://127.0.0.1:18765/v1"
+api_key = "unused"
+
+[model.grok-4.5]
+base_url = "http://127.0.0.1:18765/v1"
+api_key = "unused"
+
+# 可选：Cursor / Claude 走 Anthropic Messages
+[model.via-ccp]
+model = "claude-fable-5[1m]"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "messages"
+context_window = 1000000
+api_key = "unused"
+supports_reasoning_effort = true
+reasoning_effort = "high"
+
+# 可选：图/视频工具（全局 URL，不是模型 base_url）
+[endpoints]
+xai_api_base_url = "http://127.0.0.1:18765/v1"
+```
+
+**3. 启动 grok-build**
+
+```bash
+grok --model grok-4.6
+# 或：grok --model grok-4.5
+# 或：grok --model via-ccp
+```
+
+入站 `api_key` 会收下（`Authorization: Bearer …` 或 `x-api-key`；`unused`、其他占位值，以及看起来像 JWT 的 session token 视为空），但**不会**当成用户/租户身份。Grok `/v1/responses` 透传会转发会话、compaction（`x-compaction-at`、`x-compactions-remaining`）、doom-loop，以及字符集受限的 `x-grok-model-override`，不会转发 `Authorization`、`Cookie` 或 `x-grok-user-id`。
+
+`GET /v1/models` 会带上 `model`、`context_window`、`api_backend`（`grok-*` 为 `responses`，其余为 `messages`）、`supports_reasoning_effort` 和 `reasoning_efforts`（grok-4.6 含 `xhigh` / `high` / `medium` / `low`）。`GROK_MODELS_BASE_URL=http://127.0.0.1:18765/v1` 拉目录时不会掉进 Chat Completions。本代理不实现 `/v1/chat/completions`。
+
+媒体路由（`/v1/images/*`、`/v1/videos/*`）转发到 `https://api.x.ai/v1`（可用 `CCP_GROK_MEDIA_BASE_URL` 覆盖）。有真实客户端 key 就转发；占位 key 和 grok-build session JWT 回退到本机已登录的 Grok OAuth。
+
 ---
 
 ## 模型
@@ -146,6 +200,7 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 ## 功能
 
 - 提供 Anthropic 兼容接口：`POST /v1/messages`、`count_tokens`、`/healthz`、`/v1/models`
+- 提供 grok-build 兼容接口：`POST /v1/responses`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/videos/generations`、`GET /v1/videos/{id}`
 - 主上游走 Cursor Agent 长连接；需要时可用 `CCP_CURSOR_HTTP1=1` 改走 HTTP/1
 - 流式回复带 keep-alive（`ping`），长时间安静思考时 Claude Code 不易误判卡住
 - 按 `ANTHROPIC_MODEL` 选后端

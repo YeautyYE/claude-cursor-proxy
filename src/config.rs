@@ -305,6 +305,14 @@ pub fn grok_base_url() -> String {
     "https://cli-chat-proxy.grok.com/v1".to_string()
 }
 
+pub fn grok_media_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_GROK_MEDIA_BASE_URL") {
+        return raw.clone();
+    }
+    "https://api.x.ai/v1".to_string()
+}
+
 pub fn grok_client_version() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {

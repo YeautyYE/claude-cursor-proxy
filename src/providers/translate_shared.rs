@@ -57,21 +57,24 @@ pub fn flatten_system_text(system_val: Option<&Value>) -> Option<String> {
     }
 }
 
+pub fn parse_effort_str(value: &str) -> Result<&str, anyhow::Error> {
+    const VALID: &[&str] = &["low", "fast", "minimal", "medium", "high", "xhigh", "max"];
+    if VALID.contains(&value) {
+        Ok(value)
+    } else {
+        anyhow::bail!("Invalid output_config.effort: {value}")
+    }
+}
+
 pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error> {
     let output_config = match req.extra.get("output_config") {
         Some(Value::Object(m)) => m,
         _ => return Ok(None),
     };
     match output_config.get("effort") {
-        Some(Value::String(s)) => {
-            let valid = ["low", "medium", "high", "xhigh", "max"];
-            if valid.contains(&s.as_str()) {
-                Ok(Some(s.as_str()))
-            } else {
-                anyhow::bail!("Invalid output_config.effort: {s}")
-            }
-        }
-        _ => Ok(None),
+        Some(Value::String(s)) => Ok(Some(parse_effort_str(s)?)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => anyhow::bail!("Invalid output_config.effort: must be a string"),
     }
 }
 
