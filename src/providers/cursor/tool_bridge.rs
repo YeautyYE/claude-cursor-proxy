@@ -245,6 +245,12 @@ impl BridgeRegistry {
     }
 }
 
+/// Serialize tests that share the process-wide bridge registry.
+pub fn lock_bridge_registry_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // Tool detection helpers
 // ---------------------------------------------------------------------------
@@ -675,6 +681,25 @@ pub fn start_cursor_tool_bridge(
         }
     }
 
+    if !paused {
+        // Flush any remaining text from XML parser
+        let flushed = state.xml_parser.flush();
+        for evt in &flushed {
+            if let RecoveredCursorEvent::ToolUse(tool_use) = evt {
+                let input_json =
+                    serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
+                framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
+                if let Some(pending) = pending_from_recovered_tool(tool_use) {
+                    state.pending_tool = Some(pending);
+                }
+                paused = true;
+            }
+        }
+        if !paused {
+            framer.finalize();
+        }
+    }
+
     if paused {
         let remaining = state.remaining_events.clone();
         let mut stored_state = CursorBridgeState::new(
@@ -695,25 +720,6 @@ pub fn start_cursor_tool_bridge(
         stored_state.input_tokens = state.input_tokens;
         stored_state.output_tokens = state.output_tokens;
         BridgeRegistry::insert(stored_state);
-    }
-
-    if !paused {
-        // Flush any remaining text from XML parser
-        let flushed = state.xml_parser.flush();
-        for evt in &flushed {
-            if let RecoveredCursorEvent::ToolUse(tool_use) = evt {
-                let input_json =
-                    serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
-                framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
-                if let Some(pending) = pending_from_recovered_tool(tool_use) {
-                    state.pending_tool = Some(pending);
-                }
-                paused = true;
-            }
-        }
-        if !paused {
-            framer.finalize();
-        }
     }
 
     (sse, paused)
@@ -1034,10 +1040,6 @@ mod tests {
     use super::*;
     use crate::anthropic::schema::MessagesRequest;
     use crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse;
-    use std::sync::Mutex;
-
-    /// Serialize tests that share the global bridge registry.
-    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
     // -----------------------------------------------------------------------
     // PendingCursorTool tests
@@ -1384,7 +1386,7 @@ mod tests {
 
     #[test]
     fn bridge_registry_manages_sessions() {
-        let _lock = REGISTRY_LOCK.lock().unwrap();
+        let _lock = lock_bridge_registry_for_test();
         BridgeRegistry::clear();
         assert_eq!(BridgeRegistry::active_count(), 0);
 
@@ -1406,7 +1408,7 @@ mod tests {
 
     #[test]
     fn bridge_registry_set_and_get_pending_tool() {
-        let _lock = REGISTRY_LOCK.lock().unwrap();
+        let _lock = lock_bridge_registry_for_test();
         BridgeRegistry::clear();
         let state = CursorBridgeState::new(
             "session-pt".into(),

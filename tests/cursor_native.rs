@@ -2396,6 +2396,7 @@ fn bridge_start_pauses_on_tool_use_xml() {
     use claude_cursor_proxy::providers::cursor::response::*;
     use claude_cursor_proxy::providers::cursor::tool_bridge::*;
 
+    let _registry = lock_bridge_registry_for_test();
     // Create upstream events with a text delta containing XML tool_use
     let events = vec![
         CursorStreamEvent::TextDelta {
@@ -2470,6 +2471,7 @@ fn bridge_start_passes_through_without_tool_use() {
     use claude_cursor_proxy::providers::cursor::response::*;
     use claude_cursor_proxy::providers::cursor::tool_bridge::*;
 
+    let _registry = lock_bridge_registry_for_test();
     let events = vec![
         CursorStreamEvent::TextDelta {
             text: "hello world".to_string(),
@@ -2515,6 +2517,7 @@ fn bridge_start_creates_pending_tool_in_registry() {
     use claude_cursor_proxy::providers::cursor::response::*;
     use claude_cursor_proxy::providers::cursor::tool_bridge::*;
 
+    let _registry = lock_bridge_registry_for_test();
     // Clean state
     BridgeRegistry::clear();
 
@@ -2547,6 +2550,7 @@ fn bridge_resume_continues_after_tool_use_pause() {
     use claude_cursor_proxy::providers::cursor::response::*;
     use claude_cursor_proxy::providers::cursor::tool_bridge::*;
 
+    let _registry = lock_bridge_registry_for_test();
     BridgeRegistry::clear();
 
     // Events: tool_use in the middle, text after
@@ -2649,6 +2653,7 @@ fn bridge_rejects_tool_not_in_allowed_list() {
     use claude_cursor_proxy::providers::cursor::response::*;
     use claude_cursor_proxy::providers::cursor::tool_bridge::*;
 
+    let _registry = lock_bridge_registry_for_test();
     BridgeRegistry::clear();
 
     let events = vec![CursorStreamEvent::TextDelta {
