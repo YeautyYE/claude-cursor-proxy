@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.46 (2026-08-17)
+
+- grok-build / Grok CLI: remap Cursor native Shell/Task/Read/WebSearch onto exact grok-build client names (`run_terminal_command`, `spawn_subagent`, …), keep `/v1/responses` live sessions from looping, and recover dead Cursor runs in-request.
+
 ## v0.1.45 (2026-08-14)
 
 - Fix the 400 `Missing tool_result blocks for pending tools` after a Claude Code tool turn is interrupted or abandoned (often while background shells are still running). A fresh request with no current-turn `tool_result` now briefly queues, then supersedes the stale live run instead of demanding an impossible result. Supersession and downstream tool ids are bound to the observed Run generation; replacement atomically reserves the slot and waits for the old transport/pump to tear down, so a delayed waiter cannot cancel a newer Run, overlap two Runs, or inject an old result into its replacement. Historical `tool_result` blocks no longer misclassify a new user turn as a resume; partial, mismatched, extra, duplicate, and mixed result-plus-user-content batches remain a strict 400.
