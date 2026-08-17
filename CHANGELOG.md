@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.49 (2026-08-18)
+
+- Live-open concurrency soft-starts at 4 and doubles on success up to 128 (grok-cli fan-out). `CCP_CURSOR_LIVE_OPEN_CONCURRENCY` is an optional cap, not a required knob. A full gate waits, then returns 429 instead of failing immediately.
+- ResumeAction open uses the same budget as a first open (H2 20s, HTTP/1 90s, still bounded by the 45s recovery window). A flat 10s cap no longer kills HTTP/1 resumes after H2 `INTERNAL_ERROR` (the Claude Code `gemini-3.6-flash-high` 409).
+
 ## v0.1.48 (2026-08-18)
 
 - Stabilize grok-build `/v1/responses` against Cursor live-open races: hold HTTP until the Run is accepted, map ambiguous open/resume timeouts to HTTP 409 (no same-request 5xx retry), and return 429 when the live-open semaphore is saturated so grok can back off.

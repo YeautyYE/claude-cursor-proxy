@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use prost::Message;
 use rand::Rng;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
@@ -2433,7 +2433,6 @@ fn reconnect_prefers_http1(force_http1: bool) -> bool {
     force_http1
 }
 
-const LIVE_RECONNECT_OPEN_CAP: Duration = Duration::from_secs(10);
 pub(crate) const LIVE_H2_OPEN_ATTEMPT: Duration = Duration::from_secs(20);
 const LIVE_H1_OPEN_ATTEMPT: Duration = Duration::from_secs(90);
 pub(crate) const LIVE_AMBIGUOUS_OPEN_TTL: Duration = Duration::from_secs(90);
@@ -2441,12 +2440,21 @@ const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
 const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
 const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
-const DEFAULT_LIVE_OPEN_CONCURRENCY: usize = 4;
+const LIVE_OPEN_SOFT_START: usize = 4;
+const LIVE_OPEN_MAX: usize = 128;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
-fn live_reconnect_open_timeout(remaining: Duration) -> Duration {
-    remaining.min(LIVE_RECONNECT_OPEN_CAP)
+/// ResumeAction open is fatal on timeout (acceptance is ambiguous), so the
+/// first attempt must use the same budget as a first open. A flat 10s cap
+/// killed HTTP/1 resumes after H2 INTERNAL_ERROR before Cursor answered.
+fn live_reconnect_open_timeout(remaining: Duration, force_http1: bool) -> Duration {
+    let cap = if force_http1 {
+        live_h1_open_attempt_timeout()
+    } else {
+        live_h2_open_attempt_timeout()
+    };
+    remaining.min(cap)
 }
 
 fn live_h2_open_attempt_timeout() -> Duration {
@@ -2478,48 +2486,225 @@ async fn with_live_open_timeout<T>(
     per_attempt: Duration,
     fut: impl std::future::Future<Output = Result<T, CursorError>>,
 ) -> Result<T, CursorError> {
-    let _permit = match Arc::clone(&LIVE_OPEN_SEM).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return Err(live_open_saturated_error()),
-    };
+    let _permit = LIVE_OPEN_GATE.acquire(per_attempt).await?;
     match tokio::time::timeout(per_attempt, fut).await {
-        Ok(result) => result,
-        Err(_) => Err(CursorError::new(
-            504,
-            format!(
-                "Cursor live open timed out after {}s",
-                per_attempt.as_secs()
-            ),
-            None,
-        )),
+        Ok(Ok(value)) => {
+            LIVE_OPEN_GATE.on_success();
+            Ok(value)
+        }
+        Ok(Err(err)) => {
+            if live_open_should_shrink(&err) {
+                LIVE_OPEN_GATE.on_failure();
+            }
+            Err(err)
+        }
+        Err(_) => {
+            LIVE_OPEN_GATE.on_failure();
+            Err(CursorError::new(
+                504,
+                format!(
+                    "Cursor live open timed out after {}s",
+                    per_attempt.as_secs()
+                ),
+                None,
+            ))
+        }
     }
 }
 
-static LIVE_OPEN_SEM: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(live_open_concurrency_limit(
-        std::env::var("CCP_CURSOR_LIVE_OPEN_CONCURRENCY")
-            .ok()
-            .as_deref(),
-    )))
-});
-
-fn live_open_concurrency_limit(raw: Option<&str>) -> usize {
+fn live_open_concurrency_max(raw: Option<&str>) -> usize {
     if let Some(n) = raw
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
     {
-        return n;
+        return n.min(LIVE_OPEN_MAX);
     }
-    if cfg!(test) {
-        64
-    } else {
-        DEFAULT_LIVE_OPEN_CONCURRENCY
+    LIVE_OPEN_MAX
+}
+
+fn live_open_soft_start(max: usize) -> usize {
+    LIVE_OPEN_SOFT_START.min(max.max(1))
+}
+
+fn live_open_grow(current: usize, max: usize) -> usize {
+    if current >= max {
+        return max;
     }
+    current
+        .saturating_mul(2)
+        .max(current.saturating_add(1))
+        .min(max)
+}
+
+fn live_open_shrink(current: usize, min: usize) -> usize {
+    let min = min.max(1);
+    if current <= min {
+        return min;
+    }
+    (current / 2).max(min)
+}
+
+fn live_open_should_shrink(err: &CursorError) -> bool {
+    err.status == 504 || err.message.to_ascii_lowercase().contains("timed out")
 }
 
 fn live_open_saturated_error() -> CursorError {
     CursorError::new(429, "Cursor live open concurrency saturated", None)
 }
+
+struct AdaptiveLiveOpenGate {
+    inner: Arc<AdaptiveLiveOpenInner>,
+}
+
+struct AdaptiveLiveOpenInner {
+    min: usize,
+    max: usize,
+    limit: AtomicUsize,
+    inflight: AtomicUsize,
+    notify: Notify,
+}
+
+struct LiveOpenPermit {
+    inner: Arc<AdaptiveLiveOpenInner>,
+}
+
+impl std::fmt::Debug for LiveOpenPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveOpenPermit").finish_non_exhaustive()
+    }
+}
+
+impl Drop for LiveOpenPermit {
+    fn drop(&mut self) {
+        self.inner.inflight.fetch_sub(1, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+}
+
+impl AdaptiveLiveOpenGate {
+    fn new(max: usize) -> Self {
+        let max = max.clamp(1, LIVE_OPEN_MAX);
+        Self::with_bounds(live_open_soft_start(max), max)
+    }
+
+    fn with_bounds(min: usize, max: usize) -> Self {
+        let max = max.clamp(1, LIVE_OPEN_MAX);
+        let min = min.clamp(1, max);
+        Self {
+            inner: Arc::new(AdaptiveLiveOpenInner {
+                min,
+                max,
+                limit: AtomicUsize::new(min),
+                inflight: AtomicUsize::new(0),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn limit(&self) -> usize {
+        self.inner.limit.load(Ordering::SeqCst)
+    }
+
+    fn on_success(&self) {
+        loop {
+            let cur = self.inner.limit.load(Ordering::SeqCst);
+            let next = live_open_grow(cur, self.inner.max);
+            if next == cur {
+                return;
+            }
+            if self
+                .inner
+                .limit
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.inner.notify.notify_waiters();
+                return;
+            }
+        }
+    }
+
+    fn on_failure(&self) {
+        loop {
+            let cur = self.inner.limit.load(Ordering::SeqCst);
+            let next = live_open_shrink(cur, self.inner.min);
+            if next == cur {
+                return;
+            }
+            if self
+                .inner
+                .limit
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn try_acquire(&self) -> Option<LiveOpenPermit> {
+        loop {
+            let inflight = self.inner.inflight.load(Ordering::SeqCst);
+            let limit = self.inner.limit.load(Ordering::SeqCst);
+            if inflight >= limit {
+                return None;
+            }
+            if self
+                .inner
+                .inflight
+                .compare_exchange(inflight, inflight + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(LiveOpenPermit {
+                    inner: Arc::clone(&self.inner),
+                });
+            }
+        }
+    }
+
+    async fn acquire(&self, wait: Duration) -> Result<LiveOpenPermit, CursorError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(permit) = self.try_acquire() {
+                return Ok(permit);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(live_open_saturated_error());
+            }
+            let notified = self.inner.notify.notified();
+            if let Some(permit) = self.try_acquire() {
+                return Ok(permit);
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(remaining) => {
+                    if let Some(permit) = self.try_acquire() {
+                        return Ok(permit);
+                    }
+                    return Err(live_open_saturated_error());
+                }
+            }
+        }
+    }
+}
+
+/// Soft-starts at 4 so a cold process does not stampede H2, then doubles on
+/// successful opens up to 128 (grok-cli fan-out). The env var is an optional
+/// cap, not something operators have to set for parallelism.
+static LIVE_OPEN_GATE: LazyLock<AdaptiveLiveOpenGate> = LazyLock::new(|| {
+    let max = live_open_concurrency_max(
+        std::env::var("CCP_CURSOR_LIVE_OPEN_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    );
+    if cfg!(test) {
+        AdaptiveLiveOpenGate::with_bounds(max, max)
+    } else {
+        AdaptiveLiveOpenGate::new(max)
+    }
+});
 
 #[derive(Debug, Default, Clone)]
 struct ProcessH2Circuit {
@@ -3563,6 +3748,7 @@ async fn try_live_reconnect(
             hard_deadline
                 .saturating_duration_since(Instant::now())
                 .min(reconnect.recovery.remaining(Instant::now())),
+            reconnect.force_http1,
         );
         if open_wait.is_zero() {
             let outcome = LiveReconnectOutcome::Failed(
@@ -7759,18 +7945,94 @@ mod tests {
     }
 
     #[test]
-    fn live_open_concurrency_limit_defaults_and_rejects_zero() {
-        assert_eq!(live_open_concurrency_limit(Some("4")), 4);
-        assert_eq!(live_open_concurrency_limit(Some("1")), 1);
+    fn live_open_max_defaults_to_grok_cli_parallelism() {
         assert_eq!(
-            live_open_concurrency_limit(Some("0")),
-            live_open_concurrency_limit(None)
+            live_open_concurrency_max(None),
+            128,
+            "grok-cli can fan out to 128; do not require CCP_CURSOR_LIVE_OPEN_CONCURRENCY"
         );
+        assert_eq!(live_open_concurrency_max(Some("16")), 16);
+        assert_eq!(live_open_concurrency_max(Some("1")), 1);
+        assert_eq!(live_open_concurrency_max(Some("0")), 128);
+        assert_eq!(live_open_concurrency_max(Some("999")), 128);
+        assert_eq!(live_open_concurrency_max(Some("nope")), 128);
+    }
+
+    #[test]
+    fn live_open_limit_grows_to_128_and_shrinks_to_soft_start() {
+        let mut n = live_open_soft_start(128);
         assert_eq!(
-            live_open_concurrency_limit(Some("nope")),
-            live_open_concurrency_limit(None)
+            n, 4,
+            "first wave stays small so H2 handshakes do not stampede"
         );
-        assert!(live_open_concurrency_limit(None) >= DEFAULT_LIVE_OPEN_CONCURRENCY);
+        while n < 128 {
+            let next = live_open_grow(n, 128);
+            assert!(next > n, "must grow from {n}");
+            n = next;
+        }
+        assert_eq!(n, 128);
+        assert_eq!(live_open_grow(128, 128), 128);
+        assert_eq!(
+            live_open_grow(100, 16),
+            16,
+            "optional env still caps the max"
+        );
+
+        n = live_open_shrink(128, 4);
+        assert_eq!(n, 64);
+        while n > 4 {
+            n = live_open_shrink(n, 4);
+        }
+        assert_eq!(n, 4);
+        assert_eq!(live_open_shrink(4, 4), 4);
+    }
+
+    #[tokio::test]
+    async fn adaptive_live_open_waits_instead_of_instant_429() {
+        let gate = AdaptiveLiveOpenGate::new(4);
+        let mut held = Vec::new();
+        for i in 0..4 {
+            held.push(
+                gate.try_acquire()
+                    .unwrap_or_else(|| panic!("soft-start slot {i}")),
+            );
+        }
+        let started = Instant::now();
+        let err = gate
+            .acquire(Duration::from_millis(80))
+            .await
+            .expect_err("full gate must 429 after waiting");
+        assert_eq!(err.status, 429);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "must queue behind in-flight opens, not fail immediately: {:?}",
+            started.elapsed()
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn adaptive_live_open_grows_so_a_burst_does_not_need_an_env_var() {
+        let gate = AdaptiveLiveOpenGate::new(128);
+        assert_eq!(gate.limit(), 4);
+        gate.on_success();
+        assert_eq!(gate.limit(), 8);
+        gate.on_success();
+        assert_eq!(gate.limit(), 16);
+        let mut held = Vec::new();
+        for i in 0..16 {
+            held.push(
+                gate.try_acquire()
+                    .unwrap_or_else(|| panic!("admit {i} after growth")),
+            );
+        }
+        assert!(
+            gate.try_acquire().is_none(),
+            "limit 16 must still bound a stampede"
+        );
+        drop(held);
+        gate.on_failure();
+        assert_eq!(gate.limit(), 8, "open timeouts shrink the window");
     }
 
     #[test]
@@ -8619,16 +8881,34 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_open_timeout_is_capped_inside_hard_deadline() {
+    fn reconnect_open_timeout_matches_transport_not_a_flat_10s() {
         assert_eq!(
-            live_reconnect_open_timeout(Duration::from_secs(1800)),
-            Duration::from_secs(10)
+            live_reconnect_open_timeout(Duration::from_secs(1800), false),
+            LIVE_H2_OPEN_ATTEMPT,
+            "H2 ResumeAction must get the same budget as first H2 open"
         );
         assert_eq!(
-            live_reconnect_open_timeout(Duration::from_secs(5)),
+            live_reconnect_open_timeout(Duration::from_secs(1800), true),
+            LIVE_H1_OPEN_ATTEMPT,
+            "HTTP/1 ResumeAction after H2 INTERNAL_ERROR must not die at 10s"
+        );
+        assert_eq!(
+            live_reconnect_open_timeout(LIVE_RECOVERY_DEADLINE, true),
+            LIVE_RECOVERY_DEADLINE,
+            "recovery remaining still bounds a fresh HTTP/1 resume"
+        );
+        assert_eq!(
+            live_reconnect_open_timeout(Duration::from_secs(5), false),
             Duration::from_secs(5)
         );
-        assert_eq!(live_reconnect_open_timeout(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            live_reconnect_open_timeout(Duration::from_secs(5), true),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            live_reconnect_open_timeout(Duration::ZERO, true),
+            Duration::ZERO
+        );
     }
 
     #[tokio::test]
