@@ -8,9 +8,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](https://github.com/YeautyYE/claude-cursor-proxy/releases)
 
-Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). This project is a **Cursor-first** Anthropic-compatible **proxy** for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). This project is a **Cursor-first** local **proxy** for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Grok Build](https://x.ai/cli) (`grok` / grok-build).
 
-**Run Cursor models (Fable 5) from Claude Code — stably.**
+**Run Cursor models (Fable 5) from Claude Code or grok-build — stably.**
 
 ```
 Claude Code ──Anthropic /v1/messages──► claude-cursor-proxy (:18765)
@@ -27,16 +27,15 @@ grok-build  ──Responses / Messages ──►        │
 
 ## What it does
 
-Claude Code only speaks Anthropic’s API (`/v1/messages`, etc.).  
-Cursor uses its own Agent protocol. They do not talk to each other directly.
+Claude Code speaks Anthropic (`/v1/messages`). grok-build speaks OpenAI Responses (`/v1/responses`). Cursor uses its own Agent protocol. They do not talk to each other directly.
 
 This tool runs a local one-way proxy (default `127.0.0.1:18765`):
 
-1. Claude Code sends normal Anthropic requests to the proxy
+1. Claude Code or grok-build send their usual requests to the proxy
 2. The proxy translates them for Cursor and forwards upstream
-3. It streams Anthropic-shaped SSE back — with keep-alive so long thinking turns are not killed by Claude Code’s idle watchdog
+3. It streams the matching SSE back — Anthropic `ping` keep-alive for Claude Code, Responses events for grok-build
 
-Primary upstream: **Cursor (Fable 5)** via `ANTHROPIC_MODEL=claude-fable-5[1m]`. Additional backends in the same process: Codex, Kimi, Grok.
+Primary upstream: **Cursor (Fable 5)**. Additional backends in the same process: Codex, Kimi, Grok.
 
 > Not affiliated with Anthropic, Cursor, OpenAI, Moonshot, or xAI.
 
@@ -49,7 +48,7 @@ Primary upstream: **Cursor (Fable 5)** via `ANTHROPIC_MODEL=claude-fable-5[1m]`.
 | **Stable sessions** | HTTP/2 BiDi upstream + Anthropic `ping` SSE keep-alive downstream |
 | **Fable 5** | Set `ANTHROPIC_MODEL=claude-fable-5[1m]` (and the same for `ANTHROPIC_SMALL_FAST_MODEL`) |
 | **Usage / ctx** | Cursor turn usage mapped onto Anthropic `usage` for status lines and compaction |
-| **Tools** | Cursor exec / native tools proxied into Claude Code’s tool loop (best-effort) |
+| **Tools** | Cursor exec / native tools remapped into Claude Code and grok-build tool loops (best-effort) |
 | **Simple install** | Checksummed binaries; macOS ad-hoc codesign; config under `~/.config/claude-cursor-proxy` |
 
 Honest scope: best-effort compatibility — **not** a full Cursor IDE mirror. See [Limitations](#limitations).
@@ -272,7 +271,7 @@ claude-cursor-proxy cursor auth status
 - **No client auth on the proxy.** Loopback by default; non-loopback only behind a firewall or authenticating reverse proxy.
 - **Rate limits** follow the upstream account.
 - **Parity is best-effort.** Text, tools, thinking, and streaming work for supported paths; some edge cases are approximated or omitted.
-- **Not a full Cursor IDE.** Workspace/tool callbacks beyond Claude Code’s tool loop are incomplete.
+- **Not a full Cursor IDE.** Workspace/tool callbacks beyond Claude Code / grok-build tool loops are incomplete.
 - **Linux prebuilts are glibc.** Alpine/musl: build from source.
 
 | Symptom | Fix |

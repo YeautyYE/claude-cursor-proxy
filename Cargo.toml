@@ -1,7 +1,7 @@
 [package]
 name = "claude-cursor-proxy"
 version = "0.1.45"
-description = "Local Anthropic-compatible proxy so Claude Code can use Cursor (Fable 5) and other providers"
+description = "Local proxy so Claude Code and grok-build can use Cursor (Fable 5) and other providers"
 edition = "2024"
 rust-version = "1.85"
 authors = ["YeautyYE", "claude-cursor-proxy contributors"]
@@ -10,7 +10,7 @@ publish = false
 repository = "https://github.com/YeautyYE/claude-cursor-proxy"
 homepage = "https://github.com/YeautyYE/claude-cursor-proxy"
 readme = "README.md"
-keywords = ["claude-code", "cursor", "proxy", "anthropic", "fable"]
+keywords = ["claude-code", "cursor", "grok", "proxy", "anthropic"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]

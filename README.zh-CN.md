@@ -8,9 +8,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](https://github.com/YeautyYE/claude-cursor-proxy/releases)
 
-基于 [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) 改进。本地 **单向代理**（Claude Code → 本代理 → Cursor）。命令行工具名与仓库名均为 **`claude-cursor-proxy`**。
+基于 [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) 改进。本地 **单向代理**：Claude Code 与 [Grok Build](https://x.ai/cli)（`grok` / grok-build）→ 本代理 → Cursor。命令行工具名与仓库名均为 **`claude-cursor-proxy`**。
 
-**让 Claude Code 稳定调用 Cursor 上的模型（推荐 Fable 5）。**
+**让 Claude Code 和 grok-build 稳定调用 Cursor 上的模型（推荐 Fable 5）。**
 
 ```
 Claude Code ──Anthropic /v1/messages──► claude-cursor-proxy (:18765)
@@ -27,18 +27,15 @@ grok-build  ──Responses / Messages ──►        │
 
 ## 这是什么
 
-Claude Code 只认 Anthropic 的接口（`/v1/messages` 等）。  
-Cursor 用的是自己的 Agent 协议，两边直接连不上。
+Claude Code 走 Anthropic（`/v1/messages`），grok-build 走 OpenAI Responses（`/v1/responses`）。Cursor 用自己的 Agent 协议，两边直接连不上。
 
 本工具在本机跑一个单向代理（默认 `127.0.0.1:18765`）：
 
-1. Claude Code 照常发 Anthropic 请求
+1. Claude Code 或 grok-build 照常把请求发给本代理
 2. 代理转成 Cursor 能懂的请求，再发给 Cursor
-3. 把 Cursor 的流式回复转回 Anthropic 格式给 Claude Code  
-   （会定期发 keep-alive，避免长时间思考被 Claude Code 当成卡住而断开）
+3. 按客户端把流式回复转回去：Claude Code 用 Anthropic SSE（带 `ping` keep-alive），grok-build 用 Responses 事件
 
-**主路径是 Cursor（Fable 5）**：设 `ANTHROPIC_MODEL=claude-fable-5[1m]` 即可。  
-同一进程里还可选 Codex / Kimi / Grok 等额外后端。
+**主路径是 Cursor（Fable 5）**。同一进程里还可选 Codex / Kimi / Grok 等额外后端。
 
 > 本项目与 Anthropic、Cursor、OpenAI、Moonshot、xAI 均无官方关联。
 
@@ -51,7 +48,7 @@ Cursor 用的是自己的 Agent 协议，两边直接连不上。
 | **会话更稳** | 上游连 Cursor 长连接；下游给 Claude Code 定期 `ping`，长思考不易被掐断 |
 | **Fable 5** | 设 `ANTHROPIC_MODEL=claude-fable-5[1m]`（`ANTHROPIC_SMALL_FAST_MODEL` 写同样的即可） |
 | **用量 / 上下文** | 把 Cursor 的用量信息转成 Anthropic 的 `usage`，状态栏和上下文压缩更正常 |
-| **工具调用** | 尽量把 Cursor 侧工具接到 Claude Code 的工具循环里（尽力而为） |
+| **工具调用** | 尽量把 Cursor 侧工具接到 Claude Code / grok-build 的工具循环里（尽力而为） |
 | **安装简单** | 预编译包带校验；macOS 会做 ad-hoc 签名；配置在 `~/.config/claude-cursor-proxy` |
 
 说明：这是兼容层，**不是**完整 Cursor IDE。边界见 [限制](#限制)。
@@ -300,7 +297,7 @@ claude-cursor-proxy cursor auth status
 - **代理本身不做访问控制。** 默认只监听本机；若绑到公网，务必放在防火墙或带鉴权的反向代理后面。
 - **限流** 跟你的上游账号走。
 - **兼容是尽力而为。** 文本、工具、思考、流式在支持路径上可用；部分边界情况会近似或省略。
-- **不是完整 Cursor IDE。** 超出 Claude Code 工具循环的 workspace / 回调能力不完整。
+- **不是完整 Cursor IDE。** 超出 Claude Code / grok-build 工具循环的 workspace / 回调能力不完整。
 - **Linux 预编译依赖 glibc。** Alpine / musl 请自行从源码编译。
 
 ---

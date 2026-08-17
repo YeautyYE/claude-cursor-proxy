@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 - Primary: `README.md` (English)
 - Chinese companion: `README.zh-CN.md` (full parity)
-- First screen: attribution → tagline → ASCII architecture → Fable 5 quick start
+- First screen: attribution → tagline (Claude Code + grok-build) → ASCII architecture → Fable 5 / grok-build quick start
 
 ## Intentionally not done
 
