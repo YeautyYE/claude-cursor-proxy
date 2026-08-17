@@ -203,11 +203,10 @@ enum LiveStartPeek {
     Ready(mpsc::Receiver<LiveEventResult>),
 }
 
-/// Streaming clients see "Waiting for response" until Anthropic SSE starts.
-/// Commit `message_start` before `start_live` / peek / retries so grok-build
-/// and Claude Code are not stuck on a blank HTTP request for tens of seconds.
-fn commit_streaming_live_sse_before_start_live(want_stream: bool) -> bool {
-    want_stream
+/// Streaming Anthropic clients see "Waiting for response" until SSE starts.
+/// `/v1/responses` must wait for live open so a 20s timeout can still be JSON 409.
+fn commit_streaming_live_sse_before_start_live(want_stream: bool, hold_http: bool) -> bool {
+    want_stream && !hold_http
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1514,7 +1513,10 @@ impl Provider for CursorProvider {
             let request_context = cursor_request_context(&body);
             let has_refresh = auth.refresh_token.is_some();
             let initial_reservation = preclaimed_live_reservation.take();
-            if commit_streaming_live_sse_before_start_live(want_stream) {
+            if commit_streaming_live_sse_before_start_live(
+                want_stream,
+                ctx.hold_http_until_live_open,
+            ) {
                 return spawn_streaming_live_sse(
                     client.clone(),
                     token,
@@ -1741,7 +1743,7 @@ fn map_cursor_error_to_response(err: &client::CursorError) -> Response {
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(err.message.as_str());
-    let classified = crate::retry::classify_proxy_error_status(err.status, detail);
+    let classified = crate::retry::classify_proxy_error_status(err.status, &err.client_message());
     match classified {
         400 => json_error(StatusCode::BAD_REQUEST, "invalid_request_error", detail),
         401 => json_error(StatusCode::UNAUTHORIZED, "authentication_error", detail),
@@ -2348,6 +2350,17 @@ mod tests {
     }
 
     #[test]
+    fn live_open_timeout_is_http_409_not_502() {
+        let err = client::CursorError::new(504, "Cursor live open timed out after 20s", None);
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "ambiguous live open must fail closed as 409 so grok-build does not 5xx-retry"
+        );
+    }
+
+    #[test]
     fn classified_451_is_not_rewritten_to_502() {
         let err = client::CursorError::new(
             502,
@@ -2394,11 +2407,15 @@ mod tests {
     #[test]
     fn streaming_live_commits_sse_before_start_live() {
         assert!(
-            commit_streaming_live_sse_before_start_live(true),
-            "grok-build / Claude Code must get message_start before start_live / peek / retry"
+            commit_streaming_live_sse_before_start_live(true, false),
+            "Claude Code must get message_start before start_live / peek / retry"
         );
         assert!(
-            !commit_streaming_live_sse_before_start_live(false),
+            !commit_streaming_live_sse_before_start_live(true, true),
+            "/v1/responses must wait for live open so 409 is JSON, not grok 500"
+        );
+        assert!(
+            !commit_streaming_live_sse_before_start_live(false, false),
             "non-streaming JSON collection still waits for the live run"
         );
     }
@@ -2488,6 +2505,7 @@ mod tests {
                 parent_agent_id: Some("agent%2Fparent".into()),
                 app: Some("cli-bg".into()),
             },
+            hold_http_until_live_open: false,
         };
         let identity = live_run_identity("parent-session", &ctx);
         assert_eq!(identity.session_id, "parent-session");
@@ -2515,6 +2533,7 @@ mod tests {
                 parent_agent_id: Some("agent%2Fparent".into()),
                 app: Some("cli-bg".into()),
             },
+            hold_http_until_live_open: false,
         };
         let nested_cont = continuation_for_request(Some(&session), &nested);
         assert!(
@@ -2534,6 +2553,7 @@ mod tests {
                 parent_agent_id: None,
                 app: Some("cli".into()),
             },
+            hold_http_until_live_open: false,
         };
         let parent_cont = continuation_for_request(Some(&session), &parent);
         assert!(parent_cont.has_checkpoint);

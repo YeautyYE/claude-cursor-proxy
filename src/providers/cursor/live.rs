@@ -18,10 +18,12 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use prost::Message;
-use tokio::sync::{mpsc, oneshot, watch};
+use rand::Rng;
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
+    encode_client_heartbeat_frame,
 };
 use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
@@ -1789,7 +1791,12 @@ impl CursorHttpClient {
             ));
         }
 
-        let force_http1 = http1::prefer_http1_agent();
+        let force_http1 = live_open_prefers_http1();
+        let http = if force_http1 && !self.prefers_http1() {
+            CursorHttpClient::with_prefer_http1(true)
+        } else {
+            self.clone()
+        };
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -1829,7 +1836,7 @@ impl CursorHttpClient {
         };
 
         let cursor_identity = LiveIdentityHeaders::build(token);
-        let open = self.open_live_transport(
+        let open = http.open_live_transport(
             token,
             &request_id,
             &first_message,
@@ -1882,7 +1889,7 @@ impl CursorHttpClient {
         let seeded_blobs: HashMap<Vec<u8>, Vec<u8>> =
             continuation.pre_fetched_blobs.into_iter().collect();
         let reconnect = LiveReconnectContext {
-            http: self.clone(),
+            http,
             token: token.to_string(),
             identity: cursor_identity,
             session_id: worker_session.clone(),
@@ -1894,6 +1901,7 @@ impl CursorHttpClient {
             opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
             recovery: LiveRecoveryEpisode::default(),
             breakers: TransportBreakers::default(),
+            last_trigger: String::new(),
         };
         // Match event fan-out: a tiny upstream queue stalls the reqwest body
         // pump (and Cursor's TCP window) during thinking bursts.
@@ -1954,7 +1962,10 @@ impl CursorHttpClient {
         )
         .await
         {
-            Ok(pair) => Ok(pair),
+            Ok(pair) => {
+                note_process_h2_open_success();
+                Ok(pair)
+            }
             Err(err) if allow_h1_fallback && is_explicit_http1_required(&err) => {
                 let Some(wait) = live_h1_fallback_budget(h1_timeout, started.elapsed()) else {
                     return Err(err);
@@ -1972,7 +1983,12 @@ impl CursorHttpClient {
                 )
                 .await
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                if is_ambiguous_live_open_timeout(&err) {
+                    note_process_h2_open_timeout();
+                }
+                Err(err)
+            }
         }
     }
 
@@ -2058,6 +2074,22 @@ impl CursorHttpClient {
             .send(Ok(first_frame))
             .await
             .map_err(|_| CursorError::internal("Cursor request channel closed at startup"))?;
+        let heartbeat_tx = request_tx.clone();
+        let heartbeat_secs = env_u64("CCP_CURSOR_HEARTBEAT_SECS", 5);
+        let heartbeat_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Ok(frame) = encode_client_heartbeat_frame() else {
+                    break;
+                };
+                if heartbeat_tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
+            }
+        });
         let request_body = futures_util::stream::unfold(request_rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         });
@@ -2108,11 +2140,12 @@ impl CursorHttpClient {
             request = request.header("x-cursor-checksum", &cs.1);
         }
 
-        let response = request
+        let send_result = request
             .body(reqwest::Body::wrap_stream(request_body))
             .send()
-            .await
-            .map_err(|e| CursorError::from_reqwest(e, self.timeout_secs))?;
+            .await;
+        heartbeat_task.abort();
+        let response = send_result.map_err(|e| CursorError::from_reqwest(e, self.timeout_secs))?;
         let status = response.status().as_u16();
         if status >= 400 {
             let detail = response.text().await.ok();
@@ -2258,6 +2291,7 @@ struct LiveReconnectContext {
     opening_checkpoint: Option<Vec<u8>>,
     recovery: LiveRecoveryEpisode,
     breakers: TransportBreakers,
+    last_trigger: String,
 }
 
 type LiveUpstream = mpsc::Receiver<Result<Option<Bytes>, String>>;
@@ -2406,6 +2440,8 @@ pub(crate) const LIVE_AMBIGUOUS_OPEN_TTL: Duration = Duration::from_secs(90);
 const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
 const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
+const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
+const DEFAULT_LIVE_OPEN_CONCURRENCY: usize = 4;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -2442,6 +2478,10 @@ async fn with_live_open_timeout<T>(
     per_attempt: Duration,
     fut: impl std::future::Future<Output = Result<T, CursorError>>,
 ) -> Result<T, CursorError> {
+    let _permit = match Arc::clone(&LIVE_OPEN_SEM).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return Err(live_open_saturated_error()),
+    };
     match tokio::time::timeout(per_attempt, fut).await {
         Ok(result) => result,
         Err(_) => Err(CursorError::new(
@@ -2453,6 +2493,131 @@ async fn with_live_open_timeout<T>(
             None,
         )),
     }
+}
+
+static LIVE_OPEN_SEM: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(live_open_concurrency_limit(
+        std::env::var("CCP_CURSOR_LIVE_OPEN_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    )))
+});
+
+fn live_open_concurrency_limit(raw: Option<&str>) -> usize {
+    if let Some(n) = raw
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    if cfg!(test) {
+        64
+    } else {
+        DEFAULT_LIVE_OPEN_CONCURRENCY
+    }
+}
+
+fn live_open_saturated_error() -> CursorError {
+    CursorError::new(429, "Cursor live open concurrency saturated", None)
+}
+
+#[derive(Debug, Default, Clone)]
+struct ProcessH2Circuit {
+    consecutive_timeouts: u32,
+    open_since: Option<Instant>,
+}
+
+impl ProcessH2Circuit {
+    fn prefers_http1(&self) -> bool {
+        self.prefers_http1_at(Instant::now())
+    }
+
+    fn prefers_http1_at(&self, now: Instant) -> bool {
+        match self.open_since {
+            None => false,
+            Some(opened) => now.saturating_duration_since(opened) < TRANSPORT_BREAKER_COOLDOWN,
+        }
+    }
+
+    fn on_h2_open_timeout(&mut self) -> bool {
+        self.on_h2_open_timeout_at(Instant::now())
+    }
+
+    fn on_h2_open_timeout_at(&mut self, now: Instant) -> bool {
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        if self.open_since.is_some() {
+            self.open_since = Some(now);
+            return false;
+        }
+        if self.consecutive_timeouts >= TRANSPORT_BREAKER_THRESHOLD {
+            self.open_since = Some(now);
+            return true;
+        }
+        false
+    }
+
+    fn on_h2_open_success(&mut self) {
+        self.consecutive_timeouts = 0;
+        self.open_since = None;
+    }
+}
+
+static PROCESS_H2_CIRCUIT: Mutex<ProcessH2Circuit> = Mutex::new(ProcessH2Circuit {
+    consecutive_timeouts: 0,
+    open_since: None,
+});
+
+fn live_open_prefers_http1_from(env_http1: bool, circuit_open: bool) -> bool {
+    env_http1 || circuit_open
+}
+
+fn process_h2_circuit_prefers_http1() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .prefers_http1()
+}
+
+fn live_open_prefers_http1() -> bool {
+    live_open_prefers_http1_from(
+        http1::prefer_http1_agent(),
+        process_h2_circuit_prefers_http1(),
+    )
+}
+
+fn note_process_h2_open_timeout() {
+    if cfg!(test) {
+        return;
+    }
+    let just_opened = PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .on_h2_open_timeout();
+    if just_opened {
+        crate::logging::create_logger("cursor").warn(
+            "live_h2_circuit_open",
+            Some(serde_json::Map::from_iter([
+                ("prefer_http1".into(), serde_json::json!(true)),
+                (
+                    "consecutive_timeouts".into(),
+                    serde_json::json!(TRANSPORT_BREAKER_THRESHOLD),
+                ),
+            ])),
+        );
+    }
+}
+
+fn note_process_h2_open_success() {
+    if cfg!(test) {
+        return;
+    }
+    PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .on_h2_open_success();
 }
 
 fn live_reconnect_allow_h1_fallback(force_http1: bool, http1_rejected: bool) -> bool {
@@ -2879,6 +3044,9 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
     if crate::retry::is_billing_block(&text) || crate::retry::is_billing_block(&err.message) {
         return false;
     }
+    if text.contains("concurrency saturated") || err.message.contains("concurrency saturated") {
+        return false;
+    }
     if cursor_connect_error_is_missing_conversation_data(&text)
         || err
             .detail
@@ -3019,19 +3187,28 @@ fn live_reconnect_skip_reason(
     None
 }
 
-/// First ResumeAction is immediate; later attempts 1s×2^n + 20% jitter, cap 8s.
-/// Hollow (HTTP 200 then zero-byte RST) retries stay at 0ms. Sleep never exceeds
-/// half the remaining recovery window — the old 60s cap made ten attempts a
-/// five-minute 502.
-fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool, remaining_ms: u64) -> u64 {
-    if hollow || attempt <= 1 || remaining_ms == 0 {
+/// Full jitter from attempt 1: sleep ∈ [0, min(8s, 1s×2^(n-1), remaining/2)].
+/// Hollow (HTTP 200 then zero-byte RST) retries stay at 0ms.
+fn live_reconnect_backoff_ceiling_ms(attempt: u32, remaining_ms: u64) -> u64 {
+    if attempt == 0 || remaining_ms == 0 {
         return 0;
     }
-    let shift = (attempt - 2).min(3);
-    let base_ms = 1_000u64 << shift;
-    let jitter = ((base_ms as f64) * 0.2 * ((attempt as f64 * 0.37) % 1.0)) as u64;
-    let delay = (base_ms + jitter).min(LIVE_RECONNECT_BACKOFF_CAP_MS);
-    delay.min(remaining_ms / 2)
+    let exp = 2u64.saturating_pow(attempt.saturating_sub(1).min(16));
+    let grown = LIVE_RECONNECT_BACKOFF_BASE_MS.saturating_mul(exp);
+    grown
+        .min(LIVE_RECONNECT_BACKOFF_CAP_MS)
+        .min(remaining_ms / 2)
+}
+
+fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool, remaining_ms: u64) -> u64 {
+    if hollow {
+        return 0;
+    }
+    let ceiling = live_reconnect_backoff_ceiling_ms(attempt, remaining_ms);
+    if ceiling == 0 {
+        return 0;
+    }
+    rand::thread_rng().gen_range(0..=ceiling)
 }
 
 fn is_h2_stream_reset(message: &str) -> bool {
@@ -3066,6 +3243,7 @@ fn prepare_live_reconnect(
     reconnect_attempts: u32,
     stream_error: Option<&str>,
 ) {
+    reconnect.last_trigger = stream_error.unwrap_or("stream_drop").to_string();
     if live_reconnect_should_force_http1(
         got_chunk_since_reconnect,
         reconnect_attempts,
@@ -3110,36 +3288,62 @@ fn reconnect_note(outcome: &LiveReconnectOutcome) -> String {
     }
 }
 
+fn live_reconnect_log_fields(
+    outcome: &LiveReconnectOutcome,
+    attempts: u32,
+    max_reconnects: u32,
+    http1: bool,
+    trigger: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("attempts".into(), serde_json::json!(attempts));
+    fields.insert("max".into(), serde_json::json!(max_reconnects));
+    fields.insert("http1".into(), serde_json::json!(http1));
+    if !trigger.is_empty() {
+        fields.insert("trigger".into(), serde_json::json!(trigger));
+    }
+    match outcome {
+        LiveReconnectOutcome::Reconnected => {
+            fields.insert("outcome".into(), serde_json::json!("ok"));
+        }
+        LiveReconnectOutcome::Skipped(reason) => {
+            fields.insert("outcome".into(), serde_json::json!("skipped"));
+            fields.insert("reason".into(), serde_json::json!(reason));
+        }
+        LiveReconnectOutcome::Failed(detail) => {
+            fields.insert("outcome".into(), serde_json::json!("failed"));
+            fields.insert("detail".into(), serde_json::json!(detail));
+        }
+    }
+    fields
+}
+
 fn log_live_reconnect(
     outcome: &LiveReconnectOutcome,
     attempts: u32,
     max_reconnects: u32,
     http: &CursorHttpClient,
+    trigger: &str,
 ) {
-    let mut fields = serde_json::Map::new();
-    fields.insert("attempts".into(), serde_json::json!(attempts));
-    fields.insert("max".into(), serde_json::json!(max_reconnects));
-    fields.insert("http1".into(), serde_json::json!(http.prefers_http1()));
+    let fields = live_reconnect_log_fields(
+        outcome,
+        attempts,
+        max_reconnects,
+        http.prefers_http1(),
+        trigger,
+    );
     match outcome {
         LiveReconnectOutcome::Reconnected => {
-            fields.insert("outcome".into(), serde_json::json!("ok"));
             crate::logging::create_logger("cursor").info("live_reconnect", Some(fields));
         }
-        LiveReconnectOutcome::Skipped(reason) => {
-            fields.insert("outcome".into(), serde_json::json!("skipped"));
-            fields.insert("reason".into(), serde_json::json!(reason));
-            crate::logging::create_logger("cursor").warn("live_reconnect", Some(fields));
-        }
-        LiveReconnectOutcome::Failed(detail) => {
-            fields.insert("outcome".into(), serde_json::json!("failed"));
-            fields.insert("detail".into(), serde_json::json!(detail));
+        LiveReconnectOutcome::Skipped(_) | LiveReconnectOutcome::Failed(_) => {
             crate::logging::create_logger("cursor").warn("live_reconnect", Some(fields));
         }
     }
 }
 
 /// Re-open AgentService/Run with `ResumeAction` after a transport stall.
-/// Retries retryable open failures up to `max_reconnects` (first attempt has no delay).
+/// Retries retryable open failures up to `max_reconnects` with full jitter.
 async fn wait_for_live_cancel(cancel_requested: &AtomicBool) {
     while !cancel_requested.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3192,6 +3396,7 @@ async fn try_live_reconnect(
             *reconnect_attempts,
             max_reconnects,
             &reconnect.http,
+            &reconnect.last_trigger,
         );
         return outcome;
     };
@@ -3213,6 +3418,7 @@ async fn try_live_reconnect(
                 *reconnect_attempts,
                 max_reconnects,
                 &reconnect.http,
+                &reconnect.last_trigger,
             );
             return outcome;
         }
@@ -3224,6 +3430,7 @@ async fn try_live_reconnect(
                 *reconnect_attempts,
                 max_reconnects,
                 &reconnect.http,
+                &reconnect.last_trigger,
             );
             return outcome;
         }
@@ -3242,6 +3449,7 @@ async fn try_live_reconnect(
                 *reconnect_attempts,
                 max_reconnects,
                 &reconnect.http,
+                &reconnect.last_trigger,
             );
             return outcome;
         }
@@ -3255,6 +3463,7 @@ async fn try_live_reconnect(
                 *reconnect_attempts,
                 max_reconnects,
                 &reconnect.http,
+                &reconnect.last_trigger,
             );
             return outcome;
         }
@@ -3286,6 +3495,7 @@ async fn try_live_reconnect(
                         *reconnect_attempts,
                         max_reconnects,
                         &reconnect.http,
+                        &reconnect.last_trigger,
                     );
                     return outcome;
                 }
@@ -3363,6 +3573,7 @@ async fn try_live_reconnect(
                 *reconnect_attempts,
                 max_reconnects,
                 &reconnect.http,
+                &reconnect.last_trigger,
             );
             return outcome;
         }
@@ -3408,6 +3619,7 @@ async fn try_live_reconnect(
                         *reconnect_attempts,
                         max_reconnects,
                         &reconnect.http,
+                        &reconnect.last_trigger,
                     );
                     return outcome;
                 }
@@ -3428,6 +3640,7 @@ async fn try_live_reconnect(
                             *reconnect_attempts,
                             max_reconnects,
                             &reconnect.http,
+                            &reconnect.last_trigger,
                         );
                         return outcome;
                     }
@@ -3471,6 +3684,7 @@ async fn try_live_reconnect(
                             *reconnect_attempts,
                             max_reconnects,
                             &reconnect.http,
+                            &reconnect.last_trigger,
                         );
                         return outcome;
                     }
@@ -3490,6 +3704,7 @@ async fn try_live_reconnect(
                                     *reconnect_attempts,
                                     max_reconnects,
                                     &reconnect.http,
+                                    &reconnect.last_trigger,
                                 );
                                 return outcome;
                             }
@@ -3954,7 +4169,7 @@ async fn drive_live_run(
                         &mut reconnect,
                         got_chunk_since_reconnect,
                         reconnect_attempts,
-                        None,
+                        Some("idle_stall"),
                     );
                     try_live_reconnect(
                         &mut reconnect,
@@ -4137,7 +4352,7 @@ async fn drive_live_run(
                                     &mut reconnect,
                                     got_chunk_since_reconnect,
                                     reconnect_attempts,
-                                    None,
+                                    Some("outbound_send"),
                                 );
                                 try_live_reconnect(
                                     &mut reconnect,
@@ -4415,7 +4630,7 @@ async fn drive_live_run(
                                 &mut reconnect,
                                 got_chunk_since_reconnect,
                                 reconnect_attempts,
-                                None,
+                                Some("stream_eof"),
                             );
                             try_live_reconnect(
                                 &mut reconnect,
@@ -6554,6 +6769,26 @@ fn publish_live_usage(
     }
 }
 
+fn live_stream_request_failed_log_fields(
+    req_id: &str,
+    status: u16,
+    error: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        ("status".to_string(), serde_json::json!(status)),
+        ("message".to_string(), serde_json::json!(error)),
+        ("path".to_string(), serde_json::json!("live_sse")),
+    ])
+}
+
+fn log_live_stream_request_failed(req_id: &str, status: u16, error: &str) {
+    crate::logging::create_logger("server").info(
+        "request_failed",
+        Some(live_stream_request_failed_log_fields(req_id, status, error)),
+    );
+}
+
 fn live_sse_on_driver_drop(encoder: &CursorSseEncoder) -> Option<Vec<u8>> {
     if encoder.is_finalized() {
         return None;
@@ -6728,6 +6963,12 @@ pub fn live_sse_response(
                                 let error_type = anthropic_error_type_from_live_error(&error);
                                 let status =
                                     crate::retry::classify_proxy_error_status(502, &error);
+                                let req_id = state
+                                    .monitor
+                                    .as_ref()
+                                    .map(|(_, id)| id.as_str())
+                                    .unwrap_or("-");
+                                log_live_stream_request_failed(req_id, status, &error);
                                 if let Some((ref handle, ref req_id)) = state.monitor {
                                     handle.request_failed(req_id, Some(status), error.clone());
                                 }
@@ -6743,6 +6984,16 @@ pub fn live_sse_response(
                             None => {
                                 state.done = true;
                                 if let Some(error_bytes) = live_sse_on_driver_drop(&state.encoder) {
+                                    let req_id = state
+                                        .monitor
+                                        .as_ref()
+                                        .map(|(_, id)| id.as_str())
+                                        .unwrap_or("-");
+                                    log_live_stream_request_failed(
+                                        req_id,
+                                        502,
+                                        "Cursor stream ended without turn_ended",
+                                    );
                                     if let Some((ref handle, ref req_id)) = state.monitor {
                                         handle.request_failed(
                                             req_id,
@@ -6860,6 +7111,7 @@ mod tests {
             opening_checkpoint: None,
             recovery: LiveRecoveryEpisode::default(),
             breakers: TransportBreakers::default(),
+            last_trigger: String::new(),
         }
     }
 
@@ -7416,24 +7668,166 @@ mod tests {
     }
 
     #[test]
-    fn first_reconnect_has_no_backoff() {
-        assert_eq!(live_reconnect_backoff_ms_for(1, false, u64::MAX), 0);
-        assert!(live_reconnect_backoff_ms_for(2, false, u64::MAX) >= 1_000);
-        assert!(live_reconnect_backoff_ms_for(2, false, u64::MAX) <= 1_200);
-        assert!(live_reconnect_backoff_ms_for(3, false, u64::MAX) >= 2_000);
-        assert!(
-            live_reconnect_backoff_ms_for(20, false, u64::MAX) <= LIVE_RECONNECT_BACKOFF_CAP_MS,
+    fn reconnect_backoff_uses_full_jitter_from_attempt_one() {
+        assert_eq!(live_reconnect_backoff_ceiling_ms(1, u64::MAX), 1_000);
+        assert_eq!(live_reconnect_backoff_ceiling_ms(2, u64::MAX), 2_000);
+        assert_eq!(live_reconnect_backoff_ceiling_ms(3, u64::MAX), 4_000);
+        assert_eq!(
+            live_reconnect_backoff_ceiling_ms(20, u64::MAX),
+            LIVE_RECONNECT_BACKOFF_CAP_MS,
             "backoff must not recreate the five-minute 502"
         );
         assert_eq!(
-            live_reconnect_backoff_ms_for(10, true, u64::MAX),
-            0,
-            "zero-byte INTERNAL_ERROR must not wait between attempts"
-        );
-        assert_eq!(
-            live_reconnect_backoff_ms_for(3, false, 800),
+            live_reconnect_backoff_ceiling_ms(3, 800),
             400,
             "sleep at most half the remaining recovery window"
+        );
+        assert_eq!(live_reconnect_backoff_ms_for(10, true, u64::MAX), 0);
+
+        let samples: Vec<u64> = (0..40)
+            .map(|_| live_reconnect_backoff_ms_for(1, false, u64::MAX))
+            .collect();
+        assert!(
+            samples.iter().all(|&ms| ms <= 1_000),
+            "attempt 1 full jitter must stay in 0..=1000: {samples:?}"
+        );
+        assert!(
+            samples.iter().any(|&ms| ms > 0),
+            "attempt 1 must not stay at 0ms or reconnect storms collide: {samples:?}"
+        );
+        for _ in 0..20 {
+            let ms = live_reconnect_backoff_ms_for(2, false, u64::MAX);
+            assert!(ms <= 2_000, "{ms}");
+        }
+    }
+
+    #[test]
+    fn process_h2_circuit_trips_after_consecutive_open_timeouts() {
+        let mut circuit = ProcessH2Circuit::default();
+        let t0 = Instant::now();
+        assert!(!circuit.prefers_http1_at(t0));
+        assert!(!circuit.on_h2_open_timeout_at(t0));
+        assert!(!circuit.on_h2_open_timeout_at(t0));
+        assert!(
+            circuit.on_h2_open_timeout_at(t0),
+            "third H2 open timeout opens the process circuit for the next Run"
+        );
+        assert!(circuit.prefers_http1_at(t0));
+        assert!(
+            !circuit.on_h2_open_timeout_at(t0),
+            "already-open circuit must not log a second trip"
+        );
+        circuit.on_h2_open_success();
+        assert!(!circuit.prefers_http1_at(t0));
+        assert_eq!(circuit.consecutive_timeouts, 0);
+        assert!(circuit.open_since.is_none());
+    }
+
+    #[test]
+    fn process_h2_circuit_probes_h2_after_cooldown() {
+        let mut circuit = ProcessH2Circuit::default();
+        let t0 = Instant::now();
+        assert!(!circuit.on_h2_open_timeout_at(t0));
+        assert!(!circuit.on_h2_open_timeout_at(t0));
+        assert!(circuit.on_h2_open_timeout_at(t0));
+        assert!(
+            circuit.prefers_http1_at(t0 + Duration::from_secs(29)),
+            "inside the cooldown window the next open must stay on HTTP/1"
+        );
+        let probe_at = t0 + TRANSPORT_BREAKER_COOLDOWN;
+        assert!(
+            !circuit.prefers_http1_at(probe_at),
+            "after cooldown the next open must probe H2; a stuck HTTP/1 pin never recovers"
+        );
+        assert!(
+            !circuit.on_h2_open_timeout_at(probe_at),
+            "a failed H2 probe must not log another circuit trip"
+        );
+        assert!(
+            circuit.prefers_http1_at(probe_at),
+            "a failed probe must reopen the HTTP/1 window"
+        );
+        circuit.on_h2_open_success();
+        assert!(!circuit.prefers_http1_at(probe_at + TRANSPORT_BREAKER_COOLDOWN));
+    }
+
+    #[test]
+    fn live_open_prefers_http1_from_env_or_circuit() {
+        assert!(!live_open_prefers_http1_from(false, false));
+        assert!(live_open_prefers_http1_from(true, false));
+        assert!(live_open_prefers_http1_from(false, true));
+    }
+
+    #[test]
+    fn live_open_concurrency_limit_defaults_and_rejects_zero() {
+        assert_eq!(live_open_concurrency_limit(Some("4")), 4);
+        assert_eq!(live_open_concurrency_limit(Some("1")), 1);
+        assert_eq!(
+            live_open_concurrency_limit(Some("0")),
+            live_open_concurrency_limit(None)
+        );
+        assert_eq!(
+            live_open_concurrency_limit(Some("nope")),
+            live_open_concurrency_limit(None)
+        );
+        assert!(live_open_concurrency_limit(None) >= DEFAULT_LIVE_OPEN_CONCURRENCY);
+    }
+
+    #[test]
+    fn live_open_saturation_is_429_so_grok_retries() {
+        let err = live_open_saturated_error();
+        assert_eq!(
+            err.status, 429,
+            "saturation never sent a Run; grok-build must retry 429, not treat 409 as invalid_request"
+        );
+        assert!(!is_ambiguous_live_open_timeout(&err));
+        assert!(!crate::retry::is_ambiguous_live_accept(&err.message));
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(err.status, &err.message),
+            429
+        );
+        assert!(
+            crate::retry::should_retry_status(err.status),
+            "grok-build retries 429; a fifth concurrent open must not fail closed"
+        );
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&err),
+            "saturation never sent a Run; do not replay it inside the same POST"
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&err),
+            "saturation must not tombstone the live slot"
+        );
+    }
+
+    #[test]
+    fn live_reconnect_log_includes_trigger() {
+        let fields = live_reconnect_log_fields(
+            &LiveReconnectOutcome::Reconnected,
+            2,
+            10,
+            false,
+            "stream error received",
+        );
+        assert_eq!(
+            fields.get("trigger").and_then(|v| v.as_str()),
+            Some("stream error received")
+        );
+        assert_eq!(fields.get("outcome").and_then(|v| v.as_str()), Some("ok"));
+    }
+
+    #[test]
+    fn live_stream_request_failed_log_is_proxy_log_shaped() {
+        let fields = live_stream_request_failed_log_fields(
+            "req-1",
+            409,
+            "Cursor live open timed out after 20s",
+        );
+        assert_eq!(fields.get("reqId").and_then(|v| v.as_str()), Some("req-1"));
+        assert_eq!(fields.get("status").and_then(|v| v.as_u64()), Some(409));
+        assert_eq!(
+            fields.get("path").and_then(|v| v.as_str()),
+            Some("live_sse")
         );
     }
 
@@ -8438,6 +8832,13 @@ mod tests {
             cursor_start_error_is_same_request_retryable(&missing),
             "missing conversation in a 4xx body must still same-request retry"
         );
+
+        let open_timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&open_timeout),
+            "response-less live open must seal, not replay Run with a new request id"
+        );
+        assert!(live_start_error_seals_tombstone(&open_timeout));
     }
 
     #[test]
@@ -9803,6 +10204,25 @@ mod tests {
             resolve_advertised_name("Task", Some(&canonical_task)).as_deref(),
             Some("task"),
             "grok-build canonical `task` must match Cursor native Task"
+        );
+    }
+
+    #[test]
+    fn advertised_name_prefers_claude_bash_when_both_clients_listed() {
+        let both = BTreeSet::from([
+            "Bash".to_string(),
+            "run_terminal_command".to_string(),
+            "Read".to_string(),
+            "read_file".to_string(),
+        ]);
+        assert_eq!(
+            resolve_advertised_name("Bash", Some(&both)).as_deref(),
+            Some("Bash"),
+            "Claude Code sessions must not emit grok run_terminal_command just because the alias exists"
+        );
+        assert_eq!(
+            resolve_advertised_name("Read", Some(&both)).as_deref(),
+            Some("Read")
         );
     }
 
@@ -11211,6 +11631,28 @@ mod tests {
         let framed = encode_connect_frame(full, 0);
         let mut decoder = super::super::connect::ConnectFrameDecoder::new();
         decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn xml_grok_tool_call_todo_write_exposes_todo_write() {
+        let allowed = BTreeSet::from(["todo_write".to_string()]);
+        let xml = concat!(
+            r#"<tool_call> todo_write <parameter> {"todos":[{"id":"1","content":"x","status":"completed"}]} </parameter> </tool_call>"#,
+            " </assistant>"
+        );
+        let (cont, event, _) =
+            drive_native_task_frame(xml_tool_use_frame(xml), Some(&allowed), None).await;
+        assert!(
+            !cont,
+            "grok <tool_call> todo_write must be ClientOnly, not transcript text"
+        );
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "todo_write");
+                assert_eq!(tools[0].input["todos"][0]["content"], "x");
+            }
+            other => panic!("expected todo_write from grok <tool_call> XML, got {other:?}"),
+        }
     }
 
     #[tokio::test]

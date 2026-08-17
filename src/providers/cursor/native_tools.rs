@@ -632,7 +632,10 @@ pub fn adapt_tool_input_for_client(
         }
         "Bash" | "Shell" | "bash" => {
             coerce_integer_fields(obj, &["timeout"]);
-            adapt_shell_like(obj, false);
+            // Cursor ShellArgs has no description. Claude Code uses it as the
+            // Bash widget title; without it the TUI dumps the whole command
+            // (including python3 -c bodies) into the header.
+            adapt_shell_like(obj, true);
         }
         "write" | "write_file" | "WriteFile" => {
             if !has_nonempty_str(obj, "file_path") {
@@ -1787,6 +1790,27 @@ mod tests {
             !description.contains('\0'),
             "description must be clean text"
         );
+    }
+
+    #[test]
+    fn adapt_bash_adds_description_for_claude_code_tui() {
+        let adapted = adapt_tool_input_for_client(
+            "Bash",
+            serde_json::json!({
+                "command": "python3 -c \"\nimport sys\nprint(1)\n\"",
+                "timeout": 30000
+            }),
+        );
+        let description = adapted["description"].as_str().unwrap_or("");
+        assert!(
+            !description.is_empty(),
+            "Claude Code Bash TUI uses description as the widget title; Cursor Shell has none"
+        );
+        assert!(
+            !description.contains('\n'),
+            "description must be a single-line preview, got {description:?}"
+        );
+        assert!(adapted["command"].as_str().unwrap().contains('\n'));
     }
 
     #[test]

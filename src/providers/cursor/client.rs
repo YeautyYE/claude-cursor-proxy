@@ -82,10 +82,12 @@ fn apply_cursor_reqwest_mode(
             builder.no_proxy().http2_prior_knowledge()
         }
         CursorReqwestMode::Http1Only => builder.http1_only(),
+        // gRPC keepalive: do not PING more often than ~60s. 10s/15s closed the
+        // shared H2 connection (every live stream) when Clash delayed ACK.
         CursorReqwestMode::Http2Alpn => builder
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
-            .http2_keep_alive_while_idle(true)
-            .http2_keep_alive_interval(std::time::Duration::from_secs(10)),
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
+            .http2_keep_alive_while_idle(false)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(60)),
     }
 }
 
@@ -1198,7 +1200,7 @@ fn model_details_to_ids(models: &[proto::ModelDetails]) -> Vec<String> {
     out
 }
 
-fn encode_client_heartbeat_frame() -> Result<Bytes, CursorError> {
+pub(crate) fn encode_client_heartbeat_frame() -> Result<Bytes, CursorError> {
     // Empty ClientHeartbeat is identical every tick — cache the Connect frame.
     static CACHED: std::sync::OnceLock<Bytes> = std::sync::OnceLock::new();
     if let Some(frame) = CACHED.get() {

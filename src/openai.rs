@@ -193,6 +193,9 @@ pub fn responses_to_messages(body: &Value) -> anyhow::Result<MessagesRequest> {
     if let Some(previous) = body.get("previous_response_id") {
         extra.insert("previous_response_id".into(), previous.clone());
     }
+    if let Some(metadata) = body.get("metadata") {
+        extra.insert("metadata".into(), metadata.clone());
+    }
     let (messages, system_parts) = convert_input(body.get("input"))?;
     if !system_parts.is_empty() {
         let existing = extra
@@ -588,7 +591,7 @@ impl AnthropicToResponses {
         }
         let message = self.failed_message.as_deref().unwrap_or("");
         let kind = self.failed_kind.as_deref().unwrap_or("");
-        let status = match kind {
+        let from_kind = match kind {
             "rate_limit_error" => 429,
             "authentication_error" => 401,
             "permission_error" => 403,
@@ -596,6 +599,7 @@ impl AnthropicToResponses {
             "not_found_error" => 404,
             _ => crate::retry::classify_proxy_error_status(502, message),
         };
+        let status = crate::retry::classify_proxy_error_status(from_kind, message);
         (400..500).contains(&status).then_some(status)
     }
 
@@ -1318,6 +1322,27 @@ data: {"type":"error","error":{"type":"api_error","message":"Connect error 502: 
             translator.http_error_status(),
             Some(403),
             "pre-output geo 502 must surface as HTTP 403, not 500"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_responses_ambiguous_live_open_is_http_409() {
+        let mut translator =
+            AnthropicToResponses::new("resp_open".into(), "cursor-grok-4.5-high-fast".into());
+        translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
+
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"Cursor error 504: Cursor live open timed out after 20s"}}
+
+"#,
+        );
+        assert_eq!(
+            translator.http_error_status(),
+            Some(409),
+            "pre-output live-open timeout must be JSON 409, not streamed 500: {:?}",
+            translator.http_error_status()
         );
     }
 

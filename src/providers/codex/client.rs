@@ -1318,6 +1318,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         }
     }
 
@@ -1696,6 +1697,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let headers = build_codex_headers(&auth, &ctx, false).unwrap();
         assert_eq!(
@@ -1721,6 +1723,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let headers = build_codex_headers(&auth, &ctx, true).unwrap();
         assert_eq!(
@@ -1749,6 +1752,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let headers = build_codex_headers(&auth, &ctx, false).unwrap();
         assert!(headers.get("session_id").is_none());
@@ -1771,6 +1775,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let err = build_codex_headers(&auth, &ctx, false).unwrap_err();
         assert_eq!(err.status, 500);
@@ -1827,6 +1832,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
@@ -1903,6 +1909,7 @@ mod tests {
             traffic: None,
             monitor: None,
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let result = build_codex_headers(&auth, &ctx, false);
         assert!(

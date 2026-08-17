@@ -91,20 +91,25 @@ impl CursorToolUseXmlParser {
                 break;
             }
 
-            // Drop redundant close tags that can appear after recovery.
+            // Drop redundant *complete* close tags that can appear after
+            // recovery. Incomplete prefixes must stay buffered so a split
+            // `</assistant>` / `</tool_call>` does not leak `>`.
             if self.drop_redundant_close_tag() {
                 continue;
             }
 
-            // Look for the start of a <tool_use tag.
-            let start = self.buffer.find("<tool_use");
-            if start.is_none() {
+            // Look for the start of a <tool_use or <tool_call tag.
+            let Some((start, kind)) = next_xml_tool_start(&self.buffer) else {
                 // No tag start found: hold back a prefix of the buffer that
-                // could be a partial <tool_use marker, unless we are flushing.
+                // could be a partial marker, unless we are flushing.
                 let hold = if flush {
                     0
                 } else {
-                    tool_use_prefix_suffix_length(&self.buffer)
+                    let mut hold = xml_tool_prefix_suffix_length(&self.buffer);
+                    if self.recovered_tool_use {
+                        hold = hold.max(xml_close_prefix_suffix_length(&self.buffer));
+                    }
+                    hold
                 };
                 let end = self.buffer.len().saturating_sub(hold);
                 let text = self.buffer[..end].to_string();
@@ -113,9 +118,7 @@ impl CursorToolUseXmlParser {
                 }
                 self.buffer = self.buffer[end..].to_string();
                 break;
-            }
-
-            let start = start.unwrap();
+            };
 
             // Emit any text before the tag.
             if start > 0 {
@@ -124,8 +127,8 @@ impl CursorToolUseXmlParser {
                 continue;
             }
 
-            // Look for the close tag.
-            let close_start = self.buffer.find("</tool_use>");
+            let close = kind.close_tag();
+            let close_start = self.buffer.find(close);
             if close_start.is_none() {
                 // No close tag yet; if we are flushing, emit the whole buffer
                 // as text. Otherwise hold and wait for more data.
@@ -137,11 +140,10 @@ impl CursorToolUseXmlParser {
             }
 
             let close_start = close_start.unwrap();
-            let close_end = close_start + "</tool_use>".len();
+            let close_end = close_start + close.len();
             let raw = self.buffer[..close_end].to_string();
 
-            // Try to parse a complete <tool_use...>...</tool_use> element.
-            if let Some(parsed) = self.parse_tool_use(&raw) {
+            if let Some(parsed) = self.parse_xml_tool(&raw, kind) {
                 self.recovered_tool_use = true;
                 events.push(RecoveredCursorEvent::ToolUse(parsed));
             } else {
@@ -155,6 +157,13 @@ impl CursorToolUseXmlParser {
     }
 
     /// Try to parse a complete `<tool_use ...>...</tool_use>` element.
+    fn parse_xml_tool(&mut self, raw: &str, kind: XmlToolKind) -> Option<RecoveredCursorToolUse> {
+        match kind {
+            XmlToolKind::ToolUse => self.parse_tool_use(raw),
+            XmlToolKind::ToolCall => self.parse_tool_call(raw),
+        }
+    }
+
     fn parse_tool_use(&mut self, raw: &str) -> Option<RecoveredCursorToolUse> {
         let re = regex_lite::Regex::new(r"^<tool_use\b([^>]*)>([\s\S]*?)</tool_use>$").ok()?;
         let caps = re.captures(raw)?;
@@ -171,9 +180,7 @@ impl CursorToolUseXmlParser {
         };
 
         // Check allowed tool names.
-        if let Some(ref allowed) = self.allowed_tool_names
-            && !allowed.contains(name)
-        {
+        if !self.tool_name_allowed(name) {
             return None;
         }
 
@@ -203,7 +210,33 @@ impl CursorToolUseXmlParser {
         })
     }
 
-    /// Drop a redundant `</tool_use>` close tag that follows an already-
+    fn parse_tool_call(&mut self, raw: &str) -> Option<RecoveredCursorToolUse> {
+        let re = regex_lite::Regex::new(r"^<tool_call\b([^>]*)>([\s\S]*)</tool_call>$").ok()?;
+        let caps = re.captures(raw)?;
+        let attrs = parse_xml_attributes(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
+        let body = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        let mut name = attrs.get("name").filter(|value| !value.is_empty()).cloned();
+        let input = parse_tool_call_body(body, &mut name)?;
+        let name = name.filter(|value| !value.is_empty())?;
+        if !self.tool_name_allowed(&name) {
+            return None;
+        }
+        Some(RecoveredCursorToolUse {
+            id: (self.id_factory)(),
+            original_id: None,
+            name,
+            input,
+        })
+    }
+
+    fn tool_name_allowed(&self, name: &str) -> bool {
+        match &self.allowed_tool_names {
+            Some(allowed) => allowed.contains(name),
+            None => true,
+        }
+    }
+
+    /// Drop a redundant close tag that follows an already-
     /// recovered tool_use (the XML stream may contain duplicate close tags
     /// after recovery).
     fn drop_redundant_close_tag(&mut self) -> bool {
@@ -212,17 +245,14 @@ impl CursorToolUseXmlParser {
         }
         let trimmed_start = self.buffer.len() - self.buffer.trim_start().len();
         let slice = &self.buffer[trimmed_start..];
-        if let Some(rest) = slice.strip_prefix("</tool_use>") {
-            let prefix = &self.buffer[..trimmed_start];
-            self.buffer = format!("{prefix}{rest}");
-            true
-        } else if let Some(rest) = slice.strip_prefix("</tool_use") {
-            let prefix = &self.buffer[..trimmed_start];
-            self.buffer = format!("{prefix}{rest}");
-            true
-        } else {
-            false
+        for tag in ["</tool_use>", "</tool_call>", "</assistant>"] {
+            if let Some(rest) = slice.strip_prefix(tag) {
+                let prefix = &self.buffer[..trimmed_start];
+                self.buffer = format!("{prefix}{rest}");
+                return true;
+            }
         }
+        false
     }
 
     /// Push text into events, filtering empty text and trailing whitespace
@@ -279,10 +309,132 @@ fn decode_xml_attribute(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
+#[derive(Clone, Copy)]
+enum XmlToolKind {
+    ToolUse,
+    ToolCall,
+}
+
+impl XmlToolKind {
+    fn close_tag(self) -> &'static str {
+        match self {
+            Self::ToolUse => "</tool_use>",
+            Self::ToolCall => "</tool_call>",
+        }
+    }
+}
+
+fn next_xml_tool_start(buffer: &str) -> Option<(usize, XmlToolKind)> {
+    let tool_use = buffer.find("<tool_use");
+    let tool_call = buffer.find("<tool_call");
+    match (tool_use, tool_call) {
+        (Some(use_at), Some(call_at)) if use_at <= call_at => Some((use_at, XmlToolKind::ToolUse)),
+        (Some(_), Some(call_at)) => Some((call_at, XmlToolKind::ToolCall)),
+        (Some(use_at), None) => Some((use_at, XmlToolKind::ToolUse)),
+        (None, Some(call_at)) => Some((call_at, XmlToolKind::ToolCall)),
+        (None, None) => None,
+    }
+}
+
+fn parse_tool_call_body(
+    body: &str,
+    name: &mut Option<String>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Some(serde_json::Map::new());
+    }
+    if let Some(object) = parse_json_object(trimmed) {
+        return tool_call_input_from_object(object, name);
+    }
+    let ident = regex_lite::Regex::new(r"^([A-Za-z_][\w.-]*)\s*([\s\S]*)$").ok()?;
+    let caps = ident.captures(trimmed)?;
+    if name.as_ref().is_none_or(|value| value.is_empty()) {
+        *name = Some(caps.get(1)?.as_str().to_string());
+    }
+    let rest = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+    if rest.is_empty() {
+        return Some(serde_json::Map::new());
+    }
+    if let Some(object) = parse_json_object(rest) {
+        return tool_call_input_from_object(object, name);
+    }
+    parse_parameter_tags(rest)
+}
+
+fn tool_call_input_from_object(
+    mut object: serde_json::Map<String, serde_json::Value>,
+    name: &mut Option<String>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if name.as_ref().is_none_or(|value| value.is_empty())
+        && let Some(n) = object.get("name").and_then(serde_json::Value::as_str)
+        && !n.is_empty()
+    {
+        *name = Some(n.to_string());
+    }
+    if let Some(args) = object
+        .get("arguments")
+        .or_else(|| object.get("parameters"))
+        .cloned()
+    {
+        return match args {
+            serde_json::Value::Object(map) => Some(map),
+            other => {
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert("input".into(), other);
+                Some(wrapped)
+            }
+        };
+    }
+    object.remove("name");
+    Some(object)
+}
+
+fn parse_parameter_tags(body: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let re = regex_lite::Regex::new(r"<parameter\b([^>]*)>([\s\S]*?)</parameter>").ok()?;
+    let mut map = serde_json::Map::new();
+    let mut found = false;
+    for cap in re.captures_iter(body) {
+        found = true;
+        let attrs = parse_xml_attributes(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
+        let raw = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        let value = match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(parsed) => parsed,
+            Err(_) => serde_json::Value::String(raw.to_string()),
+        };
+        if let Some(param_name) = attrs.get("name").filter(|value| !value.is_empty()) {
+            map.insert(param_name.clone(), value);
+        } else if let serde_json::Value::Object(object) = value {
+            return Some(object);
+        } else {
+            map.insert("input".into(), value);
+        }
+    }
+    found.then_some(map)
+}
+
+fn parse_json_object(raw: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        Ok(serde_json::Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
 /// Compute how many characters at the end of `value` could be a partial
-/// `<tool_use` marker. Returns a length in [0, "<tool_use".len() - 1].
-fn tool_use_prefix_suffix_length(value: &str) -> usize {
-    let marker = "<tool_use";
+/// `<tool_use` / `<tool_call` marker.
+fn xml_tool_prefix_suffix_length(value: &str) -> usize {
+    prefix_suffix_length(value, "<tool_use").max(prefix_suffix_length(value, "<tool_call"))
+}
+
+fn xml_close_prefix_suffix_length(value: &str) -> usize {
+    ["</tool_use>", "</tool_call>", "</assistant>"]
+        .into_iter()
+        .map(|marker| prefix_suffix_length(value, marker))
+        .max()
+        .unwrap_or(0)
+}
+
+fn prefix_suffix_length(value: &str, marker: &str) -> usize {
     let max = marker.len().saturating_sub(1).min(value.len());
     for len in (1..=max).rev() {
         if value.ends_with(&marker[..len]) {
@@ -491,12 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_prefix_suffix_identifies_partial_tag() {
-        assert_eq!(tool_use_prefix_suffix_length("<tool_"), 6);
-        assert_eq!(tool_use_prefix_suffix_length("<tool_us"), 8);
-        assert_eq!(tool_use_prefix_suffix_length("hello <tool_"), 6);
-        assert_eq!(tool_use_prefix_suffix_length("hello"), 0);
-        assert_eq!(tool_use_prefix_suffix_length("<"), 1); // "<" is a prefix of "<tool_use"
+    fn xml_tool_prefix_suffix_identifies_partial_tag() {
+        assert_eq!(xml_tool_prefix_suffix_length("<tool_"), 6);
+        assert_eq!(xml_tool_prefix_suffix_length("<tool_us"), 8);
+        assert_eq!(xml_tool_prefix_suffix_length("<tool_ca"), 8);
+        assert_eq!(xml_tool_prefix_suffix_length("hello <tool_"), 6);
+        assert_eq!(xml_tool_prefix_suffix_length("hello"), 0);
+        assert_eq!(xml_tool_prefix_suffix_length("<"), 1);
     }
 
     #[test]
@@ -514,5 +667,132 @@ mod tests {
         assert!(parser.flush().is_empty());
         // Another flush should also be empty.
         assert!(parser.flush().is_empty());
+    }
+
+    #[test]
+    fn recovers_grok_tool_call_with_unnamed_parameter_json() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["todo_write".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let input = concat!(
+            "调查已经齐了。\n",
+            r#"<tool_call> todo_write <parameter> {"todos":[{"id":"1","content":"\u91cd\u8bd5","status":"completed"}]} </parameter> </tool_call>"#,
+            " </assistant>"
+        );
+        let events = parser.push(input);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveredCursorEvent::ToolUse(tool) if tool.name == "todo_write")),
+            "grok <tool_call> todo_write must become a structured tool, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RecoveredCursorEvent::Text(text)
+                    if text.contains("<tool_call")
+                        || text.contains("</tool_call>")
+                        || text.contains("</assistant>")
+            )),
+            "raw grok tool XML and chat-template close tags must not leak as text: {events:?}"
+        );
+        let RecoveredCursorEvent::ToolUse(tool) = events
+            .iter()
+            .find(|event| matches!(event, RecoveredCursorEvent::ToolUse(_)))
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            tool.input["todos"][0]["content"].as_str(),
+            Some("重试"),
+            "JSON unicode escapes inside <parameter> must decode: {:?}",
+            tool.input
+        );
+        assert!(parser.saw_tool_use());
+    }
+
+    #[test]
+    fn recovers_split_grok_tool_call_xml() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["todo_write".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let first = parser.push("ok <tool_");
+        assert_eq!(first, vec![RecoveredCursorEvent::Text("ok ".into())]);
+        let events = parser
+            .push(r#"call> todo_write <parameter>{"todos":[]}</parameter></tool_call> after"#);
+        assert!(matches!(
+            &events[0],
+            RecoveredCursorEvent::ToolUse(tool) if tool.name == "todo_write"
+        ));
+        assert_eq!(events[1], RecoveredCursorEvent::Text(" after".into()));
+    }
+
+    #[test]
+    fn grok_tool_call_disallowed_name_stays_text() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["read_file".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser
+            .push(r#"<tool_call> todo_write <parameter> {"todos":[]} </parameter> </tool_call>"#);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], RecoveredCursorEvent::Text(text) if text.contains("todo_write"))
+        );
+        assert!(!parser.saw_tool_use());
+    }
+
+    #[test]
+    fn split_assistant_close_tag_is_held_until_complete() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["todo_write".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let first = parser.push(concat!(
+            r#"<tool_call> todo_write <parameter> {"todos":[]} </parameter> </tool_call>"#,
+            "</assistant",
+        ));
+        assert!(
+            first.iter().any(|event| matches!(
+                event,
+                RecoveredCursorEvent::ToolUse(tool) if tool.name == "todo_write"
+            )),
+            "tool_call must recover before the split closer: {first:?}"
+        );
+        assert!(
+            !first.iter().any(|event| matches!(
+                event,
+                RecoveredCursorEvent::Text(text) if text.contains("assistant") || text == ">"
+            )),
+            "incomplete </assistant must not leak or be stripped early: {first:?}"
+        );
+        let rest = parser.push(">");
+        assert!(
+            rest.is_empty(),
+            "completing </assistant> must not emit leftover text: {rest:?}"
+        );
+        assert!(parser.flush().is_empty());
+    }
+
+    #[test]
+    fn assistant_close_prefix_does_not_eat_unrelated_text() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["todo_write".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(concat!(
+            r#"<tool_call> todo_write <parameter> {"todos":[]} </parameter> </tool_call>"#,
+            "</assistant_note>",
+        ));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveredCursorEvent::Text(text) if text.contains("</assistant_note>")
+            )),
+            "only the exact </assistant> closer is redundant: {events:?}"
+        );
     }
 }

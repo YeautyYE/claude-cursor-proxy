@@ -283,6 +283,8 @@ claude-cursor-proxy cursor auth status
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
+| grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.48 and restart serve. Ambiguous live opens are HTTP 409; open-slot saturation is 429. |
+| Claude Code Bash widget titles a giant `python3 -c` script | Update to ≥0.1.48 and restart serve. Cursor Shell has no description; the proxy now fills a short one-line title. |
 | 45s 502 `idle timeout` / `0 response bytes` | Update to ≥0.1.39 and restart serve. Still set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`. Clash/Surge TUN: DIRECT `*.cursor.sh`. Optional: `CCP_CURSOR_HTTP1=1` |
 | `Stream idle timeout - no chunks received` before a background tool result resumes | Update to ≥0.1.45 and restart serve. The pre-response live-result classification wait is capped at 5s instead of 30s; once an SSE response exists, 15s Anthropic pings still protect quiet model thinking. |
 | 502 `Image not found [internal]` on a text-only turn | Update to ≥0.1.40 and restart serve, then retry the same message once (the poisoned conversation checkpoint is cleared on that error). A new Claude Code session also works. |

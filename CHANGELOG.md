@@ -3,6 +3,13 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.48 (2026-08-18)
+
+- Stabilize grok-build `/v1/responses` against Cursor live-open races: hold HTTP until the Run is accepted, map ambiguous open/resume timeouts to HTTP 409 (no same-request 5xx retry), and return 429 when the live-open semaphore is saturated so grok can back off.
+- Hash a fallback session from user + cwd + first user text (and Responses `metadata.user_id`) so grok-build without Claude session headers does not share one Cursor slot. Recover allowlisted grok `<tool_call>` XML into structured tools.
+- Keep Claude Code on immediate `/v1/messages` SSE. Synthesize a short Bash `description` from Cursor Shell (which has none) so the TUI title is not the entire `python3 -c` body; prefer advertised `Bash` when both Claude and grok names are listed.
+- H2 keepalive is 60s/20s without idle PINGs; reconnect uses full jitter plus an open semaphore; the H2 circuit half-opens after cooldown instead of sticking on HTTP/1.
+
 ## v0.1.47 (2026-08-17)
 
 - Pass Cursor billing and geo/policy failures through as HTTP 429/403 instead of grok-build's generic 500 "our side". Unpaid-invoice text stays on 429, unsupported country/region text stays on 403, and `/v1/responses` holds the stream peek until a pre-output 4xx can be returned as JSON.

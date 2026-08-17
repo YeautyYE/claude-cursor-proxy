@@ -1075,6 +1075,7 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
         traffic: None,
         monitor: None,
         claude_code: Default::default(),
+        hold_http_until_live_open: false,
     };
 
     let response = provider.handle_messages(body, ctx).await;

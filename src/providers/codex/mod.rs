@@ -1014,6 +1014,7 @@ mod tests {
             traffic: None,
             monitor: Some(monitor.clone()),
             claude_code: Default::default(),
+            hold_http_until_live_open: false,
         };
         let chunk = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":48}}\n\n";
 

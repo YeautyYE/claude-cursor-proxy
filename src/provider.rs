@@ -55,4 +55,7 @@ pub struct RequestContext {
     pub monitor: Option<MonitorHandle>,
     /// Nested-agent headers from Claude Code. Same session id as the parent.
     pub claude_code: ClaudeCodeAgentHeaders,
+    /// `/v1/responses` must not commit Anthropic SSE before live open, or
+    /// grok-build maps a later `response.failed` to HTTP 500 and retries.
+    pub hold_http_until_live_open: bool,
 }

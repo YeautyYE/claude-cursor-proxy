@@ -110,12 +110,25 @@ pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
     {
         return 400;
     }
+    if is_ambiguous_live_accept(message) {
+        return 409;
+    }
     if let Some(embedded) = embedded_connect_http_status(message)
         && (400..500).contains(&embedded)
     {
         return embedded;
     }
     status
+}
+
+/// `.send()` / ResumeAction timed out: Cursor may already have the Run.
+/// grok-build retries 5xx; 409 fail-closes without duplicating the turn.
+pub fn is_ambiguous_live_accept(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("live open timed out")
+        || lower.contains("response-less resumeaction")
+        || lower.contains("acceptance is ambiguous")
+        || lower.contains("resume produced no progress")
 }
 
 pub fn anthropic_error_kind_for_status(status: u16, message: &str) -> &'static str {
@@ -312,5 +325,71 @@ mod tests {
         let message = "Cursor error 502: Cursor upstream HTTP 502 You have an unpaid invoice — pay your invoice in Stripe";
         assert_eq!(classify_proxy_error_status(502, message), 429);
         assert!(!should_retry_upstream(502, message));
+    }
+
+    #[test]
+    fn ambiguous_live_open_timeout_is_classified_as_409() {
+        let messages = [
+            "Cursor live open timed out after 20s",
+            "Cursor error 504: Cursor live open timed out after 20s",
+            "Cursor live open timed out after 10s (response-less ResumeAction send is ambiguous)",
+            "Cursor BidiAppend timed out; acceptance is ambiguous",
+        ];
+        for message in messages {
+            assert_eq!(
+                classify_proxy_error_status(504, message),
+                409,
+                "ambiguous accept must be 409 so grok-build does not 5xx-retry: {message}"
+            );
+            assert_eq!(classify_proxy_error_status(502, message), 409, "{message}");
+            assert!(
+                !should_retry_upstream(504, message),
+                "ambiguous 504 must not be same-request retryable: {message}"
+            );
+            assert_eq!(
+                anthropic_error_kind_for_status(504, message),
+                "invalid_request_error"
+            );
+        }
+        assert_eq!(
+            classify_proxy_error_status(504, "Gateway Timeout"),
+            504,
+            "generic 504 is not a live-open accept ambiguity"
+        );
+        assert_eq!(
+            classify_proxy_error_status(429, "Cursor live open concurrency saturated"),
+            429,
+            "saturation is retryable overload, not an ambiguous accept"
+        );
+        assert!(should_retry_status(429));
+        assert!(
+            !is_ambiguous_live_accept("Cursor live open concurrency saturated"),
+            "do not remap saturation onto 409"
+        );
+    }
+
+    #[test]
+    fn hollow_resume_produced_no_progress_is_classified_as_409() {
+        let messages = [
+            "Cursor resume produced no progress before the stream stalled",
+            "Cursor resume produced no progress before the recovery deadline",
+            "Cursor resume produced no progress before the stream ended",
+        ];
+        for message in messages {
+            assert_eq!(
+                classify_proxy_error_status(502, message),
+                409,
+                "hollow ResumeAction must be 409 so grok-build does not 5xx-retry: {message}"
+            );
+            assert!(
+                !should_retry_upstream(502, message),
+                "hollow resume must not be same-request retryable: {message}"
+            );
+        }
+        assert_eq!(
+            classify_proxy_error_status(502, "Cursor live run cancelled"),
+            502,
+            "an explicit cancel is not a hollow-resume accept ambiguity"
+        );
     }
 }

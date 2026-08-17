@@ -401,6 +401,7 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
         traffic,
         monitor: state.monitor.clone(),
         claude_code: claude_code_headers_from(&headers),
+        hold_http_until_live_open: true,
     };
     let mut request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let response = if provider.name() == "grok" {
@@ -1035,6 +1036,7 @@ async fn dispatch_request(
         traffic,
         monitor: state.monitor.clone(),
         claude_code,
+        hold_http_until_live_open: false,
     };
 
     let response = if count_tokens {
@@ -1420,33 +1422,137 @@ fn resolve_responses_session_id(
             fallback: false,
         };
     }
-    match messages {
-        Some(messages) => resolve_session_id(None, messages),
-        None => ResolvedSessionId {
-            session_id: derive_fallback_session_id(&MessagesRequest {
-                model: crate::openai::responses_model(body),
-                max_tokens: None,
-                messages: Vec::new(),
-                stream: true,
-                extra: Map::new(),
-            }),
-            fallback: true,
-        },
+    ResolvedSessionId {
+        session_id: derive_fallback_session_id_from_responses(body, messages),
+        fallback: true,
     }
 }
 
 fn derive_fallback_session_id(body: &MessagesRequest) -> String {
-    let user_id = metadata_user_id(body).unwrap_or("");
-    let cwd = working_directory_from_body(body).unwrap_or_default();
+    hash_fallback_session(
+        metadata_user_id(body).unwrap_or(""),
+        &working_directory_from_body(body).unwrap_or_default(),
+        &first_user_message_fingerprint(body),
+    )
+}
+
+fn derive_fallback_session_id_from_responses(
+    body: &Value,
+    messages: Option<&MessagesRequest>,
+) -> String {
+    let user_id = responses_metadata_user_id(body)
+        .or_else(|| messages.and_then(metadata_user_id))
+        .unwrap_or("");
+    let cwd = messages
+        .and_then(working_directory_from_body)
+        .or_else(|| crate::project::cwd_from_system(body.get("instructions")))
+        .unwrap_or_default();
+    let first_user = messages
+        .map(first_user_message_fingerprint)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| first_user_text_from_responses_input(body));
+    hash_fallback_session(user_id, &cwd, &first_user)
+}
+
+fn hash_fallback_session(user_id: &str, cwd: &str, first_user: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(user_id.as_bytes());
     hasher.update([0]);
     hasher.update(cwd.as_bytes());
+    hasher.update([0]);
+    hasher.update(first_user.as_bytes());
     format!("ccp-fb-{:x}", hasher.finalize())
 }
 
+fn first_user_message_fingerprint(body: &MessagesRequest) -> String {
+    body.messages
+        .iter()
+        .filter(|message| message.role.eq_ignore_ascii_case("user"))
+        .map(|message| fingerprint_message_content(&message.content))
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
+}
+
+fn fingerprint_message_content(content: &Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        serde_json::Value::Array(parts) => {
+            if parts.iter().all(part_is_tool_result) {
+                return String::new();
+            }
+            parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| part.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn part_is_tool_result(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("tool_result")
+}
+
+fn first_user_text_from_responses_input(body: &Value) -> String {
+    let Some(input) = body.get("input") else {
+        return String::new();
+    };
+    if let Some(text) = input.as_str() {
+        return text.trim().to_string();
+    }
+    let Some(items) = input.as_array() else {
+        return String::new();
+    };
+    for item in items {
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        if kind != "message" {
+            continue;
+        }
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+        if !role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        let text = match item.get("content") {
+            Some(Value::String(text)) => text.trim().to_string(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string(),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
 fn metadata_user_id(body: &MessagesRequest) -> Option<&str> {
-    let metadata = body.extra.get("metadata")?;
+    json_metadata_user_id(body.extra.get("metadata")?)
+}
+
+fn responses_metadata_user_id(body: &Value) -> Option<&str> {
+    json_metadata_user_id(body.get("metadata")?)
+}
+
+fn json_metadata_user_id(metadata: &Value) -> Option<&str> {
     metadata
         .get("user_id")
         .or_else(|| metadata.get("userId"))
@@ -1473,7 +1579,8 @@ fn header_text(headers: &http::HeaderMap, name: &str) -> Option<String> {
 
 fn claude_code_headers_from(headers: &http::HeaderMap) -> ClaudeCodeAgentHeaders {
     ClaudeCodeAgentHeaders {
-        agent_id: header_text(headers, "x-claude-code-agent-id"),
+        agent_id: header_text(headers, "x-claude-code-agent-id")
+            .or_else(|| header_text(headers, "x-grok-agent-id")),
         parent_agent_id: header_text(headers, "x-claude-code-parent-agent-id"),
         app: header_text(headers, "x-app"),
     }
@@ -1706,16 +1813,16 @@ mod tests {
     }
 
     #[test]
-    fn session_id_fallback_changes_with_user_or_cwd_not_later_messages() {
+    fn session_id_fallback_changes_with_user_or_cwd_or_first_message() {
         let base = derive_fallback_session_id(&fallback_body("user-1", "/tmp/proj", "hello"));
         let other_user = derive_fallback_session_id(&fallback_body("user-2", "/tmp/proj", "hello"));
         let other_cwd = derive_fallback_session_id(&fallback_body("user-1", "/tmp/other", "hello"));
         let other_msg = derive_fallback_session_id(&fallback_body("user-1", "/tmp/proj", "hola"));
         assert_ne!(base, other_user);
         assert_ne!(base, other_cwd);
-        assert_eq!(
+        assert_ne!(
             base, other_msg,
-            "fallback is user_id + cwd; first-message text must not mint a new session"
+            "headerless concurrent grok agents in one cwd must not share a live slot"
         );
     }
 
@@ -1785,6 +1892,98 @@ mod tests {
             "/v1/responses must keep live BiDi when grok-build only puts conv id in prompt_cache_key"
         );
         assert!(!resolved.fallback);
+    }
+
+    #[test]
+    fn responses_fallback_session_splits_on_raw_input_when_conversion_missing() {
+        let headers = http::HeaderMap::new();
+        let hello = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]
+        });
+        let hola = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hola"}]}]
+        });
+        let a = resolve_responses_session_id(&headers, &hello, None);
+        let b = resolve_responses_session_id(&headers, &hola, None);
+        assert!(a.fallback && b.fallback);
+        assert_ne!(
+            a.session_id, b.session_id,
+            "headerless grok /v1/responses must not share ccp-fb-6e34 when conversion is None"
+        );
+        let hello_again = resolve_responses_session_id(&headers, &hello, None);
+        assert_eq!(
+            a.session_id, hello_again.session_id,
+            "later turns with the same first user text must keep the live slot"
+        );
+    }
+
+    #[test]
+    fn responses_fallback_session_stable_for_full_history_tool_follow_up() {
+        let headers = http::HeaderMap::new();
+        let first = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "instructions": "# Environment\n - Primary working directory: /tmp/carve\n",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ]
+        });
+        let follow = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "instructions": "# Environment\n - Primary working directory: /tmp/carve\n",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+                {"type":"function_call","call_id":"c1","name":"todo_write","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"}
+            ]
+        });
+        let first_messages = crate::openai::responses_to_messages(&first).unwrap();
+        let follow_messages = crate::openai::responses_to_messages(&follow).unwrap();
+        let a = resolve_responses_session_id(&headers, &first, Some(&first_messages));
+        let b = resolve_responses_session_id(&headers, &follow, Some(&follow_messages));
+        assert_eq!(
+            a.session_id, b.session_id,
+            "grok-build replays full history; a tool follow-up must keep the live slot"
+        );
+    }
+
+    #[test]
+    fn responses_fallback_reads_metadata_user_id_from_raw_body() {
+        let headers = http::HeaderMap::new();
+        let user_a = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "metadata": {"user_id": "user-a"},
+            "instructions": "# Environment\n - Primary working directory: /tmp/carve\n",
+            "input": "hello"
+        });
+        let user_b = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "metadata": {"user_id": "user-b"},
+            "instructions": "# Environment\n - Primary working directory: /tmp/carve\n",
+            "input": "hello"
+        });
+        let messages_a = crate::openai::responses_to_messages(&user_a).unwrap();
+        let messages_b = crate::openai::responses_to_messages(&user_b).unwrap();
+        let a = resolve_responses_session_id(&headers, &user_a, Some(&messages_a));
+        let b = resolve_responses_session_id(&headers, &user_b, Some(&messages_b));
+        assert!(a.fallback && b.fallback);
+        assert_ne!(
+            a.session_id, b.session_id,
+            "headerless users with the same cwd and prompt must not share a live slot"
+        );
+    }
+
+    #[test]
+    fn grok_agent_id_header_populates_live_identity() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-grok-agent-id", "agent/child-9".parse().unwrap());
+        let mapped = claude_code_headers_from(&headers);
+        assert_eq!(
+            mapped.agent_id.as_deref(),
+            Some("agent/child-9"),
+            "grok subagents must get their own live run key when session fallback collides"
+        );
     }
 
     #[test]
@@ -2021,6 +2220,39 @@ mod tests {
                 .get(http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
             Some("5")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_live_open_timeout_sse_becomes_http_409() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"cursor-grok-4.5-high-fast\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Cursor error 504: Cursor live open timed out after 20s\"}}\n\n",
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(
+            wrapped.status(),
+            StatusCode::CONFLICT,
+            "ambiguous live open must be JSON 409 before SSE 200, not grok 500"
+        );
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out after 20s"),
+            "{body}"
         );
     }
 }
