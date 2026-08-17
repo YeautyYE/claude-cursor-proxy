@@ -137,8 +137,7 @@ const GROK_BUILD_CLIENT_TOOL_NAMES: &[&str] = &[
 ];
 
 fn is_grok_build_client_tool_name(name: &str) -> bool {
-    is_grok_build_subagent_lifecycle_tool(name)
-        || GROK_BUILD_CLIENT_TOOL_NAMES.contains(&name)
+    is_grok_build_subagent_lifecycle_tool(name) || GROK_BUILD_CLIENT_TOOL_NAMES.contains(&name)
 }
 
 fn is_cursor_native_tool_name(name: &str) -> bool {
