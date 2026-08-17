@@ -2851,6 +2851,15 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if crate::retry::is_billing_block(message) {
         return false;
     }
+    if cursor_connect_error_is_missing_conversation_data(message)
+        || terminal_error_allows_fresh_retry(message)
+    {
+        return true;
+    }
+    let classified = crate::retry::classify_proxy_error_status(502, message);
+    if (400..500).contains(&classified) && !crate::retry::is_upstream_rate_limit(message) {
+        return false;
+    }
     if cursor_connect_error_is_missing_image(message) {
         return false;
     }
@@ -2858,9 +2867,7 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if lower.contains("outdated_client") || lower.contains("outdated client") {
         return false;
     }
-    terminal_error_allows_fresh_retry(message)
-        || live_error_is_resource_exhausted(message)
-        || cursor_connect_error_is_missing_conversation_data(message)
+    live_error_is_resource_exhausted(message)
         || message.contains("Connect error 502")
         || message.contains("Connect error 503")
         || message.contains("Connect error 504")
@@ -2868,14 +2875,28 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
 }
 
 pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) -> bool {
-    if crate::retry::is_billing_block(&err.message) {
+    let text = err.client_message();
+    if crate::retry::is_billing_block(&text) || crate::retry::is_billing_block(&err.message) {
         return false;
     }
-    if cursor_connect_error_is_missing_image(&err.message) {
+    if cursor_connect_error_is_missing_conversation_data(&text)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(cursor_connect_error_is_missing_conversation_data)
+        || terminal_error_allows_fresh_retry(&text)
+    {
+        return true;
+    }
+    let classified = crate::retry::classify_proxy_error_status(err.status, &text);
+    if (400..500).contains(&classified) && !crate::retry::is_upstream_rate_limit(&text) {
         return false;
     }
-    crate::retry::should_retry_upstream(err.status, &err.message)
-        || live_error_is_same_request_retryable(&err.message)
+    if cursor_connect_error_is_missing_image(&text) {
+        return false;
+    }
+    crate::retry::should_retry_upstream(err.status, &text)
+        || live_error_is_same_request_retryable(&text)
 }
 
 pub(crate) fn same_request_retry_wait_ms(attempt: u32, message: &str) -> u64 {
@@ -6705,12 +6726,8 @@ pub fn live_sse_response(
                             Some(Err(error)) => {
                                 state.done = true;
                                 let error_type = anthropic_error_type_from_live_error(&error);
-                                let status = match error_type {
-                                    "rate_limit_error" => 429,
-                                    "authentication_error" => 401,
-                                    "permission_error" => 403,
-                                    _ => 502,
-                                };
+                                let status =
+                                    crate::retry::classify_proxy_error_status(502, &error);
                                 if let Some((ref handle, ref req_id)) = state.monitor {
                                     handle.request_failed(req_id, Some(status), error.clone());
                                 }
@@ -8363,6 +8380,63 @@ mod tests {
         assert_eq!(
             anthropic_error_type_from_live_error("Cursor stream stalled"),
             "api_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error(
+                "Connect error 502: This model is not available in your country or region [internal]"
+            ),
+            "permission_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Connect error 502: 不支持的国家/区域 [internal]"),
+            "permission_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error(
+                "Connect error 502: model slug is not supported [invalid_argument]"
+            ),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Cursor upstream HTTP 403"),
+            "permission_error"
+        );
+        assert_eq!(
+            anthropic_error_type_from_live_error("Cursor RunSSE HTTP 429"),
+            "rate_limit_error"
+        );
+    }
+
+    #[test]
+    fn start_error_classifies_http_body_detail_not_just_message() {
+        let invoice = CursorError::new(
+            502,
+            "Cursor upstream HTTP 502",
+            Some(
+                "You have an unpaid invoice — Visit cursor.com/dashboard and pay your invoice"
+                    .into(),
+            ),
+        );
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&invoice),
+            "billing text in the HTTP body must fail closed"
+        );
+
+        let geo = CursorError::new(
+            403,
+            "Cursor upstream HTTP 403",
+            Some("This model is not available in your country or region".into()),
+        );
+        assert!(!cursor_start_error_is_same_request_retryable(&geo));
+
+        let missing = CursorError::new(
+            400,
+            "Cursor upstream HTTP 400",
+            Some("Conversation data missing [failed_precondition]".into()),
+        );
+        assert!(
+            cursor_start_error_is_same_request_retryable(&missing),
+            "missing conversation in a 4xx body must still same-request retry"
         );
     }
 

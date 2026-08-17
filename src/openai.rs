@@ -491,6 +491,9 @@ pub struct AnthropicToResponses {
     started: bool,
     finished: bool,
     failed: bool,
+    failed_kind: Option<String>,
+    failed_message: Option<String>,
+    saw_keepalive: bool,
     sequence: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -552,9 +555,15 @@ impl AnthropicToResponses {
     }
 
     pub fn fail(&mut self, message: &str) -> Vec<u8> {
+        self.fail_with("api_error", message)
+    }
+
+    fn fail_with(&mut self, kind: &str, message: &str) -> Vec<u8> {
         if self.finished || self.failed {
             return Vec::new();
         }
+        self.failed_kind = Some(kind.to_string());
+        self.failed_message = Some(message.to_string());
         let mut out = Vec::new();
         if !self.started {
             self.started = true;
@@ -565,6 +574,35 @@ impl AnthropicToResponses {
         }
         out.extend(self.failed_event(message));
         out
+    }
+
+    pub fn failure_message(&self) -> Option<&str> {
+        self.failed_message.as_deref()
+    }
+
+    /// HTTP status grok-build should see when this failure happened before any
+    /// model output. `None` means keep the streaming 200 and `response.failed`.
+    pub fn http_error_status(&self) -> Option<u16> {
+        if !self.failed || self.has_deliverable_output() {
+            return None;
+        }
+        let message = self.failed_message.as_deref().unwrap_or("");
+        let kind = self.failed_kind.as_deref().unwrap_or("");
+        let status = match kind {
+            "rate_limit_error" => 429,
+            "authentication_error" => 401,
+            "permission_error" => 403,
+            "invalid_request_error" => 400,
+            "not_found_error" => 404,
+            _ => crate::retry::classify_proxy_error_status(502, message),
+        };
+        (400..500).contains(&status).then_some(status)
+    }
+
+    pub(crate) fn should_stop_error_peek(&self) -> bool {
+        self.has_deliverable_output()
+            || self.saw_keepalive
+            || (self.failed && self.http_error_status().is_none())
     }
 
     fn render(&mut self, event: &SseEvent) -> Vec<u8> {
@@ -689,9 +727,14 @@ impl AnthropicToResponses {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("upstream error");
-                self.fail(message)
+                let kind = value
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("api_error");
+                self.fail_with(kind, message)
             }
             "ping" => {
+                self.saw_keepalive = true;
                 // grok-build /v1/responses idle-watchdogs on a silent body.
                 // Anthropic `ping` must become Responses bytes, not drop.
                 let mut out = Vec::new();
@@ -853,9 +896,10 @@ impl AnthropicToResponses {
     fn failed_event(&mut self, message: &str) -> Vec<u8> {
         self.failed = true;
         self.finished = true;
+        let code = crate::retry::responses_error_code(self.failed_kind.as_deref(), message);
         let mut response = self.base_response("failed", self.final_output());
         response["error"] = json!({
-            "code": "server_error",
+            "code": code,
             "message": message
         });
         let mut out = self.emit(json!({
@@ -1214,6 +1258,66 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"tools r
         assert!(
             !rest.contains("server_error"),
             "a delivered text turn must not become response.failed: {rest}"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_responses_rate_limit_is_not_server_error() {
+        let mut translator =
+            AnthropicToResponses::new("resp_429".into(), "cursor-grok-4.5-high-fast".into());
+        let bytes = translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
+
+event: error
+data: {"type":"error","error":{"type":"rate_limit_error","message":"Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice - pay your invoice. [resource_exhausted]"}}
+
+"#,
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("unpaid invoice"),
+            "billing text must reach grok-build: {text}"
+        );
+        assert!(
+            !text.contains("\"code\":\"server_error\"")
+                && !text.contains("\"code\": \"server_error\""),
+            "rate_limit_error must not become Responses server_error (HTTP 500): {text}"
+        );
+        assert!(
+            translator.http_error_status() == Some(429),
+            "pre-output Cursor 429 must surface as HTTP 429, not 500: {:?}",
+            translator.http_error_status()
+        );
+    }
+
+    #[test]
+    fn anthropic_to_responses_geo_block_is_not_server_error() {
+        let mut translator =
+            AnthropicToResponses::new("resp_geo".into(), "cursor-grok-4.5-high-fast".into());
+        let bytes = translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
+
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"Connect error 502: This model is not available in your country or region [internal]"}}
+
+"#,
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("country or region"),
+            "geo text must reach grok-build: {text}"
+        );
+        assert!(
+            !text.contains("\"code\":\"server_error\"")
+                && !text.contains("\"code\": \"server_error\""),
+            "geo blocks must not become Responses server_error (HTTP 500): {text}"
+        );
+        assert_eq!(
+            translator.http_error_status(),
+            Some(403),
+            "pre-output geo 502 must surface as HTTP 403, not 500"
         );
     }
 

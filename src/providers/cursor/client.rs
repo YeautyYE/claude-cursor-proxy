@@ -1562,6 +1562,20 @@ impl CursorError {
         }
     }
 
+    /// Text live SSE and retry gates can classify. Direct HTTP errors keep
+    /// the status in `message` ("Cursor upstream HTTP 403") and the policy
+    /// body in `detail`; both must reach grok-build.
+    pub fn client_message(&self) -> String {
+        let mut text = format!("Cursor error {}: {}", self.status, self.message);
+        if let Some(detail) = self.detail.as_deref().filter(|s| !s.is_empty())
+            && !self.message.contains(detail)
+        {
+            text.push(' ');
+            text.push_str(detail);
+        }
+        text
+    }
+
     pub fn from_reqwest(e: reqwest::Error, timeout_secs: u64) -> Self {
         if e.is_timeout() {
             return Self {
@@ -1602,6 +1616,19 @@ impl std::error::Error for CursorError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_message_includes_http_status_and_body_detail() {
+        let err = CursorError::new(
+            403,
+            "Cursor upstream HTTP 403",
+            Some("This model is not available in your country or region".into()),
+        );
+        let text = err.client_message();
+        assert!(text.contains("Cursor error 403"), "{text}");
+        assert!(text.contains("Cursor upstream HTTP 403"), "{text}");
+        assert!(text.contains("country or region"), "{text}");
+    }
 
     #[test]
     fn buffered_run_rejects_useful_stream_without_turn_ended() {

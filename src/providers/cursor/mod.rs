@@ -316,7 +316,7 @@ async fn start_live_events_with_retries(
                     reservation.release();
                     crate::retry::sleep(same_request_retry_wait_ms(
                         transient_retries,
-                        &error.message,
+                        &error.client_message(),
                     ))
                     .await;
                     transient_retries += 1;
@@ -432,7 +432,7 @@ fn spawn_streaming_live_sse(
                             }
                         }
                         Err(error) => {
-                            let _ = tx.send(Err(error.message)).await;
+                            let _ = tx.send(Err(error.client_message())).await;
                             break;
                         }
                     }
@@ -661,7 +661,7 @@ async fn live_json_recording_usage(
             }
             (StatusCode::OK, Json(json)).into_response()
         }
-        Err(error) => json_error(StatusCode::BAD_GATEWAY, "api_error", error),
+        Err(error) => json_error_from_cursor_message(error),
     }
 }
 
@@ -1229,7 +1229,7 @@ impl Provider for CursorProvider {
             LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
             match LiveRunRegistry::probe_run(session_id, agent_id) {
                 LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
-                    return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
+                    return json_error_from_cursor_message(error);
                 }
                 LiveRunProbe::TerminalError(_) => {
                     // Ambiguous cancel / retryable probe already sealed or
@@ -1268,7 +1268,7 @@ impl Provider for CursorProvider {
                         LiveResumeOutcome::TerminalError(error)
                             if live_probe_error_blocks_new_run(&error) =>
                         {
-                            return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
+                            return json_error_from_cursor_message(error);
                         }
                         LiveResumeOutcome::TerminalError(_) => {
                             let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
@@ -1599,8 +1599,11 @@ impl Provider for CursorProvider {
                     if transport_retries < crate::retry::MAX_RATE_LIMIT_RETRIES
                         && cursor_start_error_is_same_request_retryable(&e) =>
                 {
-                    crate::retry::sleep(same_request_retry_wait_ms(transport_retries, &e.message))
-                        .await;
+                    crate::retry::sleep(same_request_retry_wait_ms(
+                        transport_retries,
+                        &e.client_message(),
+                    ))
+                    .await;
                     transport_retries += 1;
                 }
                 Err(e) => return map_cursor_error_to_response(&e),
@@ -1721,13 +1724,25 @@ fn now_ms() -> u64 {
 // Error mapping
 // ---------------------------------------------------------------------------
 
+fn json_error_from_cursor_message(message: impl Into<String>) -> Response {
+    let message = message.into();
+    let status = crate::retry::classify_proxy_error_status(502, &message);
+    let kind = crate::retry::anthropic_error_kind_for_status(status, &message);
+    json_error(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        kind,
+        message,
+    )
+}
+
 fn map_cursor_error_to_response(err: &client::CursorError) -> Response {
     let detail = err
         .detail
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(err.message.as_str());
-    match err.status {
+    let classified = crate::retry::classify_proxy_error_status(err.status, detail);
+    match classified {
         400 => json_error(StatusCode::BAD_REQUEST, "invalid_request_error", detail),
         401 => json_error(StatusCode::UNAUTHORIZED, "authentication_error", detail),
         // permission_denied / OUTDATED_CLIENT are NOT login failures — do not force re-login.
@@ -1748,17 +1763,19 @@ cli-* version (e.g. cli-2026.07.16-899851b)."
 Re-running `cursor auth login` usually will not help."
             ),
         ),
+        404 => json_error(StatusCode::NOT_FOUND, "not_found_error", detail),
         409 => json_error(StatusCode::CONFLICT, "invalid_request_error", detail),
         429 => {
             let retry_after = err.retry_after.as_deref().unwrap_or("5");
-            let resp = json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                &err.message,
-            );
+            let resp = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", detail);
             let headers = [(http::header::RETRY_AFTER, retry_after)];
             (headers, resp).into_response()
         }
+        other if (400..500).contains(&other) => json_error(
+            StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_REQUEST),
+            crate::retry::anthropic_error_kind_for_status(other, detail),
+            detail,
+        ),
         _ => json_error(StatusCode::BAD_GATEWAY, "api_error", detail),
     }
 }
@@ -2120,8 +2137,26 @@ mod tests {
             ),
             "billing 429 must fail closed, not spin"
         );
+        assert!(
+            !live_error_is_same_request_retryable(
+                "Connect error 502: This model is not available in your country or region [internal]"
+            ),
+            "geo blocks must fail closed, not retry as a 502"
+        );
         assert!(!live_error_is_same_request_retryable(
             "Connect error 502: Image not found [internal]"
+        ));
+        assert!(!live_error_is_same_request_retryable(
+            "Connect error 502: model slug is not supported [invalid_argument]"
+        ));
+        assert!(
+            live_error_is_same_request_retryable(
+                "Connect error 400: Conversation data missing [failed_precondition] (stale Cursor conversation reset; retry this message to continue)"
+            ),
+            "conversation-missing must still same-request retry after 4xx classification"
+        );
+        assert!(!live_error_is_same_request_retryable(
+            "Cursor error 403: Cursor upstream HTTP 403"
         ));
         assert_eq!(
             same_request_retry_wait_ms(
@@ -2282,6 +2317,78 @@ mod tests {
             panic!("the billing error must still be delivered");
         };
         assert!(error.contains("unpaid invoice"), "{error}");
+    }
+
+    #[test]
+    fn unpaid_invoice_connect_error_is_http_429_not_502() {
+        let err = client::CursorError::internal(
+            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — Your team has an unpaid invoice. Please contact your team administrator to pay your invoice and continue using Cursor. [resource_exhausted]",
+        );
+        assert_eq!(err.status, 502, "internal() still records a gateway status");
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "grok-build maps 500/502 to 'our side'; Cursor billing 429 must stay 429"
+        );
+    }
+
+    #[test]
+    fn geo_restriction_connect_error_is_http_403_not_502() {
+        let err = client::CursorError::internal(
+            "Connect error 502: ERROR_OPENAI: This model is not available in your country or region [internal]",
+        );
+        assert_eq!(err.status, 502);
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "geo blocks must not become grok-build 'our side' 500/502"
+        );
+    }
+
+    #[test]
+    fn classified_451_is_not_rewritten_to_502() {
+        let err = client::CursorError::new(
+            502,
+            "Connect error 451: unavailable for legal reasons",
+            None,
+        );
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(response.status().as_u16(), 451);
+    }
+
+    #[tokio::test]
+    async fn http_429_response_uses_upstream_detail_and_retry_after() {
+        let mut err = client::CursorError::new(
+            429,
+            "Cursor upstream HTTP 429",
+            Some(
+                "You have an unpaid invoice — Visit cursor.com/dashboard and pay your invoice"
+                    .into(),
+            ),
+        );
+        err.retry_after = Some("9".into());
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("9")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unpaid invoice"),
+            "{body}"
+        );
     }
 
     #[test]

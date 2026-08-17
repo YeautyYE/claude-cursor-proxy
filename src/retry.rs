@@ -25,7 +25,126 @@ pub fn is_billing_block(message: &str) -> bool {
 }
 
 pub fn should_retry_upstream(status: u16, message: &str) -> bool {
+    let status = classify_proxy_error_status(status, message);
     should_retry_status(status) && !is_billing_block(message)
+}
+
+/// Cursor Connect often records `status: 502` while the message is still
+/// `Connect error 429`. grok-build maps 500/502 to "Server error (our side)".
+pub fn is_upstream_rate_limit(message: &str) -> bool {
+    is_billing_block(message)
+        || message.contains("[resource_exhausted]")
+        || message.contains("ERROR_RATE_LIMITED")
+        || message.contains("ERROR_RESOURCE_EXHAUSTED")
+        || message.contains("Connect error 429")
+        || message.contains("Cursor error 429")
+}
+
+/// Model / provider geo fences. Cursor often wraps these as Connect 502
+/// `[internal]`, which grok-build then shows as "our side".
+pub fn is_geo_policy_block(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let place = lower.contains("country")
+        || lower.contains("region")
+        || lower.contains("territor")
+        || message.contains("国家")
+        || message.contains("区域")
+        || message.contains("地区");
+    if !place {
+        return false;
+    }
+    lower.contains("not available")
+        || lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("restricted")
+        || lower.contains("blocked")
+        || message.contains("不支持")
+}
+
+fn embedded_connect_http_status(message: &str) -> Option<u16> {
+    for label in [
+        "Connect error ",
+        "Cursor error ",
+        "Cursor upstream HTTP ",
+        "Cursor RunSSE HTTP ",
+    ] {
+        let mut rest = message;
+        while let Some(idx) = rest.find(label) {
+            rest = &rest[idx + label.len()..];
+            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if digits.len() == 3
+                && let Ok(status) = digits.parse::<u16>()
+                && (400..600).contains(&status)
+            {
+                return Some(status);
+            }
+        }
+    }
+    None
+}
+
+pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
+    if is_upstream_rate_limit(message) || status == 429 {
+        return 429;
+    }
+    if is_geo_policy_block(message)
+        || message.contains("[permission_denied]")
+        || message.contains("Connect error 403")
+        || message.contains("Cursor error 403")
+    {
+        return 403;
+    }
+    if message.contains("[unauthenticated]")
+        || message.contains("Connect error 401")
+        || message.contains("Cursor error 401")
+    {
+        return 401;
+    }
+    if message.contains("[not_found]") || message.contains("Connect error 404") {
+        return 404;
+    }
+    if message.contains("[invalid_argument]")
+        || message.contains("[failed_precondition]")
+        || message.contains("Connect error 400")
+        || message.contains("Cursor error 400")
+    {
+        return 400;
+    }
+    if let Some(embedded) = embedded_connect_http_status(message)
+        && (400..500).contains(&embedded)
+    {
+        return embedded;
+    }
+    status
+}
+
+pub fn anthropic_error_kind_for_status(status: u16, message: &str) -> &'static str {
+    match classify_proxy_error_status(status, message) {
+        429 => "rate_limit_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        400 | 409 => "invalid_request_error",
+        other if (400..500).contains(&other) => "invalid_request_error",
+        _ => "api_error",
+    }
+}
+
+/// Responses `error.code` grok-build maps to HTTP 500 when this is
+/// `server_error`. Client/policy failures must stay off that path.
+pub fn responses_error_code(kind: Option<&str>, message: &str) -> &'static str {
+    match kind {
+        Some("rate_limit_error") => "rate_limit",
+        Some("authentication_error") => "invalid_api_key",
+        Some("permission_error") => "invalid_request",
+        Some("invalid_request_error" | "not_found_error") => "invalid_request",
+        _ => match classify_proxy_error_status(502, message) {
+            429 => "rate_limit",
+            401 => "invalid_api_key",
+            400 | 403 | 404 | 409 => "invalid_request",
+            _ => "server_error",
+        },
+    }
 }
 
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
@@ -103,5 +222,95 @@ mod tests {
         ));
         assert!(!should_retry_upstream(400, "bad request"));
         assert!(!should_retry_upstream(401, "unauthorized"));
+    }
+
+    #[test]
+    fn unpaid_invoice_502_is_classified_as_429() {
+        let message = "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — Your team has an unpaid invoice. Please contact your team administrator to pay your invoice and continue using Cursor. [resource_exhausted]";
+        assert_eq!(classify_proxy_error_status(502, message), 429);
+        assert_eq!(
+            anthropic_error_kind_for_status(429, message),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, "Connect error 502: Conversation data missing"),
+            502
+        );
+    }
+
+    #[test]
+    fn geo_restriction_502_is_classified_as_403() {
+        let en = "Connect error 502: ERROR_OPENAI: This model is not available in your country or region [internal]";
+        assert_eq!(classify_proxy_error_status(502, en), 403);
+        assert_eq!(anthropic_error_kind_for_status(502, en), "permission_error");
+        assert!(!should_retry_upstream(502, en));
+
+        let zh = "Connect error 403: 不支持的国家/区域";
+        assert_eq!(classify_proxy_error_status(502, zh), 403);
+        assert_eq!(
+            classify_proxy_error_status(
+                502,
+                "Connect error 403: ERROR_CUSTOM_MESSAGE: Model not available in your region [permission_denied]"
+            ),
+            403
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, "Connect error 400: invalid model"),
+            400
+        );
+        assert_eq!(
+            classify_proxy_error_status(
+                502,
+                "Connect error 502: model slug is not supported [invalid_argument]"
+            ),
+            400
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, "Connect error 502: blob missing [not_found]"),
+            404
+        );
+        assert!(!should_retry_upstream(
+            502,
+            "Connect error 502: model slug is not supported [invalid_argument]"
+        ));
+    }
+
+    #[test]
+    fn regional_outage_wording_is_not_a_geo_policy_block() {
+        let outage = "Connect error 502: regional endpoint unavailable [unavailable]";
+        assert_eq!(
+            classify_proxy_error_status(502, outage),
+            502,
+            "gRPC unavailable + 'region' must not become a terminal 403"
+        );
+        assert!(should_retry_upstream(502, outage));
+        assert!(!is_geo_policy_block(outage));
+    }
+
+    #[test]
+    fn direct_cursor_http_status_in_message_is_classified() {
+        assert_eq!(
+            classify_proxy_error_status(502, "Cursor upstream HTTP 403"),
+            403
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, "Cursor RunSSE HTTP 429"),
+            429
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, "Cursor error 451: legal restriction"),
+            451
+        );
+        assert_eq!(
+            anthropic_error_kind_for_status(502, "Cursor error 451: legal restriction"),
+            "invalid_request_error"
+        );
+    }
+
+    #[test]
+    fn unpaid_invoice_in_http_body_text_is_429() {
+        let message = "Cursor error 502: Cursor upstream HTTP 502 You have an unpaid invoice — pay your invoice in Stripe";
+        assert_eq!(classify_proxy_error_status(502, message), 429);
+        assert!(!should_retry_upstream(502, message));
     }
 }

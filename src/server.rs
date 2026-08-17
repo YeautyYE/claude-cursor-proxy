@@ -471,7 +471,7 @@ fn shared_grok_provider() -> &'static crate::providers::grok::GrokProvider {
 
 async fn wrap_anthropic_as_responses(response: Response, model: &str) -> Response {
     if !response.status().is_success() {
-        return response;
+        return rewrite_classified_error_response(response).await;
     }
     let content_type = response
         .headers()
@@ -511,11 +511,54 @@ async fn wrap_anthropic_as_responses(response: Response, model: &str) -> Respons
     }
     let id = format!("resp_{}", Uuid::new_v4().simple());
     let model = model.to_string();
-    let (parts, body) = response.into_parts();
-    let translator = crate::openai::AnthropicToResponses::new(id, model);
+    let (parts, mut body) = response.into_parts();
+    let mut translator = crate::openai::AnthropicToResponses::new(id, model);
+    let mut prelude = Vec::new();
+    // Hold HTTP headers so pre-output Cursor policy errors can become JSON 4xx.
+    // grok-build treats streamed response.failed as HTTP 500 "our side".
+    let deadline = tokio::time::Instant::now() + responses_error_peek_timeout();
+    let mut body_done = false;
+    loop {
+        if let Some(response) = responses_json_error_from_translator(&translator) {
+            return response;
+        }
+        if translator.should_stop_error_peek() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                let data = frame.into_data().ok().unwrap_or_else(bytes::Bytes::new);
+                prelude.extend(translator.push(&data));
+            }
+            Ok(Some(Err(_))) => {
+                prelude.extend(translator.fail("upstream stream failed"));
+                body_done = true;
+                break;
+            }
+            Ok(None) => {
+                prelude.extend(translator.finish());
+                body_done = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    if let Some(response) = responses_json_error_from_translator(&translator) {
+        return response;
+    }
     let stream = futures_util::stream::unfold(
-        (body, translator, false),
-        |(mut body, mut translator, done)| async move {
+        (Some(prelude), body, translator, body_done),
+        |(prelude, mut body, mut translator, done)| async move {
+            if let Some(prelude) = prelude {
+                return Some((
+                    Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(prelude)),
+                    (None, body, translator, done),
+                ));
+            }
             if done {
                 return None;
             }
@@ -525,21 +568,21 @@ async fn wrap_anthropic_as_responses(response: Response, model: &str) -> Respons
                     let out = translator.push(&data);
                     Some((
                         Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(out)),
-                        (body, translator, false),
+                        (None, body, translator, false),
                     ))
                 }
                 Some(Err(_)) => {
                     let out = translator.fail("upstream stream failed");
                     Some((
                         Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(out)),
-                        (body, translator, true),
+                        (None, body, translator, true),
                     ))
                 }
                 None => {
                     let out = translator.finish();
                     Some((
                         Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(out)),
-                        (body, translator, true),
+                        (None, body, translator, true),
                     ))
                 }
             }
@@ -551,6 +594,87 @@ async fn wrap_anthropic_as_responses(response: Response, model: &str) -> Respons
         http::HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+fn responses_json_error_from_translator(
+    translator: &crate::openai::AnthropicToResponses,
+) -> Option<Response> {
+    let status = translator.http_error_status()?;
+    let message = translator
+        .failure_message()
+        .unwrap_or("upstream rate limited")
+        .to_string();
+    let kind = crate::retry::anthropic_error_kind_for_status(status, &message);
+    Some(json_error(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::TOO_MANY_REQUESTS),
+        kind,
+        message,
+    ))
+}
+
+fn responses_error_peek_timeout() -> Duration {
+    // grok-build maps every streamed `response.failed` to HTTP 500 and hides
+    // the body. Hold headers until a pre-output 4xx is classifiable, first
+    // model output arrives, or this cap. Cursor live often starts after 250ms.
+    Duration::from_millis(
+        std::env::var("CCP_RESPONSES_ERROR_PEEK_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(8_000),
+    )
+}
+
+async fn rewrite_classified_error_response(response: Response) -> Response {
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let retry_after = parts.headers.get(http::header::RETRY_AFTER).cloned();
+    let bytes = match axum::body::to_bytes(body, 8 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "upstream error body exceeds the size limit",
+            );
+        }
+    };
+    let message = error_message_from_json_bytes(&bytes).unwrap_or_default();
+    let classified = crate::retry::classify_proxy_error_status(status.as_u16(), &message);
+    if classified == status.as_u16() {
+        let mut response = Response::from_parts(parts, Body::from(bytes));
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
+    let kind = crate::retry::anthropic_error_kind_for_status(classified, &message);
+    let shown = if message.is_empty() {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        message
+    };
+    let mut response = json_error(
+        StatusCode::from_u16(classified).unwrap_or(status),
+        kind,
+        shown,
+    );
+    if let Some(value) = retry_after {
+        response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn error_message_from_json_bytes(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 async fn dispatch_request(
@@ -1441,9 +1565,14 @@ mod tests {
     use super::{
         claude_code_headers_from, derive_fallback_session_id, enable_accepted_tcp_nodelay,
         resolve_responses_session_id, resolve_session_id, session_id_from_headers,
+        wrap_anthropic_as_responses,
     };
+    use crate::anthropic::error::json_error;
     use crate::anthropic::schema::MessagesRequest;
+    use axum::body::Body;
+    use axum::http::{Response, StatusCode};
     use serde_json::json;
+    use std::time::Duration;
     use tokio::net::TcpListener;
 
     fn body_from(value: serde_json::Value) -> MessagesRequest {
@@ -1678,6 +1807,220 @@ mod tests {
         assert_eq!(
             resolved.session_id, again.session_id,
             "later /v1/responses turns must reuse the same live slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_json_502_unpaid_invoice_becomes_429() {
+        let response = json_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice. [resource_exhausted]",
+        );
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(wrapped.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unpaid invoice"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_rate_limit_sse_becomes_http_429() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"cursor-grok-4.5-high-fast\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice. [resource_exhausted]\"}}\n\n",
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(
+            wrapped.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "grok-build treats streamed server_error as HTTP 500 'our side'"
+        );
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unpaid invoice"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_json_502_geo_block_becomes_403() {
+        let response = json_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "Connect error 502: ERROR_OPENAI: This model is not available in your country or region [internal]",
+        );
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(wrapped.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("country or region"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_json_502_unsupported_region_zh_becomes_403() {
+        let response = json_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "Connect error 502: 不支持的国家/区域 [internal]",
+        );
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(wrapped.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("不支持的国家/区域"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_geo_sse_becomes_http_403() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"cursor-grok-4.5-high-fast\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Connect error 502: This model is not available in your country or region [internal]\"}}\n\n",
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(wrapped.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("country or region"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_delayed_geo_sse_becomes_http_403() {
+        let first = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"cursor-grok-4.5-high-fast\"}}\n\n";
+        let second = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Connect error 502: This model is not available in your country or region [internal]\"}}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
+        tokio::spawn(async move {
+            let _ = tx.send(bytes::Bytes::from(first)).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = tx.send(bytes::Bytes::from(second)).await;
+        });
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(
+            wrapped.status(),
+            StatusCode::FORBIDDEN,
+            "pre-output geo errors after message_start must still become HTTP 403, not streamed 200"
+        );
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("country or region"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preserves_retry_after_when_status_stays_429() {
+        let response = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::RETRY_AFTER, "7")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have an unpaid invoice"}}"#,
+            ))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(wrapped.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            wrapped
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("7"),
+            "grok-build honors Retry-After on 429"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preserves_retry_after_when_502_invoice_becomes_429() {
+        let response = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::RETRY_AFTER, "5")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"api_error","message":"Connect error 429: You have an unpaid invoice"}}"#,
+            ))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(wrapped.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            wrapped
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
         );
     }
 }
