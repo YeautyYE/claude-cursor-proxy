@@ -5,7 +5,10 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 
 ## v0.1.46 (2026-08-17)
 
-- grok-build / Grok CLI: remap Cursor native Shell/Task/Read/WebSearch onto exact grok-build client names (`run_terminal_command`, `spawn_subagent`, …), keep `/v1/responses` live sessions from looping, and recover dead Cursor runs in-request.
+- grok-build / Grok CLI is a first-class client over OpenAI Responses (`/v1/responses`).
+- Cursor native Shell/Task/Read/WebSearch are remapped onto exact grok-build client names (`run_terminal_command`, `spawn_subagent`, …).
+- Live session recovery so grok-build does not loop on `mcp_claude-local_*` / 409 / 502; dead Cursor runs recover in-request.
+- Advertise those grok-build names on the MCP catalog (Fable only invokes MCP), steal `mcp_claude-local_*` back, reject foreign spoofs, and map `subagent_type` model slugs to general-purpose.
 
 ## v0.1.45 (2026-08-14)
 
