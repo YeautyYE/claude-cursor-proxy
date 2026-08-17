@@ -279,6 +279,7 @@ claude-cursor-proxy cursor auth status
 | 工具调用重复 | 加上 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
 | `/deep-research` 只用 Bash/curl | 升级代理；transcript 应有 `Workflow`；必要时 `enableWorkflows: true` |
 | 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| grok-build 在未付款账单或不支持的国家/区域时报 `Server error (500) - Something went wrong on our side` | 升级到 ≥0.1.47 并重启 serve。未付款是 HTTP 429 并带发票原文；地区限制是 HTTP 403 并带国家/区域原文。 |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 后台工具结果恢复前出现 `Stream idle timeout - no chunks received` | 升级到 ≥0.1.45 并重启 serve。live 工具结果在 HTTP 响应前的分类等待由 30 秒缩短到最多 5 秒；HTTP SSE 建立后仍会每 15 秒发送 Anthropic ping，保护长时间静默思考。 |
 | 纯文本回合却 502 `Image not found [internal]` | 升级到 ≥0.1.40 并重启 serve，然后把同一条消息再发一次（该错误会清掉带过期图片 id 的 conversation checkpoint）。新开一个 Claude Code session 也可以。 |

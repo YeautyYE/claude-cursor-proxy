@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.47 (2026-08-17)
+
+- Pass Cursor billing and geo/policy failures through as HTTP 429/403 instead of grok-build's generic 500 "our side". Unpaid-invoice text stays on 429, unsupported country/region text stays on 403, and `/v1/responses` holds the stream peek until a pre-output 4xx can be returned as JSON.
+
 ## v0.1.46 (2026-08-17)
 
 - grok-build / Grok CLI is a first-class client over OpenAI Responses (`/v1/responses`).
