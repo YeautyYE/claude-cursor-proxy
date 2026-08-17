@@ -24,7 +24,44 @@ async fn bind_error_names_address_and_port() {
         .to_string();
 
     assert!(err.contains(&format!("127.0.0.1:{port}")));
-    assert!(err.contains("failed to bind proxy listener"));
+    assert!(
+        err.contains("already in use") || err.contains("failed to bind proxy listener"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn wildcard_listener_blocks_loopback_bind() {
+    let occupied = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = occupied.local_addr().unwrap().port();
+
+    let err = bind_proxy_listener("127.0.0.1", port)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("already in use"),
+        "0.0.0.0 and 127.0.0.1 must not silently share a port: {err}"
+    );
+    assert!(err.contains(&port.to_string()), "{err}");
+}
+
+#[tokio::test]
+async fn loopback_listener_blocks_wildcard_bind() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = occupied.local_addr().unwrap().port();
+
+    let err = bind_proxy_listener("0.0.0.0", port)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("already in use"),
+        "127.0.0.1 and 0.0.0.0 must not silently share a port: {err}"
+    );
+    assert!(err.contains(&port.to_string()), "{err}");
 }
 
 #[tokio::test]

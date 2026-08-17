@@ -26,9 +26,10 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static PROCESS_STARTED_AT: LazyLock<String> = LazyLock::new(|| jiff::Timestamp::now().to_string());
 use tokio::net::TcpListener;
@@ -59,14 +60,53 @@ async fn serve_inner(
     serve_listener(listener, config.monitor, shutdown).await
 }
 
+const PORT_CONFLICT_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
 pub async fn bind_proxy_listener(bind_address: &str, port: u16) -> anyhow::Result<TcpListener> {
     let ip = bind_address
-        .parse::<std::net::IpAddr>()
+        .parse::<IpAddr>()
         .map_err(|err| anyhow::anyhow!("invalid proxy bind address {bind_address:?}: {err}"))?;
-    let addr = std::net::SocketAddr::new(ip, port);
+    let addr = SocketAddr::new(ip, port);
+    if port != 0 {
+        if let Some(conflict) = probe_port_already_accepts(addr) {
+            anyhow::bail!(
+                "failed to bind proxy listener on {addr}: port {port} is already in use on {conflict}; \
+                 another process is listening. macOS can bind 127.0.0.1:{port} and 0.0.0.0:{port} at the same time, \
+                 which splits client traffic — refusing to start a second serve"
+            );
+        }
+    }
     TcpListener::bind(addr)
         .await
         .map_err(|err| anyhow::anyhow!("failed to bind proxy listener on {addr}: {err}"))
+}
+
+fn probe_port_already_accepts(addr: SocketAddr) -> Option<SocketAddr> {
+    port_conflict_probe_addrs(addr)
+        .into_iter()
+        .find(|probe| TcpStream::connect_timeout(probe, PORT_CONFLICT_PROBE_TIMEOUT).is_ok())
+}
+
+fn port_conflict_probe_addrs(addr: SocketAddr) -> Vec<SocketAddr> {
+    let port = addr.port();
+    let mut addrs = Vec::new();
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            if !ip.is_unspecified() {
+                addrs.push(addr);
+            }
+            addrs.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        }
+        IpAddr::V6(ip) => {
+            if !ip.is_unspecified() {
+                addrs.push(addr);
+            }
+            addrs.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+        }
+    }
+    addrs.sort();
+    addrs.dedup();
+    addrs
 }
 
 pub async fn serve_listener(
@@ -307,14 +347,35 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
             );
         }
     };
-    let session_id = session_id_from_headers(&headers).or_else(|| {
-        headers
-            .get("x-grok-session-id")
-            .or_else(|| headers.get("x-grok-conv-id"))
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    });
+    log.info(
+        "request",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), json!(&req_id)),
+            ("method".to_string(), json!("POST")),
+            ("path".to_string(), json!("/v1/responses")),
+            ("query".to_string(), json!({})),
+        ])),
+    );
+    let converted = crate::openai::responses_to_messages(&value);
+    let resolved_session = resolve_responses_session_id(&headers, &value, converted.as_ref().ok());
+    if resolved_session.fallback {
+        log.info(
+            "session_id_fallback",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("sessionId".to_string(), json!(&resolved_session.session_id)),
+                (
+                    "reason".to_string(),
+                    json!("missing X-Claude-Code-Session-Id"),
+                ),
+                (
+                    "hasPromptCacheKey".to_string(),
+                    json!(responses_session_id_from_body(&value).is_some()),
+                ),
+            ])),
+        );
+    }
+    let session_id = Some(resolved_session.session_id);
     start_request_monitor(
         state.monitor.as_ref(),
         &req_id,
@@ -347,7 +408,7 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
             .handle_responses_raw(&body_bytes, normalized_model.clone(), context, &headers)
             .await
     } else {
-        let mut messages = match crate::openai::responses_to_messages(&value) {
+        let mut messages = match converted {
             Ok(messages) => messages,
             Err(error) => {
                 let response = json_error(
@@ -1168,11 +1229,14 @@ fn start_request_monitor(
     }
 }
 
-/// Claude Code 2.1.193 (`cli.js`) and installed 2.1.211 (`claude.exe`) both send
-/// `X-Claude-Code-Session-Id` on Anthropic requests. HTTP header names are
-/// case-insensitive (`x-claude-code-session-id` matches). Keep this list so a
-/// future rename can be accepted alongside the current name.
-const CLAUDE_SESSION_ID_HEADERS: &[&str] = &["x-claude-code-session-id"];
+/// Claude Code sends `X-Claude-Code-Session-Id`. grok-build's Messages client
+/// sends `x-grok-session-id` / `x-grok-conv-id` instead. Without those, every
+/// grok chat hashed to the same fallback live slot and 409'd each other.
+const CLAUDE_SESSION_ID_HEADERS: &[&str] = &[
+    "x-claude-code-session-id",
+    "x-grok-session-id",
+    "x-grok-conv-id",
+];
 
 struct ResolvedSessionId {
     session_id: String,
@@ -1204,6 +1268,46 @@ fn resolve_session_id(
     ResolvedSessionId {
         session_id: derive_fallback_session_id(body),
         fallback: true,
+    }
+}
+
+/// grok-build's Responses client puts `x_grok_conv_id` on `prompt_cache_key`
+/// even when the `x-grok-*` headers are empty. Without a session, Cursor
+/// skips live BiDi (`no_session`), XML/tool steal never runs, and the model
+/// narrates the same "restore native tools / fan-out" turn until grok retries.
+fn responses_session_id_from_body(body: &Value) -> Option<String> {
+    body.get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn resolve_responses_session_id(
+    headers: &http::HeaderMap,
+    body: &Value,
+    messages: Option<&MessagesRequest>,
+) -> ResolvedSessionId {
+    if let Some(session_id) =
+        session_id_from_headers(headers).or_else(|| responses_session_id_from_body(body))
+    {
+        return ResolvedSessionId {
+            session_id,
+            fallback: false,
+        };
+    }
+    match messages {
+        Some(messages) => resolve_session_id(None, messages),
+        None => ResolvedSessionId {
+            session_id: derive_fallback_session_id(&MessagesRequest {
+                model: crate::openai::responses_model(body),
+                max_tokens: None,
+                messages: Vec::new(),
+                stream: true,
+                extra: Map::new(),
+            }),
+            fallback: true,
+        },
     }
 }
 
@@ -1336,7 +1440,7 @@ fn set_mode(path: &Path, mode: u32) {
 mod tests {
     use super::{
         claude_code_headers_from, derive_fallback_session_id, enable_accepted_tcp_nodelay,
-        resolve_session_id, session_id_from_headers,
+        resolve_responses_session_id, resolve_session_id, session_id_from_headers,
     };
     use crate::anthropic::schema::MessagesRequest;
     use serde_json::json;
@@ -1384,6 +1488,45 @@ mod tests {
             session_id_from_headers(&lower).as_deref(),
             Some("sess-lower")
         );
+    }
+
+    #[test]
+    fn session_id_reads_grok_build_headers_before_fallback() {
+        let mut session = http::HeaderMap::new();
+        session.insert("x-grok-session-id", "grok-sess-1".parse().unwrap());
+        assert_eq!(
+            session_id_from_headers(&session).as_deref(),
+            Some("grok-sess-1")
+        );
+
+        let mut conv = http::HeaderMap::new();
+        conv.insert("x-grok-conv-id", "grok-conv-9".parse().unwrap());
+        assert_eq!(
+            session_id_from_headers(&conv).as_deref(),
+            Some("grok-conv-9")
+        );
+
+        let mut both = http::HeaderMap::new();
+        both.insert("x-grok-session-id", "grok-sess-1".parse().unwrap());
+        both.insert("x-grok-conv-id", "grok-conv-9".parse().unwrap());
+        assert_eq!(
+            session_id_from_headers(&both).as_deref(),
+            Some("grok-sess-1"),
+            "session id is more stable than conv id across tool turns"
+        );
+
+        let mut claude_wins = http::HeaderMap::new();
+        claude_wins.insert("x-claude-code-session-id", "claude-sess".parse().unwrap());
+        claude_wins.insert("x-grok-session-id", "grok-sess-1".parse().unwrap());
+        assert_eq!(
+            session_id_from_headers(&claude_wins).as_deref(),
+            Some("claude-sess")
+        );
+
+        let body = fallback_body("user-1", "/tmp/proj", "hello");
+        let resolved = resolve_session_id(session_id_from_headers(&session), &body);
+        assert_eq!(resolved.session_id, "grok-sess-1");
+        assert!(!resolved.fallback);
     }
 
     #[test]
@@ -1481,5 +1624,60 @@ mod tests {
         let resolved = resolve_session_id(None, &empty);
         assert!(resolved.fallback);
         assert!(!resolved.session_id.is_empty());
+    }
+
+    #[test]
+    fn responses_session_uses_grok_header_when_present() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-grok-session-id", "grok-sess-live".parse().unwrap());
+        let body = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "input": "hello",
+            "prompt_cache_key": "conv-should-lose"
+        });
+        let messages = crate::openai::responses_to_messages(&body).unwrap();
+        let resolved = resolve_responses_session_id(&headers, &body, Some(&messages));
+        assert_eq!(resolved.session_id, "grok-sess-live");
+        assert!(!resolved.fallback);
+    }
+
+    #[test]
+    fn responses_session_uses_prompt_cache_key_when_headers_missing() {
+        let headers = http::HeaderMap::new();
+        let body = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "input": "hello",
+            "prompt_cache_key": "conv-from-body"
+        });
+        let messages = crate::openai::responses_to_messages(&body).unwrap();
+        let resolved = resolve_responses_session_id(&headers, &body, Some(&messages));
+        assert_eq!(
+            resolved.session_id, "conv-from-body",
+            "/v1/responses must keep live BiDi when grok-build only puts conv id in prompt_cache_key"
+        );
+        assert!(!resolved.fallback);
+    }
+
+    #[test]
+    fn responses_session_always_assigns_id_when_headers_and_cache_key_missing() {
+        let headers = http::HeaderMap::new();
+        let body = json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "instructions": "# Environment\n - Primary working directory: /tmp/carve\n",
+            "input": "hello"
+        });
+        let messages = crate::openai::responses_to_messages(&body).unwrap();
+        let resolved = resolve_responses_session_id(&headers, &body, Some(&messages));
+        assert!(
+            resolved.fallback,
+            "missing grok session headers must log a derived fallback, not skip live"
+        );
+        assert!(resolved.session_id.starts_with("ccp-fb-"));
+        assert!(!resolved.session_id.is_empty());
+        let again = resolve_responses_session_id(&headers, &body, Some(&messages));
+        assert_eq!(
+            resolved.session_id, again.session_id,
+            "later /v1/responses turns must reuse the same live slot"
+        );
     }
 }

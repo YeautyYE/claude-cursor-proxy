@@ -35,7 +35,9 @@ use super::exec_results::{
 };
 use super::http1::{self, BidiAppendSession};
 use super::native_tools::{
-    accumulate_partial_args_text, map_tool_call_started, merge_partial_args_json,
+    accumulate_partial_args_text, adapt_client_tool_input, adapt_native_task_to_spawn_subagent,
+    adapt_tool_input_for_client, advertised_name_fallbacks, map_tool_call_started,
+    merge_partial_args_json, resolve_glob_client_name,
 };
 use super::proto::{
     self, AgentClientMessage, AskQuestionArgs, AskQuestionInteractionQuery,
@@ -48,6 +50,7 @@ use super::proto::{
 };
 use super::request::{
     CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_tool_name,
+    is_grok_build_subagent_lifecycle_tool, normalize_grok_build_lifecycle_name,
     strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
@@ -587,7 +590,9 @@ impl PendingExecState {
         // Bind every downstream id to this live Run. Cursor ids (including
         // fallback `exec_N` ids) may repeat after a replacement Run starts;
         // without this suffix, a delayed result from the old Run could resume
-        // a same-named exec in the replacement.
+        // a same-named exec in the replacement. Collapse newlines first so
+        // grok-build's `[A-Za-z0-9_-]` sanitizer keeps a single matchable token.
+        exec.tool_use_id = exec.tool_use_id.replace(['\n', '\r'], "_");
         if let Some(generation) = self.run_generation.as_deref() {
             exec.tool_use_id = format!("{}__cursor_run_{generation}", exec.tool_use_id);
         }
@@ -1239,12 +1244,7 @@ impl LiveRunRegistry {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         match runs.runs.get(&key) {
-            Some(LiveRunEntry::Running(handle))
-                if !handle.is_completed()
-                    && !handle.is_cancel_requested()
-                    && !handle.has_terminal_error()
-                    && handle.run_id() == expected_run_id =>
-            {
+            Some(LiveRunEntry::Running(handle)) if handle.run_id() == expected_run_id => {
                 let handle = Arc::clone(handle);
                 runs.remove_key(&key);
                 match Self::reserve_key(&mut runs, key.clone()) {
@@ -1258,12 +1258,19 @@ impl LiveRunRegistry {
                     }
                 }
             }
-            Some(
-                LiveRunEntry::Starting { .. }
-                | LiveRunEntry::Ambiguous { .. }
-                | LiveRunEntry::Succeeded { .. }
-                | LiveRunEntry::Running(_),
-            ) => LiveReplacementClaim::Conflict,
+            Some(LiveRunEntry::Succeeded { .. } | LiveRunEntry::Ambiguous { .. }) => {
+                runs.remove_key(&key);
+                match Self::reserve_key(&mut runs, key) {
+                    Some(reservation) => LiveReplacementClaim::Reserved {
+                        reservation,
+                        superseded: None,
+                    },
+                    None => LiveReplacementClaim::Conflict,
+                }
+            }
+            Some(LiveRunEntry::Starting { .. } | LiveRunEntry::Running(_)) => {
+                LiveReplacementClaim::Conflict
+            }
             None => match Self::reserve_key(&mut runs, key) {
                 Some(reservation) => LiveReplacementClaim::Reserved {
                     reservation,
@@ -1274,6 +1281,70 @@ impl LiveRunRegistry {
         }
     }
 
+    /// After the nested wait, a fresh compact/next-turn may take a slot that
+    /// has no runnable handle (Starting / Succeeded / Ambiguous). A still-
+    /// Running occupant must use [`Self::claim_replacement_for_run`].
+    pub fn claim_replacement_for_occupied_slot(
+        session_id: &str,
+        agent_id: Option<&str>,
+    ) -> LiveReplacementClaim {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(_)) => LiveReplacementClaim::Conflict,
+            Some(LiveRunEntry::Starting { cancel, .. }) => {
+                let _ = cancel.send_replace(true);
+                runs.remove_key(&key);
+                match Self::reserve_key(&mut runs, key) {
+                    Some(reservation) => LiveReplacementClaim::Reserved {
+                        reservation,
+                        superseded: None,
+                    },
+                    None => LiveReplacementClaim::Conflict,
+                }
+            }
+            Some(LiveRunEntry::Succeeded { .. } | LiveRunEntry::Ambiguous { .. }) => {
+                runs.remove_key(&key);
+                match Self::reserve_key(&mut runs, key) {
+                    Some(reservation) => LiveReplacementClaim::Reserved {
+                        reservation,
+                        superseded: None,
+                    },
+                    None => LiveReplacementClaim::Conflict,
+                }
+            }
+            None => match Self::reserve_key(&mut runs, key) {
+                Some(reservation) => LiveReplacementClaim::Reserved {
+                    reservation,
+                    superseded: None,
+                },
+                None => LiveReplacementClaim::Conflict,
+            },
+        }
+    }
+}
+
+/// After a generation-bound replacement claim, decide whether a failed
+/// `cancel_and_wait` may keep the Starting reservation.
+///
+/// `SupersedeRunning` already decided the old BiDi cannot be resumed. Keeping
+/// the reservation lets the next Anthropic/grok turn start a replacement Run
+/// (tool results become history). Restoring the dying handle and returning 409
+/// strands grok-build, which treats 409 as non-retryable.
+pub(crate) fn finish_replacement_after_cancel(
+    reservation: LiveRunReservation,
+    _handle: Arc<CursorLiveRunHandle>,
+    _has_current_tool_results: bool,
+    cancel_result: Result<(), CursorError>,
+) -> Result<LiveRunReservation, CursorError> {
+    match cancel_result {
+        Ok(()) => Ok(reservation),
+        Err(_error) => Ok(reservation),
+    }
+}
+
+impl LiveRunRegistry {
     fn reserve_key(runs: &mut LiveRunMap, key: String) -> Option<LiveRunReservation> {
         if runs.runs.contains_key(&key) {
             return None;
@@ -1414,6 +1485,18 @@ impl LiveRunRegistry {
         }
     }
 
+    /// Run id of a `Running` occupant, including handles `get_run` hides
+    /// (cancel already requested). Starting / Ambiguous / Succeeded have no id.
+    pub fn running_generation(session_id: &str, agent_id: Option<&str>) -> Option<String> {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(handle)) => Some(handle.run_id().to_string()),
+            _ => None,
+        }
+    }
+
     /// True while a reservation or live handle owns this Claude session slot
     /// (no agent id). Nested occupancy is [`Self::is_occupied_run`].
     pub fn is_occupied(session_id: &str) -> bool {
@@ -1439,7 +1522,7 @@ impl LiveRunRegistry {
             _ => None,
         };
         if let Some(error) = error {
-            if terminal_error_allows_fresh_retry(&error) {
+            if terminal_error_clears_live_slot(&error) {
                 runs.remove_key(&key);
                 return LiveRunProbe::Free;
             }
@@ -1483,6 +1566,22 @@ impl LiveRunRegistry {
             runs.runs.get(&key),
             Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until
         )
+    }
+
+    /// Clear an Ambiguous tombstone for a next-turn POST (compact / new
+    /// inference). Starting reservations and Running handles are left alone so
+    /// an in-flight open cannot be aborted by a concurrent waiter.
+    pub fn take_ambiguous_tombstone(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Ambiguous { .. }) => {
+                runs.remove_key(&key);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn take_terminal_error(session_id: &str) -> Option<String> {
@@ -2696,7 +2795,7 @@ pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
         || err.message.contains("reset")
 }
 
-fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
+pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("timed out")
         || lower.contains("no progress")
@@ -2705,8 +2804,85 @@ fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
         || lower.contains("ended before the first byte")
 }
 
+/// Probe `TerminalError` that must 502 the current POST. Ambiguous accept and
+/// same-request-retryable errors must not brick grok-build's next turn.
+pub(crate) fn live_probe_error_blocks_new_run(error: &str) -> bool {
+    !live_error_is_same_request_retryable(error) && !terminal_error_is_ambiguous_accept(error)
+}
+
 fn terminal_error_allows_fresh_retry(message: &str) -> bool {
     message.contains(CONVERSATION_RESET_RETRY_NOTE)
+}
+
+fn live_error_is_resource_exhausted(message: &str) -> bool {
+    message.contains("[resource_exhausted]")
+        || message.contains("ERROR_RESOURCE_EXHAUSTED")
+        || message.contains("Connect error 429")
+        || message.contains("Cursor error 429")
+}
+
+fn terminal_error_clears_live_slot(message: &str) -> bool {
+    live_error_is_same_request_retryable(message)
+}
+
+pub(crate) fn live_error_allows_fresh_conversation(message: &str) -> bool {
+    terminal_error_allows_fresh_retry(message)
+}
+
+/// ClientOnly tools (Workflow/Skill/spawn_subagent) tear the BiDi down.
+/// Resuming them races the dying driver and 502s with
+/// "acknowledgement dropped", which grok-build retries as the same turn.
+pub(crate) fn live_pending_must_supersede(pending: &[PendingCursorExec]) -> bool {
+    !pending.is_empty()
+        && pending
+            .iter()
+            .all(|exec| matches!(exec.kind, CursorExecKind::ClientOnly))
+}
+
+/// The live driver already left the select loop (ClientOnly teardown or
+/// channel close). A 502 here becomes grok-build's "Retrying (attempt 1)"
+/// loop; the next POST must start a fresh run with tool_result history.
+pub(crate) fn live_resume_error_is_dead_driver(error: &CursorError) -> bool {
+    let message = error.message.as_str();
+    message.contains("acknowledgement dropped") || message.contains("already closed")
+}
+
+pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
+    if crate::retry::is_billing_block(message) {
+        return false;
+    }
+    if cursor_connect_error_is_missing_image(message) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("outdated_client") || lower.contains("outdated client") {
+        return false;
+    }
+    terminal_error_allows_fresh_retry(message)
+        || live_error_is_resource_exhausted(message)
+        || cursor_connect_error_is_missing_conversation_data(message)
+        || message.contains("Connect error 502")
+        || message.contains("Connect error 503")
+        || message.contains("Connect error 504")
+        || lower.contains("unable to reach the model provider")
+}
+
+pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) -> bool {
+    if crate::retry::is_billing_block(&err.message) {
+        return false;
+    }
+    if cursor_connect_error_is_missing_image(&err.message) {
+        return false;
+    }
+    crate::retry::should_retry_upstream(err.status, &err.message)
+        || live_error_is_same_request_retryable(&err.message)
+}
+
+pub(crate) fn same_request_retry_wait_ms(attempt: u32, message: &str) -> u64 {
+    if live_error_allows_fresh_conversation(message) {
+        return 0;
+    }
+    crate::retry::compute_backoff_delay(attempt, None).wait_ms
 }
 
 fn classify_outbound_send(result: Result<(), CursorError>) -> Result<bool, CursorError> {
@@ -3853,6 +4029,11 @@ async fn drive_live_run(
                             )
                             .is_err()
                         {
+                            let _ = ack.send(Err(CursorError::new(
+                                409,
+                                "Cursor live resume dispatch was cancelled before driver acceptance",
+                                None,
+                            )));
                             continue;
                         }
                         let frames = match encode_tool_result_batch(pending.awaiting(), &tool_results) {
@@ -4683,6 +4864,19 @@ async fn process_live_frame(
             }
             return expose_collected_tools(pending, pending_shared, sink).await;
         }
+        if let Some(exec) = hosted_query_client_only_exec(&query, allowed_tool_names) {
+            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                return false;
+            }
+            if !pending_has_client_only(pending, &exec) {
+                pending.queue(exec, Duration::ZERO);
+            }
+            *last_progress = Instant::now();
+            *useful = true;
+            // Do not auto-approve Cursor hosted search/fetch/plan. Expose
+            // immediately: Cursor blocks on InteractionResponse.
+            return expose_collected_tools(pending, pending_shared, sink).await;
+        }
         match encode_interaction_auto_response(&query) {
             Ok(Some(reply)) => {
                 if !send_frame_or_fail(
@@ -4790,6 +4984,7 @@ async fn process_live_frame(
             }
             return true;
         };
+        native.claude_input = adapt_tool_input_for_client(&emit_name, native.claude_input);
         native.claude_name = emit_name;
         logical_tools_waiting.resolve_exec(&native);
         pending.queue(native, tool_batch_quiet);
@@ -4897,21 +5092,6 @@ async fn process_interaction_update(
                 merge_partial_args_json(&mut mapped, args_text);
             }
             let provider = mcp_provider_identifier(&started);
-            if started
-                .tool_call
-                .as_ref()
-                .and_then(|tc| tc.web_fetch_tool_call.as_ref())
-                .is_some()
-            {
-                // Cursor-native WebFetch (ToolCall tag 37). Nested Anthropic
-                // hosted web_fetch is emulated on the Messages path; this
-                // frame is UI/exec transcript, not ClientOnly.
-                if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
-                    eprintln!(
-                        "[ccp-cursor] web_fetch_tool_call ignored (hosted web_fetch emulator covers nested Anthropic)"
-                    );
-                }
-            }
             if let Some(emit_name) =
                 client_only_anthropic_name(&mapped.name, provider, allowed_tool_names)
             {
@@ -4925,11 +5105,41 @@ async fn process_interaction_update(
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
-                exec.claude_name = emit_name;
+                exec.claude_name = emit_name.clone();
+                exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
                 pending.queue(exec, Duration::ZERO);
+                // Lifecycle MCP must not wait for turn_ended: Cursor may also
+                // try to exec `mcp_claude-local_*` as a native tool.
+                if is_grok_build_subagent_lifecycle_tool(&emit_name) {
+                    *useful = true;
+                    *last_progress = Instant::now();
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
                 if !defer_client_only_exposure {
                     return expose_collected_tools(pending, pending_shared, sink).await;
                 }
+            }
+            if mapped.name == "Task"
+                && task_nest_depth == 0
+                && let Some(emit_name) = advertised_client_task_name(allowed_tool_names)
+            {
+                // Cursor native Task (tag 19) may start a server-side child
+                // before we observe this frame. Expose immediately and drop
+                // the BiDi segment; do not wait for turn_ended.
+                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                    return false;
+                }
+                let mut exec = mcp_client_only_pending_exec(&mapped);
+                exec.claude_name = emit_name.clone();
+                exec.claude_input = if emit_name == "spawn_subagent" {
+                    adapt_native_task_to_spawn_subagent(mapped.input.clone())
+                } else {
+                    adapt_client_tool_input(&emit_name, mapped.input.clone())
+                };
+                pending.queue(exec, Duration::ZERO);
+                *useful = true;
+                *last_progress = Instant::now();
+                return expose_collected_tools(pending, pending_shared, sink).await;
             }
             if mapped.name == "AskUserQuestion"
                 && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
@@ -4948,7 +5158,11 @@ async fn process_interaction_update(
                 }
             }
             if mapped.name == "Glob"
-                && let Some(emit_name) = resolve_advertised_name("Glob", allowed_tool_names)
+                && let Some(emit_name) = resolve_glob_client_name(
+                    &mapped.input,
+                    advertised_hosted_client_name("Glob", allowed_tool_names),
+                    advertised_hosted_client_name("Bash", allowed_tool_names),
+                )
             {
                 // Official ExecServerMessage has no glob_args (0xlane agent_v1).
                 // tool_call_started is the only signal — expose as ClientOnly.
@@ -4956,13 +5170,54 @@ async fn process_interaction_update(
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
-                exec.claude_name = emit_name;
+                exec.claude_name = emit_name.clone();
+                exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
                 if !defer_client_only_exposure {
                     return expose_collected_tools(pending, pending_shared, sink).await;
                 }
+            }
+            if matches!(mapped.name.as_str(), "TodoWrite" | "TodoRead")
+                && let Some(emit_name) =
+                    advertised_hosted_client_name(&mapped.name, allowed_tool_names)
+            {
+                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                    return false;
+                }
+                let mut exec = mcp_client_only_pending_exec(&mapped);
+                exec.claude_name = emit_name.clone();
+                exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
+                pending.queue(exec, Duration::ZERO);
+                *useful = true;
+                *last_progress = Instant::now();
+                if !defer_client_only_exposure {
+                    return expose_collected_tools(pending, pending_shared, sink).await;
+                }
+            }
+            if matches!(
+                mapped.name.as_str(),
+                "WebSearch" | "WebFetch" | "CreatePlan"
+            ) && let Some(emit_name) =
+                advertised_hosted_client_name(&mapped.name, allowed_tool_names)
+            {
+                // Cursor hosted search/fetch/plan stay on Cursor unless we
+                // steal them here. grok-build has web_search / web_fetch /
+                // enter_plan_mode; Claude Code has WebSearch / WebFetch /
+                // CreatePlan. Expose immediately like Task: Cursor then
+                // sends InteractionQuery and would otherwise block until we
+                // auto-approve the hosted path.
+                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                    return false;
+                }
+                let mut exec = mcp_client_only_pending_exec(&mapped);
+                exec.claude_name = emit_name.clone();
+                exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
+                pending.queue(exec, Duration::ZERO);
+                *useful = true;
+                *last_progress = Instant::now();
+                return expose_collected_tools(pending, pending_shared, sink).await;
             }
         }
         // Native UI transcript only. Execution is driven by ExecServerMessage,
@@ -5027,7 +5282,8 @@ async fn process_interaction_update(
                         client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
                     {
                         let mut exec = client_only_pending_exec(&tool_use);
-                        exec.claude_name = emit_name;
+                        exec.claude_name = emit_name.clone();
+                        exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
                         // Direct frame tests expose immediately. The live
                         // driver defers until turn_ended/END/EOF so a trailing
                         // END error cannot be bypassed by closing the sink.
@@ -5405,7 +5661,8 @@ async fn flush_xml_tool_uses(
                     client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
                 {
                     let mut exec = client_only_pending_exec(&tool_use);
-                    exec.claude_name = emit_name;
+                    exec.claude_name = emit_name.clone();
+                    exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
                     pending.queue(exec, Duration::ZERO);
                     exposed_client_only = true;
                 } else if !tool_use.name.is_empty() {
@@ -5469,18 +5726,41 @@ fn mcp_provider_identifier(started: &super::proto::ToolCallStarted) -> &str {
         .unwrap_or("")
 }
 
-fn qualified_mcp_provider(name: &str) -> Option<&str> {
-    name.split_once('/')
-        .or_else(|| name.split_once(':'))
-        .and_then(|(provider, tool)| {
-            (!provider.is_empty() && !tool.is_empty() && !tool.contains('/') && !tool.contains(':'))
-                .then_some(provider)
-        })
-}
-
 /// Decide whether an MCP/XML tool should be ClientOnly, and which Anthropic
 /// `tool_use.name` to emit. Cursor may send `claude-local/Workflow` while Claude
 /// Code advertised `Workflow`.
+/// grok-build: exact `spawn_subagent`. Claude Code: `Agent`, then legacy `Task`.
+/// Lowercase `task` is an alias only — never emit it (grok dispatch is exact).
+fn advertised_client_task_name(allowed: Option<&BTreeSet<String>>) -> Option<String> {
+    let allowed = allowed?;
+    if allowed.contains("spawn_subagent") {
+        return Some("spawn_subagent".to_string());
+    }
+    if allowed.contains("Agent") {
+        return Some("Agent".to_string());
+    }
+    if allowed.contains("Task") {
+        return Some("Task".to_string());
+    }
+    None
+}
+
+fn lifecycle_client_only_name(
+    mapped_name: &str,
+    provider_identifier: &str,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    let allowed = allowed?;
+    let exact = normalize_grok_build_lifecycle_name(mapped_name)?;
+    if !allowed.contains(exact) {
+        return None;
+    }
+    if !provider_identifier.is_empty() && provider_identifier != CLAUDE_LOCAL_MCP_PROVIDER {
+        return None;
+    }
+    Some(exact.to_string())
+}
+
 fn client_only_anthropic_name(
     mapped_name: &str,
     provider_identifier: &str,
@@ -5490,28 +5770,31 @@ fn client_only_anthropic_name(
     if stripped.is_empty() {
         return None;
     }
+    if normalize_grok_build_lifecycle_name(mapped_name).is_some()
+        || normalize_grok_build_lifecycle_name(stripped).is_some()
+    {
+        return lifecycle_client_only_name(mapped_name, provider_identifier, allowed);
+    }
+    // Cursor native Task is translated only by advertised_client_task_name.
+    // Claude Task / internal aliases must not become ClientOnly via this path.
+    if matches!(mapped_name, "Task" | "task" | "Agent")
+        || matches!(stripped, "Task" | "task" | "Agent")
+    {
+        return None;
+    }
     let local = is_claude_local_tool_name(stripped)
         || (stripped != mapped_name && is_claude_local_tool_name(mapped_name));
     if !local {
         return None;
     }
 
-    let in_advertised = match allowed {
-        None => true,
-        Some(set) => set.contains(mapped_name) || set.contains(stripped),
-    };
-    let claude_local_provider = provider_identifier == CLAUDE_LOCAL_MCP_PROVIDER
-        || qualified_mcp_provider(mapped_name) == Some(CLAUDE_LOCAL_MCP_PROVIDER);
-    if !claude_local_provider && !in_advertised {
-        return None;
-    }
-
-    if let Some(set) = allowed {
-        if let Some(hit) = set.get(stripped) {
-            return Some(hit.clone());
-        }
-    }
-    Some(stripped.to_string())
+    // Missing/empty tool lists must not invent Workflow/web_search/etc.
+    // XML recovery and MCP both go through here.
+    let set = allowed.filter(|set| !set.is_empty())?;
+    // Prefix stripping is enough to match `claude-local/Workflow` to
+    // advertised `Workflow`. The provider id must not invent a tool that
+    // the downstream client never listed.
+    set.get(stripped).or_else(|| set.get(mapped_name)).cloned()
 }
 
 fn mcp_client_only_pending_exec(
@@ -5535,7 +5818,115 @@ fn mcp_client_only_pending_exec(
 }
 
 fn advertised_ask_user_question(allowed: Option<&BTreeSet<String>>) -> Option<String> {
-    resolve_advertised_name("AskUserQuestion", allowed)
+    advertised_hosted_client_name("AskUserQuestion", allowed)
+}
+
+/// Steal a Cursor hosted/native tool only when the client actually advertised
+/// an equivalent. `allowed=None` means no tool list — do not invent WebSearch
+/// / WebFetch / CreatePlan / AskUserQuestion.
+fn advertised_hosted_client_name(
+    mapped_name: &str,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    let allowed = allowed.filter(|set| !set.is_empty())?;
+    resolve_advertised_name(mapped_name, Some(allowed))
+}
+
+fn hosted_query_client_only_exec(
+    query: &InteractionQuery,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<PendingCursorExec> {
+    if let Some(search) = query.web_search_request_query.as_ref()
+        && let Some(emit_name) = advertised_hosted_client_name("WebSearch", allowed)
+    {
+        let args = search.args.as_ref();
+        let tool_use_id = args
+            .map(|a| a.tool_call_id.as_str())
+            .filter(|id| !id.is_empty())
+            .unwrap_or("web_search_query")
+            .to_string();
+        let query_text = args.map(|a| a.search_term.as_str()).unwrap_or("");
+        return Some(query_client_only_pending_exec(
+            query.id,
+            tool_use_id,
+            emit_name,
+            serde_json::json!({ "query": query_text }),
+        ));
+    }
+    if let Some(fetch) = query.web_fetch_request_query.as_ref()
+        && let Some(emit_name) = advertised_hosted_client_name("WebFetch", allowed)
+    {
+        let args = fetch.args.as_ref();
+        let tool_use_id = args
+            .map(|a| a.tool_call_id.as_str())
+            .filter(|id| !id.is_empty())
+            .unwrap_or("web_fetch_query")
+            .to_string();
+        let url = args.map(|a| a.url.as_str()).unwrap_or("");
+        return Some(query_client_only_pending_exec(
+            query.id,
+            tool_use_id,
+            emit_name,
+            serde_json::json!({ "url": url }),
+        ));
+    }
+    if let Some(plan) = query.create_plan_request_query.as_ref()
+        && let Some(emit_name) = advertised_hosted_client_name("CreatePlan", allowed)
+    {
+        let tool_use_id = if plan.tool_call_id.is_empty() {
+            "create_plan_query".to_string()
+        } else {
+            plan.tool_call_id.clone()
+        };
+        let input = plan.args.as_ref().map_or_else(
+            || serde_json::json!({}),
+            |args| {
+                serde_json::json!({
+                    "name": args.name,
+                    "overview": args.overview,
+                    "plan": args.plan,
+                    "is_project": args.is_project,
+                })
+            },
+        );
+        return Some(query_client_only_pending_exec(
+            query.id,
+            tool_use_id,
+            emit_name,
+            input,
+        ));
+    }
+    None
+}
+
+fn query_client_only_pending_exec(
+    _query_id: u32,
+    tool_use_id: String,
+    emit_name: String,
+    input: serde_json::Value,
+) -> PendingCursorExec {
+    // Same id / exec_id as tool_call_started so a later InteractionQuery
+    // does not emit a second tool_use for the same call.
+    let mapped = super::native_tools::MappedClaudeTool {
+        tool_use_id,
+        name: emit_name.clone(),
+        input: input.clone(),
+    };
+    let mut exec = mcp_client_only_pending_exec(&mapped);
+    exec.claude_name = emit_name.clone();
+    exec.claude_input = adapt_client_tool_input(&emit_name, input);
+    exec
+}
+
+fn pending_has_client_only(pending: &PendingExecState, exec: &PendingCursorExec) -> bool {
+    pending.all().any(|queued| {
+        queued.claude_name == exec.claude_name
+            || queued.tool_use_id == exec.tool_use_id
+            || queued
+                .tool_use_id
+                .starts_with(&format!("{}__cursor_run_", exec.tool_use_id))
+            || queued.exec_id == exec.exec_id
+    })
 }
 
 fn ask_user_question_pending_exec(
@@ -5886,28 +6277,13 @@ fn resolve_advertised_name(
     mapped_name: &str,
     allowed: Option<&BTreeSet<String>>,
 ) -> Option<String> {
-    let Some(allowed) = allowed else {
-        return Some(mapped_name.to_string());
-    };
+    let allowed = allowed.filter(|set| !set.is_empty())?;
     if allowed.contains(mapped_name) {
         return Some(mapped_name.to_string());
     }
-    let fallbacks: &[&str] = match mapped_name {
-        "Bash" => &["Bash", "Shell", "bash"],
-        "Read" => &["Read", "read_file", "ReadFile"],
-        // Never fall back to Edit: Claude Edit requires old_string/new_string,
-        // while Cursor Write/Edit overwrite maps to {file_path, content}.
-        "Write" => &["Write", "write_file", "WriteFile"],
-        "Grep" => &["Grep", "grep", "Search"],
-        "Glob" => &["Glob", "glob", "Find"],
-        "WebSearch" => &["WebSearch", "web_search"],
-        "WebFetch" => &["WebFetch", "web_fetch", "Fetch"],
-        "TodoWrite" => &["TodoWrite", "TodoWrite"],
-        "TodoRead" => &["TodoRead"],
-        "AskUserQuestion" => &["AskUserQuestion", "AskQuestion"],
-        "CreatePlan" => &["CreatePlan", "Plan"],
-        _ => &[],
-    };
+    // Never fall back to Edit: Claude Edit requires old_string/new_string,
+    // while Cursor Write/Edit overwrite maps to {file_path, content}.
+    let fallbacks = advertised_name_fallbacks(mapped_name);
     if let Some(name) = fallbacks
         .iter()
         .find_map(|candidate| allowed.get(*candidate).cloned())
@@ -6173,6 +6549,15 @@ fn live_sse_on_driver_drop(encoder: &CursorSseEncoder) -> Option<Vec<u8>> {
     ))
 }
 
+/// No-byte live events keep `recv()` ready. If the Anthropic ping deadline
+/// has already passed, emit that ping instead of draining another counter.
+fn sse_keepalive_after_empty_event(
+    now: tokio::time::Instant,
+    ping_deadline: tokio::time::Instant,
+) -> bool {
+    now >= ping_deadline
+}
+
 pub fn live_sse_response(
     events: mpsc::Receiver<LiveEventResult>,
     message_id: String,
@@ -6192,6 +6577,8 @@ pub fn live_sse_response(
         /// Periodic Anthropic `ping` so Claude Code's stream idle watchdog
         /// (≥300s by default) does not abort during quiet Cursor thinking.
         ping: tokio::time::Interval,
+        ping_period: Duration,
+        next_ping_at: tokio::time::Instant,
     }
 
     let mut encoder = CursorSseEncoder::new(message_id, model);
@@ -6229,6 +6616,8 @@ pub fn live_sse_response(
                 .checked_sub(MONITOR_PROGRESS_MIN_INTERVAL)
                 .unwrap_or_else(Instant::now),
             ping,
+            ping_period: Duration::from_secs(ping_secs),
+            next_ping_at: tokio::time::Instant::now() + Duration::from_secs(ping_secs),
         },
         |mut state| async move {
             loop {
@@ -6265,7 +6654,28 @@ pub fn live_sse_response(
                                 // arrive in bursts after channel backlog.
                                 apply_live_run_event(&mut state.encoder, event);
                                 let bytes = state.encoder.take_bytes();
-                                if !bytes.is_empty() {
+                                if bytes.is_empty() {
+                                    // OutputTokenDelta / usage-only events keep
+                                    // recv() ready and starve the ping arm of
+                                    // this biased select. Emit an already-due
+                                    // keepalive before draining more no-byte
+                                    // events.
+                                    if sse_keepalive_after_empty_event(
+                                        tokio::time::Instant::now(),
+                                        state.next_ping_at,
+                                    ) {
+                                        let now = tokio::time::Instant::now();
+                                        state.ping.reset();
+                                        state.next_ping_at = now + state.ping_period;
+                                        let ping = format_sse_event_bytes(
+                                            EVENT_PING,
+                                            &serde_json::json!({ "type": "ping" }),
+                                        );
+                                        return Some((Ok(Bytes::from(ping)), state));
+                                    }
+                                } else {
+                                    state.next_ping_at =
+                                        tokio::time::Instant::now() + state.ping_period;
                                     let force = state.encoder.is_finalized();
                                     publish_live_usage(
                                         &state.monitor,
@@ -6356,6 +6766,8 @@ pub fn live_sse_response(
                     _ = state.ping.tick(), if !state.encoder.is_finalized() => {
                         // Keep the Anthropic SSE byte stream alive during long
                         // quiet thinking (Cursor may only send BiDi heartbeats).
+                        state.next_ping_at =
+                            tokio::time::Instant::now() + state.ping_period;
                         let ping = format_sse_event_bytes(
                             EVENT_PING,
                             &serde_json::json!({ "type": "ping" }),
@@ -7407,6 +7819,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resource_exhausted_terminal_error_frees_the_live_slot() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("quota-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "quota-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]".into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert quota failure");
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(&session, None),
+                LiveRunProbe::Free
+            ),
+            "the next grok turn must not replay a consumed 429 as 502"
+        );
+        LiveRunRegistry::clear();
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn trailing_missing_conversation_end_overrides_prior_chunk_turn_ended() {
@@ -8112,6 +8557,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_tool_ids_collapse_newlines_before_generation_suffix() {
+        let mut state = PendingExecState::for_run("gen-1");
+        assert!(state.queue(
+            pending_exec(
+                1,
+                "call-72ee1731-4917-4d55-96f6-89841af2f48f-3\nfc_owTHooM-2dTqGa-65a125c0",
+            ),
+            Duration::ZERO
+        ));
+        assert_eq!(
+            state.expose()[0].tool_use_id,
+            "call-72ee1731-4917-4d55-96f6-89841af2f48f-3_fc_owTHooM-2dTqGa-65a125c0__cursor_run_gen-1"
+        );
+    }
+
     fn pending_client_only(id: u32, tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
             id,
@@ -8121,6 +8582,40 @@ mod tests {
             claude_input: serde_json::json!({"name": "deep-research"}),
             kind: CursorExecKind::ClientOnly,
         }
+    }
+
+    #[test]
+    fn client_only_pending_must_supersede_instead_of_resume() {
+        let client = pending_client_only(1, "spawn-1");
+        let native = pending_exec(2, "read-1");
+        assert!(
+            live_pending_must_supersede(std::slice::from_ref(&client)),
+            "ClientOnly spawn_subagent/Workflow must start a fresh run"
+        );
+        assert!(
+            !live_pending_must_supersede(std::slice::from_ref(&native)),
+            "native Read/Bash still resume the same BiDi"
+        );
+        assert!(
+            !live_pending_must_supersede(&[client, native]),
+            "a mixed batch is not a ClientOnly teardown"
+        );
+        assert!(!live_pending_must_supersede(&[]));
+    }
+
+    #[test]
+    fn dead_driver_resume_is_supersede_not_502() {
+        assert!(live_resume_error_is_dead_driver(&CursorError::internal(
+            "Cursor live resume acknowledgement dropped"
+        )));
+        assert!(live_resume_error_is_dead_driver(&CursorError::internal(
+            "Cursor live run already closed"
+        )));
+        assert!(!live_resume_error_is_dead_driver(&CursorError::new(
+            400,
+            "Cursor tool result id x is not pending",
+            None
+        )));
     }
 
     fn dummy_handle(run_id: &str) -> Arc<CursorLiveRunHandle> {
@@ -8595,7 +9090,14 @@ mod tests {
         .await
         .expect("tool-result classification must finish before downstream stream-idle");
 
-        assert!(matches!(outcome, super::super::LiveResumeOutcome::Conflict));
+        assert!(
+            matches!(
+                outcome,
+                super::super::LiveResumeOutcome::SupersedeRunning(ref run_id)
+                    if run_id == "bounded-wait-generation"
+            ),
+            "stale tool_result against an empty pending batch must take over, not 409"
+        );
         LiveRunRegistry::clear();
     }
 
@@ -8647,10 +9149,10 @@ mod tests {
         let (outcome, ()) = tokio::join!(wait, remove);
 
         match outcome {
-            super::super::LiveResumeOutcome::MissingTools(missing) => {
-                assert_eq!(missing, ["tool-b"]);
+            super::super::LiveResumeOutcome::SupersedeRunning(run_id) => {
+                assert_eq!(run_id, "partial-generation");
             }
-            _ => panic!("a partial current batch must remain a 400 after the slot disappears"),
+            _ => panic!("a partial current batch must supersede the observed generation"),
         }
         LiveRunRegistry::clear();
     }
@@ -8722,6 +9224,568 @@ mod tests {
         driver.await.expect("mock old driver");
         assert!(LiveRunRegistry::is_starting_run(&session, None));
         drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn fresh_request_supersedes_cancel_requested_generation_instead_of_409() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("dying-compact-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("dying-compact-generation");
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert dying run");
+        handle.cancel();
+        assert!(
+            LiveRunRegistry::get_run(&session, None).is_none(),
+            "get_run hides a cancel-requested handle so compact's next POST must not depend on it"
+        );
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(&session, None),
+                LiveRunProbe::Occupied
+            ),
+            "the dying handle still occupies the slot until teardown finishes"
+        );
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": "post-compact turn"}]
+            }))
+            .unwrap();
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_after_compact".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        let super::super::LiveResumeOutcome::SupersedeRunning(run_id) = outcome else {
+            panic!("a cancel-requested occupant must be superseded, not 409");
+        };
+        assert_eq!(run_id, "dying-compact-generation");
+
+        let LiveReplacementClaim::Reserved {
+            reservation,
+            superseded: Some(superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, &run_id)
+        else {
+            panic!("the observed dying generation must be claimable");
+        };
+        assert_eq!(superseded.run_id(), "dying-compact-generation");
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        reservation.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn claim_replacement_cancel_requested_is_generation_bound() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("dying-bound-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("dying-generation");
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert dying run");
+        handle.cancel();
+
+        assert!(
+            matches!(
+                LiveRunRegistry::claim_replacement_for_run(&session, None, "other-generation"),
+                LiveReplacementClaim::Conflict
+            ),
+            "a stale waiter must not take over a cancel-requested generation it did not observe"
+        );
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "a mismatched claim must leave the dying generation in place"
+        );
+
+        let LiveReplacementClaim::Reserved {
+            reservation,
+            superseded: Some(superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, "dying-generation")
+        else {
+            panic!("the matching cancel-requested generation must be replaceable");
+        };
+        assert_eq!(superseded.run_id(), "dying-generation");
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        reservation.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn fresh_request_keeps_reservation_when_cancel_is_ambiguous() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("fresh-amb-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("amb-generation");
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert");
+        let LiveReplacementClaim::Reserved {
+            mut reservation,
+            superseded: Some(superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, "amb-generation")
+        else {
+            panic!("matching generation must be claimable");
+        };
+        reservation.protect_on_drop();
+        let error = CursorError::new(
+            409,
+            "Cursor live run ended in an ambiguous upstream state; replacement blocked: acceptance is ambiguous",
+            None,
+        );
+        let kept = finish_replacement_after_cancel(reservation, superseded, false, Err(error))
+            .expect("a fresh turn must keep the Starting reservation");
+        assert!(
+            LiveRunRegistry::is_starting_run(&session, None),
+            "re-inserting the dying handle would 409 grok-build's next turn"
+        );
+        assert!(LiveRunRegistry::running_generation(&session, None).is_none());
+        kept.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn tool_result_request_keeps_reservation_when_cancel_is_ambiguous() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("tool-amb-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("amb-tool-generation");
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert");
+        let LiveReplacementClaim::Reserved {
+            mut reservation,
+            superseded: Some(superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, "amb-tool-generation")
+        else {
+            panic!("matching generation must be claimable");
+        };
+        reservation.protect_on_drop();
+        let error = CursorError::new(
+            409,
+            "Cursor live run ended in an ambiguous upstream state; replacement blocked: acceptance is ambiguous",
+            None,
+        );
+        let kept = finish_replacement_after_cancel(reservation, superseded, true, Err(error))
+            .expect("a superseded tool-result turn must keep the Starting reservation");
+        assert!(
+            LiveRunRegistry::is_starting_run(&session, None),
+            "re-inserting the dying handle 409s grok-build after compact/tool batches"
+        );
+        assert!(LiveRunRegistry::running_generation(&session, None).is_none());
+        kept.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn fresh_request_clears_ambiguous_tombstone_instead_of_409() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("amb-tombstone-compact-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
+        assert!(LiveRunRegistry::is_ambiguous_run(&session, None));
+        assert!(
+            LiveRunRegistry::reserve(&session).is_none(),
+            "untouched Ambiguous must still block reserve / same-request open"
+        );
+
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": "post-compact turn"}]
+            }))
+            .unwrap();
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_tombstone".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(outcome, super::super::LiveResumeOutcome::Free),
+            "compact's next POST must clear the Ambiguous tombstone, not 409 after 1.5s"
+        );
+        assert!(
+            !LiveRunRegistry::is_ambiguous_run(&session, None),
+            "the next turn must remove the tombstone so start_live can claim"
+        );
+        assert!(
+            !LiveRunRegistry::is_occupied(&session),
+            "cleared tombstone must look Free to try_claim_run"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    fn compact_turn_body() -> crate::anthropic::schema::MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Context 100% full. Compact the conversation."}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn compact_wait_does_not_409_when_running_seals_success_mid_wait() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("compact-seal-mid-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("compact-seal-generation");
+        handle.set_request_fingerprint(1);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert running");
+        let body = compact_turn_body();
+        let sealer = async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            handle.completed.store(true, Ordering::Release);
+            LiveRunRegistry::seal_success_if(&session, "compact-seal-generation");
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_compact_seal".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, sealer);
+        assert!(
+            !matches!(outcome, super::super::LiveResumeOutcome::Conflict),
+            "compact must not 409 after the prior generation seals Succeeded mid-wait"
+        );
+        if let super::super::LiveResumeOutcome::SupersedeRunning(run_id) = &outcome {
+            assert_eq!(run_id, "compact-seal-generation");
+            assert!(
+                !matches!(
+                    LiveRunRegistry::claim_replacement_for_run(
+                        &session,
+                        None,
+                        "compact-seal-generation"
+                    ),
+                    LiveReplacementClaim::Conflict
+                ),
+                "the sealed generation must still be claimable"
+            );
+        }
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn compact_takes_same_fingerprint_succeeded_after_nested_wait() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("compact-same-fp-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let body = compact_turn_body();
+        let fingerprint =
+            live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+        let handle = dummy_handle("same-fp-generation");
+        handle.set_request_fingerprint(fingerprint);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert");
+        LiveRunRegistry::seal_success_if(&session, "same-fp-generation");
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "same-fingerprint Succeeded must still block reserve at entry"
+        );
+        LiveRunRegistry::release_success_if_new_request(&session, None, fingerprint);
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "entry-time identical retry must keep the Succeeded tombstone"
+        );
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_same_fp".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            !matches!(outcome, super::super::LiveResumeOutcome::Conflict),
+            "after the nested wait, compact must take the same-fingerprint Succeeded tombstone"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn compact_claims_starting_slot_after_nested_wait() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("compact-starting-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        let body = compact_turn_body();
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_starting".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            !matches!(outcome, super::super::LiveResumeOutcome::Conflict),
+            "compact must not 409 a Starting occupant after the nested wait"
+        );
+        assert!(
+            !matches!(
+                LiveRunRegistry::claim_replacement_for_occupied_slot(&session, None),
+                LiveReplacementClaim::Conflict
+            ),
+            "Starting after nested wait must be claimable for a fresh compact"
+        );
+        drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn claim_replacement_reserves_when_observed_generation_already_succeeded() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("claim-succeeded-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("finished-generation");
+        handle.set_request_fingerprint(9);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert");
+        LiveRunRegistry::seal_success_if(&session, "finished-generation");
+        assert!(LiveRunRegistry::is_occupied(&session));
+
+        let LiveReplacementClaim::Reserved {
+            reservation,
+            superseded,
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, "finished-generation")
+        else {
+            panic!("an observed generation that sealed Succeeded must still be replaceable");
+        };
+        assert!(
+            superseded.is_none(),
+            "Succeeded has no live handle to cancel"
+        );
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        reservation.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn claim_occupied_slot_refuses_a_running_handle() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("claim-occupied-running-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(dummy_handle("still-running"))
+            .expect("insert");
+        assert!(
+            matches!(
+                LiveRunRegistry::claim_replacement_for_occupied_slot(&session, None),
+                LiveReplacementClaim::Conflict
+            ),
+            "a Running occupant must be claimed by observed run id, not the Starting/Succeeded path"
+        );
+        assert_eq!(
+            LiveRunRegistry::running_generation(&session, None).as_deref(),
+            Some("still-running")
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn take_ambiguous_tombstone_does_not_abort_starting() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("take-starting-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        assert!(
+            !LiveRunRegistry::take_ambiguous_tombstone(&session, None),
+            "Starting is not a tombstone"
+        );
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
+        assert!(LiveRunRegistry::take_ambiguous_tombstone(&session, None));
+        assert!(!LiveRunRegistry::is_occupied(&session));
+        assert!(!LiveRunRegistry::take_ambiguous_tombstone(&session, None));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn ambiguous_cancel_probe_error_does_not_block_new_run() {
+        assert!(
+            !live_probe_error_blocks_new_run(
+                "Cursor live cancellation interrupted an operation whose completion is unresolved; acceptance is ambiguous"
+            ),
+            "compact's next POST must not 502 an ambiguous cancel"
+        );
+        assert!(!live_probe_error_blocks_new_run(
+            "Cursor live run ended in an ambiguous upstream state; replacement blocked: acceptance is ambiguous"
+        ));
+        assert!(
+            live_probe_error_blocks_new_run("Cursor live run hard timeout"),
+            "a definitive non-retryable failure must still 502"
+        );
+        assert!(!live_probe_error_blocks_new_run(
+            "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]"
+        ));
+    }
+
+    #[test]
+    fn advertised_name_maps_bash_to_run_terminal_command() {
+        let allowed = BTreeSet::from(["run_terminal_command".to_string(), "read_file".to_string()]);
+        assert_eq!(
+            resolve_advertised_name("Bash", Some(&allowed)).as_deref(),
+            Some("run_terminal_command")
+        );
+        assert_eq!(
+            resolve_advertised_name("Read", Some(&allowed)).as_deref(),
+            Some("read_file")
+        );
+        assert!(
+            resolve_advertised_name("Write", Some(&allowed)).is_none(),
+            "unadvertised Cursor tools must still throw, not invent a name"
+        );
+        assert!(
+            resolve_advertised_name("Read", None).is_none(),
+            "allowed=None must not invent Read/Bash/Write for grok or Claude Code"
+        );
+        assert!(resolve_advertised_name("Bash", None).is_none());
+        assert!(resolve_advertised_name("Write", None).is_none());
+        assert!(resolve_advertised_name("Grep", None).is_none());
+        assert!(resolve_advertised_name("LS", None).is_none());
+        let empty = BTreeSet::new();
+        assert!(
+            resolve_advertised_name("Read", Some(&empty)).is_none(),
+            "empty allowlist is the same as missing tools"
+        );
+        let task_allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        assert_eq!(
+            resolve_advertised_name("Task", Some(&task_allowed)).as_deref(),
+            Some("spawn_subagent")
+        );
+        let grok = BTreeSet::from([
+            "run_terminal_command".to_string(),
+            "read_file".to_string(),
+            "write".to_string(),
+            "list_dir".to_string(),
+            "todo_write".to_string(),
+            "get_command_or_subagent_output".to_string(),
+        ]);
+        assert_eq!(
+            resolve_advertised_name("Write", Some(&grok)).as_deref(),
+            Some("write")
+        );
+        assert_eq!(
+            resolve_advertised_name("LS", Some(&grok)).as_deref(),
+            Some("list_dir")
+        );
+        assert_eq!(
+            resolve_advertised_name("TodoWrite", Some(&grok)).as_deref(),
+            Some("todo_write")
+        );
+        assert_eq!(
+            resolve_advertised_name("TaskOutput", Some(&grok)).as_deref(),
+            Some("get_command_or_subagent_output")
+        );
+        let canonical_task = BTreeSet::from(["task".to_string()]);
+        assert_eq!(
+            resolve_advertised_name("Task", Some(&canonical_task)).as_deref(),
+            Some("task"),
+            "grok-build canonical `task` must match Cursor native Task"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unrelated_tool_results_supersede_abandoned_pending_generation() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("unrelated-pending-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "stale-generation".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![
+                pending_exec(1, "call-f38a5db0-c948-4429-890d-d1113d2c7a36-0"),
+                pending_exec(2, "fc_owSziHw-6jKPYy-a2c1c5de7ba52d13_0"),
+            ])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert stale run");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "cursor-grok-4.6-xhigh-fast",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "fc_other_tool",
+                    "content": "from a different turn"
+                }]}]
+            }))
+            .unwrap();
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_unrelated".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                super::super::LiveResumeOutcome::SupersedeRunning(ref run_id) if run_id == "stale-generation"
+            ),
+            "unrelated tool_result ids must supersede, not 400 missing tools"
+        );
         LiveRunRegistry::clear();
     }
 
@@ -9028,15 +10092,100 @@ mod tests {
         );
         let read_only = BTreeSet::from(["Read".to_string()]);
         assert_eq!(
-            client_only_anthropic_name("claude-local/Workflow", "claude-local", Some(&read_only))
-                .as_deref(),
-            Some("Workflow"),
-            "claude-local provider still exposes Workflow when tools[].name did not match"
+            client_only_anthropic_name("claude-local/Workflow", "claude-local", Some(&read_only)),
+            None,
+            "claude-local must not invent Workflow when the client only advertised Read"
+        );
+        assert_eq!(
+            client_only_anthropic_name("web_search", "claude-local", Some(&read_only)),
+            None,
+            "claude-local must not invent web_search against an unrelated allowlist"
         );
         assert_eq!(
             client_only_anthropic_name("plugin/search", "plugin", Some(&allowed)),
             None,
             "non-claude-local qualified names stay UI transcript unless advertised"
+        );
+    }
+
+    #[test]
+    fn client_only_anthropic_name_rejects_lifecycle_spoof() {
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("spawn_subagent", "claude-local", Some(&allowed)).as_deref(),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            client_only_anthropic_name(
+                "mcp_claude-local_spawn_subagent",
+                "claude-local",
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("spawn_subagent"),
+            "Cursor MCP catalog name must become grok-build spawn_subagent"
+        );
+        assert_eq!(
+            client_only_anthropic_name(
+                "mcp__claude-local__spawn_subagent",
+                "claude-local",
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            client_only_anthropic_name(
+                "claude-local/spawn_subagent",
+                "claude-local",
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            client_only_anthropic_name("evil/spawn_subagent", "evil", Some(&allowed)),
+            None,
+            "prefix stripping must not promote a foreign MCP spawn"
+        );
+        assert_eq!(
+            client_only_anthropic_name("spawn_subagent", "evil", Some(&allowed)),
+            None,
+            "external provider cannot impersonate claude-local spawn_subagent"
+        );
+        assert_eq!(
+            client_only_anthropic_name("spawn_subagent", "claude-local", None),
+            None,
+            "allowed=None must not translate lifecycle tools"
+        );
+        assert_eq!(
+            client_only_anthropic_name("web_search", "", None),
+            None,
+            "allowed=None must not invent XML/hosted web_search"
+        );
+        assert_eq!(
+            client_only_anthropic_name("web_fetch", "claude-local", None),
+            None,
+            "allowed=None must not invent web_fetch even with claude-local provider"
+        );
+        assert_eq!(
+            client_only_anthropic_name("enter_plan_mode", "", None),
+            None
+        );
+        assert_eq!(
+            client_only_anthropic_name("Workflow", "claude-local", None),
+            None,
+            "allowed=None must not invent Workflow via MCP provider bypass"
+        );
+        let aliases = BTreeSet::from(["task".to_string(), "Agent".to_string(), "Task".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("spawn_subagent", "claude-local", Some(&aliases)),
+            None
+        );
+        assert_eq!(
+            client_only_anthropic_name("task", "claude-local", Some(&aliases)),
+            None,
+            "internal task alias is not a reserved lifecycle MCP name"
         );
     }
 
@@ -9247,6 +10396,1100 @@ mod tests {
             }
             other => panic!("expected Glob NativeToolBatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_exposes_spawn_subagent_client_only() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, TaskToolCall, TaskToolCallArgsProto, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "task-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        task_tool_call: Some(TaskToolCall {
+                            args: Some(TaskToolCallArgsProto {
+                                description: "explore live".into(),
+                                prompt: "find TaskToolCall".into(),
+                                model: None,
+                                subagent_type: "explore".into(),
+                                resume: None,
+                                run_in_background: Some(true),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        assert!(!cont, "native Task must become ClientOnly spawn_subagent");
+        let event = event_rx.recv().await.expect("NativeToolBatch");
+        match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "spawn_subagent");
+                assert_eq!(
+                    tools[0].input.get("prompt").and_then(|v| v.as_str()),
+                    Some("find TaskToolCall")
+                );
+                assert_eq!(
+                    tools[0].input.get("subagent_type").and_then(|v| v.as_str()),
+                    Some("explore")
+                );
+                assert_eq!(
+                    tools[0].input.get("background"),
+                    Some(&serde_json::json!(true))
+                );
+            }
+            other => panic!("expected spawn_subagent NativeToolBatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_stays_transcript_when_unadvertised() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, TaskToolCall, TaskToolCallArgsProto, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: None,
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "task-hidden".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        task_tool_call: Some(TaskToolCall {
+                            args: Some(TaskToolCallArgsProto {
+                                description: "hidden".into(),
+                                prompt: "must not invent".into(),
+                                model: None,
+                                subagent_type: "explore".into(),
+                                resume: None,
+                                run_in_background: None,
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+            kv_server_message: None,
+            interaction_query: None,
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["read_file".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        assert!(cont, "unadvertised Task must not invent spawn_subagent");
+        assert!(event_rx.try_recv().is_err(), "no ClientOnly batch");
+    }
+
+    fn native_task_started_frame(
+        call_id: &str,
+        prompt: &str,
+        background: Option<bool>,
+    ) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, TaskToolCall, TaskToolCallArgsProto, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: call_id.into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        task_tool_call: Some(TaskToolCall {
+                            args: Some(TaskToolCallArgsProto {
+                                description: "explore live".into(),
+                                prompt: prompt.into(),
+                                model: Some("cursor-grok4.6".into()),
+                                subagent_type: "explore".into(),
+                                resume: None,
+                                run_in_background: background,
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    fn glob_started_frame(pattern: &str, dir: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, GlobToolArgs, GlobToolCall, InteractionUpdate, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "glob-map".into(),
+                    model_call_id: "model-glob".into(),
+                    tool_call: Some(ToolCall {
+                        glob_tool_call: Some(GlobToolCall {
+                            args: Some(GlobToolArgs {
+                                glob_pattern: pattern.into(),
+                                target_directory: Some(dir.into()),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    fn todo_write_started_frame() -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, TodoItem, ToolCall, ToolCallStarted,
+            UpdateTodosArgs, UpdateTodosToolCall,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "todo-1".into(),
+                    model_call_id: "model-todo".into(),
+                    tool_call: Some(ToolCall {
+                        update_todos_tool_call: Some(UpdateTodosToolCall {
+                            args: Some(UpdateTodosArgs {
+                                todos: vec![TodoItem {
+                                    id: "1".into(),
+                                    content: "collect".into(),
+                                    status: 1,
+                                }],
+                                merge: true,
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    async fn drive_native_task_frame(
+        frame: super::super::connect::ConnectFrame,
+        allowed: Option<&BTreeSet<String>>,
+        turn_ctx: Option<&mut LiveTurnCtx<'_>>,
+    ) -> (bool, Option<Result<LiveRunEvent, String>>, PendingExecState) {
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(allowed.cloned());
+        let cont = process_live_frame(
+            frame,
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            allowed,
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            turn_ctx,
+        )
+        .await;
+        let event = event_rx.try_recv().ok();
+        (cont, event, pending)
+    }
+
+    #[tokio::test]
+    async fn glob_listing_maps_to_list_dir() {
+        let allowed = BTreeSet::from(["list_dir".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(glob_started_frame("*", "/tmp/carve"), Some(&allowed), None)
+                .await;
+        assert!(
+            !cont,
+            "listing glob must expose list_dir and end the segment"
+        );
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "list_dir");
+                assert_eq!(tools[0].input["target_directory"], "/tmp/carve");
+                assert!(tools[0].input.get("pattern").is_none());
+            }
+            other => panic!("expected list_dir, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_pattern_maps_to_shell_not_list_dir() {
+        let allowed = BTreeSet::from(["list_dir".to_string(), "run_terminal_command".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(glob_started_frame("**/*.rs", "src"), Some(&allowed), None)
+                .await;
+        assert!(!cont);
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "run_terminal_command");
+                assert_eq!(
+                    tools[0].input["command"].as_str(),
+                    Some("rg --files -g '**/*.rs' -- 'src'")
+                );
+                assert!(
+                    tools[0].input["description"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                );
+            }
+            other => panic!("expected run_terminal_command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_write_started_exposes_claude_todowrite_schema() {
+        let allowed = BTreeSet::from(["TodoWrite".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(todo_write_started_frame(), Some(&allowed), None).await;
+        assert!(!cont, "TodoWrite must expose as ClientOnly");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "TodoWrite");
+                assert_eq!(tools[0].input["todos"][0]["content"], "collect");
+                assert_eq!(
+                    tools[0].input["todos"][0]["activeForm"],
+                    "Working on collect"
+                );
+                assert!(tools[0].input.get("merge").is_none());
+            }
+            other => panic!("expected TodoWrite, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_write_started_exposes_todo_write() {
+        let allowed = BTreeSet::from(["todo_write".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(todo_write_started_frame(), Some(&allowed), None).await;
+        assert!(!cont, "TodoWrite must expose as ClientOnly");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "todo_write");
+                assert_eq!(tools[0].input["todos"][0]["content"], "collect");
+                assert_eq!(tools[0].input["merge"], true);
+            }
+            other => panic!("expected todo_write, got {other:?}"),
+        }
+    }
+
+    fn web_search_started_frame(term: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, ToolCall, ToolCallStarted, WebSearchArgs,
+            WebSearchToolCall,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "ws-1".into(),
+                    model_call_id: "model-ws".into(),
+                    tool_call: Some(ToolCall {
+                        web_search_tool_call: Some(WebSearchToolCall {
+                            args: Some(WebSearchArgs {
+                                search_term: term.into(),
+                                tool_call_id: "ws-1".into(),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    fn web_fetch_started_frame(url: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, FetchArgs, InteractionUpdate, ToolCall, ToolCallStarted,
+            WebFetchToolCall,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "wf-37".into(),
+                    model_call_id: "model-wf".into(),
+                    tool_call: Some(ToolCall {
+                        web_fetch_tool_call: Some(WebFetchToolCall {
+                            args: Some(FetchArgs {
+                                url: url.into(),
+                                tool_call_id: "wf-37".into(),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    fn create_plan_started_frame() -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, CreatePlanArgs, CreatePlanToolCall, InteractionUpdate, ToolCall,
+            ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "plan-1".into(),
+                    model_call_id: "model-plan".into(),
+                    tool_call: Some(ToolCall {
+                        create_plan_tool_call: Some(CreatePlanToolCall {
+                            args: Some(CreatePlanArgs {
+                                name: "carve".into(),
+                                overview: "prep".into(),
+                                plan: "step 1".into(),
+                                is_project: false,
+                                todos: vec![],
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    fn read_exec_frame(path: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use prost::Message;
+
+        let mut full = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_message: Some(ExecServerMessage {
+                id: 21,
+                exec_id: Some("exec-read".into()),
+                read_args: Some(ExecReadArgs {
+                    path: path.into(),
+                    tool_call_id: "read-1".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_read_none_allowed_throws_instead_of_inventing() {
+        let (cont, event, pending) =
+            drive_native_task_frame(read_exec_frame("/tmp/x"), None, None).await;
+        assert!(
+            cont,
+            "unadvertised native Read must throw and keep the stream"
+        );
+        assert!(event.is_none(), "must not invent a client Read: {event:?}");
+        assert!(
+            pending.is_empty(),
+            "must not queue invented Read: {pending:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_started_none_allowed_stays_transcript() {
+        let (cont, event, pending) =
+            drive_native_task_frame(web_search_started_frame("rust async"), None, None).await;
+        assert!(cont, "allowed=None must not invent web_search");
+        assert!(event.is_none(), "no ClientOnly batch: {event:?}");
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_search_started_exposes_web_search() {
+        let allowed = BTreeSet::from(["web_search".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(web_search_started_frame("rust async"), Some(&allowed), None)
+                .await;
+        assert!(!cont, "WebSearch must not stay on Cursor hosted search");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "web_search");
+                assert_eq!(tools[0].input["query"], "rust async");
+                assert!(tools[0].input.get("search_term").is_none());
+            }
+            other => panic!("expected web_search, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_tag37_exposes_claude_webfetch_with_prompt() {
+        let allowed = BTreeSet::from(["WebFetch".to_string()]);
+        let (cont, event, _) = drive_native_task_frame(
+            web_fetch_started_frame("https://example.com/doc"),
+            Some(&allowed),
+            None,
+        )
+        .await;
+        assert!(!cont, "WebFetch tag 37 must not be ignored");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "WebFetch");
+                assert_eq!(tools[0].input["url"], "https://example.com/doc");
+                assert!(
+                    tools[0].input["prompt"]
+                        .as_str()
+                        .is_some_and(|p| !p.is_empty())
+                );
+            }
+            other => panic!("expected WebFetch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_plan_started_exposes_enter_plan_mode_for_claude_code() {
+        let allowed = BTreeSet::from(["EnterPlanMode".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(create_plan_started_frame(), Some(&allowed), None).await;
+        assert!(!cont, "CreatePlan must map to Claude Code EnterPlanMode");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "EnterPlanMode");
+                assert_eq!(tools[0].input, serde_json::json!({}));
+            }
+            other => panic!("expected EnterPlanMode, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_tag37_exposes_web_fetch() {
+        let allowed = BTreeSet::from(["web_fetch".to_string()]);
+        let (cont, event, _) = drive_native_task_frame(
+            web_fetch_started_frame("https://example.com/doc"),
+            Some(&allowed),
+            None,
+        )
+        .await;
+        assert!(!cont, "WebFetch tag 37 must not be ignored");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "web_fetch");
+                assert_eq!(tools[0].input["url"], "https://example.com/doc");
+            }
+            other => panic!("expected web_fetch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_plan_started_exposes_enter_plan_mode() {
+        let allowed = BTreeSet::from(["enter_plan_mode".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(create_plan_started_frame(), Some(&allowed), None).await;
+        assert!(!cont, "CreatePlan must not stay on Cursor plan UI");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "enter_plan_mode");
+                assert_eq!(tools[0].input, serde_json::json!({}));
+            }
+            other => panic!("expected enter_plan_mode, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_started_exposes_immediately_with_turn_ctx() {
+        let allowed = BTreeSet::from(["web_search".to_string()]);
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-ws",
+            user_prompt: "search",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+        let (cont, event, _) = drive_native_task_frame(
+            web_search_started_frame("rust async"),
+            Some(&allowed),
+            Some(&mut turn),
+        )
+        .await;
+        assert!(!cont, "hosted WebSearch must not wait for turn_ended");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "web_search");
+            }
+            other => panic!("expected web_search, got {other:?}"),
+        }
+    }
+
+    fn xml_tool_use_frame(xml: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{AgentServerMessage, InteractionUpdate, TextDelta};
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                text_delta: Some(TextDelta {
+                    text: xml.to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn xml_web_search_exposes_web_search() {
+        let allowed = BTreeSet::from(["web_search".to_string()]);
+        let xml = r#"<tool_use id="ws-xml" name="web_search">{"query":"rust async"}</tool_use>"#;
+        let (cont, event, _) =
+            drive_native_task_frame(xml_tool_use_frame(xml), Some(&allowed), None).await;
+        assert!(
+            !cont,
+            "XML web_search must be ClientOnly, not transcript text"
+        );
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "web_search");
+                assert_eq!(tools[0].input["query"], "rust async");
+            }
+            other => panic!("expected web_search from XML, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xml_web_search_none_allowed_stays_transcript() {
+        let xml = r#"<tool_use id="ws-xml" name="web_search">{"query":"rust async"}</tool_use>"#;
+        let (cont, event, pending) =
+            drive_native_task_frame(xml_tool_use_frame(xml), None, None).await;
+        assert!(
+            cont,
+            "allowed=None XML web_search must not tear down as ClientOnly"
+        );
+        assert!(
+            pending.is_empty(),
+            "must not queue invented web_search: {pending:?}"
+        );
+        match event {
+            None => {}
+            Some(Ok(LiveRunEvent::NativeToolBatch(tools))) => {
+                panic!("allowed=None must not invent a client tool: {tools:?}");
+            }
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { .. }))) => {}
+            other => panic!("unexpected event for unadvertised XML web_search: {other:?}"),
+        }
+    }
+
+    fn web_search_query_frame(term: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionQuery, WebSearchArgs, WebSearchRequestQuery,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_query: Some(InteractionQuery {
+                id: 11,
+                web_search_request_query: Some(WebSearchRequestQuery {
+                    args: Some(WebSearchArgs {
+                        search_term: term.into(),
+                        tool_call_id: "ws-q".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    async fn drive_live_frame_io(
+        frame: super::super::connect::ConnectFrame,
+        allowed: Option<&BTreeSet<String>>,
+    ) -> (
+        bool,
+        Option<Result<LiveRunEvent, String>>,
+        Option<bytes::Bytes>,
+    ) {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(allowed.cloned());
+        let cont = process_live_frame(
+            frame,
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            allowed,
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        let event = event_rx.try_recv().ok();
+        let reply = request_rx.try_recv().ok().and_then(|r| r.ok());
+        (cont, event, reply)
+    }
+
+    #[tokio::test]
+    async fn web_search_query_exposes_web_search_without_auto_approve() {
+        let allowed = BTreeSet::from(["web_search".to_string()]);
+        let (cont, event, reply) =
+            drive_live_frame_io(web_search_query_frame("rust async"), Some(&allowed)).await;
+        assert!(!cont, "advertised web_search query must tear down");
+        assert!(
+            reply.is_none(),
+            "must not auto-approve Cursor hosted search"
+        );
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "web_search");
+                assert_eq!(tools[0].input["query"], "rust async");
+                assert!(tools[0].input.get("search_term").is_none());
+            }
+            other => panic!("expected web_search, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_query_unadvertised_still_auto_approves() {
+        use prost::Message;
+
+        let allowed = BTreeSet::from(["Read".to_string()]);
+        let (cont, event, reply) =
+            drive_live_frame_io(web_search_query_frame("rust async"), Some(&allowed)).await;
+        assert!(cont, "unadvertised search stays on Cursor hosted path");
+        assert!(event.is_none(), "must not invent web_search: {event:?}");
+        let reply = reply.expect("auto-approve frame");
+        let decoded = super::super::client::decode_upstream_frames(&reply).unwrap();
+        let message = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        assert!(
+            message
+                .interaction_response
+                .as_ref()
+                .and_then(|r| r.web_search_request_response.as_ref())
+                .and_then(|r| r.approved.as_ref())
+                .is_some(),
+            "unadvertised WebSearch must still auto-approve Cursor hosted search"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_query_none_allowed_still_auto_approves() {
+        use prost::Message;
+
+        let (cont, event, reply) =
+            drive_live_frame_io(web_search_query_frame("rust async"), None).await;
+        assert!(cont, "missing tool list must not invent web_search");
+        assert!(event.is_none(), "must not invent web_search: {event:?}");
+        let reply = reply.expect("auto-approve frame");
+        let decoded = super::super::client::decode_upstream_frames(&reply).unwrap();
+        let message = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        assert!(
+            message
+                .interaction_response
+                .as_ref()
+                .and_then(|r| r.web_search_request_response.as_ref())
+                .and_then(|r| r.approved.as_ref())
+                .is_some(),
+            "allowed=None must auto-approve Cursor hosted search, not emit WebSearch"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_plan_query_exposes_enter_plan_mode() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, CreatePlanArgs, CreatePlanRequestQuery, InteractionQuery,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_query: Some(InteractionQuery {
+                id: 12,
+                create_plan_request_query: Some(CreatePlanRequestQuery {
+                    args: Some(CreatePlanArgs {
+                        name: "carve".into(),
+                        overview: "prep".into(),
+                        plan: "step 1".into(),
+                        is_project: false,
+                        todos: vec![],
+                    }),
+                    tool_call_id: "plan-q".into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frame = decoder.push(&framed).unwrap().into_iter().next().unwrap();
+        let allowed = BTreeSet::from(["enter_plan_mode".to_string()]);
+        let (cont, event, reply) = drive_live_frame_io(frame, Some(&allowed)).await;
+        assert!(!cont, "CreatePlan query must not stay on Cursor plan UI");
+        assert!(reply.is_none(), "must not auto-succeed Cursor CreatePlan");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "enter_plan_mode");
+                assert_eq!(tools[0].input, serde_json::json!({}));
+            }
+            other => panic!("expected enter_plan_mode, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_exposes_agent_for_claude_code() {
+        let frame = native_task_started_frame("task-agent", "must become Agent", Some(true));
+        let allowed = BTreeSet::from(["task".to_string(), "Agent".to_string(), "Task".to_string()]);
+        let (cont, event, _) = drive_native_task_frame(frame, Some(&allowed), None).await;
+        assert!(!cont, "Claude Code Agent must steal native Task");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "Agent");
+                assert_eq!(tools[0].input["prompt"], "must become Agent");
+                assert_eq!(tools[0].input["run_in_background"], true);
+                assert!(tools[0].input.get("resume_from").is_none());
+                assert!(tools[0].input.get("background").is_none());
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_does_not_invent_spawn_from_task_alias() {
+        let frame = native_task_started_frame("task-alias", "must not invent", Some(true));
+        let allowed = BTreeSet::from(["task".to_string()]);
+        let (cont, event, pending) = drive_native_task_frame(frame, Some(&allowed), None).await;
+        assert!(cont, "lowercase task must not authorize spawn_subagent");
+        assert!(event.is_none(), "no ClientOnly batch: {event:?}");
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_none_allowed_stays_transcript() {
+        let frame = native_task_started_frame("task-open", "must not invent", Some(true));
+        let (cont, event, pending) = drive_native_task_frame(frame, None, None).await;
+        assert!(cont, "allowed=None must not translate native Task");
+        assert!(event.is_none(), "no ClientOnly batch: {event:?}");
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_exposes_spawn_immediately_with_turn_ctx() {
+        let frame = native_task_started_frame("task-prod", "find TaskToolCall", Some(false));
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-task",
+            user_prompt: "spawn a child",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+        let (cont, event, _) =
+            drive_native_task_frame(frame, Some(&allowed), Some(&mut turn)).await;
+        assert!(!cont, "production turn_ctx must still expose and tear down");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "spawn_subagent");
+                assert_eq!(
+                    tools[0].input.get("prompt").and_then(|v| v.as_str()),
+                    Some("find TaskToolCall")
+                );
+                assert_eq!(
+                    tools[0].input.get("background"),
+                    Some(&serde_json::json!(false))
+                );
+                assert!(tools[0].input.get("model").is_none());
+                assert!(tools[0].input.get("readonly").is_none());
+            }
+            other => panic!("expected spawn_subagent NativeToolBatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_native_task_is_not_promoted_to_spawn() {
+        use super::super::proto::{
+            InteractionUpdate, TaskToolCall, TaskToolCallArgsProto, ToolCall, ToolCallStarted,
+        };
+
+        let nested = InteractionUpdate {
+            tool_call_started: Some(ToolCallStarted {
+                call_id: "nested-task".into(),
+                model_call_id: "model-2".into(),
+                tool_call: Some(ToolCall {
+                    task_tool_call: Some(TaskToolCall {
+                        args: Some(TaskToolCallArgsProto {
+                            description: "nested".into(),
+                            prompt: "child context only".into(),
+                            model: None,
+                            subagent_type: "explore".into(),
+                            resume: None,
+                            run_in_background: Some(true),
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let frame = task_nested_frame(nested);
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut logical = LogicalToolTracker::default();
+        let cont = drive_task_frame(
+            frame,
+            &outbound,
+            &mut sink,
+            &mut pending,
+            &pending_shared,
+            &mut logical,
+            &allowed,
+        )
+        .await;
+        assert!(cont, "nested Task must stay in the Cursor child transcript");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "nested Task must not emit spawn_subagent"
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
@@ -9789,6 +12032,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_cursor_catalog_spawn_name_exposes_spawn_subagent() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "mcp-spawn-1".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "mcp_claude-local_spawn_subagent".into(),
+                                tool_name: "mcp_claude-local_spawn_subagent".into(),
+                                tool_call_id: "mcp-spawn-1".into(),
+                                provider_identifier: "claude-local".into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("prompt".into(), br#""find TaskToolCall""#.to_vec());
+                                    m.insert("description".into(), br#""explore""#.to_vec());
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(frames.into_iter().next().unwrap(), Some(&allowed), None).await;
+        assert!(!cont, "catalog MCP spawn must expose and tear down");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "spawn_subagent");
+                assert_eq!(
+                    tools[0].input.get("prompt").and_then(|v| v.as_str()),
+                    Some("find TaskToolCall")
+                );
+            }
+            other => panic!("expected spawn_subagent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_spawn_protobuf_value_args_are_clean_json() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+        use prost_types::value::Kind;
+
+        fn proto_value_bytes(kind: Kind) -> Vec<u8> {
+            prost_types::Value { kind: Some(kind) }.encode_to_vec()
+        }
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "mcp-spawn-proto".into(),
+                    model_call_id: "model-proto".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "mcp_claude-local_spawn_subagent".into(),
+                                tool_name: "mcp_claude-local_spawn_subagent".into(),
+                                tool_call_id: "mcp-spawn-proto".into(),
+                                provider_identifier: "claude-local".into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert(
+                                        "description".into(),
+                                        proto_value_bytes(Kind::StringValue(
+                                            "SPAWN smoke test".into(),
+                                        )),
+                                    );
+                                    m.insert(
+                                        "prompt".into(),
+                                        proto_value_bytes(Kind::StringValue(
+                                            "Reply with exactly one line: SPAWN_OK".into(),
+                                        )),
+                                    );
+                                    m.insert(
+                                        "subagent_type".into(),
+                                        proto_value_bytes(Kind::StringValue(
+                                            "general-purpose".into(),
+                                        )),
+                                    );
+                                    m.insert(
+                                        "background".into(),
+                                        proto_value_bytes(Kind::BoolValue(true)),
+                                    );
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let (cont, event, _) =
+            drive_native_task_frame(frames.into_iter().next().unwrap(), Some(&allowed), None).await;
+        assert!(!cont, "protobuf MCP spawn must expose and tear down");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "spawn_subagent");
+                assert_eq!(
+                    tools[0].input.get("description").and_then(|v| v.as_str()),
+                    Some("SPAWN smoke test")
+                );
+                assert_eq!(
+                    tools[0].input.get("prompt").and_then(|v| v.as_str()),
+                    Some("Reply with exactly one line: SPAWN_OK")
+                );
+                assert_eq!(
+                    tools[0].input.get("subagent_type").and_then(|v| v.as_str()),
+                    Some("general-purpose")
+                );
+                assert_eq!(
+                    tools[0].input.get("background"),
+                    Some(&serde_json::json!(true))
+                );
+            }
+            other => panic!("expected clean spawn_subagent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_qualified_workflow_name_exposes_client_only_as_workflow() {
         for (tool_name, name, provider) in [
             (
@@ -9798,6 +12194,16 @@ mod tests {
             ),
             ("claude-local:Workflow", "Workflow", "claude-local"),
             ("Workflow", "claude-local/Workflow", "claude-local"),
+            (
+                "mcp_claude-local_Workflow",
+                "mcp_claude-local_Workflow",
+                "claude-local",
+            ),
+            (
+                "mcp__claude-local__Workflow",
+                "mcp__claude-local__Workflow",
+                "claude-local",
+            ),
         ] {
             let tools = client_only_tools_from_mcp_started(tool_name, name, provider).await;
             assert_eq!(tools.len(), 1, "{tool_name} / {name}");
@@ -10407,6 +12813,30 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("event: ping"));
         assert!(text.contains(r#""type":"ping"#) || text.contains(r#""type": "ping"#));
+    }
+
+    #[test]
+    fn empty_live_event_emits_keepalive_when_due() {
+        let now = tokio::time::Instant::now();
+        assert!(
+            !sse_keepalive_after_empty_event(now, now + Duration::from_secs(15)),
+            "a future ping deadline must keep draining"
+        );
+        assert!(
+            sse_keepalive_after_empty_event(now, now),
+            "an already-due ping must win over another no-byte event"
+        );
+        let mut encoder = CursorSseEncoder::new("msg_ping", "claude-fable-5");
+        encoder.begin();
+        let _ = encoder.take_bytes();
+        apply_live_run_event(
+            &mut encoder,
+            LiveRunEvent::Cursor(CursorStreamEvent::OutputTokenDelta { tokens: 4 }),
+        );
+        assert!(
+            encoder.take_bytes().is_empty(),
+            "OutputTokenDelta must stay a no-byte event so the keepalive path is the one that fires"
+        );
     }
 
     #[test]

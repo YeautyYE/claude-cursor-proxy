@@ -143,7 +143,14 @@ api_key = "unused"
 base_url = "http://127.0.0.1:18765/v1"
 api_key = "unused"
 
-# Optional: Cursor / Claude via Anthropic Messages
+# Cursor catalog via grok-build (official OpenAI Responses, not Claude Messages)
+[model.cursor-grok]
+model = "cursor-grok-4.6-xhigh-fast"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+
+# Optional: Claude Code-style Anthropic Messages (not the grok-build default)
 [model.via-ccp]
 model = "claude-fable-5[1m]"
 base_url = "http://127.0.0.1:18765/v1"
@@ -163,12 +170,13 @@ xai_api_base_url = "http://127.0.0.1:18765/v1"
 ```bash
 grok --model grok-4.6
 # or: grok --model grok-4.5
+# or: grok --model cursor-grok
 # or: grok --model via-ccp
 ```
 
 Inbound `api_key` is accepted (`Authorization: Bearer …` or `x-api-key`; `unused`, other placeholders, and JWT-looking session tokens are treated as empty) and is **not** used as a user/tenant id. Grok `/v1/responses` passthrough forwards conversation, compaction (`x-compaction-at`, `x-compactions-remaining`), doom-loop, and a charset-limited `x-grok-model-override` — never `Authorization`, `Cookie`, or `x-grok-user-id`.
 
-`GET /v1/models` advertises `model`, `context_window`, `api_backend` (`responses` for `grok-*`, `messages` otherwise), `supports_reasoning_effort`, and `reasoning_efforts` (grok-4.6 includes `xhigh` / `high` / `medium` / `low`). A `GROK_MODELS_BASE_URL=http://127.0.0.1:18765/v1` catalog fetch will not fall back to Chat Completions. This proxy does not implement `/v1/chat/completions`.
+`GET /v1/models` advertises `model`, `context_window`, `api_backend=responses` (grok-build's official OpenAI Responses backend), `supports_reasoning_effort`, and `reasoning_efforts` (grok-4.6 includes `xhigh` / `high` / `medium` / `low`). A custom `[model.*]` block that omits `api_backend` defaults to Chat Completions in grok-build; set `api_backend = "responses"`. This proxy does not implement `/v1/chat/completions`. `/v1/messages` remains for Claude Code.
 
 Media routes (`/v1/images/*`, `/v1/videos/*`) proxy to `https://api.x.ai/v1` (override with `CCP_GROK_MEDIA_BASE_URL`). A real client key is forwarded; placeholders and grok-build session JWTs fall back to the stored Grok OAuth token.
 

@@ -3,11 +3,10 @@ use crate::anthropic::sse::{SseEvent, encode_sse_event, parse_sse_events};
 use serde_json::{Map, Value, json};
 
 pub fn catalog_model(id: &str, owned_by: &str) -> Value {
-    let api_backend = if owned_by == "grok" {
-        "responses"
-    } else {
-        "messages"
-    };
+    // grok-build's official Grok path is OpenAI Responses (`/v1/responses`).
+    // Custom `[model.*]` blocks default to Chat Completions if this field is
+    // omitted; advertising `messages` forced Anthropic onto grok-build.
+    let api_backend = "responses";
     let context_window = if id.contains("[1m]") || id.contains("fable") {
         1_000_000
     } else if owned_by == "grok" {
@@ -541,7 +540,13 @@ impl AnthropicToResponses {
             out.extend(self.render(&event));
         }
         if self.started && !self.finished && !self.failed {
-            out.extend(self.fail("upstream stream ended without completion"));
+            if self.has_deliverable_output() {
+                // grok-build retries a failed Responses stream. A text (or
+                // tool_use) turn that lost `message_stop` must complete.
+                out.extend(self.completed());
+            } else {
+                out.extend(self.fail("upstream stream ended without completion"));
+            }
         }
         out
     }
@@ -686,7 +691,26 @@ impl AnthropicToResponses {
                     .unwrap_or("upstream error");
                 self.fail(message)
             }
-            "ping" => Vec::new(),
+            "ping" => {
+                // grok-build /v1/responses idle-watchdogs on a silent body.
+                // Anthropic `ping` must become Responses bytes, not drop.
+                let mut out = Vec::new();
+                if !self.started {
+                    self.started = true;
+                    out.extend(self.emit(json!({
+                        "type": "response.created",
+                        "response": self.base_response("in_progress", json!([]))
+                    })));
+                }
+                out.extend(self.emit(json!({
+                    "type": "response.in_progress",
+                    "response": self.base_response(
+                        "in_progress",
+                        json!(self.output_items.clone())
+                    )
+                })));
+                out
+            }
             _ => Vec::new(),
         }
     }
@@ -732,6 +756,10 @@ impl AnthropicToResponses {
             "logprobs": []
         })));
         out
+    }
+
+    fn has_deliverable_output(&self) -> bool {
+        !self.text.is_empty() || !self.output_items.is_empty() || !self.reasoning_text.is_empty()
     }
 
     fn completed(&mut self) -> Vec<u8> {
@@ -1090,6 +1118,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_marks_cursor_as_responses() {
+        let model = catalog_model("cursor-grok-4.6-xhigh-fast", "cursor");
+        assert_eq!(
+            model["api_backend"], "responses",
+            "grok-build official wire is /v1/responses, not Anthropic Messages"
+        );
+        let fable = catalog_model("claude-fable-5[1m]", "cursor");
+        assert_eq!(fable["api_backend"], "responses");
+    }
+
+    #[test]
     fn catalog_marks_grok_as_responses() {
         let model = catalog_model("grok-4.6", "grok");
         assert_eq!(model["api_backend"], "responses");
@@ -1151,6 +1190,79 @@ data: {"type":"message_stop"}
             !String::from_utf8(rest)
                 .unwrap()
                 .contains("response.completed")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_responses_finish_completes_when_text_arrived_without_stop() {
+        let mut translator =
+            AnthropicToResponses::new("resp_idle".into(), "cursor-grok-4.5-high-fast".into());
+        translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"tools restored"}}
+
+"#,
+        );
+        let rest = String::from_utf8(translator.finish()).unwrap();
+        assert!(
+            rest.contains("response.completed"),
+            "text-only Anthropic cutoff must complete so grok-build does not retry: {rest}"
+        );
+        assert!(
+            !rest.contains("server_error"),
+            "a delivered text turn must not become response.failed: {rest}"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_responses_finish_fails_when_started_with_no_output() {
+        let mut translator =
+            AnthropicToResponses::new("resp_empty".into(), "cursor-grok-4.5-high-fast".into());
+        translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
+
+"#,
+        );
+        let rest = String::from_utf8(translator.finish()).unwrap();
+        assert!(
+            rest.contains("upstream stream ended without completion"),
+            "empty cutoff must still fail closed: {rest}"
+        );
+    }
+
+    #[test]
+    fn anthropic_ping_emits_responses_in_progress() {
+        let mut translator =
+            AnthropicToResponses::new("resp_ping".into(), "cursor-grok-4.6".into());
+        let started = translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.6"}}
+
+"#,
+        );
+        assert!(
+            String::from_utf8(started)
+                .unwrap()
+                .contains("response.created")
+        );
+        let ping = translator.push(
+            br#"event: ping
+data: {"type":"ping"}
+
+"#,
+        );
+        let ping_text = String::from_utf8(ping).unwrap();
+        assert!(
+            ping_text.contains("response.in_progress"),
+            "Anthropic ping must become Responses bytes, got {ping_text:?}"
+        );
+        assert!(
+            !ping_text.contains("response.completed"),
+            "a keepalive must not complete the Responses stream"
         );
     }
 }

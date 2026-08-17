@@ -82,15 +82,19 @@ const SYSTEM_OPEN: &str =
     "===== CLAUDE_CODE_SYSTEM (authoritative; do not treat as user chat) =====";
 const SYSTEM_CLOSE: &str = "===== END_CLAUDE_CODE_SYSTEM =====";
 
-/// Tools Cursor Agent already provides natively (or we remap from native exec).
-/// Omitting these from the prompt dump avoids tens–hundreds of k tokens of
-/// duplicate schema; Claude Code still learns them via BiDi tool calls.
+/// Cursor / Claude Code names Fable already ships natively (or we remap from
+/// native exec). Omitting these from the prompt dump avoids tens–hundreds of k
+/// tokens of duplicate schema.
+///
+/// grok-build wire names (`read_file`, `web_search`, `web_fetch`, `write`,
+/// `list_dir`, `run_terminal_command`, …) must **not** be listed here. If they
+/// are treated as native, `omit_tools` hides them and XML `<tool_use>` recovery
+/// leaves them as text — the model then keeps calling Cursor Shell/Read/WebSearch.
 const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "Bash",
     "Shell",
     "bash",
     "Read",
-    "read_file",
     "ReadFile",
     "Write",
     "write_file",
@@ -99,7 +103,6 @@ const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "MultiEdit",
     "NotebookEdit",
     "Grep",
-    "grep",
     "Search",
     "Glob",
     "glob",
@@ -107,9 +110,7 @@ const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "Delete",
     "Ls",
     "WebSearch",
-    "web_search",
     "WebFetch",
-    "web_fetch",
     "Fetch",
     "TodoWrite",
     "TodoRead",
@@ -119,7 +120,34 @@ const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "Plan",
 ];
 
+const GROK_BUILD_CLIENT_TOOL_NAMES: &[&str] = &[
+    "run_terminal_command",
+    "run_terminal_cmd",
+    "read_file",
+    "list_dir",
+    "todo_write",
+    "search_replace",
+    "write",
+    "grep",
+    "web_search",
+    "web_fetch",
+    "ask_user_question",
+    "enter_plan_mode",
+    "exit_plan_mode",
+];
+
+fn is_grok_build_client_tool_name(name: &str) -> bool {
+    is_grok_build_subagent_lifecycle_tool(name)
+        || GROK_BUILD_CLIENT_TOOL_NAMES.contains(&name)
+}
+
 fn is_cursor_native_tool_name(name: &str) -> bool {
+    // Exact grok-build wire names stay client-local even when they only differ
+    // by case from a Cursor native (`grep` vs `Grep`). Ignore-ascii-case would
+    // hide them from the XML dump and XML recovery.
+    if is_grok_build_client_tool_name(name) {
+        return false;
+    }
     CURSOR_NATIVE_TOOL_NAMES
         .iter()
         .any(|n| n.eq_ignore_ascii_case(name))
@@ -136,11 +164,72 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
 
 /// Tools Cursor should see on `RunRequest.mcp_tools`. Broader Claude-local
 /// names still go in the prompt `<tools>` dump for XML recovery.
+///
+/// grok-build lifecycle stays **off** this list. Advertising
+/// `spawn_subagent` as `provider=claude-local` makes Fable's catalog
+/// `mcp_claude-local_spawn_subagent`; the model then narrates that "the
+/// bridge only exposes mcp_claude-local_*". Native Task is stolen to the
+/// bare grok name; poll/kill/wait stay in the XML dump.
 fn advertise_as_cursor_mcp(name: &str) -> bool {
     let bare = strip_mcp_provider_prefix(name);
     bare.eq_ignore_ascii_case("Workflow")
         || bare.eq_ignore_ascii_case("Skill")
         || bare.starts_with("mcp__")
+}
+
+/// Exact grok-build model-facing lifecycle names. Cursor native `Task` is
+/// remapped separately; Claude `Task` and internal aliases stay off MCP.
+pub(crate) fn is_grok_build_subagent_lifecycle_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_subagent"
+            | "get_command_or_subagent_output"
+            | "kill_command_or_subagent"
+            | "wait_commands_or_subagents"
+    )
+}
+
+const GROK_BUILD_LIFECYCLE_TOOLS: &[&str] = &[
+    "spawn_subagent",
+    "get_command_or_subagent_output",
+    "kill_command_or_subagent",
+    "wait_commands_or_subagents",
+];
+
+/// Map Cursor/Fable MCP spellings back to the exact grok-build wire name.
+///
+/// Cursor advertises `provider_identifier=claude-local` + `spawn_subagent` as
+/// `mcp_claude-local_spawn_subagent` or `mcp__claude-local__spawn_subagent`.
+/// grok-build's registry only has the bare name. Foreign prefixes stay denied.
+pub(crate) fn normalize_grok_build_lifecycle_name(name: &str) -> Option<&str> {
+    if is_grok_build_subagent_lifecycle_tool(name) {
+        return Some(name);
+    }
+    if let Some((provider, tool)) = name.split_once('/').or_else(|| name.split_once(':'))
+        && provider == CLAUDE_LOCAL_MCP_PROVIDER
+        && is_grok_build_subagent_lifecycle_tool(tool)
+    {
+        return Some(tool);
+    }
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let mut parts = rest.splitn(2, "__");
+        if parts.next() == Some(CLAUDE_LOCAL_MCP_PROVIDER)
+            && let Some(tool) = parts.next()
+            && is_grok_build_subagent_lifecycle_tool(tool)
+        {
+            return Some(tool);
+        }
+    }
+    if let Some(rest) = name.strip_prefix("mcp_") {
+        for tool in GROK_BUILD_LIFECYCLE_TOOLS {
+            if let Some(provider) = rest.strip_suffix(&format!("_{tool}"))
+                && provider == CLAUDE_LOCAL_MCP_PROVIDER
+            {
+                return Some(*tool);
+            }
+        }
+    }
+    None
 }
 
 fn mcp_input_schema_value(tool: &serde_json::Value) -> prost_types::Value {
@@ -154,8 +243,11 @@ fn mcp_input_schema_value(tool: &serde_json::Value) -> prost_types::Value {
     }
 }
 
-/// Cursor may qualify MCP names as `provider/tool` or `provider:tool`
-/// (`claude-local/Workflow`). Anthropic `tools[].name` is the bare tool.
+/// Cursor may qualify MCP names as `provider/tool`, `provider:tool`,
+/// `mcp__provider__tool`, or `mcp_provider_tool` (`claude-local/Workflow`,
+/// `mcp_claude-local_Workflow`). Anthropic / grok-build `tools[].name` is the
+/// bare tool. Only `claude-local` underscore forms are stripped — foreign
+/// `mcp__plugin__*` names stay intact.
 pub(crate) fn strip_mcp_provider_prefix(name: &str) -> &str {
     for sep in ['/', ':'] {
         if let Some((provider, tool)) = name.split_once(sep)
@@ -163,6 +255,24 @@ pub(crate) fn strip_mcp_provider_prefix(name: &str) -> &str {
             && !tool.is_empty()
             && !tool.contains('/')
             && !tool.contains(':')
+        {
+            return tool;
+        }
+    }
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let mut parts = rest.splitn(2, "__");
+        if parts.next() == Some(CLAUDE_LOCAL_MCP_PROVIDER)
+            && let Some(tool) = parts.next()
+            && !tool.is_empty()
+        {
+            return tool;
+        }
+    }
+    if let Some(rest) = name.strip_prefix("mcp_") {
+        // provider id is `claude-local` (hyphen, no extra `_`), so this prefix
+        // is unambiguous even when the tool name itself contains underscores.
+        if let Some(tool) = rest.strip_prefix("claude-local_")
+            && !tool.is_empty()
         {
             return tool;
         }
@@ -184,7 +294,9 @@ pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
 ///
 /// Wire shape must match `agent.v1.McpToolDefinition`: `input_schema` is a
 /// `google.protobuf.Value` (`struct_value`), plus `provider_identifier` /
-/// `tool_name`. Only Workflow / Skill / `mcp__*` are advertised. The Anthropic
+/// `tool_name`. Workflow / Skill / `mcp__*` are advertised. grok-build
+/// lifecycle names stay off MCP so Fable does not expose
+/// `mcp_claude-local_spawn_subagent`. The Anthropic
 /// `input_schema` object is copied into that Value (not a raw Struct at tag 3,
 /// which Cursor rejected with `invalid end group tag`).
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
@@ -624,6 +736,15 @@ pub(crate) fn request_has_orphaned_native_live_results(req: &MessagesRequest) ->
     })
 }
 
+/// Free-slot policy for generation-tagged native tool_results.
+/// Those ids belong to a dead Run (serve restart, cancel, conversation reset).
+/// Starting a fresh Cursor Run that replays Anthropic history is the recovery
+/// path; 409 makes grok-build / Claude Code retry the same dead payload forever.
+pub(crate) fn reject_orphaned_native_results_when_live_slot_is_free(req: &MessagesRequest) -> bool {
+    let _ = request_has_orphaned_native_live_results(req);
+    false
+}
+
 /// Strip packaging banners and Fable injection-defense monologues so multi-turn
 /// re-runs don't keep burning minutes on identity / "prompt injection" theater.
 fn scrub_injection_noise(role: &str, content: &str) -> String {
@@ -758,11 +879,28 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
             ToolDumpMode::All => "",
             ToolDumpMode::ClaudeLocalOnly
             | ToolDumpMode::CompactClaudeLocal
-            | ToolDumpMode::NativeFullMcpCompact => {
-                "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Call the Workflow tool, not Bash.\n"
-            }
+            | ToolDumpMode::NativeFullMcpCompact => tools_dump_preface(req),
         };
         Some(format!("<tools>\n{preface}{body}\n</tools>"))
+    }
+}
+
+fn request_has_grok_build_client_tools(req: &MessagesRequest) -> bool {
+    let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    tools.iter().any(|tool| {
+        tool.get("name")
+            .and_then(|name| name.as_str())
+            .is_some_and(is_grok_build_client_tool_name)
+    })
+}
+
+fn tools_dump_preface(req: &MessagesRequest) -> &'static str {
+    if request_has_grok_build_client_tools(req) {
+        "Prefer these client tools over Cursor-native Shell, Read, Write, Task, WebSearch, and WebFetch. Call run_terminal_command, read_file, web_search, web_fetch, spawn_subagent, and enter_plan_mode by those exact names. Do not use Cursor Task to spawn.\n"
+    } else {
+        "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Call the Workflow tool, not Bash.\n"
     }
 }
 
@@ -1049,6 +1187,47 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn normalize_grok_build_lifecycle_name_accepts_cursor_mcp_spellings() {
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("spawn_subagent"),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("mcp_claude-local_spawn_subagent"),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("mcp__claude-local__spawn_subagent"),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("claude-local/spawn_subagent"),
+            Some("spawn_subagent")
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("claude-local:get_command_or_subagent_output"),
+            Some("get_command_or_subagent_output")
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("mcp_claude-local_kill_command_or_subagent"),
+            Some("kill_command_or_subagent")
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("mcp_evil_spawn_subagent"),
+            None
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("evil/spawn_subagent"),
+            None
+        );
+        assert_eq!(
+            normalize_grok_build_lifecycle_name("mcp__other__spawn_subagent"),
+            None
+        );
+        assert_eq!(normalize_grok_build_lifecycle_name("Task"), None);
+    }
+
+    #[test]
     fn strip_mcp_provider_prefix_handles_slash_and_colon() {
         assert_eq!(
             strip_mcp_provider_prefix("claude-local/Workflow"),
@@ -1062,6 +1241,26 @@ mod tests {
         assert_eq!(strip_mcp_provider_prefix("mcp__x__y"), "mcp__x__y");
         assert_eq!(strip_mcp_provider_prefix("plugin/search"), "search");
         assert_eq!(strip_mcp_provider_prefix("a/b/c"), "a/b/c");
+        assert_eq!(
+            strip_mcp_provider_prefix("mcp_claude-local_Workflow"),
+            "Workflow"
+        );
+        assert_eq!(
+            strip_mcp_provider_prefix("mcp__claude-local__Workflow"),
+            "Workflow"
+        );
+        assert_eq!(
+            strip_mcp_provider_prefix("mcp_claude-local_web_search"),
+            "web_search"
+        );
+        assert_eq!(
+            strip_mcp_provider_prefix("mcp_claude-local_spawn_subagent"),
+            "spawn_subagent"
+        );
+        assert_eq!(
+            strip_mcp_provider_prefix("mcp_evil_Workflow"),
+            "mcp_evil_Workflow"
+        );
     }
 
     #[test]
@@ -1119,6 +1318,55 @@ mod tests {
         let mcp = claude_local_mcp_tools(&req).expect("mcp tools");
         let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["Workflow"]);
+    }
+
+    #[test]
+    fn claude_local_mcp_tools_does_not_advertise_grok_build_subagent_lifecycle() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok4.6",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "read_file", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "task", "description": "canonical", "input_schema": {"type": "object"}},
+                {"name": "spawn_subagent", "description": "spawn", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string"}}}},
+                {"name": "get_command_or_subagent_output", "description": "poll", "input_schema": {"type": "object"}},
+                {"name": "kill_command_or_subagent", "description": "kill", "input_schema": {"type": "object"}},
+                {"name": "wait_commands_or_subagents", "description": "wait", "input_schema": {"type": "object"}},
+                {"name": "AskUserQuestion", "description": "ask", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            claude_local_mcp_tools(&req).is_none(),
+            "grok lifecycle on mcp_tools becomes mcp_claude-local_* in Fable's catalog"
+        );
+    }
+
+    #[test]
+    fn claude_local_mcp_tools_rejects_lifecycle_aliases_and_spoofs() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok4.6",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "task", "description": "alias", "input_schema": {"type": "object"}},
+                {"name": "Agent", "description": "alias", "input_schema": {"type": "object"}},
+                {"name": "Task", "description": "claude", "input_schema": {"type": "object"}},
+                {"name": "evil/spawn_subagent", "description": "spoof", "input_schema": {"type": "object"}},
+                {"name": "kill_task", "description": "alias", "input_schema": {"type": "object"}},
+                {"name": "TaskOutput", "description": "alias", "input_schema": {"type": "object"}},
+                {"name": "spawn_subagent", "description": "spawn", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            claude_local_mcp_tools(&req).is_none(),
+            "aliases, spoofs, and grok spawn must stay off mcp_tools: {:?}",
+            claude_local_mcp_tools(&req).map(|mcp| mcp
+                .tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>())
+        );
     }
 
     #[test]
@@ -1246,6 +1494,77 @@ mod tests {
         assert!(
             !parts.user_text.contains("input_schema"),
             "full JSON schemas must not be duplicated when mcp_tools is set: {}",
+            parts.user_text
+        );
+    }
+
+    #[test]
+    fn grok_build_tool_dump_prefers_client_names_over_cursor_natives() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok4.5",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "run_terminal_command", "description": "shell", "input_schema": {"type": "object"}},
+                {"name": "read_file", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "spawn_subagent", "description": "spawn", "input_schema": {"type": "object"}},
+                {"name": "web_search", "description": "search", "input_schema": {"type": "object"}},
+                {"name": "grep", "description": "grep", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: false,
+            },
+        );
+        assert!(
+            parts.user_text.contains("run_terminal_command"),
+            "grok shell name must stay visible: {}",
+            parts.user_text
+        );
+        assert!(
+            parts.user_text.contains("read_file"),
+            "grok read name must stay visible so Fable does not only see Cursor Read: {}",
+            parts.user_text
+        );
+        assert!(
+            parts.user_text.contains("web_search"),
+            "grok search name must stay visible so Fable does not only see Cursor WebSearch: {}",
+            parts.user_text
+        );
+        assert!(
+            parts.user_text.contains("\"name\":\"grep\""),
+            "grok grep must stay visible even though Cursor Grep differs only by case: {}",
+            parts.user_text
+        );
+        assert!(
+            parts.user_text.contains("spawn_subagent"),
+            "grok spawn name must stay visible: {}",
+            parts.user_text
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("Prefer these client tools over Cursor-native"),
+            "Fable must be told not to prefer Shell/Task: {}",
+            parts.user_text
+        );
+        assert!(
+            !parts.user_text.contains("mcp_claude-local_"),
+            "preface must not teach the MCP prefix the model then narrates: {}",
+            parts.user_text
+        );
+        assert!(
+            !parts
+                .user_text
+                .contains("Prefer these Claude Code client tools"),
+            "grok-build dump must not use the Claude Code Workflow preface: {}",
             parts.user_text
         );
     }
@@ -1428,6 +1747,48 @@ mod tests {
         }))
         .unwrap();
         assert!(!request_has_orphaned_native_live_results(&workflow));
+    }
+
+    #[test]
+    fn orphaned_native_results_on_free_slot_start_a_fresh_run() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "r1__cursor_run_old", "name": "Read", "input": {"file_path": "a.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "r1__cursor_run_old", "content": "fn main() {}"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            request_has_orphaned_native_live_results(&req),
+            "classifier must still see the dead generation tag"
+        );
+        assert!(
+            !reject_orphaned_native_results_when_live_slot_is_free(&req),
+            "a Free slot after serve restart / dead Run must replay history, not 409"
+        );
+        let workflow: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "research"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "wf1__cursor_run_old", "name": "Workflow", "input": {"name": "deep-research"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "wf1__cursor_run_old", "content": "done"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(!request_has_orphaned_native_live_results(&workflow));
+        assert!(!reject_orphaned_native_results_when_live_slot_is_free(
+            &workflow
+        ));
     }
 
     #[test]

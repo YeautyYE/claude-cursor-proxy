@@ -13,6 +13,9 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use crate::anthropic::schema::MessagesRequest;
+use crate::providers::cursor::native_tools::{
+    adapt_tool_input_for_client, advertised_name_fallbacks,
+};
 use crate::providers::cursor::response::CursorStreamEvent;
 use crate::providers::cursor::sse::CursorSseFramer;
 use crate::providers::cursor::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
@@ -582,12 +585,14 @@ pub fn start_cursor_tool_bridge(
                     // Tool not in Claude Code's advertised set — skip.
                     continue;
                 };
-                let input_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                let adapted = adapt_tool_input_for_client(&emit_name, input.clone());
+                let input_json =
+                    serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
                 framer.emit_tool_pause(tool_use_id, &emit_name, &input_json);
                 state.pending_tool = Some(PendingCursorTool::Generic {
                     tool_use_id: tool_use_id.clone(),
                     name: emit_name,
-                    input: input.clone(),
+                    input: adapted,
                 });
                 paused = true;
             }
@@ -607,9 +612,13 @@ pub fn start_cursor_tool_bridge(
                             framer.emit_text_delta(t);
                         }
                         RecoveredCursorEvent::ToolUse(tool_use) => {
-                            let input_json = serde_json::to_string(&tool_use.input)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
+                            let input = serde_json::Value::Object(tool_use.input.clone());
+                            let (emit_name, input_json) = advertised_tool_payload(
+                                &tool_use.name,
+                                &input,
+                                state.allowed_tool_names.as_ref(),
+                            );
+                            framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
 
                             if let Some(pending) = pending_from_recovered_tool(tool_use) {
                                 state.pending_tool = Some(pending);
@@ -825,8 +834,9 @@ pub fn resume_cursor_tool_bridge(
                     input,
                 } => {
                     if !paused_again {
+                        let adapted = adapt_tool_input_for_client(name, input.clone());
                         let input_json =
-                            serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                            serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
                         framer.emit_tool_pause(tool_use_id, name, &input_json);
                         paused_again = true;
                     }
@@ -891,6 +901,17 @@ pub fn resume_cursor_tool_bridge(
 // ---------------------------------------------------------------------------
 
 /// Pick a Claude-advertised tool name for a mapped Cursor tool, or None to skip.
+fn advertised_tool_payload(
+    name: &str,
+    input: &serde_json::Value,
+    allowed: Option<&BTreeSet<String>>,
+) -> (String, String) {
+    let emit_name = resolve_advertised_name(name, allowed).unwrap_or_else(|| name.to_string());
+    let adapted = adapt_tool_input_for_client(&emit_name, input.clone());
+    let json = serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
+    (emit_name, json)
+}
+
 fn resolve_advertised_name(
     mapped_name: &str,
     allowed: Option<&BTreeSet<String>>,
@@ -901,23 +922,9 @@ fn resolve_advertised_name(
     if allowed.contains(mapped_name) {
         return Some(mapped_name.to_string());
     }
-    // Common Claude Code aliases / fallbacks.
-    let fallbacks: &[&str] = match mapped_name {
-        "Bash" => &["Bash", "Shell", "bash"],
-        "Read" => &["Read", "read_file", "ReadFile"],
-        // Never fall back to Edit: Claude Edit requires old_string/new_string,
-        // while Cursor Write/Edit overwrite maps to {file_path, content}.
-        "Write" => &["Write", "write_file", "WriteFile"],
-        "Grep" => &["Grep", "grep", "Search"],
-        "Glob" => &["Glob", "glob", "Find"],
-        "WebSearch" => &["WebSearch", "web_search"],
-        "WebFetch" => &["WebFetch", "web_fetch", "Fetch"],
-        "TodoWrite" => &["TodoWrite"],
-        "TodoRead" => &["TodoRead"],
-        "AskUserQuestion" => &["AskUserQuestion", "AskQuestion"],
-        "CreatePlan" => &["CreatePlan", "Plan"],
-        _ => &[],
-    };
+    // Never fall back to Edit: Claude Edit requires old_string/new_string,
+    // while Cursor Write/Edit overwrite maps to {file_path, content}.
+    let fallbacks = advertised_name_fallbacks(mapped_name);
     for cand in fallbacks {
         if allowed.contains(*cand) {
             return Some((*cand).to_string());
@@ -947,6 +954,7 @@ fn resolve_advertised_name(
 fn claude_file_path(input: &serde_json::Map<String, serde_json::Value>) -> String {
     input
         .get("file_path")
+        .or_else(|| input.get("target_file"))
         .or_else(|| input.get("path"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -972,7 +980,7 @@ fn pending_from_recovered_tool(
     tool_use: &crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse,
 ) -> Option<PendingCursorTool> {
     match tool_use.name.as_str() {
-        "Read" => {
+        "Read" | "read_file" | "ReadFile" => {
             let file_path = claude_file_path(&tool_use.input);
             Some(PendingCursorTool::Read {
                 tool_use_id: tool_use.id.clone(),
@@ -988,7 +996,7 @@ fn pending_from_recovered_tool(
                 content,
             })
         }
-        "Bash" | "Shell" => {
+        "Bash" | "Shell" | "run_terminal_command" | "run_terminal_cmd" => {
             let command = tool_use
                 .input
                 .get("command")

@@ -134,33 +134,52 @@ impl GrokClient {
                 return Err(auth_error(error));
             }
         };
-        let response = self
-            .attempt(&auth.access, body, 1, traffic.as_deref(), extra_headers)
-            .await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            let refreshed = self
-                .auth
-                .force_refresh(&auth.access)
-                .await
-                .map_err(|error| {
-                    capture_failure(traffic.as_deref(), "auth", "refresh", 1);
-                    auth_error(error)
-                })?;
-            let replay = self
+        let mut access = auth.access;
+        let mut attempt = 0_u32;
+        let response = loop {
+            match self
                 .attempt(
-                    &refreshed.access,
+                    &access,
                     body,
-                    2,
+                    (attempt + 1) as u8,
                     traffic.as_deref(),
                     extra_headers,
                 )
-                .await?;
-            if replay.status() == StatusCode::UNAUTHORIZED {
-                capture_failure(traffic.as_deref(), "auth", "unauthorized", 2);
-                return Err(auth_error(anyhow::anyhow!("unauthorized")));
+                .await
+            {
+                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    let refreshed = self.auth.force_refresh(&access).await.map_err(|error| {
+                        capture_failure(traffic.as_deref(), "auth", "refresh", 1);
+                        auth_error(error)
+                    })?;
+                    access = refreshed.access;
+                    let replay = self
+                        .attempt(&access, body, 2, traffic.as_deref(), extra_headers)
+                        .await?;
+                    if replay.status() == StatusCode::UNAUTHORIZED {
+                        capture_failure(traffic.as_deref(), "auth", "unauthorized", 2);
+                        return Err(auth_error(anyhow::anyhow!("unauthorized")));
+                    }
+                    break replay;
+                }
+                Ok(response) => break response,
+                Err(error)
+                    if attempt < crate::retry::MAX_RATE_LIMIT_RETRIES
+                        && crate::retry::should_retry_upstream(
+                            error.status.as_u16(),
+                            &error.message,
+                        ) =>
+                {
+                    crate::retry::sleep(
+                        crate::retry::compute_backoff_delay(attempt, error.retry_after.as_deref())
+                            .wait_ms,
+                    )
+                    .await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
             }
-            return Ok(self.captured_response(replay, traffic.as_deref()));
-        }
+        };
         Ok(self.captured_response(response, traffic.as_deref()))
     }
 
@@ -262,14 +281,13 @@ fn sanitize_error_message(raw: &str) -> String {
         if !out.is_empty() {
             out.push(' ');
         }
-        if word.eq_ignore_ascii_case("bearer") {
-            if let Some(next) = words.peek()
-                && looks_like_secret(next)
-            {
-                out.push_str("Bearer [redacted]");
-                words.next();
-                continue;
-            }
+        if word.eq_ignore_ascii_case("bearer")
+            && let Some(next) = words.peek()
+            && looks_like_secret(next)
+        {
+            out.push_str("Bearer [redacted]");
+            words.next();
+            continue;
         }
         if looks_like_secret(word) {
             out.push_str("[redacted]");

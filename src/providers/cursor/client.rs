@@ -842,7 +842,7 @@ impl CursorHttpClient {
             ));
         }
 
-        if !buffered_finish_accepts_incomplete(finish_reason, saw_end, saw_turn_ended) {
+        if !buffered_finish_accepts_incomplete(finish_reason, saw_end, saw_turn_ended, saw_text) {
             return Err(CursorError::new(
                 502,
                 "Cursor stream ended without turn_ended",
@@ -921,11 +921,18 @@ fn buffered_finish_accepts_incomplete(
     finish_reason: &str,
     saw_end: bool,
     saw_turn_ended: bool,
+    saw_text: bool,
 ) -> bool {
     if buffered_stream_complete_enough_to_accept(saw_end, saw_turn_ended) {
         return true;
     }
-    finish_reason == "tool_call_ready"
+    if finish_reason == "tool_call_ready" {
+        return true;
+    }
+    // The idle handler already treats silence after text as success
+    // (`complete_idle_after_text`). 502 here makes grok-build retry the
+    // same buffered monologue.
+    finish_reason == "complete_idle_after_text" && saw_text
 }
 
 /// `CCP_CURSOR_NO_PROXY=1` skips HTTP(S)_PROXY for Cursor API calls.
@@ -1602,25 +1609,32 @@ mod tests {
         assert!(buffered_stream_complete_enough_to_accept(true, false));
         assert!(buffered_stream_complete_enough_to_accept(false, true));
         assert!(
-            !buffered_finish_accepts_incomplete("stream_closed", false, false),
+            !buffered_finish_accepts_incomplete("stream_closed", false, false, false),
             "clean EOF without turn_ended must not become end_turn"
         );
         assert!(buffered_finish_accepts_incomplete(
             "stream_closed",
             true,
+            false,
             false
         ));
         assert!(buffered_finish_accepts_incomplete(
             "turn_ended",
             false,
-            true
+            true,
+            false
         ));
         assert!(
-            !buffered_finish_accepts_incomplete("complete_idle_after_text", false, false),
-            "silence after text is not turn_ended"
+            !buffered_finish_accepts_incomplete("complete_idle_after_text", false, false, false),
+            "idle without text is not a complete turn"
+        );
+        assert!(
+            buffered_finish_accepts_incomplete("complete_idle_after_text", false, false, true),
+            "idle after text must return the turn; 502 makes grok-build retry the same monologue"
         );
         assert!(buffered_finish_accepts_incomplete(
             "tool_call_ready",
+            false,
             false,
             false
         ));

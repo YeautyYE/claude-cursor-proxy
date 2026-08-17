@@ -89,10 +89,8 @@ pub fn map_exec_server_message(exec: &ExecServerMessage) -> Option<MappedClaudeT
     if let Some(ref args) = exec.ls_args {
         return Some(MappedClaudeTool {
             tool_use_id: id,
-            name: "Bash".into(),
-            input: serde_json::json!({
-                "command": format!("ls -la -- {}", shell_single_quote(&args.path)),
-            }),
+            name: "LS".into(),
+            input: serde_json::json!({ "path": args.path }),
         });
     }
     // request_context_args handled elsewhere — not a user-visible tool.
@@ -166,10 +164,8 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
         let args = ls.args.as_ref()?;
         return Some(MappedClaudeTool {
             tool_use_id: call_id,
-            name: "Bash".into(),
-            input: serde_json::json!({
-                "command": format!("ls -la -- {}", shell_single_quote(&args.path)),
-            }),
+            name: "LS".into(),
+            input: serde_json::json!({ "path": args.path }),
         });
     }
     if let Some(ref del) = tc.delete_tool_call {
@@ -280,6 +276,39 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
     if let Some(ref fetch) = tc.web_fetch_tool_call {
         return map_fetch_args(fetch.args.as_ref()?, call_id);
     }
+    if let Some(ref task) = tc.task_tool_call {
+        let mut input = serde_json::Map::new();
+        if let Some(args) = task.args.as_ref() {
+            if !args.description.is_empty() {
+                input.insert("description".into(), serde_json::json!(args.description));
+            }
+            if !args.prompt.is_empty() {
+                input.insert("prompt".into(), serde_json::json!(args.prompt));
+            }
+            if !args.subagent_type.is_empty() {
+                input.insert(
+                    "subagent_type".into(),
+                    serde_json::json!(args.subagent_type),
+                );
+            }
+            if let Some(resume) = args
+                .resume
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                input.insert("resume".into(), serde_json::json!(resume));
+            }
+            if let Some(background) = args.run_in_background {
+                input.insert("run_in_background".into(), serde_json::json!(background));
+            }
+        }
+        return Some(MappedClaudeTool {
+            tool_use_id: call_id,
+            name: "Task".into(),
+            input: serde_json::Value::Object(input),
+        });
+    }
     if let Some(ref ask) = tc.ask_question_tool_call {
         let args = ask.args.as_ref()?;
         let questions: Vec<serde_json::Value> = args
@@ -373,13 +402,73 @@ pub fn accumulate_partial_args_text(dst: &mut String, incoming: &str) {
 }
 
 fn decode_mcp_arg_value(raw: &[u8]) -> serde_json::Value {
+    if raw.is_empty() {
+        return serde_json::Value::Null;
+    }
+    if let Ok(s) = std::str::from_utf8(raw)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+    {
+        return v;
+    }
+    if let Some(v) = decode_protobuf_value_bytes(raw) {
+        return v;
+    }
     if let Ok(s) = std::str::from_utf8(raw) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            return v;
-        }
         return serde_json::Value::String(s.to_string());
     }
     serde_json::Value::String(format!("base64:{}", base64_std(raw)))
+}
+
+/// Live Cursor 2026-08 encodes each `McpArgs` map value as
+/// `google.protobuf.Value` (`string_value=3` → `0x1a…`, `bool_value=4` →
+/// `0x20 0x01`). Treating those bytes as UTF-8 leaves the tag prefix in
+/// grok-build input (`\x1a\x10SPAWN smoke test`) and the child never starts.
+fn decode_protobuf_value_bytes(raw: &[u8]) -> Option<serde_json::Value> {
+    use prost::Message;
+    let first = *raw.first()?;
+    match first {
+        0x08 | 0x11 | 0x1a | 0x2a | 0x32 => {}
+        0x20 if raw.len() == 2 && matches!(raw[1], 0x00 | 0x01) => {}
+        _ => return None,
+    }
+    let value = prost_types::Value::decode(raw).ok()?;
+    value.kind.as_ref()?;
+    prost_value_to_json(&value)
+}
+
+fn json_number_from_f64(n: f64) -> Option<serde_json::Value> {
+    if !n.is_finite() {
+        return None;
+    }
+    if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        return Some(serde_json::Value::Number(serde_json::Number::from(
+            n as i64,
+        )));
+    }
+    Some(serde_json::Value::Number(serde_json::Number::from_f64(n)?))
+}
+
+fn prost_value_to_json(value: &prost_types::Value) -> Option<serde_json::Value> {
+    use prost_types::value::Kind;
+    Some(match value.kind.as_ref()? {
+        Kind::NullValue(_) => serde_json::Value::Null,
+        Kind::NumberValue(n) => json_number_from_f64(*n)?,
+        Kind::StringValue(s) => serde_json::Value::String(s.clone()),
+        Kind::BoolValue(b) => serde_json::Value::Bool(*b),
+        Kind::StructValue(s) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in &s.fields {
+                map.insert(k.clone(), prost_value_to_json(v)?);
+            }
+            serde_json::Value::Object(map)
+        }
+        Kind::ListValue(l) => serde_json::Value::Array(
+            l.values
+                .iter()
+                .map(prost_value_to_json)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    })
 }
 
 fn base64_std(bytes: &[u8]) -> String {
@@ -448,6 +537,488 @@ fn map_grep(
 
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Advertised-name aliases for Cursor native tools, including grok-build
+/// wire names (`read_file`, `run_terminal_command`, `list_dir`, `spawn_subagent`).
+///
+/// Order is preference: exact Claude/Cursor name first, then grok-build
+/// `client_name`s from `xai-grok-tools` `claude_alias.rs`.
+pub fn advertised_name_fallbacks(mapped_name: &str) -> &'static [&'static str] {
+    match mapped_name {
+        "Bash" => &[
+            "Bash",
+            "Shell",
+            "bash",
+            "run_terminal_command",
+            "run_terminal_cmd",
+        ],
+        "Read" => &["Read", "read_file", "ReadFile"],
+        "Write" => &["Write", "write", "write_file", "WriteFile"],
+        "Grep" => &["Grep", "grep", "Search"],
+        "Glob" => &["Glob", "glob", "Find", "list_dir"],
+        "LS" | "Ls" => &[
+            "LS",
+            "Ls",
+            "list_dir",
+            "Bash",
+            "run_terminal_command",
+            "Glob",
+        ],
+        "WebSearch" => &["WebSearch", "web_search"],
+        "WebFetch" => &["WebFetch", "web_fetch", "Fetch"],
+        "TodoWrite" => &["TodoWrite", "todo_write"],
+        "TodoRead" => &["TodoRead"],
+        "AskUserQuestion" => &["AskUserQuestion", "AskQuestion", "ask_user_question"],
+        "CreatePlan" => &["CreatePlan", "Plan", "EnterPlanMode", "enter_plan_mode"],
+        "Task" => &["Task", "spawn_subagent", "Agent", "task"],
+        "TaskOutput" | "BashOutput" | "BashOutputTool" | "AgentOutputTool" => &[
+            "TaskOutput",
+            "BashOutput",
+            "get_command_or_subagent_output",
+            "get_terminal_command_output",
+        ],
+        "TaskStop" | "KillShell" | "KillBash" => &[
+            "KillShell",
+            "kill_command_or_subagent",
+            "kill_terminal_command",
+        ],
+        _ => &[],
+    }
+}
+
+/// Rewrite Cursor/Claude input keys to the schema the downstream client
+/// advertised. grok-build validates `read_file.target_file` and rejects
+/// `file_path`-only payloads. MCP `google.protobuf.Value` numbers arrive as
+/// f64; grok-build `timeout_ms: Option<u64>` rejects those floats.
+pub fn adapt_tool_input_for_client(
+    advertised_name: &str,
+    mut input: serde_json::Value,
+) -> serde_json::Value {
+    if advertised_name == "spawn_subagent" {
+        return adapt_native_task_to_spawn_subagent(input);
+    }
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    match advertised_name {
+        "read_file" | "ReadFile" => {
+            coerce_integer_fields(obj, &["offset", "limit"]);
+            if !has_nonempty_str(obj, "target_file") {
+                if let Some(path) = obj.get("file_path").or_else(|| obj.get("path")).cloned() {
+                    obj.insert("target_file".into(), path);
+                }
+            }
+            obj.remove("file_path");
+            obj.remove("path");
+        }
+        "list_dir" => {
+            if !has_nonempty_str(obj, "target_directory") {
+                if let Some(path) = obj.get("path").or_else(|| obj.get("target_file")).cloned() {
+                    obj.insert("target_directory".into(), path);
+                }
+            }
+            obj.remove("path");
+            obj.remove("pattern");
+        }
+        "Glob" | "glob" => {
+            if !has_nonempty_str(obj, "pattern") {
+                obj.insert("pattern".into(), serde_json::json!("*"));
+            }
+        }
+        "run_terminal_command" | "run_terminal_cmd" => {
+            coerce_integer_fields(obj, &["timeout"]);
+            adapt_shell_like(obj, true);
+        }
+        "Bash" | "Shell" | "bash" => {
+            coerce_integer_fields(obj, &["timeout"]);
+            adapt_shell_like(obj, false);
+        }
+        "write" | "write_file" | "WriteFile" => {
+            if !has_nonempty_str(obj, "file_path") {
+                if let Some(path) = obj.get("path").or_else(|| obj.get("target_file")).cloned() {
+                    obj.insert("file_path".into(), path);
+                }
+            }
+            if !has_nonempty_str(obj, "content") {
+                if let Some(content) = obj
+                    .get("file_text")
+                    .or_else(|| obj.get("contents"))
+                    .cloned()
+                {
+                    obj.insert("content".into(), content);
+                }
+            }
+            obj.remove("path");
+            obj.remove("file_text");
+            obj.remove("contents");
+        }
+        "grep" => {
+            coerce_integer_fields(obj, &["head_limit", "-B", "-A", "-C"]);
+            if let Some(flag) = obj.remove("case_insensitive") {
+                obj.insert("-i".into(), flag);
+            }
+        }
+        "Grep" => {
+            coerce_integer_fields(obj, &["head_limit", "-B", "-A", "-C"]);
+            if let Some(flag) = obj.remove("case_insensitive") {
+                obj.insert("-i".into(), flag);
+            }
+        }
+        "web_search" => {
+            if !has_nonempty_str(obj, "query") {
+                if let Some(query) = obj.get("search_term").cloned() {
+                    obj.insert("query".into(), query);
+                }
+            }
+            obj.remove("search_term");
+        }
+        "WebFetch" | "Fetch" => {
+            if !has_nonempty_str(obj, "prompt") {
+                obj.insert(
+                    "prompt".into(),
+                    serde_json::json!("Extract the main content from this URL."),
+                );
+            }
+        }
+        "TodoWrite" => {
+            if let Some(serde_json::Value::Array(todos)) = obj.get_mut("todos") {
+                for todo in todos {
+                    let Some(item) = todo.as_object_mut() else {
+                        continue;
+                    };
+                    if !has_nonempty_str(item, "activeForm") {
+                        let content = item
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("todo");
+                        item.insert(
+                            "activeForm".into(),
+                            serde_json::json!(format!("Working on {content}")),
+                        );
+                    }
+                }
+            }
+            obj.remove("merge");
+        }
+        "get_command_or_subagent_output"
+        | "get_terminal_command_output"
+        | "wait_commands_or_subagents" => {
+            coerce_integer_fields(obj, &["timeout_ms"]);
+            adapt_task_ids_list(obj);
+        }
+        "kill_command_or_subagent" | "kill_terminal_command" => {
+            if !has_nonempty_str(obj, "task_id") {
+                let first = obj
+                    .get("task_ids")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                if let Some(id) = first {
+                    obj.insert("task_id".into(), serde_json::json!(id));
+                }
+            }
+        }
+        "enter_plan_mode" | "EnterPlanMode" => {
+            obj.clear();
+        }
+        _ => {}
+    }
+    input
+}
+
+/// Single entry for ClientOnly / XML / MCP expose: spawn uses the allowlist
+/// rebuild; everything else uses advertised-name schema adaptation.
+pub fn adapt_client_tool_input(
+    advertised_name: &str,
+    input: serde_json::Value,
+) -> serde_json::Value {
+    if advertised_name == "spawn_subagent" {
+        adapt_native_task_to_spawn_subagent(input)
+    } else {
+        adapt_tool_input_for_client(advertised_name, input)
+    }
+}
+
+pub fn glob_pattern_is_directory_listing(input: &serde_json::Value) -> bool {
+    matches!(
+        input
+            .get("pattern")
+            .and_then(|value| value.as_str())
+            .map(str::trim),
+        None | Some("") | Some("*") | Some(".") | Some("**") | Some("**/*") | Some("*/*")
+    )
+}
+
+pub fn resolve_glob_client_name(
+    input: &serde_json::Value,
+    resolved_glob: Option<String>,
+    resolved_shell: Option<String>,
+) -> Option<String> {
+    let name = resolved_glob?;
+    if name == "list_dir" && !glob_pattern_is_directory_listing(input) {
+        return resolved_shell;
+    }
+    Some(name)
+}
+
+fn has_nonempty_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    obj.get(key)
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn coerce_integer_fields(obj: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
+    for key in keys {
+        let Some(value) = obj.get(*key) else {
+            continue;
+        };
+        match coerce_whole_integer(value) {
+            Some(integer) => {
+                obj.insert((*key).into(), integer);
+            }
+            None => {
+                obj.remove(*key);
+            }
+        }
+    }
+}
+
+fn coerce_whole_integer(value: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(u) = value.as_u64() {
+        return Some(serde_json::json!(u));
+    }
+    if let Some(i) = value.as_i64() {
+        return Some(serde_json::json!(i));
+    }
+    if let Some(f) = value.as_f64() {
+        if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return Some(serde_json::json!(f as i64));
+        }
+        return None;
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|i| serde_json::json!(i));
+    }
+    None
+}
+
+fn adapt_shell_like(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    require_description: bool,
+) {
+    if !has_nonempty_str(obj, "command") {
+        if let Some(pattern) = nonempty_string(obj.get("pattern")) {
+            let path = nonempty_string(obj.get("path")).unwrap_or_else(|| ".".into());
+            obj.insert(
+                "command".into(),
+                serde_json::json!(format!(
+                    "rg --files -g {} -- {}",
+                    shell_single_quote(&pattern),
+                    shell_single_quote(&path)
+                )),
+            );
+            obj.remove("pattern");
+            obj.remove("path");
+        } else if let Some(path) = nonempty_string(obj.get("path")) {
+            obj.insert(
+                "command".into(),
+                serde_json::json!(format!("ls -la -- {}", shell_single_quote(&path))),
+            );
+            obj.remove("path");
+        }
+    }
+    if require_description && !has_nonempty_str(obj, "description") {
+        if let Some(command) = obj.get("command").and_then(|value| value.as_str()) {
+            obj.insert(
+                "description".into(),
+                serde_json::json!(shell_description(command)),
+            );
+        }
+    }
+    if obj.get("background").is_none() {
+        if let Some(flag) = obj.remove("is_background") {
+            obj.insert("background".into(), flag);
+        }
+    } else {
+        obj.remove("is_background");
+    }
+}
+
+fn shell_description(command: &str) -> String {
+    let one_line = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "run command".into();
+    }
+    const MAX: usize = 80;
+    if one_line.chars().count() <= MAX {
+        return one_line;
+    }
+    let mut out: String = one_line.chars().take(MAX.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn adapt_task_ids_list(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let has_list = obj
+        .get("task_ids")
+        .and_then(|value| value.as_array())
+        .is_some_and(|arr| !arr.is_empty());
+    if !has_list {
+        if let Some(id) = nonempty_string(obj.get("task_id")) {
+            obj.insert("task_ids".into(), serde_json::json!([id]));
+        } else if let Some(id) = obj.get("task_id").and_then(|value| value.as_u64()) {
+            obj.insert("task_ids".into(), serde_json::json!([id.to_string()]));
+        }
+    }
+    obj.remove("task_id");
+}
+
+fn nonempty_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return sanitize_spawn_string(text);
+    }
+    None
+}
+
+fn sanitize_spawn_string(raw: &str) -> Option<String> {
+    if let Some(decoded) = decode_protobuf_value_bytes(raw.as_bytes()) {
+        return match decoded {
+            serde_json::Value::String(text) => sanitize_spawn_string(&text),
+            _ => None,
+        };
+    }
+    if raw.as_bytes().first() == Some(&0x1a) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn spawn_background_flag(value: Option<&serde_json::Value>) -> Option<bool> {
+    let value = value?;
+    if let Some(flag) = value.as_bool() {
+        return Some(flag);
+    }
+    let text = value.as_str()?;
+    if let Some(decoded) = decode_protobuf_value_bytes(text.as_bytes()) {
+        return decoded.as_bool();
+    }
+    None
+}
+
+fn normalize_spawn_subagent_type(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let compact = trimmed
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    Some(match compact.as_str() {
+        "generalpurpose" => "general-purpose".into(),
+        "explore" => "explore".into(),
+        "plan" => "plan".into(),
+        _ => trimmed.to_string(),
+    })
+}
+
+/// Rebuild Cursor native Task args into grok-build `spawn_subagent` input.
+///
+/// Only allowlisted keys survive. Cursor `model` / `readonly` and any smuggled
+/// MCP fields are dropped; `resume` and `run_in_background` are renamed.
+pub fn adapt_native_task_to_spawn_subagent(input: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = input.as_object() else {
+        return serde_json::json!({});
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(description) = nonempty_string(obj.get("description")) {
+        out.insert("description".into(), serde_json::json!(description));
+    }
+    if let Some(prompt) = nonempty_string(obj.get("prompt")) {
+        out.insert("prompt".into(), serde_json::json!(prompt));
+    }
+    if let Some(subagent_type) = nonempty_string(obj.get("subagent_type"))
+        .and_then(|raw| normalize_spawn_subagent_type(&raw))
+    {
+        out.insert("subagent_type".into(), serde_json::json!(subagent_type));
+    }
+    if let Some(resume) =
+        nonempty_string(obj.get("resume_from")).or_else(|| nonempty_string(obj.get("resume")))
+    {
+        out.insert("resume_from".into(), serde_json::json!(resume));
+    }
+    if let Some(background) = spawn_background_flag(
+        obj.get("background")
+            .or_else(|| obj.get("run_in_background")),
+    ) {
+        out.insert("background".into(), serde_json::json!(background));
+    }
+    if let Some(mode) =
+        nonempty_string(obj.get("capability_mode")).and_then(|raw| normalize_capability_mode(&raw))
+    {
+        out.insert("capability_mode".into(), serde_json::json!(mode));
+    }
+    if let Some(isolation) =
+        nonempty_string(obj.get("isolation")).and_then(|raw| normalize_isolation(&raw))
+    {
+        out.insert("isolation".into(), serde_json::json!(isolation));
+    }
+    if let Some(cwd) = nonempty_string(obj.get("cwd")) {
+        out.insert("cwd".into(), serde_json::json!(cwd));
+    }
+    if let Some(model) = nonempty_string(obj.get("model")).and_then(|raw| spawn_client_model(&raw))
+    {
+        out.insert("model".into(), serde_json::json!(model));
+    }
+    serde_json::Value::Object(out)
+}
+
+fn normalize_capability_mode(raw: &str) -> Option<&'static str> {
+    let compact = raw
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match compact.as_str() {
+        "readonly" => Some("read-only"),
+        "readwrite" => Some("read-write"),
+        "execute" => Some("execute"),
+        "all" => Some("all"),
+        _ => None,
+    }
+}
+
+fn normalize_isolation(raw: &str) -> Option<&'static str> {
+    let compact = raw
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match compact.as_str() {
+        "none" => Some("none"),
+        "worktree" => Some("worktree"),
+        _ => None,
+    }
+}
+
+fn spawn_client_model(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("cursor-") || lower.starts_with("claude-fable") {
+        return None;
+    }
+    Some(raw.to_string())
 }
 
 #[cfg(test)]
@@ -638,6 +1209,86 @@ mod tests {
         );
     }
 
+    fn proto_value_bytes(kind: prost_types::value::Kind) -> Vec<u8> {
+        use prost::Message;
+        prost_types::Value { kind: Some(kind) }.encode_to_vec()
+    }
+
+    #[test]
+    fn maps_mcp_tool_args_as_protobuf_value() {
+        use prost_types::value::Kind;
+        let description = proto_value_bytes(Kind::StringValue("SPAWN smoke test".into()));
+        let background = proto_value_bytes(Kind::BoolValue(true));
+        assert_eq!(description[0], 0x1a, "live Cursor string_value tag");
+        assert_eq!(background, [0x20, 0x01], "live Cursor bool_value true");
+
+        let mut args_map = std::collections::HashMap::new();
+        args_map.insert("description".into(), description);
+        args_map.insert(
+            "prompt".into(),
+            proto_value_bytes(Kind::StringValue(
+                "Reply with exactly one line: SPAWN_OK".into(),
+            )),
+        );
+        args_map.insert(
+            "subagent_type".into(),
+            proto_value_bytes(Kind::StringValue("general-purpose".into())),
+        );
+        args_map.insert("background".into(), background);
+        let started = ToolCallStarted {
+            call_id: "m-proto".into(),
+            tool_call: Some(ToolCall {
+                mcp_tool_call: Some(crate::providers::cursor::proto::McpToolCall {
+                    args: Some(crate::providers::cursor::proto::McpArgs {
+                        name: "mcp_claude-local_spawn_subagent".into(),
+                        args: args_map,
+                        tool_call_id: "m-proto".into(),
+                        provider_identifier: "claude-local".into(),
+                        tool_name: "mcp_claude-local_spawn_subagent".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.input["description"], "SPAWN smoke test");
+        assert_eq!(m.input["prompt"], "Reply with exactly one line: SPAWN_OK");
+        assert_eq!(m.input["subagent_type"], "general-purpose");
+        assert_eq!(m.input["background"], true);
+        for key in ["description", "prompt", "subagent_type"] {
+            let text = m.input[key].as_str().unwrap();
+            assert!(
+                !text.as_bytes().contains(&0x1a),
+                "{key} must not keep protobuf string_value prefix: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_arg_space_prefixed_text_is_not_bool_value() {
+        let mut args_map = std::collections::HashMap::new();
+        args_map.insert("label".into(), b" A".to_vec());
+        let started = ToolCallStarted {
+            call_id: "m-space".into(),
+            tool_call: Some(ToolCall {
+                mcp_tool_call: Some(crate::providers::cursor::proto::McpToolCall {
+                    args: Some(crate::providers::cursor::proto::McpArgs {
+                        name: "search".into(),
+                        args: args_map,
+                        tool_call_id: "m-space".into(),
+                        provider_identifier: "plugin".into(),
+                        tool_name: "search".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.input["label"], " A");
+    }
+
     #[test]
     fn maps_workflow_mcp_without_provider_identifier_in_input() {
         let mut args_map = std::collections::HashMap::new();
@@ -664,6 +1315,37 @@ mod tests {
         assert_eq!(m.input.as_object().map(|o| o.len()), Some(1));
         assert!(m.input.get("provider_identifier").is_none());
         assert!(m.input.get("args").is_none());
+    }
+
+    #[test]
+    fn maps_cursor_task_tool_call_tag_19() {
+        let started = ToolCallStarted {
+            call_id: "task-1".into(),
+            tool_call: Some(ToolCall {
+                task_tool_call: Some(crate::providers::cursor::proto::TaskToolCall {
+                    args: Some(crate::providers::cursor::proto::TaskToolCallArgsProto {
+                        description: "explore live".into(),
+                        prompt: "find TaskToolCall".into(),
+                        model: None,
+                        subagent_type: "explore".into(),
+                        resume: Some("sa-1".into()),
+                        run_in_background: Some(true),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.name, "Task");
+        assert_eq!(m.input["description"], "explore live");
+        assert_eq!(m.input["prompt"], "find TaskToolCall");
+        assert_eq!(m.input["subagent_type"], "explore");
+        assert_eq!(m.input["resume"], "sa-1");
+        assert_eq!(m.input["run_in_background"], true);
+        let adapted = adapt_tool_input_for_client("spawn_subagent", m.input);
+        assert_eq!(adapted["resume_from"], "sa-1");
+        assert_eq!(adapted["background"], true);
     }
 
     #[test]
@@ -773,5 +1455,443 @@ mod tests {
         accumulate_partial_args_text(&mut frag, r#"{"name":""#);
         accumulate_partial_args_text(&mut frag, r#"deep-research"}"#);
         assert_eq!(frag, r#"{"name":"deep-research"}"#);
+    }
+
+    #[test]
+    fn adapt_read_file_renames_file_path_to_target_file() {
+        let adapted = adapt_tool_input_for_client(
+            "read_file",
+            serde_json::json!({"file_path": "/tmp/a.rs", "offset": 1}),
+        );
+        assert_eq!(adapted["target_file"], "/tmp/a.rs");
+        assert_eq!(adapted["offset"], 1);
+        assert!(adapted.get("file_path").is_none());
+        let already = adapt_tool_input_for_client(
+            "read_file",
+            serde_json::json!({"target_file": "/kept.rs", "file_path": "/ignored.rs"}),
+        );
+        assert_eq!(already["target_file"], "/kept.rs");
+        let claude =
+            adapt_tool_input_for_client("Read", serde_json::json!({"file_path": "/tmp/a.rs"}));
+        assert_eq!(claude["file_path"], "/tmp/a.rs");
+        assert!(claude.get("target_file").is_none());
+    }
+
+    #[test]
+    fn task_fallbacks_include_grok_build_canonical_task() {
+        assert!(advertised_name_fallbacks("Task").contains(&"task"));
+        assert!(advertised_name_fallbacks("Task").contains(&"spawn_subagent"));
+    }
+
+    #[test]
+    fn adapt_native_task_to_spawn_rebuilds_allowlist() {
+        let adapted = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "description": "explore live",
+            "prompt": "find TaskToolCall",
+            "subagent_type": "generalPurpose",
+            "resume": "sa-1",
+            "run_in_background": false,
+            "model": "cursor-grok4.6",
+            "readonly": true,
+            "provider_identifier": "evil",
+            "args": {"nested": true}
+        }));
+        let obj = adapted.as_object().expect("object");
+        assert_eq!(
+            obj.get("description").and_then(|v| v.as_str()),
+            Some("explore live")
+        );
+        assert_eq!(
+            obj.get("prompt").and_then(|v| v.as_str()),
+            Some("find TaskToolCall")
+        );
+        assert_eq!(
+            obj.get("subagent_type").and_then(|v| v.as_str()),
+            Some("general-purpose")
+        );
+        assert_eq!(
+            obj.get("resume_from").and_then(|v| v.as_str()),
+            Some("sa-1")
+        );
+        assert_eq!(obj.get("background"), Some(&serde_json::json!(false)));
+        for leaked in [
+            "model",
+            "readonly",
+            "resume",
+            "run_in_background",
+            "provider_identifier",
+            "args",
+            "capability_mode",
+        ] {
+            assert!(obj.get(leaked).is_none(), "{leaked} must not leak");
+        }
+        let unknown = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "prompt": "p",
+            "subagent_type": "my-custom-agent"
+        }));
+        assert_eq!(unknown["subagent_type"], "my-custom-agent");
+        assert!(unknown.get("background").is_none());
+        let already = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "prompt": "p",
+            "resume_from": "kept",
+            "background": false,
+            "resume": "ignored",
+            "run_in_background": true
+        }));
+        assert_eq!(already["resume_from"], "kept");
+        assert_eq!(already["background"], false);
+    }
+
+    #[test]
+    fn adapt_spawn_subagent_renames_resume_and_background() {
+        let adapted = adapt_tool_input_for_client(
+            "spawn_subagent",
+            serde_json::json!({
+                "description": "explore live",
+                "prompt": "find TaskToolCall",
+                "subagent_type": "explore",
+                "resume": "sa-1",
+                "run_in_background": true
+            }),
+        );
+        assert_eq!(adapted["resume_from"], "sa-1");
+        assert_eq!(adapted["background"], true);
+        assert!(adapted.get("resume").is_none());
+        assert!(adapted.get("run_in_background").is_none());
+        let already = adapt_tool_input_for_client(
+            "spawn_subagent",
+            serde_json::json!({
+                "prompt": "p",
+                "description": "d",
+                "resume_from": "kept",
+                "background": false,
+                "resume": "ignored",
+                "run_in_background": true
+            }),
+        );
+        assert_eq!(already["resume_from"], "kept");
+        assert_eq!(already["background"], false);
+    }
+
+    #[test]
+    fn adapt_native_task_unwraps_protobuf_prefixed_strings() {
+        use prost_types::value::Kind;
+        let description = String::from_utf8(proto_value_bytes(Kind::StringValue(
+            "SPAWN smoke test".into(),
+        )))
+        .unwrap();
+        let prompt = String::from_utf8(proto_value_bytes(Kind::StringValue(
+            "Reply with exactly one line: SPAWN_OK".into(),
+        )))
+        .unwrap();
+        let subagent_type = String::from_utf8(proto_value_bytes(Kind::StringValue(
+            "general-purpose".into(),
+        )))
+        .unwrap();
+        let adapted = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "description": description,
+            "prompt": prompt,
+            "subagent_type": subagent_type,
+            "background": " \u{0001}",
+        }));
+        assert_eq!(adapted["description"], "SPAWN smoke test");
+        assert_eq!(adapted["prompt"], "Reply with exactly one line: SPAWN_OK");
+        assert_eq!(adapted["subagent_type"], "general-purpose");
+        assert_eq!(adapted["background"], true);
+    }
+
+    #[test]
+    fn adapt_spawn_keeps_grok_isolation_and_drops_cursor_model() {
+        let adapted = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "description": "review",
+            "prompt": "audit isolation",
+            "capability_mode": "readOnly",
+            "isolation": "work_tree",
+            "cwd": "/tmp/carve",
+            "model": "cursor-grok4.5",
+            "readonly": true
+        }));
+        assert_eq!(adapted["capability_mode"], "read-only");
+        assert_eq!(adapted["isolation"], "worktree");
+        assert_eq!(adapted["cwd"], "/tmp/carve");
+        assert!(adapted.get("model").is_none());
+        assert!(adapted.get("readonly").is_none());
+        let kept_model = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "prompt": "p",
+            "description": "d",
+            "model": "grok-4.6"
+        }));
+        assert_eq!(kept_model["model"], "grok-4.6");
+        let rejected = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "prompt": "p",
+            "description": "d",
+            "capability_mode": "superuser",
+            "isolation": "jail"
+        }));
+        assert!(rejected.get("capability_mode").is_none());
+        assert!(rejected.get("isolation").is_none());
+    }
+
+    #[test]
+    fn glob_list_dir_only_when_pattern_is_a_directory_listing() {
+        assert!(glob_pattern_is_directory_listing(
+            &serde_json::json!({"pattern": "*"})
+        ));
+        assert!(!glob_pattern_is_directory_listing(
+            &serde_json::json!({"pattern": "**/*.rs"})
+        ));
+        let listing = adapt_tool_input_for_client(
+            "list_dir",
+            serde_json::json!({"pattern": "*", "path": "/tmp/carve"}),
+        );
+        assert_eq!(listing["target_directory"], "/tmp/carve");
+        assert!(listing.get("pattern").is_none());
+        let shelled = adapt_tool_input_for_client(
+            "run_terminal_command",
+            serde_json::json!({"pattern": "**/*.rs", "path": "src"}),
+        );
+        assert_eq!(
+            shelled["command"].as_str(),
+            Some("rg --files -g '**/*.rs' -- 'src'")
+        );
+        assert!(
+            resolve_glob_client_name(
+                &serde_json::json!({"pattern": "**/*.rs"}),
+                Some("list_dir".into()),
+                Some("run_terminal_command".into()),
+            )
+            .as_deref()
+                == Some("run_terminal_command")
+        );
+        assert!(
+            resolve_glob_client_name(
+                &serde_json::json!({"pattern": "**/*.rs"}),
+                Some("list_dir".into()),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_mcp_tool_keeps_fractional_timeout() {
+        let adapted = adapt_tool_input_for_client(
+            "custom_timer",
+            serde_json::json!({"timeout": 1.5, "offset": 2.0}),
+        );
+        assert_eq!(adapted["timeout"], 1.5);
+        assert_eq!(adapted["offset"], 2.0);
+    }
+
+    #[test]
+    fn grok_build_fallbacks_cover_cursor_and_claude_names() {
+        for (mapped, grok) in [
+            ("Bash", "run_terminal_command"),
+            ("Read", "read_file"),
+            ("Write", "write"),
+            ("Grep", "grep"),
+            ("Glob", "list_dir"),
+            ("LS", "list_dir"),
+            ("WebSearch", "web_search"),
+            ("WebFetch", "web_fetch"),
+            ("TodoWrite", "todo_write"),
+            ("AskUserQuestion", "ask_user_question"),
+            ("Task", "spawn_subagent"),
+            ("TaskOutput", "get_command_or_subagent_output"),
+            ("BashOutput", "get_command_or_subagent_output"),
+            ("KillShell", "kill_command_or_subagent"),
+            ("CreatePlan", "enter_plan_mode"),
+            ("CreatePlan", "EnterPlanMode"),
+        ] {
+            assert!(
+                advertised_name_fallbacks(mapped).contains(&grok),
+                "{mapped} must map to grok-build {grok}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_whole_number_args_decode_as_integers() {
+        use prost_types::value::Kind;
+        let mut args_map = std::collections::HashMap::new();
+        args_map.insert(
+            "timeout_ms".into(),
+            proto_value_bytes(Kind::NumberValue(5000.0)),
+        );
+        args_map.insert(
+            "timeout".into(),
+            proto_value_bytes(Kind::NumberValue(120000.0)),
+        );
+        let started = ToolCallStarted {
+            call_id: "m-num".into(),
+            tool_call: Some(ToolCall {
+                mcp_tool_call: Some(crate::providers::cursor::proto::McpToolCall {
+                    args: Some(crate::providers::cursor::proto::McpArgs {
+                        name: "mcp_claude-local_get_command_or_subagent_output".into(),
+                        args: args_map,
+                        tool_call_id: "m-num".into(),
+                        provider_identifier: "claude-local".into(),
+                        tool_name: "mcp_claude-local_get_command_or_subagent_output".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(
+            m.input["timeout_ms"].as_u64(),
+            Some(5000),
+            "protobuf NumberValue whole numbers must be JSON integers; grok-build rejects f64 timeout_ms"
+        );
+        assert_eq!(m.input["timeout"].as_u64(), Some(120000));
+    }
+
+    #[test]
+    fn adapt_run_terminal_command_adds_description_and_integer_timeout() {
+        let adapted = adapt_tool_input_for_client(
+            "run_terminal_command",
+            serde_json::json!({
+                "command": "ls -la",
+                "timeout": 30000.0,
+                "is_background": false
+            }),
+        );
+        assert_eq!(adapted["timeout"].as_u64(), Some(30000));
+        assert_eq!(adapted["background"], false);
+        assert!(adapted.get("is_background").is_none());
+        let description = adapted["description"].as_str().unwrap_or("");
+        assert!(!description.is_empty(), "grok-build requires description");
+        assert!(
+            !description.contains('\0'),
+            "description must be clean text"
+        );
+    }
+
+    #[test]
+    fn adapt_get_output_coerces_timeout_ms_and_task_id() {
+        let adapted = adapt_tool_input_for_client(
+            "get_command_or_subagent_output",
+            serde_json::json!({
+                "task_id": "sa-1",
+                "timeout_ms": 8000.0
+            }),
+        );
+        assert_eq!(adapted["task_ids"], serde_json::json!(["sa-1"]));
+        assert_eq!(adapted["timeout_ms"].as_u64(), Some(8000));
+        assert!(adapted.get("task_id").is_none());
+        let dropped = adapt_tool_input_for_client(
+            "get_command_or_subagent_output",
+            serde_json::json!({
+                "task_ids": ["sa-1"],
+                "timeout_ms": 80.5
+            }),
+        );
+        assert!(
+            dropped.get("timeout_ms").is_none(),
+            "fractional timeout_ms must be dropped so grok-build can poll"
+        );
+    }
+
+    #[test]
+    fn adapt_ls_path_to_list_dir_or_shell() {
+        let listed =
+            adapt_tool_input_for_client("list_dir", serde_json::json!({"path": "/tmp/carve"}));
+        assert_eq!(listed["target_directory"], "/tmp/carve");
+        assert!(listed.get("path").is_none());
+        let shelled = adapt_tool_input_for_client(
+            "run_terminal_command",
+            serde_json::json!({"path": "/tmp/carve"}),
+        );
+        assert_eq!(shelled["command"].as_str(), Some("ls -la -- '/tmp/carve'"));
+        assert!(
+            shelled["description"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+    }
+
+    #[test]
+    fn adapt_grep_renames_case_insensitive_for_grok() {
+        let adapted = adapt_tool_input_for_client(
+            "grep",
+            serde_json::json!({
+                "pattern": "TODO",
+                "path": "src",
+                "case_insensitive": true,
+                "head_limit": 20.0
+            }),
+        );
+        assert_eq!(adapted["-i"], true);
+        assert_eq!(adapted["head_limit"].as_u64(), Some(20));
+        assert!(adapted.get("case_insensitive").is_none());
+        let claude = adapt_tool_input_for_client(
+            "Grep",
+            serde_json::json!({"pattern": "TODO", "case_insensitive": true}),
+        );
+        assert_eq!(claude["-i"], true);
+        assert!(claude.get("case_insensitive").is_none());
+    }
+
+    #[test]
+    fn adapt_todo_write_adds_active_form_and_drops_merge() {
+        let adapted = adapt_tool_input_for_client(
+            "TodoWrite",
+            serde_json::json!({
+                "merge": true,
+                "todos": [{"id": "1", "content": "collect", "status": "in_progress"}]
+            }),
+        );
+        assert!(adapted.get("merge").is_none());
+        assert_eq!(adapted["todos"][0]["content"], "collect");
+        assert_eq!(adapted["todos"][0]["activeForm"], "Working on collect");
+        let grok = adapt_tool_input_for_client(
+            "todo_write",
+            serde_json::json!({
+                "merge": true,
+                "todos": [{"id": "1", "content": "collect", "status": "in_progress"}]
+            }),
+        );
+        assert_eq!(grok["merge"], true);
+        assert!(grok["todos"][0].get("activeForm").is_none());
+    }
+
+    #[test]
+    fn adapt_webfetch_adds_prompt_for_claude_code() {
+        let claude = adapt_tool_input_for_client(
+            "WebFetch",
+            serde_json::json!({"url": "https://example.com/doc"}),
+        );
+        assert_eq!(claude["url"], "https://example.com/doc");
+        assert!(
+            claude["prompt"].as_str().is_some_and(|p| !p.is_empty()),
+            "Claude Code WebFetch requires prompt"
+        );
+        let grok = adapt_tool_input_for_client(
+            "web_fetch",
+            serde_json::json!({"url": "https://example.com/doc"}),
+        );
+        assert_eq!(grok["url"], "https://example.com/doc");
+        assert!(grok.get("prompt").is_none());
+    }
+
+    #[test]
+    fn maps_cursor_ls_to_canonical_ls_not_bash() {
+        let started = ToolCallStarted {
+            call_id: "ls1".into(),
+            tool_call: Some(ToolCall {
+                ls_tool_call: Some(crate::providers::cursor::proto::LsToolCall {
+                    args: Some(crate::providers::cursor::proto::LsArgs {
+                        path: "/tmp/carve".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let m = map_tool_call_started(&started).unwrap();
+        assert_eq!(m.name, "LS");
+        assert_eq!(m.input["path"], "/tmp/carve");
+        assert!(m.input.get("command").is_none());
     }
 }

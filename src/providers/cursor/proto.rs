@@ -640,6 +640,10 @@ pub struct ToolCall {
     pub create_plan_tool_call: Option<CreatePlanToolCall>,
     #[prost(message, optional, tag = "18")]
     pub web_search_tool_call: Option<WebSearchToolCall>,
+    /// 0xlane `agent_v1.proto` + Cursor.app: `task_tool_call = 19`.
+    /// Native Cursor Task / subagent. Mapped to grok-build `spawn_subagent`.
+    #[prost(message, optional, tag = "19")]
+    pub task_tool_call: Option<TaskToolCall>,
     #[prost(message, optional, tag = "23")]
     pub ask_question_tool_call: Option<AskQuestionToolCall>,
     #[prost(message, optional, tag = "24")]
@@ -659,7 +663,8 @@ pub struct McpToolCall {
 pub struct McpArgs {
     #[prost(string, tag = "1")]
     pub name: String,
-    /// Values are typically UTF-8 JSON fragments.
+    /// Values are UTF-8 JSON fragments or `google.protobuf.Value` bytes
+    /// (`string_value=3`, `bool_value=4`). Decode in `decode_mcp_arg_value`.
     #[prost(map = "string, bytes", tag = "2")]
     pub args: std::collections::HashMap<String, Vec<u8>>,
     #[prost(string, tag = "3")]
@@ -760,6 +765,38 @@ pub struct FetchArgs {
     pub url: String,
     #[prost(string, tag = "2")]
     pub tool_call_id: String,
+}
+
+/// `agent.v1.TaskToolCall` — Cursor native Task / subagent (ToolCall tag 19).
+#[derive(Clone, PartialEq, Message)]
+pub struct TaskToolCall {
+    #[prost(message, optional, tag = "1")]
+    pub args: Option<TaskToolCallArgsProto>,
+}
+
+/// Wire args for model-initiated [`TaskToolCall`] (ToolCall tag 19).
+///
+/// Layout matches 0xlane `TaskToolCallArgsProto` (string `subagent_type`)
+/// except tag 6. 0xlane documents `optional bool readonly = 6`, but live
+/// Cursor 2026-08 sends tag 6 as LengthDelimited. Declaring it as bool
+/// drops the entire InteractionUpdate (`spawn_subagent` never reaches
+/// grok-build). Tag 6 is left undeclared so any wire type is skipped.
+/// This is not `ExecServerMessage.subagent_args` / `TaskArgs` (tag 28), whose
+/// `subagent_type` is a nested message.
+#[derive(Clone, PartialEq, Message)]
+pub struct TaskToolCallArgsProto {
+    #[prost(string, tag = "1")]
+    pub description: String,
+    #[prost(string, tag = "2")]
+    pub prompt: String,
+    #[prost(string, optional, tag = "3")]
+    pub model: Option<String>,
+    #[prost(string, tag = "4")]
+    pub subagent_type: String,
+    #[prost(string, optional, tag = "5")]
+    pub resume: Option<String>,
+    #[prost(bool, optional, tag = "7")]
+    pub run_in_background: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1667,6 +1704,125 @@ mod tests {
         assert_eq!(args.url, "https://example.com");
         assert_eq!(args.tool_call_id, "wf-1");
         assert!(decoded.fetch_tool_call.is_none());
+    }
+
+    #[test]
+    fn tool_call_task_uses_tag_19() {
+        let call = ToolCall {
+            task_tool_call: Some(TaskToolCall {
+                args: Some(TaskToolCallArgsProto {
+                    description: "explore".into(),
+                    prompt: "look around".into(),
+                    model: None,
+                    subagent_type: "explore".into(),
+                    resume: None,
+                    run_in_background: Some(true),
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        call.encode(&mut buf).unwrap();
+        // Field 19, wire type 2 → tag 0x9a.
+        assert!(
+            buf.contains(&0x9a),
+            "task_tool_call tag 19 missing in {buf:?}"
+        );
+        let decoded = ToolCall::decode(&buf[..]).unwrap();
+        let args = decoded.task_tool_call.unwrap().args.unwrap();
+        assert_eq!(args.prompt, "look around");
+        assert_eq!(args.subagent_type, "explore");
+        assert_eq!(args.run_in_background, Some(true));
+        assert!(decoded.web_search_tool_call.is_none());
+    }
+
+    fn proto_varint(mut value: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    fn proto_len_delim_field(field: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = proto_varint((field << 3) | 2);
+        out.extend(proto_varint(payload.len() as u32));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn proto_string(field: u32, value: &str) -> Vec<u8> {
+        proto_len_delim_field(field, value.as_bytes())
+    }
+
+    #[test]
+    fn tool_call_task_decodes_handcrafted_tag_19_bytes() {
+        // 0xlane TaskToolCallArgsProto: description=1, prompt=2, model=3,
+        // subagent_type=4, resume=5, readonly=6, run_in_background=7.
+        let mut args = Vec::new();
+        args.extend(proto_string(1, "explore live"));
+        args.extend(proto_string(2, "look around"));
+        args.extend(proto_string(3, "cursor-grok4.6"));
+        args.extend(proto_string(4, "explore"));
+        args.extend(proto_string(5, "sa-1"));
+        args.extend_from_slice(&[0x30, 0x01]); // tag 6 bool — skipped on live wire
+        args.extend_from_slice(&[0x38, 0x00]); // run_in_background = false
+        let task_tool_call = proto_len_delim_field(1, &args);
+        let buf = proto_len_delim_field(19, &task_tool_call);
+        assert!(
+            buf.windows(2).any(|w| w == [0x9a, 0x01]),
+            "field 19 tag must be varint 0x9a 0x01, got {buf:?}"
+        );
+
+        let decoded = ToolCall::decode(&buf[..]).unwrap();
+        let args = decoded.task_tool_call.expect("tag 19 must decode as Task");
+        let args = args.args.expect("TaskToolCall.args");
+        assert_eq!(args.description, "explore live");
+        assert_eq!(args.prompt, "look around");
+        assert_eq!(args.model.as_deref(), Some("cursor-grok4.6"));
+        assert_eq!(args.subagent_type, "explore");
+        assert_eq!(args.resume.as_deref(), Some("sa-1"));
+        assert_eq!(args.run_in_background, Some(false));
+        assert!(decoded.web_search_tool_call.is_none());
+
+        // ExecServerMessage.subagent_args is tag 28. A ToolCall that only
+        // carries tag 28 must not populate task_tool_call.
+        let tag28 = proto_len_delim_field(28, b"not-a-task");
+        let decoded28 = ToolCall::decode(&tag28[..]).unwrap();
+        assert!(
+            decoded28.task_tool_call.is_none(),
+            "tag 28 must not be mistaken for native Task tag 19"
+        );
+    }
+
+    #[test]
+    fn tool_call_task_survives_length_delimited_tag_6() {
+        // Live Cursor 2026-08-16 sends TaskToolCallArgsProto tag 6 as
+        // LengthDelimited (`invalid wire type: LengthDelimited (expected
+        // Varint)` on `readonly`). A type mismatch must not drop the Task
+        // frame — otherwise grok-build never sees spawn_subagent and loops
+        // on the same plan text.
+        let mut args = Vec::new();
+        args.extend(proto_string(1, "explore live"));
+        args.extend(proto_string(2, "look around"));
+        args.extend(proto_string(4, "explore"));
+        args.extend(proto_string(6, "not-a-bool"));
+        args.extend_from_slice(&[0x38, 0x01]); // run_in_background = true
+        let task_tool_call = proto_len_delim_field(1, &args);
+        let buf = proto_len_delim_field(19, &task_tool_call);
+        let decoded =
+            ToolCall::decode(&buf[..]).expect("length-delimited tag 6 must not fail Task decode");
+        let args = decoded
+            .task_tool_call
+            .expect("tag 19 must decode as Task")
+            .args
+            .expect("TaskToolCall.args");
+        assert_eq!(args.description, "explore live");
+        assert_eq!(args.prompt, "look around");
+        assert_eq!(args.subagent_type, "explore");
+        assert_eq!(args.run_in_background, Some(true));
     }
 
     #[test]

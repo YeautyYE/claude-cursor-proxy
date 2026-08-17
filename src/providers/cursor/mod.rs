@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -44,15 +44,18 @@ use crate::providers::cursor::hosted_web_search::{
 };
 use crate::providers::cursor::live::{
     LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim,
-    LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveSlotClaim,
-    live_request_fingerprint, live_run_key_for, live_sse_response,
-    live_start_error_seals_tombstone,
+    LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveRunReservation,
+    LiveSlotClaim, cursor_start_error_is_same_request_retryable, finish_replacement_after_cancel,
+    live_error_is_same_request_retryable, live_pending_must_supersede,
+    live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
+    live_run_key_for, live_sse_response, live_start_error_seals_tombstone,
+    same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
-    CursorPromptOptions, claude_local_mcp_tools, cursor_request_context,
-    latest_user_is_only_tool_results, render_cursor_prompt, render_cursor_prompt_parts_with,
-    request_has_client_only_tool_results, request_has_orphaned_native_live_results,
+    CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, cursor_request_context,
+    latest_user_is_only_tool_results, reject_orphaned_native_results_when_live_slot_is_free,
+    render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream,
@@ -193,6 +196,371 @@ fn live_sse_recording_usage(
         estimated_input,
         monitor,
     )
+}
+
+enum LiveStartPeek {
+    Retryable(String),
+    Ready(mpsc::Receiver<LiveEventResult>),
+}
+
+/// Streaming clients see "Waiting for response" until Anthropic SSE starts.
+/// Commit `message_start` before `start_live` / peek / retries so grok-build
+/// and Claude Code are not stuck on a blank HTTP request for tens of seconds.
+fn commit_streaming_live_sse_before_start_live(want_stream: bool) -> bool {
+    want_stream
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_live_events_with_retries(
+    client: CursorHttpClient,
+    mut token: String,
+    user_text: &str,
+    model: &str,
+    images: &[CursorSelectedImage],
+    custom_system: Option<&str>,
+    identity: LiveRunIdentity<'_>,
+    allowed: Option<BTreeSet<String>>,
+    mcp_tools: Option<crate::providers::cursor::proto::McpTools>,
+    request_context: crate::providers::cursor::proto::RequestContext,
+    fingerprint: Vec<u8>,
+    mut initial_reservation: Option<LiveRunReservation>,
+    has_refresh: bool,
+) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+    let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
+    let mut transient_retries = 0_u32;
+    loop {
+        let mut reservation = if let Some(reservation) = initial_reservation.take() {
+            reservation
+        } else {
+            match LiveRunRegistry::try_claim_run(identity.session_id, identity.agent_id) {
+                LiveSlotClaim::Reserved(reservation) => reservation,
+                LiveSlotClaim::Starting | LiveSlotClaim::Ambiguous => {
+                    if Instant::now() >= conflict_deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                LiveSlotClaim::Running => break,
+            }
+        };
+
+        reservation.protect_on_drop();
+        let start = match client
+            .start_live_agent_with_identity(
+                &token,
+                user_text,
+                model,
+                images,
+                custom_system,
+                identity,
+                allowed.clone(),
+                mcp_tools.clone(),
+                request_context.clone(),
+                Some(reservation.cancelled()),
+            )
+            .await
+        {
+            Ok(start) => Ok(start),
+            Err(error) if error.status == 401 && has_refresh => match force_refresh_cursor_auth() {
+                Ok(Some(refreshed)) => {
+                    token = refreshed.access_token;
+                    client
+                        .start_live_agent_with_identity(
+                            &token,
+                            user_text,
+                            model,
+                            images,
+                            custom_system,
+                            identity,
+                            allowed.clone(),
+                            mcp_tools.clone(),
+                            request_context.clone(),
+                            Some(reservation.cancelled()),
+                        )
+                        .await
+                }
+                _ => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+
+        match start {
+            Ok(start) => {
+                start
+                    .handle
+                    .set_request_fingerprint(live_request_fingerprint(&fingerprint));
+                if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
+                    let _ = orphaned.cancel_and_wait().await;
+                    break;
+                }
+                match peek_live_start_for_stale_reset(start.events).await {
+                    LiveStartPeek::Ready(events) => return Ok(events),
+                    LiveStartPeek::Retryable(error) => {
+                        let _ = start.handle.cancel_and_wait().await;
+                        let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
+                        if transient_retries >= crate::retry::MAX_RATE_LIMIT_RETRIES {
+                            return Err(CursorError::internal(error));
+                        }
+                        crate::retry::sleep(same_request_retry_wait_ms(transient_retries, &error))
+                            .await;
+                        transient_retries += 1;
+                        continue;
+                    }
+                }
+            }
+            Err(error) => {
+                let retryable = transient_retries < crate::retry::MAX_RATE_LIMIT_RETRIES
+                    && cursor_start_error_is_same_request_retryable(&error);
+                if retryable {
+                    reservation.release();
+                    crate::retry::sleep(same_request_retry_wait_ms(
+                        transient_retries,
+                        &error.message,
+                    ))
+                    .await;
+                    transient_retries += 1;
+                    continue;
+                }
+                if live_start_error_seals_tombstone(&error) {
+                    reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
+                } else {
+                    reservation.release();
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Err(CursorError::new(
+        409,
+        "A Cursor live run is already active for this session",
+        None,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_streaming_live_sse(
+    client: CursorHttpClient,
+    token: String,
+    user_text: String,
+    model: String,
+    images: Vec<CursorSelectedImage>,
+    custom_system: Option<String>,
+    sid: String,
+    agent_id: Option<String>,
+    parent_agent_id: Option<String>,
+    allowed: Option<BTreeSet<String>>,
+    mcp_tools: Option<crate::providers::cursor::proto::McpTools>,
+    request_context: crate::providers::cursor::proto::RequestContext,
+    fingerprint: Vec<u8>,
+    initial_reservation: Option<LiveRunReservation>,
+    has_refresh: bool,
+    message_id: String,
+    wire_model: String,
+    estimated_input: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+) -> Response {
+    let (tx, rx) = mpsc::channel(512);
+    let sid_for_sse = sid.clone();
+    let sid_for_cancel = sid.clone();
+    let agent_for_cancel = agent_id.clone();
+    tokio::spawn(async move {
+        let mut late_retries = 0_u32;
+        let mut reservation = initial_reservation;
+        loop {
+            if tx.is_closed() {
+                LiveRunRegistry::cancel_run(&sid_for_cancel, agent_for_cancel.as_deref());
+                break;
+            }
+            let identity = LiveRunIdentity {
+                session_id: &sid,
+                agent_id: agent_id.as_deref(),
+                parent_agent_id: parent_agent_id.as_deref(),
+            };
+            let start = start_live_events_with_retries(
+                client.clone(),
+                token.clone(),
+                &user_text,
+                &model,
+                &images,
+                custom_system.as_deref(),
+                identity,
+                allowed.clone(),
+                mcp_tools.clone(),
+                request_context.clone(),
+                fingerprint.clone(),
+                reservation.take(),
+                has_refresh,
+            );
+            tokio::pin!(start);
+            tokio::select! {
+                _ = tx.closed() => {
+                    LiveRunRegistry::cancel_run(&sid_for_cancel, agent_for_cancel.as_deref());
+                    break;
+                }
+                result = &mut start => {
+                    match result {
+                        Ok(events) => {
+                            match pump_live_events_until_commit_or_retry(&tx, events).await {
+                                LivePumpOutcome::ClientGone => {
+                                    LiveRunRegistry::cancel_run(
+                                        &sid_for_cancel,
+                                        agent_for_cancel.as_deref(),
+                                    );
+                                    break;
+                                }
+                                LivePumpOutcome::Retry(error)
+                                    if late_retries < crate::retry::MAX_RATE_LIMIT_RETRIES =>
+                                {
+                                    let _ = LiveRunRegistry::probe_run(
+                                        &sid_for_cancel,
+                                        agent_for_cancel.as_deref(),
+                                    );
+                                    crate::retry::sleep(same_request_retry_wait_ms(
+                                        late_retries,
+                                        &error,
+                                    ))
+                                    .await;
+                                    late_retries += 1;
+                                }
+                                LivePumpOutcome::Retry(error) => {
+                                    let _ = tx.send(Err(error)).await;
+                                    break;
+                                }
+                                LivePumpOutcome::Done => break,
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Err(error.message)).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    live_sse_recording_usage(
+        &sid_for_sse,
+        rx,
+        message_id,
+        wire_model,
+        estimated_input,
+        monitor,
+    )
+}
+
+/// Wait briefly for the first live event before committing Anthropic SSE.
+/// A missing-conversation reset on that first event can start a fresh Run
+/// on this same request; grok-build will not retry the 502 itself.
+async fn peek_live_start_for_stale_reset(
+    mut events: mpsc::Receiver<LiveEventResult>,
+) -> LiveStartPeek {
+    let wait = Duration::from_millis(env_u64_millis("CCP_CURSOR_STALE_CONV_PEEK_MS", 2_000));
+    match tokio::time::timeout(wait, events.recv()).await {
+        Ok(Some(Err(error))) if live_error_is_same_request_retryable(&error) => {
+            LiveStartPeek::Retryable(error)
+        }
+        Ok(Some(first)) => LiveStartPeek::Ready(prepend_live_event(first, events)),
+        Ok(None) | Err(_) => LiveStartPeek::Ready(events),
+    }
+}
+
+fn prepend_live_event(
+    first: LiveEventResult,
+    mut rest: mpsc::Receiver<LiveEventResult>,
+) -> mpsc::Receiver<LiveEventResult> {
+    let (tx, rx) = mpsc::channel(512);
+    tokio::spawn(async move {
+        if tx.send(first).await.is_err() {
+            return;
+        }
+        while let Some(item) = rest.recv().await {
+            if tx.send(item).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LivePumpOutcome {
+    Done,
+    Retry(String),
+    ClientGone,
+}
+
+fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
+    match event {
+        LiveRunEvent::NativeToolBatch(_) => true,
+        LiveRunEvent::Cursor(
+            CursorStreamEvent::ThinkingDelta { .. }
+            | CursorStreamEvent::TextDelta { .. }
+            | CursorStreamEvent::NativeTool { .. }
+            | CursorStreamEvent::End,
+        ) => true,
+        LiveRunEvent::Cursor(
+            CursorStreamEvent::Session { .. }
+            | CursorStreamEvent::Usage { .. }
+            | CursorStreamEvent::OutputTokenDelta { .. },
+        ) => false,
+    }
+}
+
+fn classify_live_pump_item(committed: bool, item: &LiveEventResult) -> LivePumpAction {
+    match item {
+        Err(error) if !committed && live_error_is_same_request_retryable(error) => {
+            LivePumpAction::Retry
+        }
+        Ok(event) if !committed && !live_event_commits_client_output(event) => {
+            LivePumpAction::Buffer
+        }
+        _ => LivePumpAction::Forward,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePumpAction {
+    Buffer,
+    Forward,
+    Retry,
+}
+
+async fn pump_live_events_until_commit_or_retry(
+    tx: &mpsc::Sender<LiveEventResult>,
+    mut events: mpsc::Receiver<LiveEventResult>,
+) -> LivePumpOutcome {
+    let mut committed = false;
+    let mut buffered = Vec::new();
+    while let Some(item) = events.recv().await {
+        match classify_live_pump_item(committed, &item) {
+            LivePumpAction::Retry => {
+                let Err(error) = item else {
+                    continue;
+                };
+                return LivePumpOutcome::Retry(error);
+            }
+            LivePumpAction::Buffer => buffered.push(item),
+            LivePumpAction::Forward => {
+                committed = true;
+                for pending in buffered.drain(..) {
+                    if tx.send(pending).await.is_err() {
+                        return LivePumpOutcome::ClientGone;
+                    }
+                }
+                if tx.send(item).await.is_err() {
+                    return LivePumpOutcome::ClientGone;
+                }
+            }
+        }
+    }
+    for pending in buffered {
+        if tx.send(pending).await.is_err() {
+            return LivePumpOutcome::ClientGone;
+        }
+    }
+    LivePumpOutcome::Done
 }
 
 async fn live_downstream_response(
@@ -375,6 +743,9 @@ enum LiveResumeOutcome {
     MissingTools(Vec<String>),
     ResumeError(CursorError),
     SupersedeRunning(String),
+    /// Fresh compact/next-turn spent the nested wait on Starting / same-
+    /// fingerprint Succeeded. Claim that slot; do not 409.
+    TakeOccupiedSlot,
     Conflict,
     Free,
 }
@@ -384,12 +755,64 @@ fn unresolved_live_tools_outcome(
     missing: Vec<String>,
     observed_run_id: Option<&str>,
 ) -> LiveResumeOutcome {
-    if has_current_tool_results {
-        LiveResumeOutcome::MissingTools(missing)
-    } else if let Some(run_id) = observed_run_id {
+    if let Some(run_id) = observed_run_id {
         LiveResumeOutcome::SupersedeRunning(run_id.to_string())
+    } else if has_current_tool_results {
+        LiveResumeOutcome::MissingTools(missing)
     } else {
         LiveResumeOutcome::Conflict
+    }
+}
+
+/// Classify a slot that `get_run` hides. A dying Running generation is
+/// superseded. Ambiguous is cleared. A Succeeded tombstone with a *new*
+/// fingerprint is released so compact/next-turn can start. Starting and
+/// same-fingerprint Succeeded stay Occupied until the nested wait expires.
+fn resume_when_slot_has_no_runnable_handle(
+    session_id: &str,
+    agent_id: Option<&str>,
+    fingerprint: u64,
+    observed_run_id: Option<&str>,
+) -> Option<LiveResumeOutcome> {
+    if let Some(run_id) = LiveRunRegistry::running_generation(session_id, agent_id) {
+        // get_run hides cancel-requested / terminal handles. Compact and the
+        // next grok turn close the previous SSE first; the dying generation
+        // must be superseded, not 409'd.
+        return Some(LiveResumeOutcome::SupersedeRunning(run_id));
+    }
+    if LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id) {
+        if let Some(run_id) = observed_run_id {
+            return Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()));
+        }
+        return Some(LiveResumeOutcome::Free);
+    }
+    LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
+    if !LiveRunRegistry::is_occupied_run(session_id, agent_id) {
+        if let Some(run_id) = observed_run_id {
+            return Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()));
+        }
+        return Some(LiveResumeOutcome::Free);
+    }
+    match LiveRunRegistry::probe_run(session_id, agent_id) {
+        LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
+            Some(LiveResumeOutcome::TerminalError(error))
+        }
+        LiveRunProbe::TerminalError(_) => {
+            let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
+            if let Some(run_id) = observed_run_id {
+                Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
+            } else {
+                Some(LiveResumeOutcome::Free)
+            }
+        }
+        LiveRunProbe::Free => {
+            if let Some(run_id) = observed_run_id {
+                Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
+            } else {
+                Some(LiveResumeOutcome::Free)
+            }
+        }
+        LiveRunProbe::Occupied => None,
     }
 }
 
@@ -407,6 +830,8 @@ async fn await_live_run_resume(
     want_stream: bool,
 ) -> LiveResumeOutcome {
     let has_tool_results = request_has_current_tool_result(body);
+    let fingerprint =
+        live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
     // Tool-result resumes: wait for pending tools to appear (race with expose).
     // Keep this below downstream stream-idle: no Anthropic response exists yet,
     // so SSE pings cannot protect this pre-response window.
@@ -421,24 +846,27 @@ async fn await_live_run_resume(
 
     while tokio::time::Instant::now() < deadline {
         let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
-            match LiveRunRegistry::probe_run(session_id, agent_id) {
-                LiveRunProbe::TerminalError(error) => {
-                    return LiveResumeOutcome::TerminalError(error);
-                }
-                LiveRunProbe::Occupied => {
-                    // Starting reservation or a concurrently replaced handle:
-                    // wait instead of treating the session as free.
-                    observed_non_running_slot = true;
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    continue;
-                }
-                LiveRunProbe::Free => return LiveResumeOutcome::Free,
+            if let Some(outcome) = resume_when_slot_has_no_runnable_handle(
+                session_id,
+                agent_id,
+                fingerprint,
+                observed_run_id.as_deref(),
+            ) {
+                return outcome;
             }
+            // Starting / Succeeded: wait for Running or Free.
+            observed_non_running_slot = true;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
         };
         if observed_non_running_slot {
-            // This waiter never owned the generation that just transitioned
-            // from Starting/Ambiguous to Running.
-            return LiveResumeOutcome::Conflict;
+            // A Starting slot became Running. Tool-result waiters must not
+            // attach to a generation they did not own. A fresh compact/next
+            // turn must take it over — 409 is non-retryable for grok-build.
+            if has_tool_results {
+                return LiveResumeOutcome::Conflict;
+            }
+            return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
         }
         match observed_run_id.as_deref() {
             Some(observed) if observed != run.run_id() => {
@@ -454,6 +882,9 @@ async fn await_live_run_resume(
         }
         let pending = run.pending_tools();
         if !pending.is_empty() {
+            if live_pending_must_supersede(&pending) {
+                return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+            }
             if !has_tool_results {
                 // This is a fresh/steering request, not a result for the
                 // exposed batch. Give the owning request a short chance to
@@ -477,13 +908,16 @@ async fn await_live_run_resume(
                             .await,
                         );
                     }
+                    Err(error) if live_resume_error_is_dead_driver(&error) => {
+                        return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+                    }
                     Err(error) => return LiveResumeOutcome::ResumeError(error),
                 },
-                Err(missing) => {
-                    // The request body is immutable and the exposed pending
-                    // batch is atomic; waiting cannot repair a partial,
-                    // mismatched, extra, or duplicate current result batch.
-                    return LiveResumeOutcome::MissingTools(missing);
+                Err(_missing) => {
+                    // grok-build will not synthesize the missing Cursor ids.
+                    // Partial, leftover, dual-id, and extra batches are all
+                    // unrecoverable as a resume — take over this generation.
+                    return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
                 }
             }
         }
@@ -492,14 +926,27 @@ async fn await_live_run_resume(
     }
 
     let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
-        return match LiveRunRegistry::probe_run(session_id, agent_id) {
-            LiveRunProbe::TerminalError(error) => LiveResumeOutcome::TerminalError(error),
-            LiveRunProbe::Occupied => LiveResumeOutcome::Conflict,
-            LiveRunProbe::Free => LiveResumeOutcome::Free,
-        };
+        if let Some(outcome) = resume_when_slot_has_no_runnable_handle(
+            session_id,
+            agent_id,
+            fingerprint,
+            observed_run_id.as_deref(),
+        ) {
+            return outcome;
+        }
+        if let Some(run_id) = observed_run_id {
+            return LiveResumeOutcome::SupersedeRunning(run_id);
+        }
+        if !has_tool_results {
+            return LiveResumeOutcome::TakeOccupiedSlot;
+        }
+        return LiveResumeOutcome::Conflict;
     };
     if observed_non_running_slot {
-        return LiveResumeOutcome::Conflict;
+        if has_tool_results {
+            return LiveResumeOutcome::Conflict;
+        }
+        return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
     }
     match observed_run_id.as_deref() {
         Some(observed) if observed != run.run_id() => {
@@ -515,6 +962,13 @@ async fn await_live_run_resume(
     }
     let pending = run.pending_tools();
     if !pending.is_empty() {
+        if live_pending_must_supersede(&pending) {
+            return LiveResumeOutcome::SupersedeRunning(
+                observed_run_id
+                    .clone()
+                    .unwrap_or_else(|| run.run_id().to_string()),
+            );
+        }
         if !has_tool_results {
             let missing = pending
                 .iter()
@@ -538,24 +992,27 @@ async fn await_live_run_resume(
                         .await,
                     );
                 }
+                Err(error) if live_resume_error_is_dead_driver(&error) => {
+                    return LiveResumeOutcome::SupersedeRunning(
+                        observed_run_id
+                            .clone()
+                            .unwrap_or_else(|| run.run_id().to_string()),
+                    );
+                }
                 Err(error) => return LiveResumeOutcome::ResumeError(error),
             },
-            Err(missing) => {
-                return unresolved_live_tools_outcome(
-                    has_tool_results,
-                    missing,
-                    observed_run_id.as_deref(),
+            Err(_missing) => {
+                return LiveResumeOutcome::SupersedeRunning(
+                    observed_run_id
+                        .clone()
+                        .unwrap_or_else(|| run.run_id().to_string()),
                 );
             }
         }
     }
-    if has_tool_results {
-        LiveResumeOutcome::Conflict
-    } else {
-        LiveResumeOutcome::SupersedeRunning(
-            observed_run_id.expect("a live handle established the observed generation"),
-        )
-    }
+    LiveResumeOutcome::SupersedeRunning(
+        observed_run_id.expect("a live handle established the observed generation"),
+    )
 }
 
 fn env_u64_millis(name: &str, default: u64) -> u64 {
@@ -566,15 +1023,44 @@ fn env_u64_millis(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn strip_cursor_run_generation(id: &str) -> &str {
+    id.split("__cursor_run_").next().unwrap_or(id)
+}
+
+fn tool_id_match_tokens(id: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    for raw in id.split(|c: char| c.is_whitespace() || c == ',') {
+        if raw.is_empty() {
+            continue;
+        }
+        let stripped = strip_cursor_run_generation(raw);
+        tokens.push(stripped);
+        if let Some(idx) = stripped.find("_fc_") {
+            tokens.push(&stripped[..idx]);
+            tokens.push(&stripped[idx + 1..]);
+        }
+    }
+    tokens
+}
+
+fn tool_use_ids_equivalent(left: &str, right: &str) -> bool {
+    let left_tokens = tool_id_match_tokens(left);
+    let right_tokens = tool_id_match_tokens(right);
+    left_tokens.iter().any(|left| {
+        right_tokens.iter().any(|right| {
+            left == right
+                || left.strip_prefix("fc_").is_some_and(|rest| rest == *right)
+                || right.strip_prefix("fc_").is_some_and(|rest| rest == *left)
+        })
+    })
+}
+
 fn collect_live_tool_results(
     body: &MessagesRequest,
     pending: &[PendingCursorExec],
 ) -> Result<Vec<(String, serde_json::Value)>, Vec<String>> {
-    let pending_ids: std::collections::HashSet<&str> = pending
-        .iter()
-        .map(|exec| exec.tool_use_id.as_str())
-        .collect();
-    let mut results_by_id = std::collections::HashMap::<&str, &serde_json::Value>::new();
+    let mut claimed = vec![false; pending.len()];
+    let mut results_by_pending: Vec<Option<&serde_json::Value>> = vec![None; pending.len()];
     let mut invalid_current = Vec::new();
 
     for block in current_user_blocks(body) {
@@ -586,16 +1072,21 @@ fn collect_live_tool_results(
             invalid_current.push("<missing tool_use_id>".to_string());
             continue;
         };
-        if !pending_ids.contains(tool_use_id) || results_by_id.insert(tool_use_id, block).is_some()
-        {
+        let Some(index) = pending.iter().enumerate().position(|(index, exec)| {
+            !claimed[index] && tool_use_ids_equivalent(exec.tool_use_id.as_str(), tool_use_id)
+        }) else {
             invalid_current.push(tool_use_id.to_string());
-        }
+            continue;
+        };
+        claimed[index] = true;
+        results_by_pending[index] = Some(block);
     }
 
     let missing: Vec<String> = pending
         .iter()
-        .filter(|exec| !results_by_id.contains_key(exec.tool_use_id.as_str()))
-        .map(|exec| exec.tool_use_id.clone())
+        .zip(claimed.iter())
+        .filter(|(_, claimed)| !**claimed)
+        .map(|(exec, _)| exec.tool_use_id.clone())
         .collect();
     if !missing.is_empty() {
         return Err(missing);
@@ -606,13 +1097,11 @@ fn collect_live_tool_results(
 
     Ok(pending
         .iter()
-        .map(|exec| {
+        .zip(results_by_pending)
+        .map(|(exec, block)| {
             (
                 exec.tool_use_id.clone(),
-                (*results_by_id
-                    .get(exec.tool_use_id.as_str())
-                    .expect("validated current tool result"))
-                .clone(),
+                block.expect("validated current tool result").clone(),
             )
         })
         .collect())
@@ -635,9 +1124,41 @@ fn current_user_blocks(body: &MessagesRequest) -> Vec<&serde_json::Value> {
 }
 
 fn request_has_current_tool_result(body: &MessagesRequest) -> bool {
-    current_user_blocks(body)
-        .iter()
-        .any(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_result"))
+    current_user_blocks(body).iter().any(|block| {
+        block.get("type").and_then(|value| value.as_str()) == Some("tool_result")
+            && block
+                .get("tool_use_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|id| !id.is_empty())
+    })
+}
+
+#[cfg(test)]
+fn live_current_batch_is_unrelated(body: &MessagesRequest, pending: &[PendingCursorExec]) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let mut saw_tool_result = false;
+    for block in current_user_blocks(body) {
+        if block.get("type").and_then(|value| value.as_str()) != Some("tool_result") {
+            continue;
+        }
+        let Some(tool_use_id) = block
+            .get("tool_use_id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        saw_tool_result = true;
+        if pending
+            .iter()
+            .any(|exec| tool_use_ids_equivalent(exec.tool_use_id.as_str(), tool_use_id))
+        {
+            return false;
+        }
+    }
+    saw_tool_result
 }
 
 pub struct CursorProvider;
@@ -707,11 +1228,17 @@ impl Provider for CursorProvider {
                 live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
             LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
             match LiveRunRegistry::probe_run(session_id, agent_id) {
-                LiveRunProbe::TerminalError(error) => {
+                LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
                     return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
                 }
+                LiveRunProbe::TerminalError(_) => {
+                    // Ambiguous cancel / retryable probe already sealed or
+                    // cleared the handle. A next-turn POST must not 502; drop
+                    // the tombstone so start_live can claim.
+                    let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
+                }
                 LiveRunProbe::Free => {
-                    if request_has_orphaned_native_live_results(&body) {
+                    if reject_orphaned_native_results_when_live_slot_is_free(&body) {
                         return json_error(
                             StatusCode::CONFLICT,
                             "invalid_request_error",
@@ -738,8 +1265,13 @@ impl Provider for CursorProvider {
                     .await
                     {
                         LiveResumeOutcome::Resumed(response) => return response,
-                        LiveResumeOutcome::TerminalError(error) => {
+                        LiveResumeOutcome::TerminalError(error)
+                            if live_probe_error_blocks_new_run(&error) =>
+                        {
                             return json_error(StatusCode::BAD_GATEWAY, "api_error", error);
+                        }
+                        LiveResumeOutcome::TerminalError(_) => {
+                            let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
                         }
                         LiveResumeOutcome::MissingTools(missing) => {
                             return json_error(
@@ -768,14 +1300,38 @@ impl Provider for CursorProvider {
                                 } => {
                                     if let Some(handle) = superseded {
                                         reservation.protect_on_drop();
-                                        if let Err(error) = handle.cancel_and_wait().await {
-                                            // Keep the old generation registered if
-                                            // cancellation was not acknowledged; a
-                                            // free slot could start a duplicate.
-                                            let _ = reservation.insert(handle);
-                                            return map_cursor_error_to_response(&error);
+                                        let cancel_result = handle.cancel_and_wait().await;
+                                        match finish_replacement_after_cancel(
+                                            reservation,
+                                            handle,
+                                            request_has_current_tool_result(&body),
+                                            cancel_result,
+                                        ) {
+                                            Ok(kept) => {
+                                                preclaimed_live_reservation = Some(kept);
+                                            }
+                                            Err(error) => {
+                                                return map_cursor_error_to_response(&error);
+                                            }
                                         }
+                                    } else {
+                                        preclaimed_live_reservation = Some(reservation);
                                     }
+                                }
+                            }
+                        }
+                        LiveResumeOutcome::TakeOccupiedSlot => {
+                            match LiveRunRegistry::claim_replacement_for_occupied_slot(
+                                session_id, agent_id,
+                            ) {
+                                LiveReplacementClaim::Conflict => {
+                                    return json_error(
+                                        StatusCode::CONFLICT,
+                                        "invalid_request_error",
+                                        "A Cursor live run is already active for this session",
+                                    );
+                                }
+                                LiveReplacementClaim::Reserved { reservation, .. } => {
                                     preclaimed_live_reservation = Some(reservation);
                                 }
                             }
@@ -791,7 +1347,7 @@ impl Provider for CursorProvider {
                             return map_cursor_error_to_response(&error);
                         }
                         LiveResumeOutcome::Free => {
-                            if request_has_orphaned_native_live_results(&body) {
+                            if reject_orphaned_native_results_when_live_slot_is_free(&body) {
                                 return json_error(
                                     StatusCode::CONFLICT,
                                     "invalid_request_error",
@@ -954,150 +1510,100 @@ impl Provider for CursorProvider {
             // may supersede only the exact generation it observed above, where
             // replacement was atomically preclaimed. Never blindly replace a
             // Running/Starting slot discovered here.
-            let mut start_error: Option<CursorError> = None;
-            let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
-            let mut initial_reservation = preclaimed_live_reservation.take();
-            loop {
-                let mut reservation = if let Some(reservation) = initial_reservation.take() {
-                    reservation
-                } else {
-                    match LiveRunRegistry::try_claim_run(sid, identity.agent_id) {
-                        LiveSlotClaim::Reserved(reservation) => reservation,
-                        LiveSlotClaim::Starting | LiveSlotClaim::Ambiguous => {
-                            if Instant::now() >= conflict_deadline {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            continue;
-                        }
-                        LiveSlotClaim::Running => break,
-                    }
-                };
-
-                reservation.protect_on_drop();
-                let start = match client
-                    .start_live_agent_with_identity(
-                        &token,
-                        user_text,
-                        model,
-                        &images,
-                        custom_system,
-                        identity,
-                        allowed.clone(),
-                        mcp_tools.clone(),
-                        cursor_request_context(&body),
-                        Some(reservation.cancelled()),
-                    )
-                    .await
-                {
-                    Ok(start) => Ok(start),
-                    Err(error) if error.status == 401 && auth.refresh_token.is_some() => {
-                        match force_refresh_cursor_auth() {
-                            Ok(Some(refreshed)) => {
-                                token = refreshed.access_token;
-                                client
-                                    .start_live_agent_with_identity(
-                                        &token,
-                                        user_text,
-                                        model,
-                                        &images,
-                                        custom_system,
-                                        identity,
-                                        allowed.clone(),
-                                        mcp_tools.clone(),
-                                        cursor_request_context(&body),
-                                        Some(reservation.cancelled()),
-                                    )
-                                    .await
-                            }
-                            _ => Err(error),
-                        }
-                    }
-                    Err(error) => Err(error),
-                };
-
-                match start {
-                    Ok(start) => {
-                        start
-                            .handle
-                            .set_request_fingerprint(live_request_fingerprint(
-                                &serde_json::to_vec(&body.messages).unwrap_or_default(),
-                            ));
-                        if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
-                            // Cursor already accepted this Run. Do not start another.
-                            let _ = orphaned.cancel_and_wait().await;
-                            break;
-                        }
-                        return live_downstream_response(
-                            want_stream,
-                            sid,
-                            start.events,
-                            message_id,
-                            wire_model,
-                            estimated_input,
-                            monitor,
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        if live_start_error_seals_tombstone(&error) {
-                            reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
-                        } else {
-                            reservation.release();
-                        }
-                        start_error = Some(error);
-                        break;
-                    }
-                }
+            let fingerprint = serde_json::to_vec(&body.messages).unwrap_or_default();
+            let request_context = cursor_request_context(&body);
+            let has_refresh = auth.refresh_token.is_some();
+            let initial_reservation = preclaimed_live_reservation.take();
+            if commit_streaming_live_sse_before_start_live(want_stream) {
+                return spawn_streaming_live_sse(
+                    client.clone(),
+                    token,
+                    user_text.to_string(),
+                    model.to_string(),
+                    images,
+                    custom_system.map(str::to_string),
+                    sid.to_string(),
+                    identity.agent_id.map(str::to_string),
+                    identity.parent_agent_id.map(str::to_string),
+                    allowed,
+                    mcp_tools,
+                    request_context,
+                    fingerprint,
+                    initial_reservation,
+                    has_refresh,
+                    message_id,
+                    wire_model,
+                    estimated_input,
+                    monitor,
+                );
             }
-
-            if let Some(error) = start_error {
-                return map_cursor_error_to_response(&error);
-            }
-            return json_error(
-                StatusCode::CONFLICT,
-                "invalid_request_error",
-                "A Cursor live run is already active for this session",
-            );
-        }
-
-        let upstream = match client
-            .run_agent_with_session(
-                &token,
+            match start_live_events_with_retries(
+                client.clone(),
+                token,
                 user_text,
                 model,
                 &images,
                 custom_system,
-                continuation_key.as_deref(),
+                identity,
+                allowed,
+                mcp_tools,
+                request_context,
+                fingerprint,
+                initial_reservation,
+                has_refresh,
             )
             .await
-        {
-            Ok(r) => r,
-            Err(e) if e.status == 401 && auth.refresh_token.is_some() => {
-                // One force-refresh + retry on unauthenticated (Codex-style).
-                match force_refresh_cursor_auth() {
-                    Ok(Some(refreshed)) => {
-                        token = refreshed.access_token;
-                        match client
-                            .run_agent_with_session(
-                                &token,
-                                user_text,
-                                model,
-                                &images,
-                                custom_system,
-                                continuation_key.as_deref(),
-                            )
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e2) => return map_cursor_error_to_response(&e2),
-                        }
-                    }
-                    _ => return map_cursor_error_to_response(&e),
+            {
+                Ok(events) => {
+                    return live_downstream_response(
+                        want_stream,
+                        sid,
+                        events,
+                        message_id,
+                        wire_model,
+                        estimated_input,
+                        monitor,
+                    )
+                    .await;
                 }
+                Err(error) => return map_cursor_error_to_response(&error),
             }
-            Err(e) => {
-                return map_cursor_error_to_response(&e);
+        }
+
+        let mut transport_retries = 0_u32;
+        let mut refreshed_once = false;
+        let upstream = loop {
+            match client
+                .run_agent_with_session(
+                    &token,
+                    user_text,
+                    model,
+                    &images,
+                    custom_system,
+                    continuation_key.as_deref(),
+                )
+                .await
+            {
+                Ok(r) => break r,
+                Err(e) if e.status == 401 && !refreshed_once && auth.refresh_token.is_some() => {
+                    match force_refresh_cursor_auth() {
+                        Ok(Some(refreshed)) => {
+                            token = refreshed.access_token;
+                            refreshed_once = true;
+                            continue;
+                        }
+                        _ => return map_cursor_error_to_response(&e),
+                    }
+                }
+                Err(e)
+                    if transport_retries < crate::retry::MAX_RATE_LIMIT_RETRIES
+                        && cursor_start_error_is_same_request_retryable(&e) =>
+                {
+                    crate::retry::sleep(same_request_retry_wait_ms(transport_retries, &e.message))
+                        .await;
+                    transport_retries += 1;
+                }
+                Err(e) => return map_cursor_error_to_response(&e),
             }
         };
 
@@ -1352,6 +1858,7 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::cursor::live::live_error_allows_fresh_conversation;
 
     fn pending(tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
@@ -1474,6 +1981,91 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_result_fc_alias_and_unrelated_batch() {
+        let aliased: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "fc_call-1",
+                "content": "ok"
+            }]}]
+        }))
+        .unwrap();
+        let matched = collect_live_tool_results(&aliased, &[pending("call-1")])
+            .expect("fc_ prefix is an alias of the exposed tool_use id");
+        assert_eq!(matched[0].0, "call-1");
+
+        let reverse: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "ok"
+            }]}]
+        }))
+        .unwrap();
+        let matched = collect_live_tool_results(&reverse, &[pending("fc_call-1")])
+            .expect("bare id matches an fc_ pending id");
+        assert_eq!(matched[0].0, "fc_call-1");
+
+        let unrelated: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "fc_other",
+                "content": "stale"
+            }]}]
+        }))
+        .unwrap();
+        assert!(
+            live_current_batch_is_unrelated(
+                &unrelated,
+                &[
+                    pending("call-f38a5db0-c948-4429-890d-d1113d2c7a36-0"),
+                    pending("fc_owSziHw-6jKPYy-a2c1c5de7ba52d13_0"),
+                ]
+            ),
+            "zero-overlap current results are not a resume of this live batch"
+        );
+        assert!(!live_current_batch_is_unrelated(
+            &aliased,
+            &[pending("call-1")]
+        ));
+    }
+
+    #[test]
+    fn live_tool_result_matches_dual_id_newline_and_grok_sanitize() {
+        let pending_id = "call-72ee1731-4917-4d55-96f6-89841af2f48f-3\nfc_owTHooM-2dTqGa-65a125c0-aws_uw2_0__cursor_run_f7a036cf-3617-41b9";
+        let grok_sanitized = pending_id.replace('\n', "_");
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": grok_sanitized,
+                "content": "ok"
+            }]}]
+        }))
+        .unwrap();
+        let matched = collect_live_tool_results(&body, &[pending(pending_id)])
+            .expect("newline dual-id must match grok-build's underscore sanitizer");
+        assert_eq!(matched[0].0, pending_id);
+
+        let empty_id: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "content": "no id"
+            }]}]
+        }))
+        .unwrap();
+        assert!(
+            !live_current_batch_is_unrelated(&empty_id, &[pending("call-1")]),
+            "a tool_result without tool_use_id is not an unrelated resume batch"
+        );
+        assert!(!request_has_current_tool_result(&empty_id));
+    }
+
+    #[test]
     fn live_resume_without_current_results_supersedes_pending_instead_of_400() {
         match unresolved_live_tools_outcome(
             false,
@@ -1490,11 +2082,238 @@ mod tests {
             vec!["still-required".into()],
             Some("observed-generation"),
         ) {
-            LiveResumeOutcome::MissingTools(missing) => {
-                assert_eq!(missing, ["still-required"]);
+            LiveResumeOutcome::SupersedeRunning(run_id) => {
+                assert_eq!(run_id, "observed-generation");
             }
-            _ => panic!("a partial current tool-result batch must remain a 400"),
+            _ => panic!("a mismatched current tool-result batch must supersede, not 400"),
         }
+    }
+
+    #[test]
+    fn user_facing_missing_blobs_error_allows_fresh_conversation() {
+        let message = "Connect error 502: ERROR_CUSTOM_MESSAGE: Conversation data missing - This conversation's data is missing and can't be restored. Start a new chat to continue. (26 missing blobs: 59fb2285cd72) [internal] (stale Cursor conversation reset; retry this message to continue)";
+        assert!(
+            live_error_allows_fresh_conversation(message),
+            "the grok-build 502 after a serve interrupt must be retryable on the same request"
+        );
+        assert!(!live_error_allows_fresh_conversation(
+            "Connect error 502: Cursor stream stalled after partial progress"
+        ));
+        assert!(
+            !live_error_allows_fresh_conversation(
+                "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]"
+            ),
+            "429 is not a conversation-reset; it retries via the transient path"
+        );
+        assert!(
+            live_error_is_same_request_retryable(
+                "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]"
+            ),
+            "transient provider 429 must retry on this same request"
+        );
+        assert!(live_error_is_same_request_retryable(
+            "Connect error 502: Conversation data missing (stale Cursor conversation reset; retry this message to continue)"
+        ));
+        assert!(
+            !live_error_is_same_request_retryable(
+                "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]"
+            ),
+            "billing 429 must fail closed, not spin"
+        );
+        assert!(!live_error_is_same_request_retryable(
+            "Connect error 502: Image not found [internal]"
+        ));
+        assert_eq!(
+            same_request_retry_wait_ms(
+                0,
+                "Connect error 502: Conversation data missing (stale Cursor conversation reset; retry this message to continue)"
+            ),
+            0
+        );
+        assert!(
+            same_request_retry_wait_ms(
+                0,
+                "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]"
+            ) > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_stale_conversation_reset_does_not_commit_sse() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(
+            "Connect error 502: Conversation data missing (stale Cursor conversation reset; retry this message to continue)"
+                .into(),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(
+            matches!(
+                peek_live_start_for_stale_reset(rx).await,
+                LiveStartPeek::Retryable(_)
+            ),
+            "first-event missing-conversation reset must not be forwarded to grok-build"
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_transient_429_does_not_commit_sse() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(
+            "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]"
+                .into(),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(
+            matches!(
+                peek_live_start_for_stale_reset(rx).await,
+                LiveStartPeek::Retryable(_)
+            ),
+            "first-event 429 must retry on this request instead of reaching grok-build"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_output_openai_502_is_retried_not_forwarded() {
+        let provider_502 = "Connect error 502: ERROR_OPENAI: Unable to reach the model provider — We're having trouble connecting to the model provider. This might be temporary - please try again in a moment. [unavailable]";
+        assert_eq!(
+            classify_live_pump_item(false, &Err(provider_502.into())),
+            LivePumpAction::Retry
+        );
+        assert_eq!(
+            classify_live_pump_item(
+                false,
+                &Ok(LiveRunEvent::Cursor(CursorStreamEvent::Session {
+                    session_id: "s".into()
+                }))
+            ),
+            LivePumpAction::Buffer
+        );
+
+        let (src_tx, src_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        src_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::Session {
+                session_id: "s".into(),
+            })))
+            .await
+            .unwrap();
+        src_tx.send(Err(provider_502.into())).await.unwrap();
+        drop(src_tx);
+        let outcome = pump_live_events_until_commit_or_retry(&out_tx, src_rx).await;
+        assert!(
+            matches!(outcome, LivePumpOutcome::Retry(ref error) if error.contains("Unable to reach the model provider")),
+            "{outcome:?}"
+        );
+        assert!(
+            out_rx.try_recv().is_err(),
+            "session + provider 502 must not reach grok-build"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_or_billing_live_error_is_forwarded() {
+        let billing = "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]";
+        assert_eq!(
+            classify_live_pump_item(false, &Err(billing.into())),
+            LivePumpAction::Forward
+        );
+        assert_eq!(
+            classify_live_pump_item(
+                true,
+                &Err(
+                    "Connect error 502: ERROR_OPENAI: Unable to reach the model provider [unavailable]"
+                        .into()
+                )
+            ),
+            LivePumpAction::Forward
+        );
+
+        let (src_tx, src_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        src_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                text: "hello".into(),
+            })))
+            .await
+            .unwrap();
+        src_tx
+            .send(Err(
+                "Connect error 502: ERROR_OPENAI: Unable to reach the model provider [unavailable]"
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        drop(src_tx);
+        let outcome = pump_live_events_until_commit_or_retry(&out_tx, src_rx).await;
+        assert!(matches!(outcome, LivePumpOutcome::Done), "{outcome:?}");
+        let Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) =
+            out_rx.recv().await.unwrap()
+        else {
+            panic!("text must still be forwarded");
+        };
+        assert_eq!(text, "hello");
+        let Err(error) = out_rx.recv().await.unwrap() else {
+            panic!("post-output 502 must still be forwarded");
+        };
+        assert!(
+            error.contains("Unable to reach the model provider"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_unpaid_invoice_stays_on_the_same_run() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(
+            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]"
+                .into(),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let LiveStartPeek::Ready(mut events) = peek_live_start_for_stale_reset(rx).await else {
+            panic!("billing 429 must be forwarded, not retried");
+        };
+        let Err(error) = events.recv().await.unwrap() else {
+            panic!("the billing error must still be delivered");
+        };
+        assert!(error.contains("unpaid invoice"), "{error}");
+    }
+
+    #[test]
+    fn streaming_live_commits_sse_before_start_live() {
+        assert!(
+            commit_streaming_live_sse_before_start_live(true),
+            "grok-build / Claude Code must get message_start before start_live / peek / retry"
+        );
+        assert!(
+            !commit_streaming_live_sse_before_start_live(false),
+            "non-streaming JSON collection still waits for the live run"
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_useful_first_event_stays_on_the_same_run() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "hello".into(),
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+        let LiveStartPeek::Ready(mut events) = peek_live_start_for_stale_reset(rx).await else {
+            panic!("a useful first event must keep the original live run");
+        };
+        let Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) =
+            events.recv().await.unwrap()
+        else {
+            panic!("the peeked text delta must still be delivered");
+        };
+        assert_eq!(text, "hello");
     }
 
     #[test]

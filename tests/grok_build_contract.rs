@@ -64,20 +64,15 @@ async fn models_catalog_exposes_grok_build_fields() {
             !model["model"].as_str().unwrap_or_default().is_empty(),
             "{id} missing model"
         );
-        assert!(
-            matches!(backend, "messages" | "responses"),
-            "{id} api_backend={backend:?} must be messages or responses"
+        assert_eq!(
+            backend, "responses",
+            "{id} api_backend={backend:?} must be grok-build's official Responses backend"
         );
         assert!(context_window > 0, "{id} context_window must be > 0");
-        if id.starts_with("grok-") {
-            assert_eq!(backend, "responses", "grok models must advertise responses");
-            assert_ne!(
-                backend, "chat_completions",
-                "{id} must not fall through to chat_completions"
-            );
-        } else {
-            assert_eq!(backend, "messages", "{id} non-grok models use messages");
-        }
+        assert_ne!(
+            backend, "chat_completions",
+            "{id} must not fall through to chat_completions"
+        );
     }
 
     let grok46 = data
@@ -558,8 +553,7 @@ fn invalid_effort_is_rejected() {
     }))
     .unwrap();
     let error = translate_request(&request, "grok-4.6".into())
-        .err()
-        .expect("invalid effort must fail closed");
+        .expect_err("invalid effort must fail closed");
     assert!(
         error.to_string().contains("effort"),
         "translate must name the bad effort: {error}"
@@ -841,19 +835,17 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial
     );
     let eof = sse_data_values(&String::from_utf8(truncated.finish()).unwrap());
     assert!(
-        eof.iter()
-            .any(|event| event["type"] == "response.failed"
-                && event["response"]["status"] == "failed"),
-        "EOF without message_stop must fail: {eof:?}"
+        eof.iter().any(|event| event["type"] == "response.completed"
+            && event["response"]["status"] == "completed"),
+        "text already delivered must complete on EOF so grok-build does not retry: {eof:?}"
     );
     assert!(
-        !eof.iter()
-            .any(|event| event["type"] == "response.completed"),
-        "EOF must not fabricate completed: {eof:?}"
+        !eof.iter().any(|event| event["type"] == "response.failed"),
+        "a delivered text turn must not become response.failed: {eof:?}"
     );
     assert_typed_usage(
         &eof.iter()
-            .find(|event| event["type"] == "response.failed")
+            .find(|event| event["type"] == "response.completed")
             .unwrap()["response"]["usage"],
     );
 
@@ -1089,7 +1081,7 @@ fn grok_passthrough_headers_are_allowlisted() {
         "Authorization must never be forwarded: {names:?}"
     );
     assert!(
-        !names.iter().any(|name| *name == "x-grok-user-id"),
+        !names.contains(&"x-grok-user-id"),
         "x-grok-user-id must never be forwarded: {names:?}"
     );
     assert!(

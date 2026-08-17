@@ -15,6 +15,19 @@ pub fn should_retry_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// Billing / invoice 429s will not succeed on retry. Transient provider
+/// exhaustion and gateway 502s will.
+pub fn is_billing_block(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unpaid invoice")
+        || lower.contains("pay your invoice")
+        || (lower.contains("error_rate_limited") && lower.contains("invoice"))
+}
+
+pub fn should_retry_upstream(status: u16, message: &str) -> bool {
+    should_retry_status(status) && !is_billing_block(message)
+}
+
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
     if let Some(raw) = retry_after
         && let Ok(raw_secs) = raw.parse::<f64>()
@@ -67,4 +80,28 @@ where
         }
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_transient_502_and_429_but_not_unpaid_invoice() {
+        assert!(should_retry_upstream(
+            502,
+            "Connect error 502: Conversation data missing"
+        ));
+        assert!(should_retry_upstream(
+            429,
+            "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]"
+        ));
+        assert!(should_retry_upstream(503, "Connect error 503: unavailable"));
+        assert!(!should_retry_upstream(
+            429,
+            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — Visit cursor.com/dashboard and pay your invoice in Stripe to resume requests. [resource_exhausted]"
+        ));
+        assert!(!should_retry_upstream(400, "bad request"));
+        assert!(!should_retry_upstream(401, "unauthorized"));
+    }
 }

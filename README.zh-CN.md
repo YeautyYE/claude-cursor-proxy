@@ -146,7 +146,14 @@ api_key = "unused"
 base_url = "http://127.0.0.1:18765/v1"
 api_key = "unused"
 
-# 可选：Cursor / Claude 走 Anthropic Messages
+# 用 grok-build 跑 Cursor 目录（官方 OpenAI Responses，不是 Claude Messages）
+[model.cursor-grok]
+model = "cursor-grok-4.6-xhigh-fast"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+
+# 可选：Claude Code 风格的 Anthropic Messages（不是 grok-build 默认）
 [model.via-ccp]
 model = "claude-fable-5[1m]"
 base_url = "http://127.0.0.1:18765/v1"
@@ -166,12 +173,13 @@ xai_api_base_url = "http://127.0.0.1:18765/v1"
 ```bash
 grok --model grok-4.6
 # 或：grok --model grok-4.5
+# 或：grok --model cursor-grok
 # 或：grok --model via-ccp
 ```
 
 入站 `api_key` 会收下（`Authorization: Bearer …` 或 `x-api-key`；`unused`、其他占位值，以及看起来像 JWT 的 session token 视为空），但**不会**当成用户/租户身份。Grok `/v1/responses` 透传会转发会话、compaction（`x-compaction-at`、`x-compactions-remaining`）、doom-loop，以及字符集受限的 `x-grok-model-override`，不会转发 `Authorization`、`Cookie` 或 `x-grok-user-id`。
 
-`GET /v1/models` 会带上 `model`、`context_window`、`api_backend`（`grok-*` 为 `responses`，其余为 `messages`）、`supports_reasoning_effort` 和 `reasoning_efforts`（grok-4.6 含 `xhigh` / `high` / `medium` / `low`）。`GROK_MODELS_BASE_URL=http://127.0.0.1:18765/v1` 拉目录时不会掉进 Chat Completions。本代理不实现 `/v1/chat/completions`。
+`GET /v1/models` 会带上 `model`、`context_window`、`api_backend=responses`（grok-build 官方的 OpenAI Responses）、`supports_reasoning_effort` 和 `reasoning_efforts`（grok-4.6 含 `xhigh` / `high` / `medium` / `low`）。自定义 `[model.*]` 若省略 `api_backend`，grok-build 会默认走 Chat Completions；请写 `api_backend = "responses"`。本代理不实现 `/v1/chat/completions`。`/v1/messages` 仍留给 Claude Code。
 
 媒体路由（`/v1/images/*`、`/v1/videos/*`）转发到 `https://api.x.ai/v1`（可用 `CCP_GROK_MEDIA_BASE_URL` 覆盖）。有真实客户端 key 就转发；占位 key 和 grok-build session JWT 回退到本机已登录的 Grok OAuth。
 
