@@ -921,6 +921,9 @@ fn normalize_spawn_subagent_type(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    if spawn_type_looks_like_model_id(trimmed) {
+        return Some("general-purpose".into());
+    }
     let compact = trimmed
         .chars()
         .filter(|ch| *ch != '_' && *ch != '-')
@@ -932,6 +935,15 @@ fn normalize_spawn_subagent_type(raw: &str) -> Option<String> {
         "plan" => "plan".into(),
         _ => trimmed.to_string(),
     })
+}
+
+fn spawn_type_looks_like_model_id(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.starts_with("cursor-")
+        || lower.starts_with("claude-")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("grok-")
+        || lower.contains("fable")
 }
 
 /// Rebuild Cursor native Task args into grok-build `spawn_subagent` input.
@@ -1530,6 +1542,15 @@ mod tests {
             "subagent_type": "my-custom-agent"
         }));
         assert_eq!(unknown["subagent_type"], "my-custom-agent");
+        let model_slug = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "prompt": "p",
+            "description": "d",
+            "subagent_type": "cursor-grok-4.5-high-fast"
+        }));
+        assert_eq!(
+            model_slug["subagent_type"], "general-purpose",
+            "Cursor Task often puts the model slug in subagent_type; grok-build only accepts general-purpose/explore/plan"
+        );
         assert!(unknown.get("background").is_none());
         let already = adapt_native_task_to_spawn_subagent(serde_json::json!({
             "prompt": "p",

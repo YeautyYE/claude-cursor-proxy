@@ -164,16 +164,32 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
 /// Tools Cursor should see on `RunRequest.mcp_tools`. Broader Claude-local
 /// names still go in the prompt `<tools>` dump for XML recovery.
 ///
-/// grok-build lifecycle stays **off** this list. Advertising
-/// `spawn_subagent` as `provider=claude-local` makes Fable's catalog
-/// `mcp_claude-local_spawn_subagent`; the model then narrates that "the
-/// bridge only exposes mcp_claude-local_*". Native Task is stolen to the
-/// bare grok name; poll/kill/wait stay in the XML dump.
+/// Fable's agent loop invokes the MCP catalog, not the XML dump. grok-build
+/// client names (`spawn_subagent`, `run_terminal_command`, …) must be on
+/// MCP or Cursor returns `Tool not found`. Steal maps `mcp_claude-local_*`
+/// back to the exact grok wire name. Workflow / Skill / `mcp__*` stay for
+/// Claude Code. Aliases (`task` / `Task` / `Agent`) stay off MCP.
 fn advertise_as_cursor_mcp(name: &str) -> bool {
+    if is_grok_build_client_tool_name(name) || is_grok_build_subagent_lifecycle_tool(name) {
+        return true;
+    }
+    if normalize_grok_build_lifecycle_name(name).is_some() {
+        return true;
+    }
     let bare = strip_mcp_provider_prefix(name);
+    if is_grok_build_client_tool_name(bare) && is_claude_local_mcp_spelling(name) {
+        return true;
+    }
     bare.eq_ignore_ascii_case("Workflow")
         || bare.eq_ignore_ascii_case("Skill")
         || bare.starts_with("mcp__")
+}
+
+fn is_claude_local_mcp_spelling(name: &str) -> bool {
+    name.starts_with("mcp_claude-local_")
+        || name.starts_with("mcp__claude-local__")
+        || name.starts_with("claude-local/")
+        || name.starts_with("claude-local:")
 }
 
 /// Exact grok-build model-facing lifecycle names. Cursor native `Task` is
@@ -293,11 +309,12 @@ pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
 ///
 /// Wire shape must match `agent.v1.McpToolDefinition`: `input_schema` is a
 /// `google.protobuf.Value` (`struct_value`), plus `provider_identifier` /
-/// `tool_name`. Workflow / Skill / `mcp__*` are advertised. grok-build
-/// lifecycle names stay off MCP so Fable does not expose
-/// `mcp_claude-local_spawn_subagent`. The Anthropic
-/// `input_schema` object is copied into that Value (not a raw Struct at tag 3,
-/// which Cursor rejected with `invalid end group tag`).
+/// `tool_name`. Workflow / Skill / `mcp__*` are advertised for Claude Code.
+/// grok-build client and lifecycle names are advertised too — Fable only
+/// invokes the MCP catalog, so XML-only `spawn_subagent` is `Tool not found`.
+/// Steal maps `mcp_claude-local_*` back to the exact grok wire name.
+/// The Anthropic `input_schema` object is copied into that Value (not a raw
+/// Struct at tag 3, which Cursor rejected with `invalid end group tag`).
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
     let tools = req.extra.get("tools")?.as_array()?;
     let mapped: Vec<super::proto::McpTool> = tools
@@ -1320,12 +1337,13 @@ mod tests {
     }
 
     #[test]
-    fn claude_local_mcp_tools_does_not_advertise_grok_build_subagent_lifecycle() {
+    fn claude_local_mcp_tools_advertises_grok_build_client_and_lifecycle() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor-grok4.6",
             "messages": [{"role": "user", "content": "go"}],
             "tools": [
                 {"name": "read_file", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "run_terminal_command", "description": "shell", "input_schema": {"type": "object"}},
                 {"name": "task", "description": "canonical", "input_schema": {"type": "object"}},
                 {"name": "spawn_subagent", "description": "spawn", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string"}}}},
                 {"name": "get_command_or_subagent_output", "description": "poll", "input_schema": {"type": "object"}},
@@ -1335,9 +1353,30 @@ mod tests {
             ]
         }))
         .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect(
+            "Fable only invokes MCP catalog tools; XML dump of spawn_subagent is Tool not found",
+        );
+        let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
+        for required in [
+            "read_file",
+            "run_terminal_command",
+            "spawn_subagent",
+            "get_command_or_subagent_output",
+            "kill_command_or_subagent",
+            "wait_commands_or_subagents",
+        ] {
+            assert!(
+                names.contains(&required),
+                "{required} must be on mcp_tools so Fable can invoke it: {names:?}"
+            );
+        }
         assert!(
-            claude_local_mcp_tools(&req).is_none(),
-            "grok lifecycle on mcp_tools becomes mcp_claude-local_* in Fable's catalog"
+            !names.contains(&"task"),
+            "lowercase task alias must stay off MCP: {names:?}"
+        );
+        assert!(
+            !names.contains(&"AskUserQuestion"),
+            "AskUserQuestion stays off MCP: {names:?}"
         );
     }
 
@@ -1357,14 +1396,12 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert!(
-            claude_local_mcp_tools(&req).is_none(),
-            "aliases, spoofs, and grok spawn must stay off mcp_tools: {:?}",
-            claude_local_mcp_tools(&req).map(|mcp| mcp
-                .tools
-                .iter()
-                .map(|t| t.name.clone())
-                .collect::<Vec<_>>())
+        let mcp = claude_local_mcp_tools(&req).expect("exact grok spawn should be on MCP");
+        let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["spawn_subagent"],
+            "aliases and spoofs must stay off mcp_tools: {names:?}"
         );
     }
 
