@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.51 (2026-08-18)
+
+- Recover grok Anthropic-style `<tool_use><parameter>` XML as structured tools instead of leaking it into the transcript. XML `spawn_subagent` waits for `turn_ended` so a 64-way stream is not torn after the first chunk. Sibling MCP lifecycle spawns still share one batch.
+- Raise `RLIMIT_NOFILE` at startup (macOS often starts at 256) so Surge CONNECT fan-out does not fail as `Cursor auth failed: /usr/bin/security: Too many open files`. Unreadable `auth.json` fails closed instead of impersonating Keychain. Retry initial HTTP/1 `BidiAppend` timeouts inside the POST before 409.
+
 ## v0.1.50 (2026-08-18)
 
 - Retry Cursor live-open misses inside the proxy before returning 409: H2 20s timeouts and pre-connect `BidiAppend` failures try HTTP/1 on the same request; only exhausted attempts fail closed as 409 so grok-build does not 5xx-retry. High Load 429s are not retried into the same shed.
