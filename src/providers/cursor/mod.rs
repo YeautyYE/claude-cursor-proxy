@@ -45,11 +45,11 @@ use crate::providers::cursor::hosted_web_search::{
 use crate::providers::cursor::live::{
     LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim,
     LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveRunReservation,
-    LiveSlotClaim, cursor_start_error_is_same_request_retryable, finish_replacement_after_cancel,
-    live_error_is_same_request_retryable, live_pending_must_supersede,
-    live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
-    live_run_key_for, live_sse_response, live_start_error_seals_tombstone,
-    same_request_retry_wait_ms,
+    LiveSlotClaim, cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
+    finish_replacement_after_cancel, live_error_is_same_request_retryable,
+    live_pending_must_supersede, live_probe_error_blocks_new_run, live_request_fingerprint,
+    live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
+    live_start_error_seals_tombstone, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
@@ -326,7 +326,7 @@ async fn start_live_events_with_retries(
                 } else {
                     reservation.release();
                 }
-                return Err(error);
+                return Err(exhausted_live_start_error(error, transient_retries));
             }
         }
     }
@@ -1608,7 +1608,12 @@ impl Provider for CursorProvider {
                     .await;
                     transport_retries += 1;
                 }
-                Err(e) => return map_cursor_error_to_response(&e),
+                Err(e) => {
+                    return map_cursor_error_to_response(&exhausted_live_start_error(
+                        e,
+                        transport_retries,
+                    ));
+                }
             }
         };
 
@@ -1737,12 +1742,21 @@ fn json_error_from_cursor_message(message: impl Into<String>) -> Response {
     )
 }
 
+fn user_facing_cursor_detail(err: &client::CursorError) -> &str {
+    let Some(detail) = err.detail.as_deref().filter(|s| !s.is_empty()) else {
+        return err.message.as_str();
+    };
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("error sending request for url")
+        || (lower.starts_with("error sending request") && !detail.contains('\n'))
+    {
+        return err.message.as_str();
+    }
+    detail
+}
+
 fn map_cursor_error_to_response(err: &client::CursorError) -> Response {
-    let detail = err
-        .detail
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(err.message.as_str());
+    let detail = user_facing_cursor_detail(err);
     let classified = crate::retry::classify_proxy_error_status(err.status, &err.client_message());
     match classified {
         400 => json_error(StatusCode::BAD_REQUEST, "invalid_request_error", detail),
@@ -2130,6 +2144,12 @@ mod tests {
             ),
             "transient provider 429 must retry on this same request"
         );
+        assert!(
+            !live_error_is_same_request_retryable(
+                "Connect error 429: ERROR_RESOURCE_EXHAUSTED: High Load — We're experiencing high demand for Cursor Grok 4.5 right now. Please switch to Auto, another model, or try again in a few moments. [resource_exhausted]"
+            ),
+            "High Load must fail closed as 429, not retry 3 times into the same shed"
+        );
         assert!(live_error_is_same_request_retryable(
             "Connect error 502: Conversation data missing (stale Cursor conversation reset; retry this message to continue)"
         ));
@@ -2357,6 +2377,37 @@ mod tests {
             response.status(),
             StatusCode::CONFLICT,
             "ambiguous live open must fail closed as 409 so grok-build does not 5xx-retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn bidiappend_connect_failure_is_http_502_not_409() {
+        let err = client::CursorError::new(
+            502,
+            "Cursor BidiAppend send failed; acceptance is ambiguous: Cursor upstream connect failed",
+            Some(
+                "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)"
+                    .into(),
+            ),
+        );
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "a refused BidiAppend must be retryable 502, not grok invalid_request 409"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("connect failed"),
+            "do not leak raw reqwest URL as the 409 body: {message}"
+        );
+        assert!(
+            !message.contains("api2.cursor.sh"),
+            "reqwest URL detail must not become the user-facing error: {message}"
         );
     }
 

@@ -24,9 +24,19 @@ pub fn is_billing_block(message: &str) -> bool {
         || (lower.contains("error_rate_limited") && lower.contains("invoice"))
 }
 
+/// Cursor capacity shed: the model pool is full and the message tells the
+/// client to switch models. Same-request retries turn one 429 into a flood.
+pub fn is_capacity_shed(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("high load") || lower.contains("high demand"))
+        && (lower.contains("switch to")
+            || lower.contains("another model")
+            || lower.contains("try again in a few"))
+}
+
 pub fn should_retry_upstream(status: u16, message: &str) -> bool {
     let status = classify_proxy_error_status(status, message);
-    should_retry_status(status) && !is_billing_block(message)
+    should_retry_status(status) && !is_billing_block(message) && !is_capacity_shed(message)
 }
 
 /// Cursor Connect often records `status: 502` while the message is still
@@ -125,6 +135,15 @@ pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
 /// grok-build retries 5xx; 409 fail-closes without duplicating the turn.
 pub fn is_ambiguous_live_accept(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    if lower.contains("connect failed") {
+        return false;
+    }
+    if lower.contains("error sending request for url")
+        && !lower.contains("connection reset")
+        && !lower.contains("connection closed")
+    {
+        return false;
+    }
     lower.contains("live open timed out")
         || lower.contains("response-less resumeaction")
         || lower.contains("acceptance is ambiguous")
@@ -233,6 +252,13 @@ mod tests {
             429,
             "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — Visit cursor.com/dashboard and pay your invoice in Stripe to resume requests. [resource_exhausted]"
         ));
+        assert!(
+            !should_retry_upstream(
+                429,
+                "Connect error 429: ERROR_RESOURCE_EXHAUSTED: High Load — We're experiencing high demand for Cursor Grok 4.5 right now. Please switch to Auto, another model, or try again in a few moments. [resource_exhausted]"
+            ),
+            "Cursor High Load is a capacity shed; same-request retries make the 429 flood worse"
+        );
         assert!(!should_retry_upstream(400, "bad request"));
         assert!(!should_retry_upstream(401, "unauthorized"));
     }
@@ -390,6 +416,36 @@ mod tests {
             classify_proxy_error_status(502, "Cursor live run cancelled"),
             502,
             "an explicit cancel is not a hollow-resume accept ambiguity"
+        );
+    }
+
+    #[test]
+    fn pre_connect_failure_is_not_classified_as_409() {
+        let messages = [
+            "Cursor upstream connect failed",
+            "Cursor BidiAppend initial Run failed; acceptance is ambiguous: Cursor upstream connect failed",
+            "Cursor stream produced no useful progress (reconnect failed: Cursor BidiAppend initial Run failed; acceptance is ambiguous: Cursor upstream connect failed)",
+            "Cursor KV reply send failed: Cursor error 502: Cursor BidiAppend send failed; acceptance is ambiguous: Cursor upstream connect failed",
+            "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)",
+        ];
+        for message in messages {
+            assert!(
+                !is_ambiguous_live_accept(message),
+                "a request that never reached Cursor is not an accept: {message}"
+            );
+            assert_eq!(
+                classify_proxy_error_status(502, message),
+                502,
+                "grok-build must 5xx-retry a pre-connect miss, not 409: {message}"
+            );
+            assert!(
+                should_retry_upstream(502, message),
+                "pre-connect 502 must stay same-request retryable: {message}"
+            );
+        }
+        assert!(
+            is_ambiguous_live_accept("Cursor BidiAppend timed out; acceptance is ambiguous"),
+            "a timed-out HTTP/1 append is still an accept ambiguity"
         );
     }
 }

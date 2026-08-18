@@ -67,6 +67,9 @@ enum ClientOutbound {
 }
 
 fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorError {
+    if is_pre_connect_failure(&error) {
+        return error;
+    }
     CursorError::new(
         error.status,
         format!(
@@ -1966,9 +1969,17 @@ impl CursorHttpClient {
                 note_process_h2_open_success();
                 Ok(pair)
             }
-            Err(err) if allow_h1_fallback && is_explicit_http1_required(&err) => {
-                let Some(wait) = live_h1_fallback_budget(h1_timeout, started.elapsed()) else {
-                    return Err(err);
+            Err(err) if allow_h1_fallback && live_open_should_retry_http1(&err) => {
+                if is_ambiguous_live_open_timeout(&err) {
+                    note_process_h2_open_timeout();
+                }
+                let wait = if is_ambiguous_live_open_timeout(&err) {
+                    h1_timeout
+                } else {
+                    match live_h1_fallback_budget(h1_timeout, started.elapsed()) {
+                        Some(wait) => wait,
+                        None => return Err(err),
+                    }
                 };
                 if std::env::var("CCP_CURSOR_DEBUG").is_ok() {
                     eprintln!(
@@ -1977,11 +1988,16 @@ impl CursorHttpClient {
                     );
                 }
                 let h1 = CursorHttpClient::with_prefer_http1(true);
-                with_live_open_timeout(
+                match with_live_open_timeout(
                     wait,
                     h1.open_http1_run_sse(token, request_id, first_message, identity),
                 )
                 .await
+                {
+                    Ok(pair) => Ok(pair),
+                    Err(_) if is_ambiguous_live_open_timeout(&err) => Err(err),
+                    Err(h1_err) => Err(h1_err),
+                }
             }
             Err(err) => {
                 if is_ambiguous_live_open_timeout(&err) {
@@ -2258,18 +2274,19 @@ impl LiveRecoveryEpisode {
         }
     }
 
-    fn remaining(&self, now: Instant) -> Duration {
+    fn remaining(&self, now: Instant, force_http1: bool) -> Duration {
+        let budget = live_recovery_budget(force_http1);
         let Some(started) = self.started else {
-            return LIVE_RECOVERY_DEADLINE;
+            return budget;
         };
-        LIVE_RECOVERY_DEADLINE.saturating_sub(now.saturating_duration_since(started))
+        budget.saturating_sub(now.saturating_duration_since(started))
     }
 
-    fn skip_reason(&self, now: Instant) -> Option<&'static str> {
+    fn skip_reason(&self, now: Instant, force_http1: bool) -> Option<&'static str> {
         if self.opens >= LIVE_RECOVERY_MAX_OPENS {
             return Some("recovery open budget exhausted");
         }
-        if self.started.is_some() && self.remaining(now).is_zero() {
+        if self.started.is_some() && self.remaining(now, force_http1).is_zero() {
             return Some("recovery deadline exhausted");
         }
         None
@@ -2444,6 +2461,18 @@ const LIVE_OPEN_SOFT_START: usize = 4;
 const LIVE_OPEN_MAX: usize = 128;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// H2 ResumeAction stays on the 45s episode. After a mid-stream
+/// `INTERNAL_ERROR` the next open is HTTP/1 and must use the same budget as
+/// a first HTTP/1 open — a 45s cap is how gemini-3.6-flash still died after
+/// the flat 10s ResumeAction cap was removed.
+fn live_recovery_budget(force_http1: bool) -> Duration {
+    if force_http1 {
+        live_h1_open_attempt_timeout()
+    } else {
+        LIVE_RECOVERY_DEADLINE
+    }
+}
 
 /// ResumeAction open is fatal on timeout (acceptance is ambiguous), so the
 /// first attempt must use the same budget as a first open. A flat 10s cap
@@ -2717,11 +2746,8 @@ impl ProcessH2Circuit {
         self.prefers_http1_at(Instant::now())
     }
 
-    fn prefers_http1_at(&self, now: Instant) -> bool {
-        match self.open_since {
-            None => false,
-            Some(opened) => now.saturating_duration_since(opened) < TRANSPORT_BREAKER_COOLDOWN,
-        }
+    fn prefers_http1_at(&self, _now: Instant) -> bool {
+        self.open_since.is_some()
     }
 
     fn on_h2_open_timeout(&mut self) -> bool {
@@ -2731,19 +2757,28 @@ impl ProcessH2Circuit {
     fn on_h2_open_timeout_at(&mut self, now: Instant) -> bool {
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
         if self.open_since.is_some() {
-            self.open_since = Some(now);
             return false;
         }
-        if self.consecutive_timeouts >= TRANSPORT_BREAKER_THRESHOLD {
-            self.open_since = Some(now);
-            return true;
-        }
-        false
+        self.open_since = Some(now);
+        true
     }
 
     fn on_h2_open_success(&mut self) {
         self.consecutive_timeouts = 0;
         self.open_since = None;
+    }
+
+    /// Mid-stream H2 `INTERNAL_ERROR` (gemini-3.6-flash) is not an open
+    /// timeout, but the next first-open must not go back to H2 or we loop
+    /// RST → ResumeAction → ambiguous timeout.
+    fn on_h2_stream_reset_at(&mut self, now: Instant) -> bool {
+        self.consecutive_timeouts = TRANSPORT_BREAKER_THRESHOLD;
+        if self.open_since.is_some() {
+            self.open_since = Some(now);
+            return false;
+        }
+        self.open_since = Some(now);
+        true
     }
 }
 
@@ -2786,10 +2821,7 @@ fn note_process_h2_open_timeout() {
             "live_h2_circuit_open",
             Some(serde_json::Map::from_iter([
                 ("prefer_http1".into(), serde_json::json!(true)),
-                (
-                    "consecutive_timeouts".into(),
-                    serde_json::json!(TRANSPORT_BREAKER_THRESHOLD),
-                ),
+                ("consecutive_timeouts".into(), serde_json::json!(1)),
             ])),
         );
     }
@@ -2803,6 +2835,25 @@ fn note_process_h2_open_success() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .on_h2_open_success();
+}
+
+fn note_process_h2_stream_reset() {
+    if cfg!(test) {
+        return;
+    }
+    let just_opened = PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .on_h2_stream_reset_at(Instant::now());
+    if just_opened {
+        crate::logging::create_logger("cursor").warn(
+            "live_h2_circuit_open",
+            Some(serde_json::Map::from_iter([
+                ("prefer_http1".into(), serde_json::json!(true)),
+                ("reason".into(), serde_json::json!("h2_stream_reset")),
+            ])),
+        );
+    }
 }
 
 fn live_reconnect_allow_h1_fallback(force_http1: bool, http1_rejected: bool) -> bool {
@@ -3039,6 +3090,45 @@ fn live_reconnect_on_hollow_body(
     )
 }
 
+fn live_open_should_retry_http1(err: &CursorError) -> bool {
+    if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
+    if crate::retry::is_billing_block(&err.message) || crate::retry::is_capacity_shed(&err.message)
+    {
+        return false;
+    }
+    is_explicit_http1_required(err)
+        || is_pre_connect_failure(err)
+        || is_ambiguous_live_open_timeout(err)
+}
+
+/// After this POST already retried a transport miss, fail closed as 409 so
+/// grok-build does not 5xx-retry on top of the proxy loop.
+pub(crate) fn exhausted_live_start_error(err: CursorError, attempted_retries: u32) -> CursorError {
+    if attempted_retries == 0 {
+        return err;
+    }
+    let text = err.client_message();
+    if crate::retry::is_billing_block(&text)
+        || crate::retry::is_billing_block(&err.message)
+        || crate::retry::is_capacity_shed(&text)
+        || crate::retry::is_capacity_shed(&err.message)
+    {
+        return err;
+    }
+    if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return err;
+    }
+    if is_pre_connect_failure(&err)
+        || err.message.contains("error sending request")
+        || matches!(err.status, 0 | 502 | 503 | 504)
+    {
+        return CursorError::new(409, err.message, err.detail);
+    }
+    err
+}
+
 fn is_explicit_http1_required(err: &CursorError) -> bool {
     if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
         return false;
@@ -3105,7 +3195,15 @@ pub(crate) fn is_ambiguous_live_open_timeout(err: &CursorError) -> bool {
 }
 
 fn is_pre_connect_failure(err: &CursorError) -> bool {
-    err.message.contains("connect failed")
+    let blob = format!("{}{}", err.message, err.detail.as_deref().unwrap_or(""));
+    let lower = blob.to_ascii_lowercase();
+    if lower.contains("connect failed") {
+        return true;
+    }
+    lower.contains("error sending request for url")
+        && !lower.contains("connection reset")
+        && !lower.contains("connection closed")
+        && !is_h2_stream_reset(&blob)
 }
 
 fn is_response_less_send_error(err: &CursorError) -> bool {
@@ -3198,7 +3296,7 @@ pub(crate) fn live_resume_error_is_dead_driver(error: &CursorError) -> bool {
 }
 
 pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
-    if crate::retry::is_billing_block(message) {
+    if crate::retry::is_billing_block(message) || crate::retry::is_capacity_shed(message) {
         return false;
     }
     if cursor_connect_error_is_missing_conversation_data(message)
@@ -3226,7 +3324,11 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
 
 pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) -> bool {
     let text = err.client_message();
-    if crate::retry::is_billing_block(&text) || crate::retry::is_billing_block(&err.message) {
+    if crate::retry::is_billing_block(&text)
+        || crate::retry::is_billing_block(&err.message)
+        || crate::retry::is_capacity_shed(&text)
+        || crate::retry::is_capacity_shed(&err.message)
+    {
         return false;
     }
     if text.contains("concurrency saturated") || err.message.contains("concurrency saturated") {
@@ -3437,6 +3539,7 @@ fn prepare_live_reconnect(
         stream_error,
     ) {
         reconnect.force_http1 = true;
+        note_process_h2_stream_reset();
         let mut fields = serde_json::Map::new();
         fields.insert("attempts".into(), serde_json::json!(reconnect_attempts));
         fields.insert("reason".into(), serde_json::json!("h2_stream_reset"));
@@ -3607,7 +3710,10 @@ async fn try_live_reconnect(
             );
             return outcome;
         }
-        if let Some(reason) = reconnect.recovery.skip_reason(Instant::now()) {
+        if let Some(reason) = reconnect
+            .recovery
+            .skip_reason(Instant::now(), reconnect.force_http1)
+        {
             let outcome =
                 LiveReconnectOutcome::Failed(last_fail.unwrap_or_else(|| reason.to_string()));
             log_live_reconnect(
@@ -3693,7 +3799,7 @@ async fn try_live_reconnect(
         reconnect.recovery.opens = reconnect.recovery.opens.saturating_add(1);
         let remaining_ms = reconnect
             .recovery
-            .remaining(Instant::now())
+            .remaining(Instant::now(), reconnect.force_http1)
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         let delay_ms = live_reconnect_backoff_ms_for(
@@ -3745,9 +3851,11 @@ async fn try_live_reconnect(
         };
 
         let open_wait = live_reconnect_open_timeout(
-            hard_deadline
-                .saturating_duration_since(Instant::now())
-                .min(reconnect.recovery.remaining(Instant::now())),
+            hard_deadline.saturating_duration_since(Instant::now()).min(
+                reconnect
+                    .recovery
+                    .remaining(Instant::now(), reconnect.force_http1),
+            ),
             reconnect.force_http1,
         );
         if open_wait.is_zero() {
@@ -4293,7 +4401,9 @@ async fn drive_live_run(
         if live_probation_expired(
             reconnect.recovery.on_probation,
             got_chunk_since_reconnect,
-            reconnect.recovery.remaining(Instant::now()),
+            reconnect
+                .recovery
+                .remaining(Instant::now(), reconnect.force_http1),
         ) {
             report_terminal_error(
                 &mut sink,
@@ -7375,6 +7485,63 @@ mod tests {
     }
 
     #[test]
+    fn live_open_retries_http1_on_same_request_before_409() {
+        let timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
+        assert!(
+            live_open_should_retry_http1(&timeout),
+            "H2 open timeout must try HTTP/1 on this same request_id before 409"
+        );
+        let connect = CursorError::new(502, "Cursor upstream connect failed", None);
+        assert!(
+            live_open_should_retry_http1(&connect),
+            "a refused connect never reached Cursor; retry HTTP/1 before 409"
+        );
+        let url_send = CursorError::new(
+            502,
+            "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)",
+            None,
+        );
+        assert!(live_open_should_retry_http1(&url_send));
+        let reset = CursorError::new(502, "error sending request: connection reset", None);
+        assert!(
+            !live_open_should_retry_http1(&reset),
+            "a mid-send reset is still an accept risk; do not start HTTP/1"
+        );
+        let rate = CursorError::new(429, "High Load — switch to another model", None);
+        assert!(!live_open_should_retry_http1(&rate));
+        let invoice = CursorError::new(429, "You have an unpaid invoice", None);
+        assert!(!live_open_should_retry_http1(&invoice));
+    }
+
+    #[test]
+    fn exhausted_start_retries_surface_original_as_409() {
+        let connect = CursorError::new(502, "Cursor upstream connect failed", None);
+        let exhausted = exhausted_live_start_error(connect.clone(), 3);
+        assert_eq!(
+            exhausted.status, 409,
+            "after proxy-internal retries grok-build must see 409, not 5xx-retry"
+        );
+        assert_eq!(exhausted.message, "Cursor upstream connect failed");
+        let first = exhausted_live_start_error(connect, 0);
+        assert_eq!(
+            first.status, 502,
+            "the first miss is still retryable inside this POST"
+        );
+        let timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
+        let still_timeout = exhausted_live_start_error(timeout, 0);
+        assert_eq!(
+            still_timeout.status, 504,
+            "H2 timeout is retried as HTTP/1 on the same request_id, not a new Run"
+        );
+        let shed = CursorError::new(
+            429,
+            "High Load — We're experiencing high demand. Please switch to Auto, another model, or try again in a few moments.",
+            None,
+        );
+        assert_eq!(exhausted_live_start_error(shed, 3).status, 429);
+    }
+
+    #[test]
     fn semantic_status_is_never_an_http1_fallback() {
         for status in [400, 401, 403, 404, 429] {
             let err = CursorError::new(
@@ -7651,17 +7818,62 @@ mod tests {
             "incompatible version",
             None
         )));
+        let connect_failed = CursorError::new(
+            502,
+            "Cursor upstream connect failed",
+            Some(
+                "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)"
+                    .into(),
+            ),
+        );
+        let wrapped_connect = ambiguous_http1_append_error(connect_failed.clone(), "initial Run");
+        assert_eq!(
+            wrapped_connect.message, "Cursor upstream connect failed",
+            "wrapping a refused TCP connect as 'acceptance is ambiguous' 409s grok-build"
+        );
+        assert!(
+            !live_send_failure_is_terminal(&wrapped_connect),
+            "never-connected BidiAppend must reconnect, not fail the turn"
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&wrapped_connect),
+            "a refused connect must not seal an 'already active' tombstone"
+        );
+        assert!(!live_reconnect_open_error_is_fatal(&wrapped_connect));
+        let url_send = CursorError::new(
+            502,
+            "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)",
+            Some(
+                "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)"
+                    .into(),
+            ),
+        );
+        assert!(
+            is_pre_connect_failure(&url_send),
+            "reqwest's URL-only Display is a send that never got an HTTP status"
+        );
+        assert!(
+            !is_response_less_send_error(&url_send),
+            "URL-only send failure is not an accepted Run"
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&url_send),
+            "16:37 BidiAppend URL errors must not brick the session with 409"
+        );
     }
 
     #[tokio::test]
-    async fn auxiliary_http1_send_preserves_ambiguous_append_error() {
+    async fn auxiliary_http1_connect_refused_is_not_ambiguous_accept() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("reserve closed test port");
         let address = listener.local_addr().expect("test port");
         drop(listener);
         let outbound = ClientOutbound::Http1(BidiAppendSession::new(
-            reqwest::Client::new(),
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("reqwest client"),
             format!("http://{address}"),
             "token".into(),
             "request-id".into(),
@@ -7688,7 +7900,14 @@ mod tests {
             .as_ref()
             .map(|outcome| outcome.message.clone())
             .expect("terminal error");
-        assert!(message.contains("acceptance is ambiguous"), "{message}");
+        assert!(
+            !message.contains("acceptance is ambiguous"),
+            "connection refused never reached Cursor: {message}"
+        );
+        assert!(
+            message.contains("connect failed") || message.contains("error sending request"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -7888,15 +8107,13 @@ mod tests {
     }
 
     #[test]
-    fn process_h2_circuit_trips_after_consecutive_open_timeouts() {
+    fn process_h2_circuit_trips_on_first_open_timeout() {
         let mut circuit = ProcessH2Circuit::default();
         let t0 = Instant::now();
         assert!(!circuit.prefers_http1_at(t0));
-        assert!(!circuit.on_h2_open_timeout_at(t0));
-        assert!(!circuit.on_h2_open_timeout_at(t0));
         assert!(
             circuit.on_h2_open_timeout_at(t0),
-            "third H2 open timeout opens the process circuit for the next Run"
+            "the first H2 open timeout must pin HTTP/1; waiting for 3 consecutive 20s 409s is the grok-build loop"
         );
         assert!(circuit.prefers_http1_at(t0));
         assert!(
@@ -7910,31 +8127,45 @@ mod tests {
     }
 
     #[test]
-    fn process_h2_circuit_probes_h2_after_cooldown() {
+    fn process_h2_circuit_stays_on_http1_until_h2_success() {
         let mut circuit = ProcessH2Circuit::default();
         let t0 = Instant::now();
-        assert!(!circuit.on_h2_open_timeout_at(t0));
-        assert!(!circuit.on_h2_open_timeout_at(t0));
         assert!(circuit.on_h2_open_timeout_at(t0));
         assert!(
-            circuit.prefers_http1_at(t0 + Duration::from_secs(29)),
-            "inside the cooldown window the next open must stay on HTTP/1"
-        );
-        let probe_at = t0 + TRANSPORT_BREAKER_COOLDOWN;
-        assert!(
-            !circuit.prefers_http1_at(probe_at),
-            "after cooldown the next open must probe H2; a stuck HTTP/1 pin never recovers"
+            circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN),
+            "time-based H2 probes after 30s put a user Run on H2 and 409 after 20s"
         );
         assert!(
-            !circuit.on_h2_open_timeout_at(probe_at),
-            "a failed H2 probe must not log another circuit trip"
+            circuit.prefers_http1_at(t0 + Duration::from_secs(15 * 60)),
+            "HTTP/1 pin must last until an H2 open actually succeeds"
         );
         assert!(
-            circuit.prefers_http1_at(probe_at),
-            "a failed probe must reopen the HTTP/1 window"
+            !circuit.on_h2_open_timeout_at(t0 + TRANSPORT_BREAKER_COOLDOWN),
+            "already-open circuit must not log another trip"
         );
         circuit.on_h2_open_success();
-        assert!(!circuit.prefers_http1_at(probe_at + TRANSPORT_BREAKER_COOLDOWN));
+        assert!(!circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN));
+    }
+
+    #[test]
+    fn process_h2_circuit_trips_on_first_midstream_reset() {
+        let mut circuit = ProcessH2Circuit::default();
+        let t0 = Instant::now();
+        assert!(
+            circuit.on_h2_stream_reset_at(t0),
+            "gemini-style H2 INTERNAL_ERROR must pin HTTP/1 on the next first open"
+        );
+        assert!(circuit.prefers_http1_at(t0));
+        assert!(
+            !circuit.on_h2_stream_reset_at(t0),
+            "already-open circuit must not log a second trip"
+        );
+        assert!(
+            circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN),
+            "mid-stream RST must not probe H2 on the next user open after 30s"
+        );
+        circuit.on_h2_open_success();
+        assert!(!circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN));
     }
 
     #[test]
@@ -8100,17 +8331,26 @@ mod tests {
         episode.begin(now);
         episode.opens = LIVE_RECOVERY_MAX_OPENS;
         assert_eq!(
-            episode.skip_reason(now),
+            episode.skip_reason(now, false),
             Some("recovery open budget exhausted")
         );
         episode.opens = 0;
         episode.started = Some(now - LIVE_RECOVERY_DEADLINE);
         assert_eq!(
-            episode.skip_reason(now),
+            episode.skip_reason(now, false),
             Some("recovery deadline exhausted")
         );
+        assert!(
+            episode.skip_reason(now, true).is_none(),
+            "HTTP/1 ResumeAction after H2 RST must still have budget at the 45s H2 cap"
+        );
         episode.started = Some(now);
-        assert!(episode.skip_reason(now).is_none());
+        assert!(episode.skip_reason(now, false).is_none());
+        episode.started = Some(now - live_h1_open_attempt_timeout());
+        assert_eq!(
+            episode.skip_reason(now, true),
+            Some("recovery deadline exhausted")
+        );
     }
 
     #[test]
@@ -8893,9 +9133,19 @@ mod tests {
             "HTTP/1 ResumeAction after H2 INTERNAL_ERROR must not die at 10s"
         );
         assert_eq!(
+            live_recovery_budget(true),
+            live_h1_open_attempt_timeout(),
+            "H2 INTERNAL_ERROR recovery must keep the full HTTP/1 open budget"
+        );
+        assert_eq!(
+            live_reconnect_open_timeout(live_recovery_budget(true), true),
+            live_h1_open_attempt_timeout(),
+            "HTTP/1 ResumeAction after H2 RST must not die at the 45s H2 episode cap"
+        );
+        assert_eq!(
             live_reconnect_open_timeout(LIVE_RECOVERY_DEADLINE, true),
             LIVE_RECOVERY_DEADLINE,
-            "recovery remaining still bounds a fresh HTTP/1 resume"
+            "an already-short remaining window still bounds a fresh HTTP/1 resume"
         );
         assert_eq!(
             live_reconnect_open_timeout(Duration::from_secs(5), false),
@@ -9119,6 +9369,12 @@ mod tests {
             "response-less live open must seal, not replay Run with a new request id"
         );
         assert!(live_start_error_seals_tombstone(&open_timeout));
+
+        let connect = CursorError::new(502, "Cursor upstream connect failed", None);
+        assert!(
+            cursor_start_error_is_same_request_retryable(&connect),
+            "a refused connect must retry inside this POST before returning 409"
+        );
     }
 
     #[test]
@@ -11378,6 +11634,15 @@ mod tests {
         prompt: &str,
         background: Option<bool>,
     ) -> super::super::connect::ConnectFrame {
+        native_task_started_frame_typed(call_id, prompt, background, "explore")
+    }
+
+    fn native_task_started_frame_typed(
+        call_id: &str,
+        prompt: &str,
+        background: Option<bool>,
+        subagent_type: &str,
+    ) -> super::super::connect::ConnectFrame {
         use super::super::connect::encode_connect_frame;
         use super::super::proto::{
             AgentServerMessage, InteractionUpdate, TaskToolCall, TaskToolCallArgsProto, ToolCall,
@@ -11398,7 +11663,7 @@ mod tests {
                                 description: "explore live".into(),
                                 prompt: prompt.into(),
                                 model: Some("cursor-grok4.6".into()),
-                                subagent_type: "explore".into(),
+                                subagent_type: subagent_type.into(),
                                 resume: None,
                                 run_in_background: background,
                             }),
@@ -12174,6 +12439,33 @@ mod tests {
                 assert_eq!(tools[0].input["prompt"], "must become Agent");
                 assert_eq!(tools[0].input["run_in_background"], true);
                 assert!(tools[0].input.get("resume_from").is_none());
+                assert!(tools[0].input.get("background").is_none());
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_tool_call_started_remaps_gemini_slug_for_claude_code_agent() {
+        let frame = native_task_started_frame_typed(
+            "task-gemini",
+            "CARVE INITIAL A1585-0026",
+            Some(true),
+            "gemini-3.6-flash-high",
+        );
+        let allowed = BTreeSet::from(["task".to_string(), "Agent".to_string(), "Task".to_string()]);
+        let (cont, event, _) = drive_native_task_frame(frame, Some(&allowed), None).await;
+        assert!(!cont, "Claude Code Agent must steal native Task");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "Agent");
+                assert_eq!(
+                    tools[0].input.get("subagent_type").and_then(|v| v.as_str()),
+                    Some("general-purpose"),
+                    "Cursor puts the live model slug in Task.subagent_type; Claude Code Agent catalog rejects it"
+                );
+                assert_eq!(tools[0].input["prompt"], "CARVE INITIAL A1585-0026");
+                assert_eq!(tools[0].input["run_in_background"], true);
                 assert!(tools[0].input.get("background").is_none());
             }
             other => panic!("expected Agent, got {other:?}"),

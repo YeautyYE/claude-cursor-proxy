@@ -598,6 +598,9 @@ pub fn adapt_tool_input_for_client(
     if advertised_name == "spawn_subagent" {
         return adapt_native_task_to_spawn_subagent(input);
     }
+    if matches!(advertised_name, "Agent" | "Task") {
+        return remap_model_slug_subagent_type(input);
+    }
     let Some(obj) = input.as_object_mut() else {
         return input;
     };
@@ -919,6 +922,18 @@ fn spawn_background_flag(value: Option<&serde_json::Value>) -> Option<bool> {
     None
 }
 
+fn remap_model_slug_subagent_type(mut input: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    if let Some(raw) = nonempty_string(obj.get("subagent_type"))
+        && spawn_type_looks_like_model_id(&raw)
+    {
+        obj.insert("subagent_type".into(), serde_json::json!("general-purpose"));
+    }
+    input
+}
+
 fn normalize_spawn_subagent_type(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -942,11 +957,35 @@ fn normalize_spawn_subagent_type(raw: &str) -> Option<String> {
 
 fn spawn_type_looks_like_model_id(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
+    if looks_like_named_agent_type(&lower) {
+        return false;
+    }
     lower.starts_with("cursor-")
         || lower.starts_with("claude-")
         || lower.starts_with("gpt-")
         || lower.starts_with("grok-")
-        || lower.contains("fable")
+        || lower.starts_with("gemini-")
+        || lower.starts_with("composer-")
+        || lower.starts_with("kimi-")
+        || lower.starts_with("glm-")
+        || lower.contains("claude-fable")
+        || lower.starts_with("fable-")
+}
+
+fn looks_like_named_agent_type(lower: &str) -> bool {
+    matches!(
+        lower,
+        "claude"
+            | "claude-code-guide"
+            | "general-purpose"
+            | "explore"
+            | "plan"
+            | "statusline-setup"
+    ) || lower.ends_with("-checker")
+        || lower.ends_with("-guide")
+        || lower.ends_with("-setup")
+        || lower.ends_with("-researcher")
+        || lower.ends_with("-builder")
 }
 
 /// Rebuild Cursor native Task args into grok-build `spawn_subagent` input.
@@ -1554,6 +1593,15 @@ mod tests {
             model_slug["subagent_type"], "general-purpose",
             "Cursor Task often puts the model slug in subagent_type; grok-build only accepts general-purpose/explore/plan"
         );
+        let gemini = adapt_native_task_to_spawn_subagent(serde_json::json!({
+            "prompt": "p",
+            "description": "d",
+            "subagent_type": "gemini-3.6-flash-high"
+        }));
+        assert_eq!(
+            gemini["subagent_type"], "general-purpose",
+            "gemini-3.6-flash-high is a Cursor model id, not a grok-build agent type"
+        );
         assert!(unknown.get("background").is_none());
         let already = adapt_native_task_to_spawn_subagent(serde_json::json!({
             "prompt": "p",
@@ -1564,6 +1612,80 @@ mod tests {
         }));
         assert_eq!(already["resume_from"], "kept");
         assert_eq!(already["background"], false);
+    }
+
+    #[test]
+    fn adapt_agent_remaps_gemini_model_slug_only() {
+        let adapted = adapt_client_tool_input(
+            "Agent",
+            serde_json::json!({
+                "description": "CARVE INITIAL A1585-0026",
+                "prompt": "do the carve",
+                "subagent_type": "gemini-3.6-flash-high",
+                "run_in_background": true
+            }),
+        );
+        assert_eq!(
+            adapted["subagent_type"], "general-purpose",
+            "Claude Code Agent rejects Cursor model slugs as agent types"
+        );
+        assert_eq!(adapted["run_in_background"], true);
+        assert_eq!(adapted["description"], "CARVE INITIAL A1585-0026");
+        assert_eq!(adapted["prompt"], "do the carve");
+        assert!(
+            adapted.get("background").is_none(),
+            "Agent must keep Claude Code run_in_background, not grok background"
+        );
+        assert!(adapted.get("resume_from").is_none());
+
+        let explore = adapt_client_tool_input(
+            "Agent",
+            serde_json::json!({
+                "prompt": "p",
+                "subagent_type": "Explore"
+            }),
+        );
+        assert_eq!(
+            explore["subagent_type"], "Explore",
+            "Claude Code agent catalog is case-sensitive"
+        );
+
+        let guide = adapt_client_tool_input(
+            "Agent",
+            serde_json::json!({
+                "prompt": "p",
+                "subagent_type": "claude-code-guide"
+            }),
+        );
+        assert_eq!(guide["subagent_type"], "claude-code-guide");
+
+        let custom = adapt_client_tool_input(
+            "Agent",
+            serde_json::json!({
+                "prompt": "p",
+                "subagent_type": "my-custom-agent"
+            }),
+        );
+        assert_eq!(custom["subagent_type"], "my-custom-agent");
+    }
+
+    #[test]
+    fn adapt_task_remaps_gemini_model_slug_only() {
+        let adapted = adapt_tool_input_for_client(
+            "Task",
+            serde_json::json!({
+                "prompt": "p",
+                "subagent_type": "gemini-3.6-flash-high",
+                "run_in_background": false
+            }),
+        );
+        assert_eq!(adapted["subagent_type"], "general-purpose");
+        assert_eq!(adapted["run_in_background"], false);
+        let plan = adapt_tool_input_for_client(
+            "Task",
+            serde_json::json!({"prompt": "p", "subagent_type": "Plan"}),
+        );
+        assert_eq!(plan["subagent_type"], "Plan");
     }
 
     #[test]
