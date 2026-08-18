@@ -133,11 +133,15 @@ impl CursorToolUseXmlParser {
             // `</tool_use>` is not the outer close; wait for depth zero.
             let close_start = find_matching_named_close(&self.buffer, kind.open_tag(), close);
             if close_start.is_none() {
-                // No matching close tag yet; if we are flushing, emit the whole
-                // buffer as text. Otherwise hold and wait for more data.
+                // Incomplete control markup must never become transcript text.
+                // False prefixes such as `<tool_user>` stay visible.
                 if flush {
-                    self.push_text(&mut events, &self.buffer);
-                    self.buffer.clear();
+                    if xml_tag_open_at(&self.buffer, 0, kind.open_tag()) {
+                        self.buffer.clear();
+                    } else {
+                        self.push_text(&mut events, &self.buffer);
+                        self.buffer.clear();
+                    }
                 }
                 break;
             }
@@ -149,11 +153,18 @@ impl CursorToolUseXmlParser {
             if let Some(parsed) = self.parse_xml_tool(&raw, kind) {
                 self.recovered_tool_use = true;
                 events.push(RecoveredCursorEvent::ToolUse(parsed));
+                self.buffer = self.buffer[close_end..].to_string();
+            } else if kind == XmlToolKind::ToolCall
+                && let Some((_, body)) = split_tagged_element(&raw, kind)
+                && next_xml_tool_start(body).is_some()
+            {
+                // grok-cli wraps a fan-out of `<tool_use>` in one `<tool_call>`.
+                // The wrapper is not itself a tool — unwrap and drain siblings.
+                self.buffer = format!("{body}{}", &self.buffer[close_end..]);
             } else {
-                self.push_text(&mut events, &raw);
+                // Complete but disallowed / unparsable control XML: drop it.
+                self.buffer = self.buffer[close_end..].to_string();
             }
-
-            self.buffer = self.buffer[close_end..].to_string();
         }
 
         events
@@ -178,10 +189,7 @@ impl CursorToolUseXmlParser {
             original_id
         };
 
-        // Check allowed tool names.
-        if !self.tool_name_allowed(name) {
-            return None;
-        }
+        let name = self.canonicalize_allowed_tool_name(name)?;
 
         let trimmed = body.trim();
         let input = if trimmed.is_empty() {
@@ -198,7 +206,7 @@ impl CursorToolUseXmlParser {
         Some(RecoveredCursorToolUse {
             id,
             original_id,
-            name: name.clone(),
+            name,
             input,
         })
     }
@@ -210,9 +218,7 @@ impl CursorToolUseXmlParser {
         let mut name = attrs.get("name").filter(|value| !value.is_empty()).cloned();
         let input = parse_tool_call_body(body, &mut name)?;
         let name = name.filter(|value| !value.is_empty())?;
-        if !self.tool_name_allowed(&name) {
-            return None;
-        }
+        let name = self.canonicalize_allowed_tool_name(&name)?;
         Some(RecoveredCursorToolUse {
             id: (self.id_factory)(),
             original_id: None,
@@ -221,10 +227,18 @@ impl CursorToolUseXmlParser {
         })
     }
 
-    fn tool_name_allowed(&self, name: &str) -> bool {
+    fn canonicalize_allowed_tool_name(&self, name: &str) -> Option<String> {
         match &self.allowed_tool_names {
-            Some(allowed) => allowed.contains(name),
-            None => true,
+            Some(allowed) => allowed.get(name).cloned().or_else(|| {
+                if !matches!(name, "Workflow" | "workflow" | "Skill" | "skill") {
+                    return None;
+                }
+                allowed
+                    .iter()
+                    .find(|advertised| advertised.eq_ignore_ascii_case(name))
+                    .cloned()
+            }),
+            None => Some(name.to_string()),
         }
     }
 
@@ -301,7 +315,7 @@ fn decode_xml_attribute(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum XmlToolKind {
     ToolUse,
     ToolCall,
@@ -599,11 +613,12 @@ mod tests {
             Some(["Read".to_string()].into_iter().collect()),
             test_id_factory(),
         );
-        // Bash is not in allowed set, so the text is emitted as-is.
+        // Bash is not in allowed set, so the markup is dropped.
         let events = parser.push(r#"<tool_use id="x" name="Bash">{"command":"pwd"}</tool_use>"#);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], RecoveredCursorEvent::Text(t)
-            if t.contains("Bash")));
+        assert!(
+            events.is_empty(),
+            "disallowed tool XML must be quarantined: {events:?}"
+        );
         assert!(!parser.saw_tool_use());
     }
 
@@ -614,8 +629,10 @@ mod tests {
             test_id_factory(),
         );
         let events = parser.push(r#"<tool_use id="x" name="Read">{invalid}</tool_use>"#);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], RecoveredCursorEvent::Text(_)));
+        assert!(
+            events.is_empty(),
+            "invalid tool input must be quarantined: {events:?}"
+        );
         assert!(!parser.saw_tool_use());
     }
 
@@ -649,12 +666,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], RecoveredCursorEvent::Text("some text ".into()));
 
-        // Flush should emit the remaining buffer as text since the tag
-        // could not be completed.
+        // Flush must drop incomplete control markup instead of leaking it.
         let events = parser.flush();
-        assert!(!events.is_empty());
-        assert!(matches!(&events[0], RecoveredCursorEvent::Text(t)
-            if t.contains("<tool_use") || t.contains("name")));
+        assert!(
+            !leaked_raw_xml(&events),
+            "incomplete <tool_use> on flush must not leak: {events:?}"
+        );
     }
 
     #[test]
@@ -808,9 +825,9 @@ mod tests {
         );
         let events = parser
             .push(r#"<tool_call> todo_write <parameter> {"todos":[]} </parameter> </tool_call>"#);
-        assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0], RecoveredCursorEvent::Text(text) if text.contains("todo_write"))
+            events.is_empty(),
+            "disallowed <tool_call> must be quarantined: {events:?}"
         );
         assert!(!parser.saw_tool_use());
     }
@@ -992,9 +1009,263 @@ mod tests {
             r#"<parameter name="prompt">secret</parameter>"#,
             "</tool_use>",
         ));
-        assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0], RecoveredCursorEvent::Text(text) if text.contains("spawn_subagent"))
+            events.is_empty(),
+            "disallowed named-parameter tool_use must be quarantined: {events:?}"
+        );
+        assert!(!parser.saw_tool_use());
+    }
+
+    #[test]
+    fn recovers_multiple_tool_uses_wrapped_in_tool_call() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(
+                [
+                    "read_file".to_string(),
+                    "get_command_or_subagent_output".to_string(),
+                    "run_terminal_command".to_string(),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            test_id_factory(),
+        );
+        let input = concat!(
+            "<tool_call>",
+            r#"<tool_use id="read-workflow-skill" name="read_file">"#,
+            r#"<parameter name="path">/Users/yeauty/.grok/bundled/skills/create-workflow/SKILL.md</parameter>"#,
+            "</tool_use>",
+            r#"<tool_use id="get-07" name="get_command_or_subagent_output">"#,
+            r#"<parameter name="task_id">01a01550-751c-7fc1-82ff-28b2e7e64844</parameter>"#,
+            r#"<parameter name="timeout_ms">0</parameter>"#,
+            "</tool_use>",
+            r#"<tool_use id="dump-launch" name="run_terminal_command">"#,
+            r#"<parameter name="command">python3 -c 'print(1)'</parameter>"#,
+            r#"<parameter name="description">Dump progress</parameter>"#,
+            "</tool_use>",
+            r#"<tool_use id="find-workflow-examples" name="Glob">"#,
+            r#"<parameter name="glob_pattern">**/*.rhai</parameter>"#,
+            r#"<parameter name="target_directory">/Users/yeauty/.grok</parameter>"#,
+            "</tool_use>",
+            "</tool_call>",
+        );
+        let events = parser.push(input);
+        let names: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RecoveredCursorEvent::ToolUse(tool) => Some(tool.name.as_str()),
+                RecoveredCursorEvent::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "get_command_or_subagent_output",
+                "run_terminal_command"
+            ],
+            "wrapper <tool_call> must unwrap into sibling tool_use: {events:?}"
+        );
+        assert!(
+            !leaked_raw_xml(&events),
+            "wrapper and unadvertised Glob XML must not leak: {events:?}"
+        );
+        assert!(
+            !names.contains(&"Glob"),
+            "must not invent a Glob tool the client did not advertise"
+        );
+    }
+
+    fn grok_shell_allowlist() -> BTreeSet<String> {
+        [
+            "run_terminal_command".to_string(),
+            "read_file".to_string(),
+            "get_command_or_subagent_output".to_string(),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn recovered_names(events: &[RecoveredCursorEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RecoveredCursorEvent::ToolUse(tool) => Some(tool.name.as_str()),
+                RecoveredCursorEvent::Text(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disallowed_tool_xml_is_quarantined_not_transcript() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["Read".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(r#"<tool_use id="x" name="Bash">{"command":"pwd"}</tool_use>"#);
+        assert!(
+            !leaked_raw_xml(&events),
+            "disallowed <tool_use> must not become transcript text: {events:?}"
+        );
+        assert!(
+            recovered_names(&events).is_empty(),
+            "must not execute a tool the client did not advertise: {events:?}"
+        );
+        assert!(!parser.saw_tool_use());
+    }
+
+    #[test]
+    fn invalid_tool_input_xml_is_quarantined_not_transcript() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["Read".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(r#"<tool_use id="x" name="Read">{invalid}</tool_use>"#);
+        assert!(
+            !leaked_raw_xml(&events),
+            "malformed tool input must not leak as transcript XML: {events:?}"
+        );
+        assert!(
+            recovered_names(&events).is_empty(),
+            "must not invent a tool from invalid JSON: {events:?}"
+        );
+        assert!(!parser.saw_tool_use());
+    }
+
+    #[test]
+    fn flush_incomplete_tool_use_does_not_leak_xml() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["Read".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push("some text <tool_use name=\"Read\">{\"a\":1}");
+        assert_eq!(events, vec![RecoveredCursorEvent::Text("some text ".into())]);
+        let flushed = parser.flush();
+        assert!(
+            !leaked_raw_xml(&flushed),
+            "incomplete <tool_use> on flush must not leak: {flushed:?}"
+        );
+        assert!(
+            recovered_names(&flushed).is_empty(),
+            "incomplete markup must not become a tool: {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn unadvertised_glob_xml_is_quarantined_not_invented() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(grok_shell_allowlist()),
+            test_id_factory(),
+        );
+        let events = parser.push(concat!(
+            r#"<tool_use id="glob-rhai" name="Glob">"#,
+            r#"<parameter name="glob_pattern">**/*.rhai</parameter>"#,
+            r#"<parameter name="target_directory">/Users/yeauty/.grok/bundled/skills/create-workflow</parameter>"#,
+            "</tool_use>",
+        ));
+        assert!(
+            !leaked_raw_xml(&events),
+            "unadvertised Cursor Glob XML must not appear in transcript: {events:?}"
+        );
+        assert!(
+            !recovered_names(&events).contains(&"Glob"),
+            "must not invent Glob: {events:?}"
+        );
+        assert!(!parser.saw_tool_use());
+    }
+
+    #[test]
+    fn malformed_unclosed_parameter_is_quarantined() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(grok_shell_allowlist()),
+            test_id_factory(),
+        );
+        // Capture from grok-cli 0.1.51: command parameter never closes.
+        let events = parser.push(concat!(
+            r#"<tool_use id="dump-and-collect" name="run_terminal_command">"#,
+            "<parameter name=\"command\">python3 -c <<'PY'\n",
+            "print(1)\n",
+            "PY\n",
+            r#"<parameter name="description">Dump progress, in-flight, launch pack</parameter>"#,
+            "</tool_use>",
+        ));
+        assert!(
+            !leaked_raw_xml(&events),
+            "malformed run_terminal_command XML must not leak: {events:?}"
+        );
+        assert!(
+            recovered_names(&events).is_empty(),
+            "must not execute a tool whose parameters did not parse: {events:?}"
+        );
+        assert!(!parser.saw_tool_use());
+    }
+
+    #[test]
+    fn recovers_closed_heredoc_run_terminal_command() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(grok_shell_allowlist()),
+            test_id_factory(),
+        );
+        let events = parser.push(concat!(
+            r#"<tool_use id="dump-and-collect" name="run_terminal_command">"#,
+            "<parameter name=\"command\">python3 -c <<'PY'\n",
+            "print(1)\n",
+            "PY\n",
+            "</parameter>",
+            r#"<parameter name="description">Dump progress, in-flight, launch pack</parameter>"#,
+            "</tool_use>",
+        ));
+        assert!(
+            !leaked_raw_xml(&events),
+            "closed heredoc command must not leak XML: {events:?}"
+        );
+        assert_eq!(recovered_names(&events), ["run_terminal_command"]);
+        let RecoveredCursorEvent::ToolUse(tool) = &events[0] else {
+            panic!("expected recovered shell tool: {events:?}");
+        };
+        assert_eq!(
+            tool.input["command"].as_str(),
+            Some("python3 -c <<'PY'\nprint(1)\nPY")
+        );
+        assert_eq!(
+            tool.input["description"].as_str(),
+            Some("Dump progress, in-flight, launch pack")
+        );
+    }
+
+    #[test]
+    fn xml_workflow_recovers_as_advertised_grok_name() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["workflow".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(
+            r#"<tool_use id="wf" name="Workflow"><parameter name="name">carve-bind-wave64</parameter><parameter name="agent_budget">80</parameter></tool_use>"#,
+        );
+        assert!(
+            !leaked_raw_xml(&events),
+            "Workflow XML must not leak when grok advertised workflow: {events:?}"
+        );
+        assert_eq!(recovered_names(&events), ["workflow"]);
+        let RecoveredCursorEvent::ToolUse(tool) = &events[0] else {
+            panic!("expected recovered workflow: {events:?}");
+        };
+        assert_eq!(tool.input["name"].as_str(), Some("carve-bind-wave64"));
+        assert_eq!(tool.input["agent_budget"], 80);
+    }
+
+    #[test]
+    fn case_insensitive_recovery_is_limited_to_workflow_and_skill() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["grep".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(
+            r#"<tool_use id="native-grep" name="Grep"><parameter name="pattern">secret</parameter></tool_use>"#,
+        );
+        assert!(
+            events.is_empty(),
+            "Cursor-native Grep must not be invented as grok grep: {events:?}"
         );
         assert!(!parser.saw_tool_use());
     }

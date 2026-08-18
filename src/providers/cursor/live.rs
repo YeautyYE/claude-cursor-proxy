@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -385,6 +386,15 @@ impl CursorLiveRunHandle {
         &self,
         tool_results: Vec<(String, serde_json::Value)>,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        self.resume_batch_within(tool_results, resume_dispatch_timeout())
+            .await
+    }
+
+    async fn resume_batch_within(
+        &self,
+        tool_results: Vec<(String, serde_json::Value)>,
+        dispatch_timeout: Duration,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
         let pending = self.pending_tools();
         validate_tool_result_batch(&pending, &tool_results)
             .map_err(|message| CursorError::new(400, message, None))?;
@@ -426,9 +436,17 @@ impl CursorLiveRunHandle {
             })??;
             Ok(events)
         };
+        self.await_resume_dispatch(dispatch, dispatch_state, dispatch_timeout)
+            .await
+    }
+
+    async fn await_resume_dispatch(
+        &self,
+        dispatch: impl Future<Output = Result<mpsc::Receiver<LiveEventResult>, CursorError>>,
+        dispatch_state: Arc<AtomicU8>,
+        dispatch_timeout: Duration,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
         tokio::pin!(dispatch);
-        let dispatch_timeout =
-            Duration::from_millis(env_u64("CCP_CURSOR_LIVE_RESUME_DISPATCH_MS", 2_000));
         match tokio::time::timeout(dispatch_timeout, &mut dispatch).await {
             Ok(result) => result,
             Err(_) => match dispatch_state.compare_exchange(
@@ -437,16 +455,12 @@ impl CursorLiveRunHandle {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => Err(CursorError::new(
-                    409,
+                Ok(_) => Err(resume_dispatch_retryable_error(
                     "Cursor live resume dispatch timed out before driver acceptance; retry this tool result",
-                    None,
                 )),
                 Err(RESUME_DISPATCH_STARTED) => dispatch.await,
-                Err(_) => Err(CursorError::new(
-                    409,
+                Err(_) => Err(resume_dispatch_retryable_error(
                     "Cursor live resume dispatch was cancelled before driver acceptance",
-                    None,
                 )),
             },
         }
@@ -5891,25 +5905,6 @@ async fn process_interaction_update(
                         {
                             return false;
                         }
-                    } else if !tool_use.name.is_empty() {
-                        // Unknown / native-shaped XML: keep visible as text
-                        // so we do not invent a fake Claude tool_use.
-                        let input_json = serde_json::to_string(&tool_use.input)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        let visible = format!(
-                            "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
-                            tool_use.id, tool_use.name
-                        );
-                        *saw_text = true;
-                        if !emit_cursor_or_defer(
-                            sink,
-                            deferred,
-                            CursorStreamEvent::TextDelta { text: visible },
-                        )
-                        .await
-                        {
-                            return false;
-                        }
                     }
                 }
             }
@@ -6051,7 +6046,11 @@ async fn emit_empty_turn_note_if_needed(
     if *saw_text || sink.is_none() {
         return true;
     }
-    if workflow_tool_advertised(allowed_tool_names) {
+    // Claude Code `Workflow` only. grok-cli advertises lowercase `workflow`
+    // (Rhai launcher, `{name, agent_budget}`). Synthesizing Claude
+    // `Workflow`/`deep-research` becomes `Tool not found: Workflow` and the
+    // model reports "workflow 被桥接拦了".
+    if advertised_claude_code_workflow(allowed_tool_names) {
         let (name, args) = synthetic_workflow_from_prompt(user_prompt);
         pending.queue(
             synthetic_workflow_pending_exec(&name, &args),
@@ -6065,9 +6064,7 @@ async fn emit_empty_turn_note_if_needed(
         crate::logging::create_logger("cursor").info("empty_turn_workflow", Some(fields));
         return expose_collected_tools(pending, pending_shared, sink).await;
     }
-    let note = if allowed_tool_names
-        .is_some_and(|set| set.iter().any(|n| is_claude_local_tool_name(n)))
-    {
+    let note = if advertised_claude_code_workflow(allowed_tool_names) {
         "Cursor finished this turn without text or tool calls. If the user asked for /deep-research or /workflows, call the Workflow tool (for example Workflow with name \"deep-research\") instead of ending silently."
     } else {
         "Cursor finished this turn without text or tool calls."
@@ -6260,25 +6257,6 @@ async fn flush_xml_tool_uses(
                     exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
                     pending.queue(exec, Duration::ZERO);
                     exposed_client_only = true;
-                } else if !tool_use.name.is_empty() {
-                    let input_json =
-                        serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
-                    let visible = format!(
-                        "<tool_use id=\"{}\" name=\"{}\">\n{input_json}\n</tool_use>",
-                        tool_use.id, tool_use.name
-                    );
-                    *saw_text = true;
-                    *useful = true;
-                    *last_progress = Instant::now();
-                    if !emit_cursor_or_defer(
-                        sink,
-                        deferred,
-                        CursorStreamEvent::TextDelta { text: visible },
-                    )
-                    .await
-                    {
-                        return false;
-                    }
                 }
             }
         }
@@ -6387,9 +6365,31 @@ fn client_only_anthropic_name(
     // XML recovery and MCP both go through here.
     let set = allowed.filter(|set| !set.is_empty())?;
     // Prefix stripping is enough to match `claude-local/Workflow` to
-    // advertised `Workflow`. The provider id must not invent a tool that
-    // the downstream client never listed.
-    set.get(stripped).or_else(|| set.get(mapped_name)).cloned()
+    // advertised `Workflow`. Case folding is required for grok-cli
+    // `workflow` vs Fable `Workflow`. Emit the exact advertised spelling
+    // — grok dispatch is exact and rejects `Tool not found: Workflow`.
+    set.get(stripped)
+        .or_else(|| set.get(mapped_name))
+        .cloned()
+        .or_else(|| {
+            advertised_workflow_or_skill_name(set, stripped, provider_identifier)
+        })
+}
+
+fn advertised_workflow_or_skill_name(
+    set: &BTreeSet<String>,
+    name: &str,
+    provider_identifier: &str,
+) -> Option<String> {
+    if !provider_identifier.is_empty() && provider_identifier != CLAUDE_LOCAL_MCP_PROVIDER {
+        return None;
+    }
+    if !matches!(name, "Workflow" | "workflow" | "Skill" | "skill") {
+        return None;
+    }
+    set.iter()
+        .find(|advertised| strip_mcp_provider_prefix(advertised).eq_ignore_ascii_case(name))
+        .cloned()
 }
 
 fn mcp_client_only_pending_exec(
@@ -6656,10 +6656,10 @@ fn truncate_ask_header(text: &str) -> String {
         .collect()
 }
 
-fn workflow_tool_advertised(allowed: Option<&BTreeSet<String>>) -> bool {
+fn advertised_claude_code_workflow(allowed: Option<&BTreeSet<String>>) -> bool {
     allowed.is_some_and(|set| {
         set.iter()
-            .any(|name| strip_mcp_provider_prefix(name).eq_ignore_ascii_case("Workflow"))
+            .any(|name| strip_mcp_provider_prefix(name) == "Workflow")
     })
 }
 
@@ -7067,6 +7067,24 @@ fn encode_agent_message(message: &AgentClientMessage) -> Result<Bytes, CursorErr
         .encode(&mut payload)
         .map_err(|e| CursorError::internal(format!("Cursor message encode: {e}")))?;
     Ok(encode_connect_frame(payload, 0))
+}
+
+/// How long the tool-result POST waits for the live driver to dequeue
+/// `ResumeBatch`. The driver may be blocked on a BidiAppend send (up to 30s).
+/// 2s was too short and 409 made grok-build treat a retryable wait as
+/// `invalid_request`. Still bounded so a dead driver cannot hold HTTP open
+/// until stream-idle.
+const DEFAULT_RESUME_DISPATCH_MS: u64 = 20_000;
+
+fn resume_dispatch_timeout() -> Duration {
+    Duration::from_millis(env_u64(
+        "CCP_CURSOR_LIVE_RESUME_DISPATCH_MS",
+        DEFAULT_RESUME_DISPATCH_MS,
+    ))
+}
+
+fn resume_dispatch_retryable_error(message: &str) -> CursorError {
+    CursorError::new(429, message, None)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -9773,6 +9791,37 @@ mod tests {
             "Cursor tool result id x is not pending",
             None
         )));
+        assert!(
+            !live_resume_error_is_dead_driver(&CursorError::new(
+                429,
+                "Cursor live resume dispatch timed out before driver acceptance; retry this tool result",
+                None
+            )),
+            "a late driver is still alive; 429 must retry the same tool result, not supersede"
+        );
+    }
+
+    #[test]
+    fn resume_dispatch_timeout_is_retryable_rate_limit() {
+        if std::env::var("CCP_CURSOR_LIVE_RESUME_DISPATCH_MS").is_err() {
+            assert_eq!(
+                resume_dispatch_timeout(),
+                Duration::from_millis(DEFAULT_RESUME_DISPATCH_MS)
+            );
+        }
+        let err = resume_dispatch_retryable_error(
+            "Cursor live resume dispatch timed out before driver acceptance; retry this tool result",
+        );
+        assert_eq!(err.status, 429);
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(err.status, &err.message),
+            429
+        );
+        assert_eq!(
+            crate::retry::anthropic_error_kind_for_status(err.status, &err.message),
+            "rate_limit_error"
+        );
+        assert!(!crate::retry::is_ambiguous_live_accept(&err.message));
     }
 
     fn dummy_handle(run_id: &str) -> Arc<CursorLiveRunHandle> {
@@ -11365,6 +11414,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_only_anthropic_name_maps_fable_workflow_to_grok_workflow() {
+        let allowed = BTreeSet::from(["workflow".to_string(), "skill".to_string()]);
+        for mapped in [
+            "Workflow",
+            "workflow",
+            "claude-local/Workflow",
+            "mcp_claude-local_Workflow",
+            "mcp_claude-local_workflow",
+            "mcp__claude-local__Workflow",
+        ] {
+            assert_eq!(
+                client_only_anthropic_name(mapped, "claude-local", Some(&allowed)).as_deref(),
+                Some("workflow"),
+                "{mapped} must steal as the exact grok-cli name"
+            );
+        }
+        assert_eq!(
+            client_only_anthropic_name("Skill", "claude-local", Some(&allowed)).as_deref(),
+            Some("skill")
+        );
+        let grep_allowed = BTreeSet::from(["grep".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name(
+                "mcp_claude-local_Grep",
+                "claude-local",
+                Some(&grep_allowed)
+            ),
+            None,
+            "case folding must not turn Cursor Grep into grok grep"
+        );
+        assert!(
+            client_only_anthropic_name("Workflow", "claude-local", Some(&allowed))
+                .as_deref()
+                != Some("Workflow"),
+            "must not emit Claude Code Workflow when grok advertised workflow"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_workflow_tool_call_started_exposes_client_only() {
         use super::super::connect::encode_connect_frame;
@@ -11470,6 +11558,67 @@ mod tests {
                 );
             }
             other => panic!("expected NativeToolBatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_fable_workflow_exposes_exact_grok_workflow() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "mcp-wf-grok".into(),
+                    model_call_id: "model-1".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "Workflow".into(),
+                                tool_name: "Workflow".into(),
+                                tool_call_id: "mcp-wf-grok".into(),
+                                provider_identifier: "claude-local".into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("name".into(), br#""carve-bind-wave64""#.to_vec());
+                                    m.insert("agent_budget".into(), b"80".to_vec());
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+        let (cont, event, _) = drive_native_task_frame(
+            frames.into_iter().next().unwrap(),
+            Some(&BTreeSet::from(["workflow".to_string()])),
+            None,
+        )
+        .await;
+        assert!(!cont, "stolen grok workflow must end the BiDi segment");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "workflow");
+                assert_eq!(
+                    tools[0].input.get("name").and_then(|v| v.as_str()),
+                    Some("carve-bind-wave64")
+                );
+                assert_eq!(tools[0].input.get("agent_budget"), Some(&serde_json::json!(80)));
+            }
+            other => panic!("expected grok workflow batch, got {other:?}"),
         }
     }
 
@@ -12353,6 +12502,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xml_wrapped_tool_call_exposes_sibling_client_tools() {
+        use super::super::proto::RequestContext;
+
+        let allowed = BTreeSet::from([
+            "read_file".to_string(),
+            "get_command_or_subagent_output".to_string(),
+            "run_terminal_command".to_string(),
+        ]);
+        let xml = concat!(
+            "<tool_call>",
+            r#"<tool_use name="read_file"><parameter name="path">SKILL.md</parameter></tool_use>"#,
+            r#"<tool_use name="get_command_or_subagent_output"><parameter name="task_id">t-1</parameter></tool_use>"#,
+            r#"<tool_use name="run_terminal_command"><parameter name="command">echo hi</parameter></tool_use>"#,
+            r#"<tool_use name="Glob"><parameter name="glob_pattern">**/*.rhai</parameter></tool_use>"#,
+            "</tool_call>",
+        );
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-wrap",
+            user_prompt: "fan-out",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        let cont = process_live_frame(
+            xml_tool_use_frame(xml),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(25),
+            &mut xml_parser,
+            Some(&mut turn),
+        )
+        .await;
+        assert!(
+            cont,
+            "wrapped sibling XML must stay on the BiDi until expose"
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                    assert!(
+                        !text.contains("<tool_call")
+                            && !text.contains("<tool_use")
+                            && !text.contains("<parameter")
+                            && !text.contains("read_file"),
+                        "wrapper XML must not leak as transcript: {text}"
+                    );
+                }
+                other => panic!("unexpected event before expose: {other:?}"),
+            }
+        }
+        assert!(
+            !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await,
+            "wrapped siblings must tear down as one ClientOnly batch"
+        );
+        match event_rx.recv().await.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+                assert_eq!(
+                    names,
+                    [
+                        "read_file",
+                        "get_command_or_subagent_output",
+                        "run_terminal_command"
+                    ],
+                    "{tools:?}"
+                );
+                assert!(
+                    !names.contains(&"Glob"),
+                    "unadvertised Glob must not be invented: {tools:?}"
+                );
+            }
+            other => panic!("expected wrapped sibling batch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xml_malformed_command_and_unadvertised_glob_do_not_leak() {
+        let allowed = BTreeSet::from(["run_terminal_command".to_string()]);
+        let xml = concat!(
+            r#"<tool_use id="dump-and-collect" name="run_terminal_command">"#,
+            "<parameter name=\"command\">python3 -c <<'PY'\nprint(1)\nPY\n",
+            r#"<parameter name="description">Dump progress, in-flight, launch pack</parameter>"#,
+            "</tool_use>",
+            r#"<tool_use id="glob-rhai" name="Glob">"#,
+            r#"<parameter name="glob_pattern">**/*.rhai</parameter>"#,
+            r#"<parameter name="target_directory">/Users/yeauty/.grok/bundled/skills/create-workflow</parameter>"#,
+            "</tool_use>",
+        );
+        let (cont, event, pending) =
+            drive_native_task_frame(xml_tool_use_frame(xml), Some(&allowed), None).await;
+        assert!(
+            pending.is_empty(),
+            "malformed shell XML and unadvertised Glob must not become tools: {pending:?}"
+        );
+        match event {
+            None => {}
+            Some(Ok(LiveRunEvent::NativeToolBatch(tools))) => {
+                panic!("must not invent tools from rejected XML: {tools:?}");
+            }
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }))) => {
+                assert!(
+                    !text.contains("<tool_use")
+                        && !text.contains("<tool_call")
+                        && !text.contains("<parameter"),
+                    "rejected control XML must not become transcript: {text}"
+                );
+            }
+            other => panic!("unexpected event for rejected XML: {other:?}"),
+        }
+        assert!(
+            cont,
+            "quarantined XML must not tear the BiDi down as ClientOnly: {cont}"
+        );
+    }
+
+    #[tokio::test]
+    async fn xml_recovered_unbridgeable_glob_does_not_reconstruct() {
+        let allowed = BTreeSet::from(["Glob".to_string(), "run_terminal_command".to_string()]);
+        let xml = concat!(
+            r#"<tool_use id="glob-rhai" name="Glob">"#,
+            r#"<parameter name="glob_pattern">**/*.rhai</parameter>"#,
+            "</tool_use>",
+        );
+        let (cont, event, pending) =
+            drive_native_task_frame(xml_tool_use_frame(xml), Some(&allowed), None).await;
+        assert!(
+            pending.is_empty(),
+            "XML Glob must not become a client tool just because the name is listed: {pending:?}"
+        );
+        match event {
+            None => {}
+            Some(Ok(LiveRunEvent::NativeToolBatch(tools))) => {
+                panic!("must not invent XML Glob as NativeToolBatch: {tools:?}");
+            }
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }))) => {
+                assert!(
+                    !text.contains("<tool_use") && !text.contains("<parameter"),
+                    "unbridgeable recovered Glob must not be reconstructed as XML: {text}"
+                );
+            }
+            other => panic!("unexpected event for unbridgeable Glob XML: {other:?}"),
+        }
+        assert!(cont, "dropped Glob XML must keep the BiDi open");
+    }
+
+    #[tokio::test]
     async fn xml_grok_tool_call_todo_write_exposes_todo_write() {
         let allowed = BTreeSet::from(["todo_write".to_string()]);
         let xml = concat!(
@@ -12411,7 +12735,12 @@ mod tests {
             Some(Ok(LiveRunEvent::NativeToolBatch(tools))) => {
                 panic!("allowed=None must not invent a client tool: {tools:?}");
             }
-            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { .. }))) => {}
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }))) => {
+                assert!(
+                    !text.contains("<tool_use") && !text.contains("<parameter"),
+                    "allowed=None XML must not leak as transcript: {text}"
+                );
+            }
             other => panic!("unexpected event for unadvertised XML web_search: {other:?}"),
         }
     }
@@ -13891,6 +14220,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_turn_does_not_invent_claude_workflow_for_grok() {
+        use super::super::connect::{FLAG_END, encode_connect_frame};
+
+        let framed = encode_connect_frame(b"", FLAG_END);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["workflow".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-grok-wf",
+            user_prompt: "用 workflow 按原 nonce 一次扇出 64 人",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            Some(&mut turn),
+        )
+        .await;
+        assert!(!cont, "FLAG_END must still end the live segment");
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                    panic!(
+                        "grok workflow must not be invented as Claude Workflow/deep-research: {tools:?}"
+                    );
+                }
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                    assert!(
+                        !text.contains("Workflow") && !text.contains("deep-research"),
+                        "empty-turn note must not teach Claude Workflow: {text}"
+                    );
+                }
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)) => {}
+                other => panic!("unexpected empty-turn event: {other:?}"),
+            }
+        }
+        assert!(pending.is_empty(), "must not queue a synthetic workflow");
+    }
+
+    #[tokio::test]
     async fn flag_end_without_workflow_emits_empty_turn_note() {
         use super::super::connect::{FLAG_END, encode_connect_frame};
 
@@ -15160,15 +15564,25 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            handle.resume_batch(vec![(
-                "tool-1".into(),
-                serde_json::json!({"type":"tool_result","content":"done"}),
-            )]),
+            handle.resume_batch_within(
+                vec![(
+                    "tool-1".into(),
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )],
+                Duration::from_millis(200),
+            ),
         )
         .await
         .expect("resume dispatch must finish before downstream stream-idle")
         .expect_err("an unprocessed command must return a bounded retryable error");
-        assert_eq!(error.status, 409);
+        assert_eq!(
+            error.status, 429,
+            "a busy driver is transient; grok-build retries 429 and treats 409 as invalid_request"
+        );
+        assert_eq!(
+            crate::retry::anthropic_error_kind_for_status(error.status, &error.message),
+            "rate_limit_error"
+        );
         let queued = command_rx.recv().await.expect("cancelled queued command");
         let RunCommand::ResumeBatch { dispatch_state, .. } = &queued else {
             panic!("expected queued resume");
