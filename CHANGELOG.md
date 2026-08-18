@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.52 (2026-08-19)
+
+- Quarantine malformed or unadvertised Cursor control XML instead of leaking or reconstructing it in grok transcripts. Preserve each client's exact advertised `workflow`/`Workflow` and `skill`/`Skill` names so the bridge neither intercepts nor invents tools.
+- Treat no-output Cursor turns as retryable upstream failures instead of successful assistant notes, so tool-result continuations such as `spawn_subagent` cannot silently end a grok session. Live resume dispatch now waits up to 20 seconds and returns retryable 429 on contention.
+
 ## v0.1.51 (2026-08-18)
 
 - Recover grok Anthropic-style `<tool_use><parameter>` XML as structured tools instead of leaking it into the transcript. XML `spawn_subagent` waits for `turn_ended` so a 64-way stream is not torn after the first chunk. Sibling MCP lifecycle spawns still share one batch.
