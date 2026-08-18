@@ -1139,7 +1139,10 @@ mod tests {
             test_id_factory(),
         );
         let events = parser.push("some text <tool_use name=\"Read\">{\"a\":1}");
-        assert_eq!(events, vec![RecoveredCursorEvent::Text("some text ".into())]);
+        assert_eq!(
+            events,
+            vec![RecoveredCursorEvent::Text("some text ".into())]
+        );
         let flushed = parser.flush();
         assert!(
             !leaked_raw_xml(&flushed),

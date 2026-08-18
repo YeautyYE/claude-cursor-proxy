@@ -3015,6 +3015,8 @@ fn live_should_resume_after_drop(on_probation: bool, got_chunk_since_reconnect: 
 
 const CONVERSATION_RESET_RETRY_NOTE: &str =
     "stale Cursor conversation reset; retry this message to continue";
+const EMPTY_TURN_RETRY_NOTE: &str =
+    "Cursor upstream finished this turn without text or tool calls; retry this turn";
 type LiveContinuationState<'a> = (&'a mut Option<Vec<u8>>, &'a mut HashMap<Vec<u8>, Vec<u8>>);
 
 fn annotate_connect_end_error(
@@ -3344,6 +3346,9 @@ pub(crate) fn live_resume_error_is_dead_driver(error: &CursorError) -> bool {
 pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if crate::retry::is_billing_block(message) || crate::retry::is_capacity_shed(message) {
         return false;
+    }
+    if message.contains(EMPTY_TURN_RETRY_NOTE) {
+        return true;
     }
     if cursor_connect_error_is_missing_conversation_data(message)
         || terminal_error_allows_fresh_retry(message)
@@ -5361,14 +5366,14 @@ async fn process_live_frame(
             return false;
         }
         // Connect END without turn_ended used to emit bare End → silent
-        // Anthropic Out:0. Mirror the turn_ended empty-note recovery.
-        if !emit_empty_turn_note_if_needed(
+        // Anthropic Out:0. Mirror the turn_ended empty-turn recovery.
+        if !recover_empty_turn_if_needed(
             saw_text,
             useful,
             sink,
-            deferred,
             pending,
             pending_shared,
+            terminal_error,
             allowed_tool_names,
             turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
             "flag_end",
@@ -5982,16 +5987,16 @@ async fn process_interaction_update(
             .await;
             return false;
         }
-        // Heartbeat-only "thinking" with no text/tools yields a contentless
-        // Anthropic 200 (Out:0) — Claude Code looks hung then idle. Surface a
-        // short visible note so the agent can recover / call Workflow.
-        if !emit_empty_turn_note_if_needed(
+        // Heartbeat-only "thinking" with no text/tools must not become a
+        // successful Anthropic turn. Retry before the client can accept an
+        // empty completion as the model's final answer.
+        if !recover_empty_turn_if_needed(
             saw_text,
             useful,
             sink,
-            deferred,
             pending,
             pending_shared,
+            terminal_error,
             allowed_tool_names,
             turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
             "turn_ended",
@@ -6027,18 +6032,18 @@ async fn process_interaction_update(
 }
 
 /// Recover an empty Cursor turn: emit a real Anthropic `Workflow` tool_use when
-/// that tool was advertised, otherwise a short visible note.
+/// that tool was advertised, otherwise fail with a bounded same-request retry.
 ///
 /// Used from `turn_ended`, clean Connect `FLAG_END`, and exhausted EOF — all
 /// three previously could produce silent Anthropic Out:0 completions.
 #[allow(clippy::too_many_arguments)]
-async fn emit_empty_turn_note_if_needed(
+async fn recover_empty_turn_if_needed(
     saw_text: &mut bool,
     useful: &mut bool,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
-    deferred: &mut VecDeque<LiveEventResult>,
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     allowed_tool_names: Option<&BTreeSet<String>>,
     user_prompt: &str,
     reason: &str,
@@ -6064,15 +6069,8 @@ async fn emit_empty_turn_note_if_needed(
         crate::logging::create_logger("cursor").info("empty_turn_workflow", Some(fields));
         return expose_collected_tools(pending, pending_shared, sink).await;
     }
-    let note = if advertised_claude_code_workflow(allowed_tool_names) {
-        "Cursor finished this turn without text or tool calls. If the user asked for /deep-research or /workflows, call the Workflow tool (for example Workflow with name \"deep-research\") instead of ending silently."
-    } else {
-        "Cursor finished this turn without text or tool calls."
-    };
-    *saw_text = true;
-    *useful = true;
-    // Always leave a structured breadcrumb — empty turns are otherwise invisible
-    // in proxy.log (no InteractionUpdate dump unless CCP_CURSOR_DEBUG=1).
+    // Never turn a transport/upstream anomaly into assistant-authored text:
+    // clients treat any TextDelta + End as success and will not retry.
     {
         let mut fields = serde_json::Map::new();
         fields.insert("reason".into(), serde_json::json!(reason));
@@ -6083,19 +6081,13 @@ async fn emit_empty_turn_note_if_needed(
                     .is_some_and(|set| { set.iter().any(|n| is_claude_local_tool_name(n)) })
             ),
         );
-        crate::logging::create_logger("cursor").info("empty_turn_note", Some(fields));
+        crate::logging::create_logger("cursor").warn("empty_turn_retry", Some(fields));
     }
     if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
-        eprintln!("[ccp-cursor] empty_turn_note reason={reason}");
+        eprintln!("[ccp-cursor] empty_turn_retry reason={reason}");
     }
-    emit_cursor_or_defer(
-        sink,
-        deferred,
-        CursorStreamEvent::TextDelta {
-            text: note.to_string(),
-        },
-    )
-    .await
+    report_terminal_error(sink, terminal_error, EMPTY_TURN_RETRY_NOTE.to_string()).await;
+    false
 }
 
 async fn send_frame_or_fail(
@@ -6371,9 +6363,7 @@ fn client_only_anthropic_name(
     set.get(stripped)
         .or_else(|| set.get(mapped_name))
         .cloned()
-        .or_else(|| {
-            advertised_workflow_or_skill_name(set, stripped, provider_identifier)
-        })
+        .or_else(|| advertised_workflow_or_skill_name(set, stripped, provider_identifier))
 }
 
 fn advertised_workflow_or_skill_name(
@@ -11446,8 +11436,7 @@ mod tests {
             "case folding must not turn Cursor Grep into grok grep"
         );
         assert!(
-            client_only_anthropic_name("Workflow", "claude-local", Some(&allowed))
-                .as_deref()
+            client_only_anthropic_name("Workflow", "claude-local", Some(&allowed)).as_deref()
                 != Some("Workflow"),
             "must not emit Claude Code Workflow when grok advertised workflow"
         );
@@ -11616,7 +11605,10 @@ mod tests {
                     tools[0].input.get("name").and_then(|v| v.as_str()),
                     Some("carve-bind-wave64")
                 );
-                assert_eq!(tools[0].input.get("agent_budget"), Some(&serde_json::json!(80)));
+                assert_eq!(
+                    tools[0].input.get("agent_budget"),
+                    Some(&serde_json::json!(80))
+                );
             }
             other => panic!("expected grok workflow batch, got {other:?}"),
         }
@@ -14274,28 +14266,25 @@ mod tests {
         )
         .await;
         assert!(!cont, "FLAG_END must still end the live segment");
-        while let Ok(event) = event_rx.try_recv() {
-            match event {
-                Ok(LiveRunEvent::NativeToolBatch(tools)) => {
-                    panic!(
-                        "grok workflow must not be invented as Claude Workflow/deep-research: {tools:?}"
-                    );
-                }
-                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
-                    assert!(
-                        !text.contains("Workflow") && !text.contains("deep-research"),
-                        "empty-turn note must not teach Claude Workflow: {text}"
-                    );
-                }
-                Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)) => {}
-                other => panic!("unexpected empty-turn event: {other:?}"),
-            }
-        }
+        assert!(!saw_text, "a proxy diagnostic must not become model text");
+        let error = event_rx
+            .try_recv()
+            .expect("retryable empty-turn error")
+            .expect_err("empty grok turn must fail instead of succeeding");
+        assert!(error.contains("without text or tool calls"), "{error}");
+        assert!(
+            live_error_is_same_request_retryable(&error),
+            "empty turn must retry within the same client request"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "empty turn must not also emit End"
+        );
         assert!(pending.is_empty(), "must not queue a synthetic workflow");
     }
 
     #[tokio::test]
-    async fn flag_end_without_workflow_emits_empty_turn_note() {
+    async fn flag_end_without_workflow_emits_retryable_error() {
         use super::super::connect::{FLAG_END, encode_connect_frame};
 
         let framed = encode_connect_frame(b"", FLAG_END);
@@ -14340,27 +14329,21 @@ mod tests {
         )
         .await;
         assert!(!cont, "FLAG_END must end the live segment");
-        assert!(saw_text, "empty-note must mark saw_text");
+        assert!(!saw_text, "a proxy diagnostic must not become model text");
 
-        let note = event_rx.try_recv().expect("empty-note TextDelta");
-        match note {
-            Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
-                assert!(
-                    text.contains("without text or tool calls"),
-                    "unexpected note: {text}"
-                );
-                assert!(
-                    !text.contains("Workflow"),
-                    "note-only when Workflow was not advertised"
-                );
-            }
-            other => panic!("expected TextDelta note, got {other:?}"),
-        }
-        let end = event_rx.try_recv().expect("End after note");
-        assert!(matches!(
-            end,
-            Ok(LiveRunEvent::Cursor(CursorStreamEvent::End))
-        ));
+        let error = event_rx
+            .try_recv()
+            .expect("retryable empty-turn error")
+            .expect_err("empty turn must not be reported as a success");
+        assert!(error.contains("without text or tool calls"), "{error}");
+        assert!(
+            live_error_is_same_request_retryable(&error),
+            "empty turn must trigger the bounded same-request retry path"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "empty turn must not also emit End"
+        );
     }
 
     #[test]
