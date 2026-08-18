@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.50 (2026-08-18)
+
+- Retry Cursor live-open misses inside the proxy before returning 409: H2 20s timeouts and pre-connect `BidiAppend` failures try HTTP/1 on the same request; only exhausted attempts fail closed as 409 so grok-build does not 5xx-retry. High Load 429s are not retried into the same shed.
+- Remap Cursor `Agent`/`Task` `subagent_type` model slugs (`gemini-*`, `composer-*`, …) to `general-purpose` so Claude Code does not reject `Agent type 'gemini-3.6-flash-high' not found`. The H2 circuit now pins HTTP/1 until an H2 open succeeds.
+
 ## v0.1.49 (2026-08-18)
 
 - Live-open concurrency soft-starts at 4 and doubles on success up to 128 (grok-cli fan-out). `CCP_CURSOR_LIVE_OPEN_CONCURRENCY` is an optional cap, not a required knob. A full gate waits, then returns 429 instead of failing immediately.
