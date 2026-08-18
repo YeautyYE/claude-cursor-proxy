@@ -1,6 +1,7 @@
 //! XML tool-use recovery parser.
 //!
-//! Recovers `<tool_use id="..." name="...">{"json"}</tool_use>` from text delta
+//! Recovers `<tool_use id="..." name="...">{"json"}</tool_use>` and
+//! Anthropic-style `<parameter name="...">` bodies from text delta
 //! chunks that arrive incrementally from the upstream. Produces structured
 //! `RecoveredCursorEvent` values for the bridge to emit as Anthropic tool_use
 //! content blocks.
@@ -128,10 +129,12 @@ impl CursorToolUseXmlParser {
             }
 
             let close = kind.close_tag();
-            let close_start = self.buffer.find(close);
+            // Spawn prompts often paste inner `<tool_use>` examples. The first
+            // `</tool_use>` is not the outer close; wait for depth zero.
+            let close_start = find_matching_named_close(&self.buffer, kind.open_tag(), close);
             if close_start.is_none() {
-                // No close tag yet; if we are flushing, emit the whole buffer
-                // as text. Otherwise hold and wait for more data.
+                // No matching close tag yet; if we are flushing, emit the whole
+                // buffer as text. Otherwise hold and wait for more data.
                 if flush {
                     self.push_text(&mut events, &self.buffer);
                     self.buffer.clear();
@@ -165,11 +168,7 @@ impl CursorToolUseXmlParser {
     }
 
     fn parse_tool_use(&mut self, raw: &str) -> Option<RecoveredCursorToolUse> {
-        let re = regex_lite::Regex::new(r"^<tool_use\b([^>]*)>([\s\S]*?)</tool_use>$").ok()?;
-        let caps = re.captures(raw)?;
-        let attrs_str = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let body = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
+        let (attrs_str, body) = split_tagged_element(raw, XmlToolKind::ToolUse)?;
         let attrs = parse_xml_attributes(attrs_str);
         let name = attrs.get("name")?;
         let original_id = attrs.get("id").cloned();
@@ -184,20 +183,14 @@ impl CursorToolUseXmlParser {
             return None;
         }
 
-        // Parse the JSON body.
         let trimmed = body.trim();
-        let input_value: serde_json::Value = if trimmed.is_empty() {
-            serde_json::Value::Object(serde_json::Map::new())
+        let input = if trimmed.is_empty() {
+            serde_json::Map::new()
+        } else if let Some(map) = parse_json_object(trimmed) {
+            map
         } else {
-            match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => return None,
-            }
-        };
-
-        let input = match input_value {
-            serde_json::Value::Object(map) => map,
-            _ => return None,
+            // grok-cli / Anthropic-style: <parameter name="...">value</parameter>
+            parse_parameter_tags(trimmed)?
         };
 
         let id = (self.id_factory)();
@@ -211,10 +204,9 @@ impl CursorToolUseXmlParser {
     }
 
     fn parse_tool_call(&mut self, raw: &str) -> Option<RecoveredCursorToolUse> {
-        let re = regex_lite::Regex::new(r"^<tool_call\b([^>]*)>([\s\S]*)</tool_call>$").ok()?;
-        let caps = re.captures(raw)?;
-        let attrs = parse_xml_attributes(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
-        let body = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        let (attrs_str, body) = split_tagged_element(raw, XmlToolKind::ToolCall)?;
+        let attrs = parse_xml_attributes(attrs_str);
+        let body = body.trim();
         let mut name = attrs.get("name").filter(|value| !value.is_empty()).cloned();
         let input = parse_tool_call_body(body, &mut name)?;
         let name = name.filter(|value| !value.is_empty())?;
@@ -316,12 +308,75 @@ enum XmlToolKind {
 }
 
 impl XmlToolKind {
+    fn open_tag(self) -> &'static str {
+        match self {
+            Self::ToolUse => "<tool_use",
+            Self::ToolCall => "<tool_call",
+        }
+    }
+
     fn close_tag(self) -> &'static str {
         match self {
             Self::ToolUse => "</tool_use>",
             Self::ToolCall => "</tool_call>",
         }
     }
+}
+
+fn split_tagged_element(raw: &str, kind: XmlToolKind) -> Option<(&str, &str)> {
+    let open = kind.open_tag();
+    let close = kind.close_tag();
+    if !raw.starts_with(open) || !raw.ends_with(close) {
+        return None;
+    }
+    let gt = raw.find('>')?;
+    let attrs = &raw[open.len()..gt];
+    let body = &raw[gt + 1..raw.len() - close.len()];
+    Some((attrs, body))
+}
+
+/// True when `buffer[at..]` is an XML start tag for `open` (`<tool_use`,
+/// `<parameter`, …), not a longer name like `<tool_user`.
+fn xml_tag_open_at(buffer: &str, at: usize, open: &str) -> bool {
+    let Some(rest) = buffer.get(at..) else {
+        return false;
+    };
+    if !rest.starts_with(open) {
+        return false;
+    }
+    match rest[open.len()..].chars().next() {
+        Some('>' | '/' | ' ' | '\t' | '\n' | '\r') => true,
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-' => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Index of the matching close tag for an element that starts at `buffer[0]`.
+fn find_matching_named_close(buffer: &str, open: &str, close: &str) -> Option<usize> {
+    if !xml_tag_open_at(buffer, 0, open) {
+        return None;
+    }
+    let open_gt = buffer.find('>')?;
+    let mut depth = 1i32;
+    let mut i = open_gt + 1;
+    while i < buffer.len() {
+        if buffer.get(i..).is_some_and(|rest| rest.starts_with(close)) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            i += close.len();
+            continue;
+        }
+        if xml_tag_open_at(buffer, i, open) {
+            depth += 1;
+            i += open.len();
+            continue;
+        }
+        i += buffer[i..].chars().next()?.len_utf8();
+    }
+    None
 }
 
 fn next_xml_tool_start(buffer: &str) -> Option<(usize, XmlToolKind)> {
@@ -391,13 +446,26 @@ fn tool_call_input_from_object(
 }
 
 fn parse_parameter_tags(body: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let re = regex_lite::Regex::new(r"<parameter\b([^>]*)>([\s\S]*?)</parameter>").ok()?;
+    const OPEN: &str = "<parameter";
+    const CLOSE: &str = "</parameter>";
     let mut map = serde_json::Map::new();
     let mut found = false;
-    for cap in re.captures_iter(body) {
-        found = true;
-        let attrs = parse_xml_attributes(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
-        let raw = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+    let mut i = 0;
+    while i < body.len() {
+        let Some(rel) = body[i..].find(OPEN) else {
+            break;
+        };
+        let start = i + rel;
+        if !xml_tag_open_at(body, start, OPEN) {
+            i = start + OPEN.len();
+            continue;
+        }
+        let close_at = find_matching_named_close(&body[start..], OPEN, CLOSE)?;
+        let end = start + close_at + CLOSE.len();
+        let elem = &body[start..end];
+        let gt = elem.find('>')?;
+        let attrs = parse_xml_attributes(&elem[OPEN.len()..gt]);
+        let raw = elem[gt + 1..elem.len() - CLOSE.len()].trim();
         let value = match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(parsed) => parsed,
             Err(_) => serde_json::Value::String(raw.to_string()),
@@ -409,6 +477,8 @@ fn parse_parameter_tags(body: &str) -> Option<serde_json::Map<String, serde_json
         } else {
             map.insert("input".into(), value);
         }
+        found = true;
+        i = end;
     }
     found.then_some(map)
 }
@@ -794,5 +864,138 @@ mod tests {
             )),
             "only the exact </assistant> closer is redundant: {events:?}"
         );
+    }
+
+    fn leaked_raw_xml(events: &[RecoveredCursorEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                RecoveredCursorEvent::Text(text)
+                    if text.contains("<tool_use")
+                        || text.contains("</tool_use>")
+                        || text.contains("<tool_call")
+                        || text.contains("</tool_call>")
+                        || text.contains("<parameter")
+            )
+        })
+    }
+
+    #[test]
+    fn recovers_tool_use_with_named_parameter_tags() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["spawn_subagent".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let input = concat!(
+            r#"<tool_use id="spawn-40" name="spawn_subagent">"#,
+            r#"<parameter name="background">true</parameter>"#,
+            r#"<parameter name="description">CARVE A1560 0013 REREAD_1</parameter>"#,
+            r#"<parameter name="prompt">Read 40.txt completely. Do not read any other path.</parameter>"#,
+            r#"<parameter name="subagent_type">general-purpose</parameter>"#,
+            "</tool_use>",
+            " </tool_call>",
+        );
+        let events = parser.push(input);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RecoveredCursorEvent::ToolUse(_)))
+                .count(),
+            1,
+            "named <parameter> children must become one spawn_subagent: {events:?}"
+        );
+        assert!(
+            !leaked_raw_xml(&events),
+            "raw <tool_use>/<parameter> XML must not leak as transcript: {events:?}"
+        );
+        let RecoveredCursorEvent::ToolUse(tool) = events
+            .iter()
+            .find(|event| matches!(event, RecoveredCursorEvent::ToolUse(_)))
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(tool.name, "spawn_subagent");
+        assert_eq!(tool.original_id.as_deref(), Some("spawn-40"));
+        assert_eq!(tool.input["background"], true);
+        assert_eq!(tool.input["description"], "CARVE A1560 0013 REREAD_1");
+        assert_eq!(
+            tool.input["prompt"].as_str(),
+            Some("Read 40.txt completely. Do not read any other path.")
+        );
+        assert_eq!(tool.input["subagent_type"], "general-purpose");
+        assert!(parser.flush().is_empty());
+    }
+
+    #[test]
+    fn recovers_outer_tool_use_when_prompt_contains_nested_xml() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["spawn_subagent".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let input = concat!(
+            r#"<tool_use name="spawn_subagent">"#,
+            r#"<parameter name="background">true</parameter>"#,
+            r#"<parameter name="description">outer</parameter>"#,
+            r#"<parameter name="prompt">"#,
+            "follow 40.txt. nested example: ",
+            r#"<parameter name="subagent_type">general-purpose</parameter>"#,
+            r#"<tool_use id="spawn-41" name="spawn_subagent">"#,
+            r#"<parameter name="prompt">inner</parameter>"#,
+            "</tool_use>",
+            " done",
+            "</parameter>",
+            "</tool_use>",
+        );
+        let events = parser.push(input);
+        let tools: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RecoveredCursorEvent::ToolUse(tool) => Some(tool),
+                RecoveredCursorEvent::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            tools.len(),
+            1,
+            "nested tool XML inside prompt must not become a second tool: {events:?}"
+        );
+        assert!(
+            !leaked_raw_xml(&events),
+            "nested XML belongs in the prompt field, not transcript: {events:?}"
+        );
+        assert_eq!(tools[0].name, "spawn_subagent");
+        assert_eq!(tools[0].input["description"], "outer");
+        let prompt = tools[0].input["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("follow 40.txt"),
+            "outer prompt must keep leading text: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("spawn-41") && prompt.contains("</tool_use>"),
+            "inner tool XML must stay inside prompt: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("done"),
+            "outer prompt must keep trailing text after nested XML: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn named_parameter_tool_use_disallowed_name_stays_text() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["read_file".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(concat!(
+            r#"<tool_use name="spawn_subagent">"#,
+            r#"<parameter name="prompt">secret</parameter>"#,
+            "</tool_use>",
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], RecoveredCursorEvent::Text(text) if text.contains("spawn_subagent"))
+        );
+        assert!(!parser.saw_tool_use());
     }
 }

@@ -69,6 +69,11 @@ enum ProviderGroup {
 }
 
 fn main() -> Result<()> {
+    // macOS often starts CLI tools with a 256-file soft limit. Raise before
+    // Tokio/reqwest open sockets so 64-way grok-cli waves do not fail as
+    // "Cursor auth failed: /usr/bin/security: Too many open files".
+    let _ = claude_cursor_proxy::fdlimit::raise_nofile_limit();
+
     let cli = Cli::parse();
 
     if cli.version_flag {

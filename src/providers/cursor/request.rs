@@ -164,25 +164,48 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
 /// Tools Cursor should see on `RunRequest.mcp_tools`. Broader Claude-local
 /// names still go in the prompt `<tools>` dump for XML recovery.
 ///
-/// Fable's agent loop invokes the MCP catalog, not the XML dump. grok-build
-/// client names (`spawn_subagent`, `run_terminal_command`, …) must be on
-/// MCP or Cursor returns `Tool not found`. Steal maps `mcp_claude-local_*`
-/// back to the exact grok wire name. Workflow / Skill / `mcp__*` stay for
-/// Claude Code. Aliases (`task` / `Task` / `Agent`) stay off MCP.
+/// Fable's agent loop invokes the MCP catalog, not the XML dump. Lifecycle
+/// grok names (`spawn_subagent`, …) must be on MCP or Cursor returns
+/// `Tool not found`. Filesystem/web grok names with a native remap stay off
+/// MCP so Fable does not teach `mcp_claude-local_run_terminal_command`.
+/// Steal maps remaining `mcp_claude-local_*` back to the exact grok wire name.
+/// Workflow / Skill / `mcp__*` stay for Claude Code. Aliases stay off MCP.
 fn advertise_as_cursor_mcp(name: &str) -> bool {
-    if is_grok_build_client_tool_name(name) || is_grok_build_subagent_lifecycle_tool(name) {
-        return true;
-    }
-    if normalize_grok_build_lifecycle_name(name).is_some() {
+    if is_grok_build_subagent_lifecycle_tool(name)
+        || normalize_grok_build_lifecycle_name(name).is_some()
+    {
         return true;
     }
     let bare = strip_mcp_provider_prefix(name);
-    if is_grok_build_client_tool_name(bare) && is_claude_local_mcp_spelling(name) {
+    if grok_client_tool_uses_native_remap(name) || grok_client_tool_uses_native_remap(bare) {
+        return false;
+    }
+    if is_grok_build_client_tool_name(name)
+        || (is_grok_build_client_tool_name(bare) && is_claude_local_mcp_spelling(name))
+    {
         return true;
     }
     bare.eq_ignore_ascii_case("Workflow")
         || bare.eq_ignore_ascii_case("Skill")
         || bare.starts_with("mcp__")
+}
+
+fn grok_client_tool_uses_native_remap(name: &str) -> bool {
+    matches!(
+        name,
+        "run_terminal_command"
+            | "run_terminal_cmd"
+            | "read_file"
+            | "list_dir"
+            | "todo_write"
+            | "write"
+            | "grep"
+            | "web_search"
+            | "web_fetch"
+            | "ask_user_question"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+    )
 }
 
 fn is_claude_local_mcp_spelling(name: &str) -> bool {
@@ -310,9 +333,10 @@ pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
 /// Wire shape must match `agent.v1.McpToolDefinition`: `input_schema` is a
 /// `google.protobuf.Value` (`struct_value`), plus `provider_identifier` /
 /// `tool_name`. Workflow / Skill / `mcp__*` are advertised for Claude Code.
-/// grok-build client and lifecycle names are advertised too — Fable only
-/// invokes the MCP catalog, so XML-only `spawn_subagent` is `Tool not found`.
-/// Steal maps `mcp_claude-local_*` back to the exact grok wire name.
+/// grok-build lifecycle names are advertised too — Fable only invokes the
+/// MCP catalog, so XML-only `spawn_subagent` is `Tool not found`. Filesystem
+/// and web grok names with a native remap stay off MCP. Steal maps
+/// `mcp_claude-local_*` back to the exact grok wire name.
 /// The Anthropic `input_schema` object is copied into that Value (not a raw
 /// Struct at tag 3, which Cursor rejected with `invalid end group tag`).
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
@@ -914,7 +938,7 @@ fn request_has_grok_build_client_tools(req: &MessagesRequest) -> bool {
 
 fn tools_dump_preface(req: &MessagesRequest) -> &'static str {
     if request_has_grok_build_client_tools(req) {
-        "Prefer these client tools over Cursor-native Shell, Read, Write, Task, WebSearch, and WebFetch. Call run_terminal_command, read_file, web_search, web_fetch, spawn_subagent, and enter_plan_mode by those exact names. Do not use Cursor Task to spawn.\n"
+        "Call run_terminal_command, read_file, list_dir, grep, write, search_replace, todo_write, web_search, web_fetch, spawn_subagent, and enter_plan_mode by those exact names.\n"
     } else {
         "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Call the Workflow tool, not Bash.\n"
     }
@@ -1344,6 +1368,7 @@ mod tests {
             "tools": [
                 {"name": "read_file", "description": "read", "input_schema": {"type": "object"}},
                 {"name": "run_terminal_command", "description": "shell", "input_schema": {"type": "object"}},
+                {"name": "search_replace", "description": "patch", "input_schema": {"type": "object"}},
                 {"name": "task", "description": "canonical", "input_schema": {"type": "object"}},
                 {"name": "spawn_subagent", "description": "spawn", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string"}}}},
                 {"name": "get_command_or_subagent_output", "description": "poll", "input_schema": {"type": "object"}},
@@ -1358,8 +1383,6 @@ mod tests {
         );
         let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
         for required in [
-            "read_file",
-            "run_terminal_command",
             "spawn_subagent",
             "get_command_or_subagent_output",
             "kill_command_or_subagent",
@@ -1367,7 +1390,17 @@ mod tests {
         ] {
             assert!(
                 names.contains(&required),
-                "{required} must be on mcp_tools so Fable can invoke it: {names:?}"
+                "{required} must stay on mcp_tools: {names:?}"
+            );
+        }
+        assert!(
+            names.contains(&"search_replace"),
+            "schema-incompatible grok write must stay on MCP: {names:?}"
+        );
+        for remapped in ["read_file", "run_terminal_command"] {
+            assert!(
+                !names.contains(&remapped),
+                "{remapped} has a native remap and must stay off MCP: {names:?}"
             );
         }
         assert!(
@@ -1587,15 +1620,25 @@ mod tests {
         assert!(
             parts
                 .user_text
-                .contains("Prefer these client tools over Cursor-native"),
-            "Fable must be told not to prefer Shell/Task: {}",
+                .contains("Call run_terminal_command, read_file"),
+            "preface must list grok names without teaching a dual catalog: {}",
             parts.user_text
         );
-        assert!(
-            !parts.user_text.contains("mcp_claude-local_"),
-            "preface must not teach the MCP prefix the model then narrates: {}",
-            parts.user_text
-        );
+        for banned in [
+            "Cursor-native",
+            "Cursor",
+            "MCP",
+            "bridge",
+            "Shell",
+            "Task",
+            "mcp_claude-local_",
+        ] {
+            assert!(
+                !parts.user_text.contains(banned),
+                "preface must not teach {banned}: {}",
+                parts.user_text
+            );
+        }
         assert!(
             !parts
                 .user_text

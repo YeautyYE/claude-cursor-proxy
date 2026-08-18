@@ -639,6 +639,31 @@ impl PendingExecState {
         .flatten()
     }
 
+    fn client_only_collect_deadline(&self) -> Option<tokio::time::Instant> {
+        (self.can_expose()
+            && !self.collecting.is_empty()
+            && self
+                .collecting
+                .iter()
+                .all(|exec| matches!(exec.kind, CursorExecKind::ClientOnly)))
+        .then_some(self.collect_deadline)
+        .flatten()
+    }
+
+    fn collecting_has_lifecycle(&self) -> bool {
+        // MCP sibling `spawn_subagent` may flush on a quiet window.
+        // XML-recovered lifecycle uses `client_only_*` exec ids and must wait
+        // for `turn_ended` — tearing after the first streamed chunk dumps the
+        // rest as visible `<tool_use>` XML.
+        self.collecting.iter().any(|exec| {
+            is_grok_build_subagent_lifecycle_tool(&exec.claude_name)
+                && exec
+                    .exec_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("mcp_"))
+        })
+    }
+
     fn expose(&mut self) -> Vec<PendingCursorExec> {
         if !self.can_expose() {
             return Vec::new();
@@ -3121,6 +3146,7 @@ pub(crate) fn exhausted_live_start_error(err: CursorError, attempted_retries: u3
         return err;
     }
     if is_pre_connect_failure(&err)
+        || is_initial_bidiappend_timeout(&err)
         || err.message.contains("error sending request")
         || matches!(err.status, 0 | 502 | 503 | 504)
     {
@@ -3192,6 +3218,12 @@ fn live_control_close_message(unresolved: bool) -> &'static str {
 
 pub(crate) fn is_ambiguous_live_open_timeout(err: &CursorError) -> bool {
     err.status == 504
+}
+
+fn is_initial_bidiappend_timeout(err: &CursorError) -> bool {
+    let blob = format!("{} {}", err.message, err.client_message());
+    let lower = blob.to_ascii_lowercase();
+    lower.contains("bidiappend initial run") && lower.contains("timed out")
 }
 
 fn is_pre_connect_failure(err: &CursorError) -> bool {
@@ -3333,6 +3365,9 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
     }
     if text.contains("concurrency saturated") || err.message.contains("concurrency saturated") {
         return false;
+    }
+    if is_initial_bidiappend_timeout(err) {
+        return true;
     }
     if cursor_connect_error_is_missing_conversation_data(&text)
         || err
@@ -4343,6 +4378,11 @@ async fn drive_live_run(
                     break;
                 }
             }
+            if keep_running && pending.can_expose() && pending.collecting_has_lifecycle() {
+                if !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await {
+                    keep_running = false;
+                }
+            }
             keep_running
         }};
     }
@@ -4508,7 +4548,12 @@ async fn drive_live_run(
             }
             break 'driver;
         }
-        let batch_deadline = pending.native_collect_deadline();
+        let batch_deadline = pending.native_collect_deadline().or_else(|| {
+            pending
+                .collecting_has_lifecycle()
+                .then(|| pending.client_only_collect_deadline())
+                .flatten()
+        });
         let coalesce_deadline = coalescer.deadline();
         tokio::select! {
             biased;
@@ -4880,6 +4925,19 @@ async fn drive_live_run(
                                 &pending_shared,
                                 &mut sink,
                             )
+                            .await
+                            {
+                                break 'driver;
+                            }
+                        } else if pending.collecting_has_lifecycle()
+                            && pending
+                                .client_only_collect_deadline()
+                                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                                break 'driver;
+                            }
+                            if !expose_collected_tools(&mut pending, &pending_shared, &mut sink)
                                 .await
                             {
                                 break 'driver;
@@ -5129,7 +5187,14 @@ async fn drive_live_run(
                 if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
                     break 'driver;
                 }
-                if !expose_collected_native_tools(&mut pending, &pending_shared, &mut sink).await {
+                let exposed = if pending.collecting_has_lifecycle()
+                    && pending.native_collect_deadline().is_none()
+                {
+                    expose_collected_tools(&mut pending, &pending_shared, &mut sink).await
+                } else {
+                    expose_collected_native_tools(&mut pending, &pending_shared, &mut sink).await
+                };
+                if !exposed {
                     break 'driver;
                 }
             }
@@ -5640,15 +5705,13 @@ async fn process_interaction_update(
                 exec.claude_name = emit_name.clone();
                 exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
                 pending.queue(exec, Duration::ZERO);
-                // Lifecycle MCP must not wait for turn_ended: Cursor may also
-                // try to exec `mcp_claude-local_*` as a native tool.
-                if is_grok_build_subagent_lifecycle_tool(&emit_name) {
-                    *useful = true;
-                    *last_progress = Instant::now();
-                    return expose_collected_tools(pending, pending_shared, sink).await;
-                }
+                *useful = true;
+                *last_progress = Instant::now();
                 if !defer_client_only_exposure {
                     return expose_collected_tools(pending, pending_shared, sink).await;
+                }
+                if is_grok_build_subagent_lifecycle_tool(&emit_name) {
+                    return true;
                 }
             }
             if mapped.name == "Task"
@@ -9378,6 +9441,52 @@ mod tests {
     }
 
     #[test]
+    fn initial_bidiappend_timeout_retries_inside_post_then_409() {
+        let initial = ambiguous_http1_append_error(
+            CursorError::new(408, "BidiAppend timed out", None),
+            "initial Run",
+        );
+        assert_eq!(
+            initial.message,
+            "Cursor BidiAppend initial Run failed; acceptance is ambiguous: BidiAppend timed out"
+        );
+        assert!(
+            cursor_start_error_is_same_request_retryable(&initial),
+            "first-open BidiAppend timeout must retry this POST before 409"
+        );
+        assert!(
+            live_start_error_seals_tombstone(&initial),
+            "exhausted retries still seal Starting so the next POST is not a duplicate"
+        );
+        let exhausted = exhausted_live_start_error(initial.clone(), 3);
+        assert_eq!(
+            exhausted.status, 409,
+            "after proxy-internal retries grok-build must see 409, not 408"
+        );
+        assert_eq!(exhausted.message, initial.message);
+
+        let mid_stream = ambiguous_http1_append_error(
+            CursorError::new(408, "BidiAppend timed out", None),
+            "send",
+        );
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&mid_stream),
+            "mid-stream BidiAppend timeout must not start a second Run"
+        );
+        assert!(live_send_failure_is_terminal(&mid_stream));
+
+        let send_wrapper = CursorError::new(
+            504,
+            "Cursor BidiAppend timed out; acceptance is ambiguous",
+            None,
+        );
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&send_wrapper),
+            "a timed-out in-flight send must not be replayed as a new Run"
+        );
+    }
+
+    #[test]
     fn kv_set_then_get_round_trips_the_latest_blob() {
         let key = b"conversation-state".to_vec();
         let mut blobs = HashMap::new();
@@ -9512,6 +9621,43 @@ mod tests {
         );
         assert_eq!(state.awaiting().len(), 2);
         assert!(!state.can_expose());
+    }
+
+    #[test]
+    fn xml_lifecycle_does_not_trip_mcp_sibling_flush() {
+        let mut xml_state = PendingExecState::default();
+        xml_state.queue(
+            PendingCursorExec {
+                id: 1,
+                exec_id: Some("client_only_spawn-40".into()),
+                tool_use_id: "spawn-40".into(),
+                claude_name: "spawn_subagent".into(),
+                claude_input: serde_json::json!({"prompt": "a"}),
+                kind: CursorExecKind::ClientOnly,
+            },
+            Duration::ZERO,
+        );
+        assert!(
+            !xml_state.collecting_has_lifecycle(),
+            "XML spawn_subagent must wait for turn_ended, not the MCP sibling quiet window"
+        );
+
+        let mut mcp_state = PendingExecState::default();
+        mcp_state.queue(
+            PendingCursorExec {
+                id: 2,
+                exec_id: Some("mcp_spawn-a".into()),
+                tool_use_id: "spawn-a".into(),
+                claude_name: "spawn_subagent".into(),
+                claude_input: serde_json::json!({"prompt": "b"}),
+                kind: CursorExecKind::ClientOnly,
+            },
+            Duration::ZERO,
+        );
+        assert!(
+            mcp_state.collecting_has_lifecycle(),
+            "MCP sibling spawn must still flush on the quiet window"
+        );
     }
 
     #[test]
@@ -12179,6 +12325,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xml_parameter_spawn_subagent_exposes_spawn_not_transcript() {
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let xml = concat!(
+            r#"<tool_use id="spawn-40" name="spawn_subagent">"#,
+            r#"<parameter name="background">true</parameter>"#,
+            r#"<parameter name="description">CARVE A1560 0013 REREAD_1</parameter>"#,
+            r#"<parameter name="prompt">Read 40.txt completely.</parameter>"#,
+            r#"<parameter name="subagent_type">general-purpose</parameter>"#,
+            "</tool_use>",
+            " </tool_call>",
+        );
+        let (cont, event, _) =
+            drive_native_task_frame(xml_tool_use_frame(xml), Some(&allowed), None).await;
+        assert!(
+            !cont,
+            "parameter-style XML spawn_subagent must be ClientOnly, not transcript XML"
+        );
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools[0].name, "spawn_subagent");
+                assert_eq!(tools[0].input["prompt"], "Read 40.txt completely.");
+                assert_eq!(tools[0].input["subagent_type"], "general-purpose");
+            }
+            other => panic!("expected spawn_subagent from <parameter> XML, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn xml_grok_tool_call_todo_write_exposes_todo_write() {
         let allowed = BTreeSet::from(["todo_write".to_string()]);
         let xml = concat!(
@@ -13174,6 +13348,229 @@ mod tests {
                 );
             }
             other => panic!("expected spawn_subagent, got {other:?}"),
+        }
+    }
+
+    fn mcp_spawn_started_frame(call_id: &str, prompt: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::{ConnectFrameDecoder, encode_connect_frame};
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: call_id.into(),
+                    model_call_id: format!("model-{call_id}"),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "mcp_claude-local_spawn_subagent".into(),
+                                tool_name: "mcp_claude-local_spawn_subagent".into(),
+                                tool_call_id: call_id.into(),
+                                provider_identifier: "claude-local".into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("prompt".into(), format!("\"{prompt}\"").into_bytes());
+                                    m.insert("description".into(), br#""explore""#.to_vec());
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sibling_lifecycle_spawns_share_one_batch() {
+        use super::super::proto::RequestContext;
+
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-sib",
+            user_prompt: "spawn two",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        for (call_id, prompt) in [("spawn-a", "first"), ("spawn-b", "second")] {
+            let cont = process_live_frame(
+                mcp_spawn_started_frame(call_id, prompt),
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut latest_checkpoint,
+                &terminal_error,
+                Some(&allowed),
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::from_millis(25),
+                &mut xml_parser,
+                Some(&mut turn),
+            )
+            .await;
+            assert!(
+                cont,
+                "sibling {call_id} must stay on the BiDi long enough to collect the pair"
+            );
+        }
+        assert!(
+            !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await,
+            "lifecycle batch must tear down BiDi after both siblings"
+        );
+        match event_rx.recv().await.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(
+                    tools.len(),
+                    2,
+                    "both sibling spawns must survive: {tools:?}"
+                );
+                assert!(tools.iter().all(|tool| tool.name == "spawn_subagent"));
+                let prompts: Vec<_> = tools
+                    .iter()
+                    .filter_map(|tool| tool.input.get("prompt").and_then(|v| v.as_str()))
+                    .collect();
+                assert!(prompts.contains(&"first"), "{prompts:?}");
+                assert!(prompts.contains(&"second"), "{prompts:?}");
+            }
+            other => panic!("expected sibling spawn batch, got {other:?}"),
+        }
+    }
+
+    fn xml_parameter_spawn(id: &str, prompt: &str) -> String {
+        format!(
+            concat!(
+                r#"<tool_use id="{id}" name="spawn_subagent">"#,
+                r#"<parameter name="background">true</parameter>"#,
+                r#"<parameter name="description">{id}</parameter>"#,
+                r#"<parameter name="prompt">{prompt}</parameter>"#,
+                r#"<parameter name="subagent_type">general-purpose</parameter>"#,
+                "</tool_use>",
+            ),
+            id = id,
+            prompt = prompt
+        )
+    }
+
+    #[tokio::test]
+    async fn xml_lifecycle_spawns_wait_for_turn_end_across_chunks() {
+        use super::super::proto::RequestContext;
+
+        let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-xml-spawn",
+            user_prompt: "spawn 64",
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+
+        for (call_id, prompt) in [("spawn-40", "first"), ("spawn-41", "second")] {
+            let cont = process_live_frame(
+                xml_tool_use_frame(&xml_parameter_spawn(call_id, prompt)),
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut latest_checkpoint,
+                &terminal_error,
+                Some(&allowed),
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::from_millis(25),
+                &mut xml_parser,
+                Some(&mut turn),
+            )
+            .await;
+            assert!(
+                cont,
+                "XML {call_id} must stay on the BiDi until turn_ended so later chunks can join"
+            );
+            assert!(
+                !pending.collecting_has_lifecycle(),
+                "XML lifecycle must not arm the MCP sibling flush after {call_id}"
+            );
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "XML spawns must not emit a batch until turn_ended"
+        );
+        assert!(
+            !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await,
+            "turn_ended flush must tear down BiDi after both XML spawns"
+        );
+        match event_rx.recv().await.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 2, "both XML spawns must survive: {tools:?}");
+                assert!(tools.iter().all(|tool| tool.name == "spawn_subagent"));
+                let prompts: Vec<_> = tools
+                    .iter()
+                    .filter_map(|tool| tool.input.get("prompt").and_then(|v| v.as_str()))
+                    .collect();
+                assert!(prompts.contains(&"first"), "{prompts:?}");
+                assert!(prompts.contains(&"second"), "{prompts:?}");
+            }
+            other => panic!("expected XML spawn batch, got {other:?}"),
         }
     }
 

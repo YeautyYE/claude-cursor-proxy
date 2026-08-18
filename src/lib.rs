@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod fdlimit;
 pub mod logging;
 pub mod media;
 pub mod monitor;

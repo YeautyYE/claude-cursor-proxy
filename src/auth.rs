@@ -161,14 +161,13 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     fn load(&self) -> Result<Option<T>> {
-        let parsed = load_auth_file::<T>(&self.file);
-        if parsed.is_some() {
-            return Ok(parsed);
+        if let Some(parsed) = try_load_auth_file(&self.file)? {
+            return Ok(Some(parsed));
         }
         if self.file == self.legacy_file {
             return Ok(None);
         }
-        Ok(load_auth_file::<T>(&self.legacy_file))
+        try_load_auth_file(&self.legacy_file)
     }
 
     fn save(&self, value: T) -> Result<()> {
@@ -289,10 +288,27 @@ where
 }
 
 pub fn load_auth_file<T: DeserializeOwned>(path: &str) -> Option<T> {
-    let mut file = File::open(path).ok()?;
+    try_load_auth_file(path).ok().flatten()
+}
+
+/// Open + parse an auth file. `NotFound` is `Ok(None)` so callers may fall
+/// back to Keychain. Any other IO error (EMFILE, EACCES, EISDIR, …) is `Err`
+/// so we do not skip a local credential file and impersonate another store.
+fn try_load_auth_file<T: DeserializeOwned>(path: &str) -> Result<Option<T>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(
+                anyhow::Error::from(err).context(format!("Failed to read auth file {path}"))
+            );
+        }
+    };
     let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
-    serde_json::from_str::<T>(&raw).ok()
+    file.read_to_string(&mut raw).map_err(|err| {
+        anyhow::Error::from(err).context(format!("Failed to read auth file {path}"))
+    })?;
+    Ok(serde_json::from_str(&raw).ok())
 }
 
 pub fn load_auth_file_value(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -624,5 +640,47 @@ mod tests {
         assert!(keychain.raw("svc", "acct").is_none());
         assert_eq!(store.path(), file);
         assert_eq!(store.load().unwrap().unwrap()["source"], json!("file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_auth_file_does_not_fall_back_to_keychain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        std::fs::write(&file, r#"{"source":"file"}"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let keychain = MockKeychain::default();
+        keychain.set_raw("svc", "acct", json!({"source": "keychain"}));
+        let store: KeychainFileAuthStore<serde_json::Value, _> =
+            KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain);
+
+        let err = store.load().expect_err(
+            "unreadable auth.json must fail closed, not impersonate keychain credentials",
+        );
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("permission")
+                || msg.contains("denied")
+                || msg.contains("failed to read auth file"),
+            "must surface the file IO error, got {err}"
+        );
+    }
+
+    #[test]
+    fn missing_auth_file_still_falls_back_to_keychain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "missing.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        let keychain = MockKeychain::default();
+        keychain.set_raw("svc", "acct", json!({"source": "keychain"}));
+        let store: KeychainFileAuthStore<serde_json::Value, _> =
+            KeychainFileAuthStore::new(file, legacy, "svc", "acct", true, keychain);
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded["source"], json!("keychain"));
     }
 }

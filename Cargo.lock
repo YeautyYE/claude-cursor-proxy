@@ -334,6 +334,7 @@ dependencies = [
  "http",
  "http-body-util",
  "jiff",
+ "libc",
  "once_cell",
  "predicates",
  "prost",
