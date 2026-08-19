@@ -1,4 +1,4 @@
-use crate::anthropic::schema::MessagesRequest;
+use crate::anthropic::schema::{Message, MessagesRequest};
 
 /// A selected image extracted from the request content blocks.
 #[derive(Debug, Clone)]
@@ -661,27 +661,20 @@ pub fn render_cursor_prompt_parts_with(
 /// After ClientOnly (Workflow/Skill/mcp__*) teardown there is no live run:
 /// the latest user message *is* those results and must be forwarded.
 fn render_latest_user_delta(req: &MessagesRequest) -> Option<String> {
-    let mut seen_user = false;
-    for message in req.messages.iter().rev() {
-        if message.role != "user" {
-            continue;
-        }
-        let is_latest_user = !seen_user;
-        seen_user = true;
-        let content = render_message_content(message)?;
-        let content = scrub_injection_noise("user", &content);
-        if !is_latest_user && content_is_only_tool_results(message) {
-            continue;
-        }
-        if content.trim().is_empty() {
-            continue;
-        }
-        return Some(content);
+    let rendered = current_user_messages(req)
+        .into_iter()
+        .filter_map(render_message_content)
+        .map(|content| scrub_injection_noise("user", &content))
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered.join("\n\n"))
     }
-    None
 }
 
-fn content_is_only_tool_results(message: &crate::anthropic::schema::Message) -> bool {
+fn content_is_only_tool_results(message: &Message) -> bool {
     match &message.content {
         serde_json::Value::Array(blocks) => {
             !blocks.is_empty()
@@ -693,13 +686,73 @@ fn content_is_only_tool_results(message: &crate::anthropic::schema::Message) -> 
     }
 }
 
-/// True when the newest user message is only `tool_result` blocks.
+fn is_standalone_system_reminder(message: &Message) -> bool {
+    fn wrapped(text: &str) -> bool {
+        let text = text.trim();
+        text.starts_with("<system-reminder>") && text.ends_with("</system-reminder>")
+    }
+
+    match &message.content {
+        serde_json::Value::String(text) => wrapped(text),
+        serde_json::Value::Array(blocks)
+            if !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    block.get("type").and_then(|value| value.as_str()) == Some("text")
+                }) =>
+        {
+            let text = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+                .collect::<String>();
+            wrapped(&text)
+        }
+        _ => false,
+    }
+}
+
+/// The logical user turn after the most recent assistant boundary.
+///
+/// Responses emits one user message per parallel function output. Standalone
+/// asynchronous reminders do not split that result batch or replace a newer
+/// user prompt; full-history rendering still preserves them.
+fn current_user_messages(req: &MessagesRequest) -> Vec<&Message> {
+    let mut tool_result_groups = Vec::new();
+    for message in req.messages.iter().rev() {
+        if message.role == "assistant" {
+            break;
+        }
+        if message.role != "user" || is_standalone_system_reminder(message) {
+            continue;
+        }
+        if !content_is_only_tool_results(message) {
+            if tool_result_groups.is_empty() {
+                return vec![message];
+            }
+            break;
+        }
+        tool_result_groups.push(message);
+    }
+    tool_result_groups.reverse();
+    tool_result_groups
+}
+
+pub(crate) fn current_user_blocks(req: &MessagesRequest) -> Vec<&serde_json::Value> {
+    let mut blocks = Vec::new();
+    for message in current_user_messages(req) {
+        if let serde_json::Value::Array(content) = &message.content {
+            blocks.extend(content.iter());
+        }
+    }
+    blocks
+}
+
+/// True when the current logical user turn is only `tool_result` blocks.
 pub(crate) fn latest_user_is_only_tool_results(req: &MessagesRequest) -> bool {
-    req.messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .is_some_and(content_is_only_tool_results)
+    let current = current_user_messages(req);
+    !current.is_empty()
+        && current
+            .iter()
+            .all(|message| content_is_only_tool_results(message))
 }
 
 fn tool_result_ids(message: &crate::anthropic::schema::Message) -> Vec<String> {
@@ -741,15 +794,10 @@ fn assistant_tool_name_for_id<'a>(req: &'a MessagesRequest, tool_use_id: &str) -
 /// True when the latest user message carries results for Claude-local tools
 /// (`Workflow` / `Skill` / `mcp__*`) that Cursor cannot resume on BiDi.
 pub(crate) fn request_has_client_only_tool_results(req: &MessagesRequest) -> bool {
-    let Some(user) = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-    else {
-        return false;
-    };
-    let ids = tool_result_ids(user);
+    let ids = current_user_messages(req)
+        .into_iter()
+        .flat_map(tool_result_ids)
+        .collect::<Vec<_>>();
     if ids.is_empty() {
         return false;
     }
@@ -761,19 +809,13 @@ pub(crate) fn request_has_client_only_tool_results(req: &MessagesRequest) -> boo
 /// that were bound to a previous live Run generation. Those results must not
 /// open a second Cursor Run.
 pub(crate) fn request_has_orphaned_native_live_results(req: &MessagesRequest) -> bool {
-    let Some(user) = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-    else {
-        return false;
-    };
-    let ids = tool_result_ids(user);
-    ids.iter().any(|id| {
-        id.contains("__cursor_run_")
-            && !assistant_tool_name_for_id(req, id).is_some_and(is_claude_local_tool_name)
-    })
+    current_user_messages(req)
+        .into_iter()
+        .flat_map(tool_result_ids)
+        .any(|id| {
+            id.contains("__cursor_run_")
+                && !assistant_tool_name_for_id(req, &id).is_some_and(is_claude_local_tool_name)
+        })
 }
 
 /// Free-slot policy for generation-tagged native tool_results.
@@ -1945,6 +1987,79 @@ mod tests {
         assert!(!parts.user_text.contains("first"));
         assert!(!parts.user_text.contains("fn main() {}"));
         assert!(!parts.user_text.contains("<tool_result"));
+    }
+
+    #[test]
+    fn trailing_system_reminder_does_not_hide_split_tool_result_turn() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "messages": [
+                {"role": "user", "content": "read both files"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call-1", "name": "read_file", "input": {}},
+                    {"type": "tool_use", "id": "call-2", "name": "read_file", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-1", "content": "first result"}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-2", "content": "second result"}
+                ]},
+                {
+                    "role": "user",
+                    "content": "<system-reminder>MCP servers connected.</system-reminder>"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert!(
+            latest_user_is_only_tool_results(&req),
+            "a trailing asynchronous reminder must not hide the resumable tool-result turn"
+        );
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: true,
+            },
+        );
+        assert!(parts.user_text.contains("first result"));
+        assert!(parts.user_text.contains("second result"));
+        assert!(
+            !parts.user_text.contains("MCP servers connected"),
+            "the asynchronous reminder must not replace completed tool results"
+        );
+    }
+
+    #[test]
+    fn trailing_system_reminder_does_not_replace_latest_user_text_delta() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "messages": [
+                {"role": "assistant", "content": "previous answer"},
+                {"role": "user", "content": "answer the actual question"},
+                {
+                    "role": "user",
+                    "content": "<system-reminder>Background work completed.</system-reminder>"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert!(!latest_user_is_only_tool_results(&req));
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: true,
+            },
+        );
+        assert!(parts.user_text.contains("answer the actual question"));
+        assert!(
+            !parts.user_text.contains("Background work completed"),
+            "a standalone notification is not the user's new turn"
+        );
     }
 
     #[test]

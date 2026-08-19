@@ -276,6 +276,7 @@ enum RunCommand {
         sink: mpsc::Sender<LiveEventResult>,
         ack: oneshot::Sender<Result<(), CursorError>>,
         permit: LiveResumePermit,
+        generation_permit: LiveGenerationPermit,
         dispatch_state: Arc<AtomicU8>,
     },
     Cancel {
@@ -416,7 +417,16 @@ impl CursorLiveRunHandle {
         };
         let command_tx = self.command_tx.clone();
         let command_dispatch_state = Arc::clone(&dispatch_state);
+        let cancel_requested = Arc::clone(&self.cancel_requested);
         let dispatch = async move {
+            let generation_permit = acquire_live_generation_resume_permit().await?;
+            if cancel_requested.load(Ordering::Acquire) {
+                return Err(CursorError::new(
+                    409,
+                    "Cursor live run was cancelled while waiting for generation capacity",
+                    None,
+                ));
+            }
             // Match start_live_agent capacity — post-tool thinking bursts must not
             // trip the old 64-slot ceiling (silent drop under try_send timeout).
             let (sink, events) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
@@ -427,6 +437,7 @@ impl CursorLiveRunHandle {
                     sink,
                     ack,
                     permit,
+                    generation_permit,
                     dispatch_state: command_dispatch_state,
                 })
                 .await
@@ -1832,6 +1843,7 @@ impl CursorHttpClient {
                 "Cursor live agent is disabled for this transport",
             ));
         }
+        let generation_permit = acquire_live_generation_permit(cancel.as_mut()).await?;
 
         let force_http1 = live_open_prefers_http1();
         let http = if force_http1 && !self.prefers_http1() {
@@ -1968,6 +1980,7 @@ impl CursorHttpClient {
             prompt.to_string(),
             request_context,
             reconnect,
+            generation_permit,
         ));
 
         Ok(LiveRunStart { handle, events })
@@ -2498,6 +2511,9 @@ const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
 const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
 const LIVE_OPEN_SOFT_START: usize = 4;
 const LIVE_OPEN_MAX: usize = 128;
+const LIVE_GENERATION_DEFAULT_MAX: usize = 16;
+const LIVE_GENERATION_MAX: usize = 128;
+const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 60;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -2588,6 +2604,240 @@ fn live_open_concurrency_max(raw: Option<&str>) -> usize {
         return n.min(LIVE_OPEN_MAX);
     }
     LIVE_OPEN_MAX
+}
+
+fn live_generation_concurrency_max(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(LIVE_GENERATION_MAX))
+        .unwrap_or(LIVE_GENERATION_DEFAULT_MAX)
+}
+
+fn live_generation_queue_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(LIVE_GENERATION_DEFAULT_QUEUE_SECS)
+        .clamp(1, 3600)
+}
+
+fn live_generation_saturated_error() -> CursorError {
+    CursorError::new(429, "Cursor live generation concurrency saturated", None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveGenerationPriority {
+    Start,
+    Resume,
+}
+
+#[derive(Clone)]
+struct LiveGenerationGate {
+    inner: Arc<LiveGenerationGateInner>,
+}
+
+struct LiveGenerationGateInner {
+    limit: usize,
+    inflight: AtomicUsize,
+    resume_waiters: AtomicUsize,
+    notify: Notify,
+}
+
+struct LiveGenerationPermit {
+    inner: Arc<LiveGenerationGateInner>,
+}
+
+impl std::fmt::Debug for LiveGenerationPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveGenerationPermit")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LiveGenerationPermit {
+    fn drop(&mut self) {
+        self.inner.inflight.fetch_sub(1, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+}
+
+struct LiveGenerationResumeWaiter {
+    inner: Arc<LiveGenerationGateInner>,
+}
+
+impl Drop for LiveGenerationResumeWaiter {
+    fn drop(&mut self) {
+        self.inner.resume_waiters.fetch_sub(1, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+}
+
+impl LiveGenerationGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(LiveGenerationGateInner {
+                limit: limit.clamp(1, LIVE_GENERATION_MAX),
+                inflight: AtomicUsize::new(0),
+                resume_waiters: AtomicUsize::new(0),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn limit(&self) -> usize {
+        self.inner.limit
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.inner
+            .limit
+            .saturating_sub(self.inner.inflight.load(Ordering::SeqCst))
+    }
+
+    #[cfg(test)]
+    fn resume_waiters(&self) -> usize {
+        self.inner.resume_waiters.load(Ordering::SeqCst)
+    }
+
+    fn register_resume_waiter(&self) -> LiveGenerationResumeWaiter {
+        self.inner.resume_waiters.fetch_add(1, Ordering::SeqCst);
+        LiveGenerationResumeWaiter {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    fn try_acquire(&self, priority: LiveGenerationPriority) -> Option<LiveGenerationPermit> {
+        loop {
+            if priority == LiveGenerationPriority::Start
+                && self.inner.resume_waiters.load(Ordering::SeqCst) > 0
+            {
+                return None;
+            }
+            let inflight = self.inner.inflight.load(Ordering::SeqCst);
+            if inflight >= self.inner.limit {
+                return None;
+            }
+            if self
+                .inner
+                .inflight
+                .compare_exchange(inflight, inflight + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue;
+            }
+            if priority == LiveGenerationPriority::Start
+                && self.inner.resume_waiters.load(Ordering::SeqCst) > 0
+            {
+                self.inner.inflight.fetch_sub(1, Ordering::SeqCst);
+                self.inner.notify.notify_waiters();
+                return None;
+            }
+            return Some(LiveGenerationPermit {
+                inner: Arc::clone(&self.inner),
+            });
+        }
+    }
+
+    async fn acquire(
+        &self,
+        priority: LiveGenerationPriority,
+        mut cancel: Option<&mut watch::Receiver<bool>>,
+        wait: Duration,
+    ) -> Result<LiveGenerationPermit, CursorError> {
+        let _resume_waiter =
+            (priority == LiveGenerationPriority::Resume).then(|| self.register_resume_waiter());
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(permit) = self.try_acquire(priority) {
+                return Ok(permit);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(live_generation_saturated_error());
+            }
+            let notified = self.inner.notify.notified();
+            if let Some(permit) = self.try_acquire(priority) {
+                return Ok(permit);
+            }
+            if let Some(cancel) = cancel.as_deref_mut() {
+                tokio::select! {
+                    _ = cancel.wait_for(|aborted| *aborted) => {
+                        return Err(CursorError::new(
+                            409,
+                            "Cursor live start superseded while waiting for generation capacity",
+                            None,
+                        ));
+                    }
+                    _ = notified => {}
+                    _ = tokio::time::sleep(remaining) => {
+                        if let Some(permit) = self.try_acquire(priority) {
+                            return Ok(permit);
+                        }
+                        return Err(live_generation_saturated_error());
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(remaining) => {
+                        if let Some(permit) = self.try_acquire(priority) {
+                            return Ok(permit);
+                        }
+                        return Err(live_generation_saturated_error());
+                    }
+                }
+            }
+        }
+    }
+}
+
+static LIVE_GENERATION_GATE: LazyLock<LiveGenerationGate> = LazyLock::new(|| {
+    let limit = live_generation_concurrency_max(
+        std::env::var("CCP_CURSOR_LIVE_CONCURRENCY").ok().as_deref(),
+    );
+    LiveGenerationGate::new(limit)
+});
+
+async fn acquire_live_generation_permit_with_priority(
+    cancel: Option<&mut watch::Receiver<bool>>,
+    priority: LiveGenerationPriority,
+) -> Result<LiveGenerationPermit, CursorError> {
+    let gate = &*LIVE_GENERATION_GATE;
+    let wait = Duration::from_secs(live_generation_queue_secs(
+        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
+    ));
+    let queued_at = Instant::now();
+    let permit = gate.acquire(priority, cancel, wait).await?;
+    if queued_at.elapsed() >= Duration::from_millis(100) {
+        crate::logging::create_logger("cursor").info(
+            "live_generation_admitted",
+            Some(serde_json::Map::from_iter([
+                (
+                    "queuedMs".into(),
+                    serde_json::json!(queued_at.elapsed().as_millis()),
+                ),
+                ("limit".into(), serde_json::json!(gate.limit())),
+                (
+                    "priority".into(),
+                    serde_json::json!(match priority {
+                        LiveGenerationPriority::Start => "start",
+                        LiveGenerationPriority::Resume => "resume",
+                    }),
+                ),
+            ])),
+        );
+    }
+    Ok(permit)
+}
+
+async fn acquire_live_generation_permit(
+    cancel: Option<&mut watch::Receiver<bool>>,
+) -> Result<LiveGenerationPermit, CursorError> {
+    acquire_live_generation_permit_with_priority(cancel, LiveGenerationPriority::Start).await
+}
+
+async fn acquire_live_generation_resume_permit() -> Result<LiveGenerationPermit, CursorError> {
+    acquire_live_generation_permit_with_priority(None, LiveGenerationPriority::Resume).await
 }
 
 fn live_open_soft_start(max: usize) -> usize {
@@ -3007,6 +3257,39 @@ fn live_probation_expired(on_probation: bool, got_progress: bool, remaining: Dur
     on_probation && !got_progress && remaining.is_zero()
 }
 
+fn hollow_resume_terminal_message(
+    session_id: &str,
+    opened_with_checkpoint: bool,
+    useful: bool,
+    pending_empty: bool,
+    latest_checkpoint: &mut Option<Vec<u8>>,
+    kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    fallback: impl Into<String>,
+) -> String {
+    // A checkpoint-backed turn that emitted nothing before an accepted
+    // ResumeAction also went hollow has no useful state to preserve. Rotate
+    // that binding once so the client retry replays its full history. Fresh
+    // runs and partially emitted turns remain 409/ambiguous to avoid duplicate
+    // execution when Cursor may still be working upstream.
+    if opened_with_checkpoint && !useful && pending_empty {
+        super::conversation::reset(session_id);
+        *latest_checkpoint = None;
+        kv_blobs.clear();
+        crate::logging::create_logger("cursor").warn(
+            "live_conversation_reset",
+            Some(serde_json::Map::from_iter([(
+                "reason".into(),
+                serde_json::json!("checkpoint_resume_hollow"),
+            )])),
+        );
+        return format!(
+            "Cursor recovery exhausted without producing output \
+             ({CONVERSATION_RESET_RETRY_NOTE})"
+        );
+    }
+    fallback.into()
+}
+
 /// After a ResumeAction HTTP 200, another ResumeAction is only safe once this
 /// stream has produced a body chunk. Delayed hollow EOF must fail closed.
 fn live_should_resume_after_drop(on_probation: bool, got_chunk_since_reconnect: bool) -> bool {
@@ -3017,6 +3300,11 @@ const CONVERSATION_RESET_RETRY_NOTE: &str =
     "stale Cursor conversation reset; retry this message to continue";
 const EMPTY_TURN_RETRY_NOTE: &str =
     "Cursor upstream finished this turn without text or tool calls; retry this turn";
+const EMPTY_TURN_CHECKPOINT_RETRY_NOTE: &str =
+    "completed tool results retained in Cursor checkpoint; continue without replaying tools";
+pub(crate) const EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT: &str = "Continue from the completed tool results in this Cursor conversation. \
+     Produce the final answer requested by the user now. \
+     Do not repeat completed tool calls.";
 type LiveContinuationState<'a> = (&'a mut Option<Vec<u8>>, &'a mut HashMap<Vec<u8>, Vec<u8>>);
 
 fn annotate_connect_end_error(
@@ -3343,11 +3631,19 @@ pub(crate) fn live_resume_error_is_dead_driver(error: &CursorError) -> bool {
     message.contains("acknowledgement dropped") || message.contains("already closed")
 }
 
+pub(crate) fn live_error_is_empty_turn_retry(message: &str) -> bool {
+    message.contains(EMPTY_TURN_RETRY_NOTE)
+}
+
+pub(crate) fn live_error_needs_checkpoint_continue(message: &str) -> bool {
+    live_error_is_empty_turn_retry(message) && message.contains(EMPTY_TURN_CHECKPOINT_RETRY_NOTE)
+}
+
 pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if crate::retry::is_billing_block(message) || crate::retry::is_capacity_shed(message) {
         return false;
     }
-    if message.contains(EMPTY_TURN_RETRY_NOTE) {
+    if live_error_is_empty_turn_retry(message) {
         return true;
     }
     if cursor_connect_error_is_missing_conversation_data(message)
@@ -4270,6 +4566,15 @@ struct LiveTurnCtx<'a> {
     coalescer: &'a mut LiveDeltaCoalescer,
 }
 
+fn release_generation_permit_between_segments(
+    sink: &Option<mpsc::Sender<LiveEventResult>>,
+    generation_permit: &mut Option<LiveGenerationPermit>,
+) {
+    if sink.is_none() {
+        drop(generation_permit.take());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_run(
     mut upstream: LiveUpstream,
@@ -4286,10 +4591,12 @@ async fn drive_live_run(
     session_id: String,
     run_id: String,
     seeded_blobs: HashMap<Vec<u8>, Vec<u8>>,
-    user_prompt: String,
+    mut user_prompt: String,
     request_context: RequestContext,
     mut reconnect: LiveReconnectContext,
+    generation_permit: LiveGenerationPermit,
 ) {
+    let mut generation_permit = Some(generation_permit);
     let mut sink = Some(initial_sink);
     let mut pending = PendingExecState::for_run(&run_id);
     let mut deferred = VecDeque::<LiveEventResult>::new();
@@ -4445,6 +4752,10 @@ async fn drive_live_run(
             }
             sink = None;
         }
+        // Cursor is between downstream Anthropic segments. Keep the resumable
+        // BiDi worker alive, but return scarce generation capacity until the
+        // matching tool results are ready to send.
+        release_generation_permit_between_segments(&sink, &mut generation_permit);
         if run_started.elapsed() >= hard {
             let message = if !held_turn_end_frames.is_empty() {
                 "Cursor live run timed out after an uncommitted turn_ended frame; completion is ambiguous"
@@ -4464,12 +4775,16 @@ async fn drive_live_run(
                 .recovery
                 .remaining(Instant::now(), reconnect.force_http1),
         ) {
-            report_terminal_error(
-                &mut sink,
-                &terminal_error,
-                "Cursor resume produced no progress before the recovery deadline".into(),
-            )
-            .await;
+            let message = hollow_resume_terminal_message(
+                &session_id,
+                reconnect.opening_checkpoint.is_some(),
+                useful,
+                pending.is_empty(),
+                &mut latest_checkpoint,
+                &mut kv_blobs,
+                "Cursor resume produced no progress before the recovery deadline",
+            );
+            report_terminal_error(&mut sink, &terminal_error, message).await;
             break 'driver;
         }
         if !held_turn_end_frames.is_empty() {
@@ -4556,12 +4871,17 @@ async fn drive_live_run(
                     last_liveness = Instant::now();
                     continue 'driver;
                 }
-                report_terminal_error(
-                    &mut sink,
-                    &terminal_error,
-                    format!("{message}{}", reconnect_note(&reconnect_outcome)),
-                )
-                .await;
+                let fallback = format!("{message}{}", reconnect_note(&reconnect_outcome));
+                let message = hollow_resume_terminal_message(
+                    &session_id,
+                    reconnect.opening_checkpoint.is_some(),
+                    useful,
+                    pending.is_empty(),
+                    &mut latest_checkpoint,
+                    &mut kv_blobs,
+                    fallback,
+                );
+                report_terminal_error(&mut sink, &terminal_error, message).await;
             } else {
                 report_terminal_error(&mut sink, &terminal_error, message.into()).await;
             }
@@ -4614,6 +4934,7 @@ async fn drive_live_run(
                         sink: next_sink,
                         ack,
                         permit: _resume_permit,
+                        generation_permit: resume_generation_permit,
                         dispatch_state,
                     }) => {
                         if dispatch_state
@@ -4639,6 +4960,18 @@ async fn drive_live_run(
                                 continue;
                             }
                         };
+                        if generation_permit
+                            .replace(resume_generation_permit)
+                            .is_some()
+                        {
+                            crate::logging::create_logger("cursor").warn(
+                                "live_generation_lease_replaced",
+                                Some(serde_json::Map::from_iter([(
+                                    "sessionId".into(),
+                                    serde_json::json!(session_id.as_str()),
+                                )])),
+                            );
+                        }
                         // Establish the Anthropic response before any bounded
                         // transport/reconnect work. Send failures are delivered
                         // on this event stream instead of leaving the POST
@@ -4649,6 +4982,12 @@ async fn drive_live_run(
                         sink = Some(next_sink);
                         saw_text = false;
                         useful = false;
+                        // The accepted ResumeBatch has already delivered these
+                        // native tool results to Cursor. If the next segment is
+                        // hollow, continue from its checkpoint instead of
+                        // replaying Anthropic history and executing the tools
+                        // again.
+                        user_prompt = EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT.to_string();
                         logical_tools_waiting.clear();
                         last_progress = Instant::now();
                         last_liveness = last_progress;
@@ -5098,15 +5437,20 @@ async fn drive_live_run(
                             break 'driver;
                         }
                         if abrupt_eof_should_error(useful || saw_text) {
-                            report_terminal_error(
-                                &mut sink,
-                                &terminal_error,
-                                format!(
-                                    "Cursor upstream ended without turn_ended{}",
-                                    reconnect_note(&reconnect_outcome)
-                                ),
-                            )
-                            .await;
+                            let fallback = format!(
+                                "Cursor upstream ended without turn_ended{}",
+                                reconnect_note(&reconnect_outcome)
+                            );
+                            let message = hollow_resume_terminal_message(
+                                &session_id,
+                                reconnect.opening_checkpoint.is_some(),
+                                useful,
+                                pending.is_empty(),
+                                &mut latest_checkpoint,
+                                &mut kv_blobs,
+                                fallback,
+                            );
+                            report_terminal_error(&mut sink, &terminal_error, message).await;
                             break 'driver;
                         }
                         break 'driver;
@@ -5163,9 +5507,18 @@ async fn drive_live_run(
                             last_liveness = Instant::now();
                             continue 'driver;
                         }
-                        let message = format!(
+                        let fallback = format!(
                             "Cursor response stream: {error}{}",
                             reconnect_note(&reconnect_outcome)
+                        );
+                        let message = hollow_resume_terminal_message(
+                            &session_id,
+                            reconnect.opening_checkpoint.is_some(),
+                            useful,
+                            pending.is_empty(),
+                            &mut latest_checkpoint,
+                            &mut kv_blobs,
+                            fallback,
                         );
                         report_terminal_error(&mut sink, &terminal_error, message).await;
                         break 'driver;
@@ -5376,6 +5729,9 @@ async fn process_live_frame(
             terminal_error,
             allowed_tool_names,
             turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
+            turn_ctx.as_ref().map(|ctx| ctx.session_id),
+            latest_checkpoint,
+            kv_blobs,
             "flag_end",
         )
         .await
@@ -5617,6 +5973,8 @@ async fn process_live_frame(
             deferred,
             pending,
             pending_shared,
+            kv_blobs,
+            latest_checkpoint,
             terminal_error,
             allowed_tool_names,
             saw_text,
@@ -5640,6 +5998,8 @@ async fn process_interaction_update(
     deferred: &mut VecDeque<LiveEventResult>,
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    latest_checkpoint: &mut Option<Vec<u8>>,
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     allowed_tool_names: Option<&BTreeSet<String>>,
     saw_text: &mut bool,
@@ -5680,6 +6040,8 @@ async fn process_interaction_update(
                 deferred,
                 pending,
                 pending_shared,
+                kv_blobs,
+                latest_checkpoint,
                 terminal_error,
                 allowed_tool_names,
                 saw_text,
@@ -5999,6 +6361,9 @@ async fn process_interaction_update(
             terminal_error,
             allowed_tool_names,
             turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
+            turn_ctx.as_ref().map(|ctx| ctx.session_id),
+            latest_checkpoint,
+            kv_blobs,
             "turn_ended",
         )
         .await
@@ -6031,8 +6396,9 @@ async fn process_interaction_update(
     true
 }
 
-/// Recover an empty Cursor turn: emit a real Anthropic `Workflow` tool_use when
-/// that tool was advertised, otherwise fail with a bounded same-request retry.
+/// Recover an empty Cursor turn: preserve a checkpoint that already consumed
+/// native tool results, emit a real Anthropic `Workflow` tool_use when that
+/// tool was advertised, otherwise reset and fail with a bounded retry.
 ///
 /// Used from `turn_ended`, clean Connect `FLAG_END`, and exhausted EOF — all
 /// three previously could produce silent Anthropic Out:0 completions.
@@ -6046,10 +6412,26 @@ async fn recover_empty_turn_if_needed(
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     allowed_tool_names: Option<&BTreeSet<String>>,
     user_prompt: &str,
+    session_id: Option<&str>,
+    latest_checkpoint: &mut Option<Vec<u8>>,
+    kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     reason: &str,
 ) -> bool {
     if *saw_text || sink.is_none() {
         return true;
+    }
+    if user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT && latest_checkpoint.is_some() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("reason".into(), serde_json::json!(reason));
+        fields.insert("recovery".into(), serde_json::json!("checkpoint_continue"));
+        crate::logging::create_logger("cursor").warn("empty_turn_retry", Some(fields));
+        report_terminal_error(
+            sink,
+            terminal_error,
+            format!("{EMPTY_TURN_RETRY_NOTE} ({EMPTY_TURN_CHECKPOINT_RETRY_NOTE})"),
+        )
+        .await;
+        return false;
     }
     // Claude Code `Workflow` only. grok-cli advertises lowercase `workflow`
     // (Rhai launcher, `{name, agent_budget}`). Synthesizing Claude
@@ -6086,7 +6468,22 @@ async fn recover_empty_turn_if_needed(
     if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
         eprintln!("[ccp-cursor] empty_turn_retry reason={reason}");
     }
-    report_terminal_error(sink, terminal_error, EMPTY_TURN_RETRY_NOTE.to_string()).await;
+    let message = if let Some(session_id) = session_id {
+        super::conversation::reset(session_id);
+        *latest_checkpoint = None;
+        kv_blobs.clear();
+        crate::logging::create_logger("cursor").warn(
+            "live_conversation_reset",
+            Some(serde_json::Map::from_iter([(
+                "reason".into(),
+                serde_json::json!("empty_turn"),
+            )])),
+        );
+        format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})")
+    } else {
+        EMPTY_TURN_RETRY_NOTE.to_string()
+    };
+    report_terminal_error(sink, terminal_error, message).await;
     false
 }
 
@@ -7482,6 +7879,164 @@ mod tests {
         }
     }
 
+    fn test_generation_permit() -> LiveGenerationPermit {
+        LiveGenerationGate::new(1)
+            .try_acquire(LiveGenerationPriority::Start)
+            .expect("test generation permit")
+    }
+
+    #[test]
+    fn generation_permit_releases_between_segments_before_native_batch_exposure() {
+        let generation_gate = LiveGenerationGate::new(1);
+        let mut generation_permit = Some(
+            generation_gate
+                .try_acquire(LiveGenerationPriority::Start)
+                .expect("initial generation permit"),
+        );
+        let mut pending = PendingExecState::for_run("between-segments-run");
+        assert!(pending.queue(pending_exec(1, "read-call"), Duration::from_secs(30)));
+        assert!(
+            pending.awaiting().is_empty() && pending.has_outstanding_native(),
+            "the native tool is still collecting, not exposed"
+        );
+        let sink = None;
+
+        release_generation_permit_between_segments(&sink, &mut generation_permit);
+
+        assert!(
+            generation_permit.is_none(),
+            "a driver without a downstream segment must not retain generation capacity"
+        );
+        assert_eq!(generation_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn generation_permit_releases_after_native_tool_handoff() {
+        let generation_gate = LiveGenerationGate::new(1);
+        let generation_permit = generation_gate
+            .try_acquire(LiveGenerationPriority::Start)
+            .expect("initial generation permit");
+        let (upstream_tx, upstream_rx) = mpsc::channel(4);
+        let (request_tx, _request_rx) = mpsc::channel(8);
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::clone(&pending_shared),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&completed),
+            Arc::clone(&cancel_requested),
+            Some(BTreeSet::from(["Read".into()])),
+            "generation-lease-handoff".into(),
+            "generation-lease-run".into(),
+            HashMap::new(),
+            "read the file".into(),
+            RequestContext::default(),
+            test_reconnect_context(),
+            generation_permit,
+        ));
+
+        let mut payload = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_message: Some(ExecServerMessage {
+                id: 1,
+                exec_id: Some("read-exec".into()),
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/input.txt".into(),
+                    tool_call_id: "read-call".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode read tool");
+        upstream_tx
+            .send(Ok(Some(encode_connect_frame(payload, 0))))
+            .await
+            .expect("send read tool");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("native tool was not exposed")
+            .expect("native tool event");
+        let tool_use_id = match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => tools[0].tool_use_id.clone(),
+            other => panic!("expected native tool batch, got {other:?}"),
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while generation_gate.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generation permit stayed held while waiting for local tool results");
+        assert!(
+            !completed.load(Ordering::Acquire),
+            "the live driver must remain resumable after releasing generation capacity"
+        );
+        assert_eq!(
+            pending_shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+
+        let resume_generation_permit = generation_gate
+            .try_acquire(LiveGenerationPriority::Resume)
+            .expect("resume must reacquire generation capacity");
+        let (resume_sink, _resume_events) = mpsc::channel(8);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        command_tx
+            .send(RunCommand::ResumeBatch {
+                tool_results: vec![(
+                    tool_use_id,
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )],
+                sink: resume_sink,
+                ack: ack_tx,
+                permit: LiveResumePermit {
+                    in_flight: Arc::new(AtomicBool::new(true)),
+                },
+                generation_permit: resume_generation_permit,
+                dispatch_state: Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING)),
+            })
+            .await
+            .expect("dispatch resume");
+        ack_rx
+            .await
+            .expect("resume acknowledgement")
+            .expect("resume accepted");
+        assert_eq!(
+            generation_gate.available_permits(),
+            0,
+            "active post-tool generation must hold capacity again"
+        );
+
+        cancel_requested.store(true, Ordering::Release);
+        command_tx
+            .send(RunCommand::Cancel { ack: None })
+            .await
+            .expect("cancel driver");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver did not stop")
+            .expect("driver join");
+        assert_eq!(generation_gate.available_permits(), 1);
+    }
+
     #[test]
     fn advertised_name_requires_a_real_downstream_tool() {
         let allowed = BTreeSet::from(["Read".to_string()]);
@@ -7736,6 +8291,89 @@ mod tests {
             live_should_resume_after_drop(false, false),
             "first stream drop of an already-accepted Run may ResumeAction"
         );
+    }
+
+    #[test]
+    fn hollow_resume_of_checkpoint_without_output_rotates_the_binding() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-hollow-checkpoint";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        let stale_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        super::super::conversation::merge_blobs(session_id, &stale_blobs);
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+        let mut kv_blobs = stale_blobs;
+
+        let message = hollow_resume_terminal_message(
+            session_id,
+            true,
+            false,
+            true,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+            "Cursor resume produced no progress before the recovery deadline",
+        );
+
+        assert!(message.contains(CONVERSATION_RESET_RETRY_NOTE), "{message}");
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            502,
+            "a known-stale checkpoint must be retryable rather than ambiguous"
+        );
+        assert!(!live_should_persist_continuation_message(Some(&message)));
+        assert!(latest_checkpoint.is_none());
+        assert!(kv_blobs.is_empty());
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
+    }
+
+    #[test]
+    fn hollow_resume_without_safe_reset_condition_stays_ambiguous() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-hollow-ambiguous";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        let fallback = "Cursor resume produced no progress before the recovery deadline";
+
+        for (opened_with_checkpoint, useful, pending_empty) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+            let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+            let message = hollow_resume_terminal_message(
+                session_id,
+                opened_with_checkpoint,
+                useful,
+                pending_empty,
+                &mut latest_checkpoint,
+                &mut kv_blobs,
+                fallback,
+            );
+
+            assert_eq!(message, fallback);
+            assert!(
+                terminal_error_is_ambiguous_accept(&message),
+                "unsafe reset case must remain fail-closed: {message}"
+            );
+            assert_eq!(
+                crate::retry::classify_proxy_error_status(502, &message),
+                409
+            );
+            assert!(live_should_persist_continuation_message(Some(&message)));
+            assert_eq!(latest_checkpoint, Some(vec![0x08, 0x01]));
+            assert_eq!(kv_blobs, HashMap::from([(vec![0xaa], vec![0xbb])]));
+            assert_eq!(
+                super::super::conversation::continuation_for(Some(session_id)).conversation_id,
+                original
+            );
+        }
     }
 
     #[test]
@@ -8258,6 +8896,93 @@ mod tests {
         assert_eq!(live_open_concurrency_max(Some("0")), 128);
         assert_eq!(live_open_concurrency_max(Some("999")), 128);
         assert_eq!(live_open_concurrency_max(Some("nope")), 128);
+    }
+
+    #[test]
+    fn live_generation_max_defaults_to_safe_parallelism() {
+        assert_eq!(live_generation_concurrency_max(None), 16);
+        assert_eq!(live_generation_concurrency_max(Some("8")), 8);
+        assert_eq!(live_generation_concurrency_max(Some("1")), 1);
+        assert_eq!(live_generation_concurrency_max(Some("0")), 16);
+        assert_eq!(live_generation_concurrency_max(Some("999")), 128);
+        assert_eq!(live_generation_concurrency_max(Some("nope")), 16);
+    }
+
+    #[test]
+    fn live_generation_queue_timeout_is_decoupled_from_run_lifetime() {
+        assert_eq!(live_generation_queue_secs(None), 60);
+        assert_eq!(live_generation_queue_secs(Some("15")), 15);
+        assert_eq!(live_generation_queue_secs(Some("0")), 60);
+        assert_eq!(live_generation_queue_secs(Some("9999")), 3600);
+        assert_eq!(live_generation_queue_secs(Some("nope")), 60);
+    }
+
+    #[test]
+    fn live_generation_saturation_is_retryable_without_ambiguous_acceptance() {
+        let err = live_generation_saturated_error();
+        assert_eq!(err.status, 429);
+        assert!(!is_ambiguous_live_open_timeout(&err));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_resume_overtakes_queued_new_generation() {
+        let gate = LiveGenerationGate::new(1);
+        let held = gate
+            .try_acquire(LiveGenerationPriority::Start)
+            .expect("hold the generation slot");
+
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
+        let start_ready = ready_tx.clone();
+        let start_admitted = admitted_tx.clone();
+        let start_gate = gate.clone();
+        let queued_start = tokio::spawn(async move {
+            start_ready.send("start").expect("announce queued start");
+            let _permit = start_gate
+                .acquire(LiveGenerationPriority::Start, None, Duration::from_secs(1))
+                .await
+                .expect("queued start permit");
+            start_admitted
+                .send("start")
+                .expect("announce admitted start");
+        });
+        assert_eq!(ready_rx.recv().await, Some("start"));
+        tokio::task::yield_now().await;
+
+        let resume_ready = ready_tx.clone();
+        let resume_admitted = admitted_tx.clone();
+        let resume_gate = gate.clone();
+        let queued_resume = tokio::spawn(async move {
+            resume_ready.send("resume").expect("announce queued resume");
+            let _permit = resume_gate
+                .acquire(LiveGenerationPriority::Resume, None, Duration::from_secs(1))
+                .await
+                .expect("queued resume permit");
+            resume_admitted
+                .send("resume")
+                .expect("announce admitted resume");
+        });
+        assert_eq!(ready_rx.recv().await, Some("resume"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.resume_waiters() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resume waiter should register before capacity is released");
+
+        drop(held);
+        let first = tokio::time::timeout(Duration::from_secs(1), admitted_rx.recv())
+            .await
+            .expect("one queued generation should be admitted");
+        assert_eq!(
+            first,
+            Some("resume"),
+            "tool-result continuation must not sit behind unrelated new starts"
+        );
+
+        queued_start.await.expect("queued start task");
+        queued_resume.await.expect("queued resume task");
     }
 
     #[test]
@@ -8876,6 +9601,7 @@ mod tests {
             "continue".into(),
             RequestContext::default(),
             reconnect,
+            test_generation_permit(),
         ));
 
         let mut turn_payload = Vec::new();
@@ -8977,6 +9703,7 @@ mod tests {
             "continue".into(),
             RequestContext::default(),
             reconnect,
+            test_generation_permit(),
         ));
 
         let mut workflow_payload = Vec::new();
@@ -9080,6 +9807,7 @@ mod tests {
             "continue".into(),
             RequestContext::default(),
             reconnect,
+            test_generation_permit(),
         ));
         let mut turn_payload = Vec::new();
         proto::AgentServerMessage {
@@ -9142,6 +9870,7 @@ mod tests {
             "continue".into(),
             RequestContext::default(),
             test_reconnect_context(),
+            test_generation_permit(),
         ));
         let mut turn_payload = Vec::new();
         proto::AgentServerMessage {
@@ -14212,8 +14941,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn empty_turn_does_not_invent_claude_workflow_for_grok() {
         use super::super::connect::{FLAG_END, encode_connect_frame};
+
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-grok-empty-turn";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        let stale_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        super::super::conversation::merge_blobs(session_id, &stale_blobs);
 
         let framed = encode_connect_frame(b"", FLAG_END);
         let mut decoder = super::super::connect::ConnectFrameDecoder::new();
@@ -14225,8 +14964,8 @@ mod tests {
         let mut deferred = VecDeque::new();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
-        let mut kv_blobs = HashMap::new();
-        let mut latest_checkpoint = None;
+        let mut kv_blobs = stale_blobs;
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
         let terminal_error = Arc::new(Mutex::new(None));
         let mut saw_text = false;
         let mut useful = false;
@@ -14238,7 +14977,7 @@ mod tests {
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
         let mut turn = LiveTurnCtx {
-            session_id: "sess-grok-wf",
+            session_id,
             user_prompt: "用 workflow 按原 nonce 一次扇出 64 人",
             request_context: &request_context,
             decode_failures: &mut decode_failures,
@@ -14277,10 +15016,85 @@ mod tests {
             "empty turn must retry within the same client request"
         );
         assert!(
+            error.contains(CONVERSATION_RESET_RETRY_NOTE),
+            "the retry must replay from a fresh Cursor conversation: {error}"
+        );
+        assert!(
             event_rx.try_recv().is_err(),
             "empty turn must not also emit End"
         );
         assert!(pending.is_empty(), "must not queue a synthetic workflow");
+        assert!(latest_checkpoint.is_none());
+        assert!(kv_blobs.is_empty());
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn checkpoint_continue_empty_turn_keeps_completed_tool_state() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-grok-checkpoint-continue-empty-turn";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        let checkpoint = vec![0x08, 0x02];
+        let blobs = HashMap::from([(vec![0xcc], vec![0xdd])]);
+        super::super::conversation::save_checkpoint(session_id, checkpoint.clone());
+        super::super::conversation::merge_blobs(session_id, &blobs);
+
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut latest_checkpoint = Some(checkpoint.clone());
+        let mut kv_blobs = blobs.clone();
+
+        assert!(
+            !recover_empty_turn_if_needed(
+                &mut saw_text,
+                &mut useful,
+                &mut sink,
+                &mut pending,
+                &pending_shared,
+                &terminal_error,
+                None,
+                "Continue from the completed tool results in this Cursor conversation. \
+                 Produce the final answer requested by the user now. \
+                 Do not repeat completed tool calls.",
+                Some(session_id),
+                &mut latest_checkpoint,
+                &mut kv_blobs,
+                "turn_ended",
+            )
+            .await
+        );
+
+        let error = event_rx
+            .recv()
+            .await
+            .expect("retryable checkpoint continuation error")
+            .expect_err("an empty continuation must retry");
+        assert!(
+            !error.contains(CONVERSATION_RESET_RETRY_NOTE),
+            "completed tool state must not be discarded: {error}"
+        );
+        assert_eq!(latest_checkpoint.as_deref(), Some(checkpoint.as_slice()));
+        assert_eq!(kv_blobs, blobs);
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_eq!(recovered.conversation_id, original);
+        assert!(recovered.has_checkpoint);
+        assert_eq!(recovered.pre_fetched_blobs.len(), 1);
+        assert!(
+            recovered
+                .pre_fetched_blobs
+                .contains(&(vec![0xcc], vec![0xdd]))
+        );
     }
 
     #[tokio::test]
@@ -15087,6 +15901,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             test_reconnect_context(),
+            test_generation_permit(),
         ));
         let handle = CursorLiveRunHandle {
             run_id: "multi-test-run".into(),
@@ -15423,6 +16238,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             reconnect,
+            test_generation_permit(),
         ));
 
         tokio::time::timeout(Duration::from_secs(2), driver)
@@ -15470,6 +16286,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             reconnect,
+            test_generation_permit(),
         ));
         let handle = CursorLiveRunHandle {
             run_id: "probation-cancel-run".into(),
@@ -15624,6 +16441,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             test_reconnect_context(),
+            test_generation_permit(),
         ));
         let handle = CursorLiveRunHandle {
             run_id: "cancel-fence-run".into(),
@@ -15683,6 +16501,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             test_reconnect_context(),
+            test_generation_permit(),
         ));
         let handle = Arc::new(CursorLiveRunHandle {
             run_id: "blocked-send-run".into(),
@@ -15848,6 +16667,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             test_reconnect_context(),
+            test_generation_permit(),
         ));
 
         use super::super::proto::{AgentServerMessage, InteractionHeartbeat};
@@ -15906,6 +16726,7 @@ mod tests {
             String::new(),
             RequestContext::default(),
             test_reconnect_context(),
+            test_generation_permit(),
         ));
 
         let mut payload = Vec::new();

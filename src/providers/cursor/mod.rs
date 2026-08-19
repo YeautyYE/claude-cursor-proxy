@@ -43,19 +43,22 @@ use crate::providers::cursor::hosted_web_search::{
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
 use crate::providers::cursor::live::{
-    LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim,
-    LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveRunReservation,
-    LiveSlotClaim, cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
-    finish_replacement_after_cancel, live_error_is_same_request_retryable,
+    EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT,
+    LiveEventResult, LiveReplacementClaim, LiveRunEvent, LiveRunIdentity, LiveRunProbe,
+    LiveRunRegistry, LiveRunReservation, LiveSlotClaim,
+    cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
+    finish_replacement_after_cancel, live_error_is_empty_turn_retry,
+    live_error_is_same_request_retryable, live_error_needs_checkpoint_continue,
     live_pending_must_supersede, live_probe_error_blocks_new_run, live_request_fingerprint,
     live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
     live_start_error_seals_tombstone, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
-    CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, cursor_request_context,
-    latest_user_is_only_tool_results, reject_orphaned_native_results_when_live_slot_is_free,
-    render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
+    CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, current_user_blocks,
+    cursor_request_context, latest_user_is_only_tool_results,
+    reject_orphaned_native_results_when_live_slot_is_free, render_cursor_prompt,
+    render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream,
@@ -91,6 +94,40 @@ fn shared_cursor_http_client() -> CursorHttpClient {
 
 const MAX_SESSION_USAGE: usize = 10_000;
 const LIVE_USAGE_TAP_CAP: usize = 512;
+const LIVE_EMPTY_TURN_MAX_RETRIES: u32 = 1;
+const LIVE_EMPTY_TURN_EPISODE_MS: u64 = 300_000;
+
+#[derive(Debug, Clone, Copy)]
+struct LiveLateRetryPolicy {
+    transient_max_retries: u32,
+    empty_turn_max_retries: u32,
+    empty_turn_episode: Duration,
+}
+
+impl Default for LiveLateRetryPolicy {
+    fn default() -> Self {
+        Self {
+            transient_max_retries: crate::retry::MAX_RATE_LIMIT_RETRIES,
+            empty_turn_max_retries: LIVE_EMPTY_TURN_MAX_RETRIES,
+            empty_turn_episode: Duration::from_millis(LIVE_EMPTY_TURN_EPISODE_MS),
+        }
+    }
+}
+
+impl LiveLateRetryPolicy {
+    fn from_env() -> Self {
+        Self {
+            empty_turn_episode: Duration::from_millis(
+                env_u64_millis(
+                    "CCP_CURSOR_EMPTY_TURN_EPISODE_MS",
+                    LIVE_EMPTY_TURN_EPISODE_MS,
+                )
+                .min(3_600_000),
+            ),
+            ..Self::default()
+        }
+    }
+}
 
 struct SessionUsageStore {
     map: HashMap<String, u64>,
@@ -201,6 +238,81 @@ fn live_sse_recording_usage(
 enum LiveStartPeek {
     Retryable(String),
     Ready(mpsc::Receiver<LiveEventResult>),
+}
+
+#[derive(Clone)]
+struct LiveRetryStart {
+    client: CursorHttpClient,
+    token: String,
+    user_text: String,
+    model: String,
+    images: Vec<CursorSelectedImage>,
+    custom_system: Option<String>,
+    session_id: String,
+    agent_id: Option<String>,
+    parent_agent_id: Option<String>,
+    allowed: Option<BTreeSet<String>>,
+    mcp_tools: Option<crate::providers::cursor::proto::McpTools>,
+    request_context: crate::providers::cursor::proto::RequestContext,
+    fingerprint: Vec<u8>,
+    has_refresh: bool,
+}
+
+fn live_retry_user_text<'a>(original: &'a str, error: &str) -> &'a str {
+    if live_error_needs_checkpoint_continue(error) {
+        EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT
+    } else {
+        original
+    }
+}
+
+impl LiveRetryStart {
+    fn retry_user_text(&self, error: &str) -> &str {
+        live_retry_user_text(&self.user_text, error)
+    }
+
+    async fn start(
+        &self,
+        reservation: Option<LiveRunReservation>,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        self.start_with_user_text(&self.user_text, reservation)
+            .await
+    }
+
+    async fn start_after_error(
+        &self,
+        error: &str,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        self.start_with_user_text(self.retry_user_text(error), None)
+            .await
+    }
+
+    async fn start_with_user_text(
+        &self,
+        user_text: &str,
+        reservation: Option<LiveRunReservation>,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        start_live_events_with_retries(
+            self.client.clone(),
+            self.token.clone(),
+            user_text,
+            &self.model,
+            &self.images,
+            self.custom_system.as_deref(),
+            LiveRunIdentity {
+                session_id: &self.session_id,
+                agent_id: self.agent_id.as_deref(),
+                parent_agent_id: self.parent_agent_id.as_deref(),
+            },
+            self.allowed.clone(),
+            self.mcp_tools.clone(),
+            self.request_context.clone(),
+            self.fingerprint.clone(),
+            reservation,
+            self.has_refresh,
+        )
+        .await
+    }
 }
 
 /// Streaming Anthropic clients see "Waiting for response" until SSE starts.
@@ -360,85 +472,27 @@ fn spawn_streaming_live_sse(
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
 ) -> Response {
-    let (tx, rx) = mpsc::channel(512);
     let sid_for_sse = sid.clone();
-    let sid_for_cancel = sid.clone();
-    let agent_for_cancel = agent_id.clone();
-    tokio::spawn(async move {
-        let mut late_retries = 0_u32;
-        let mut reservation = initial_reservation;
-        loop {
-            if tx.is_closed() {
-                LiveRunRegistry::cancel_run(&sid_for_cancel, agent_for_cancel.as_deref());
-                break;
-            }
-            let identity = LiveRunIdentity {
-                session_id: &sid,
-                agent_id: agent_id.as_deref(),
-                parent_agent_id: parent_agent_id.as_deref(),
-            };
-            let start = start_live_events_with_retries(
-                client.clone(),
-                token.clone(),
-                &user_text,
-                &model,
-                &images,
-                custom_system.as_deref(),
-                identity,
-                allowed.clone(),
-                mcp_tools.clone(),
-                request_context.clone(),
-                fingerprint.clone(),
-                reservation.take(),
-                has_refresh,
-            );
-            tokio::pin!(start);
-            tokio::select! {
-                _ = tx.closed() => {
-                    LiveRunRegistry::cancel_run(&sid_for_cancel, agent_for_cancel.as_deref());
-                    break;
-                }
-                result = &mut start => {
-                    match result {
-                        Ok(events) => {
-                            match pump_live_events_until_commit_or_retry(&tx, events).await {
-                                LivePumpOutcome::ClientGone => {
-                                    LiveRunRegistry::cancel_run(
-                                        &sid_for_cancel,
-                                        agent_for_cancel.as_deref(),
-                                    );
-                                    break;
-                                }
-                                LivePumpOutcome::Retry(error)
-                                    if late_retries < crate::retry::MAX_RATE_LIMIT_RETRIES =>
-                                {
-                                    let _ = LiveRunRegistry::probe_run(
-                                        &sid_for_cancel,
-                                        agent_for_cancel.as_deref(),
-                                    );
-                                    crate::retry::sleep(same_request_retry_wait_ms(
-                                        late_retries,
-                                        &error,
-                                    ))
-                                    .await;
-                                    late_retries += 1;
-                                }
-                                LivePumpOutcome::Retry(error) => {
-                                    let _ = tx.send(Err(error)).await;
-                                    break;
-                                }
-                                LivePumpOutcome::Done => break,
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(Err(error.client_message())).await;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let rx = spawn_live_events_with_late_retries(
+        LiveRetryStart {
+            client,
+            token,
+            user_text,
+            model,
+            images,
+            custom_system,
+            session_id: sid,
+            agent_id,
+            parent_agent_id,
+            allowed,
+            mcp_tools,
+            request_context,
+            fingerprint,
+            has_refresh,
+        },
+        initial_reservation,
+        None,
+    );
     live_sse_recording_usage(
         &sid_for_sse,
         rx,
@@ -457,7 +511,10 @@ async fn peek_live_start_for_stale_reset(
 ) -> LiveStartPeek {
     let wait = Duration::from_millis(env_u64_millis("CCP_CURSOR_STALE_CONV_PEEK_MS", 2_000));
     match tokio::time::timeout(wait, events.recv()).await {
-        Ok(Some(Err(error))) if live_error_is_same_request_retryable(&error) => {
+        Ok(Some(Err(error)))
+            if live_error_is_same_request_retryable(&error)
+                && !live_error_is_empty_turn_retry(&error) =>
+        {
             LiveStartPeek::Retryable(error)
         }
         Ok(Some(first)) => LiveStartPeek::Ready(prepend_live_event(first, events)),
@@ -509,6 +566,7 @@ fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
 
 fn classify_live_pump_item(committed: bool, item: &LiveEventResult) -> LivePumpAction {
     match item {
+        Err(error) if live_error_is_empty_turn_retry(error) => LivePumpAction::Retry,
         Err(error) if !committed && live_error_is_same_request_retryable(error) => {
             LivePumpAction::Retry
         }
@@ -560,6 +618,245 @@ async fn pump_live_events_until_commit_or_retry(
         }
     }
     LivePumpOutcome::Done
+}
+
+async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn forward_empty_turn_deadline(
+    tx: &mpsc::Sender<LiveEventResult>,
+    session_id: &str,
+    agent_id: Option<&str>,
+    last_error: &str,
+) {
+    LiveRunRegistry::cancel_run(session_id, agent_id);
+    let _ = tx
+        .send(Err(format!(
+            "{last_error} (empty-turn recovery deadline exhausted)"
+        )))
+        .await;
+}
+
+fn live_late_retry_limit(error: &str, policy: LiveLateRetryPolicy) -> u32 {
+    if live_error_is_empty_turn_retry(error) {
+        policy.empty_turn_max_retries
+    } else {
+        policy.transient_max_retries
+    }
+}
+
+async fn forward_live_events_with_retries<F, Fut>(
+    tx: &mpsc::Sender<LiveEventResult>,
+    mut events: mpsc::Receiver<LiveEventResult>,
+    session_id: &str,
+    agent_id: Option<&str>,
+    mut restart: F,
+    policy: LiveLateRetryPolicy,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<mpsc::Receiver<LiveEventResult>, CursorError>>,
+{
+    let episode_started = tokio::time::Instant::now();
+    let mut transient_retries = 0_u32;
+    let mut empty_turn_retries = 0_u32;
+    let mut empty_turn_deadline = None;
+    let mut last_empty_turn_error = None::<String>;
+    loop {
+        let pump = pump_live_events_until_commit_or_retry(tx, events);
+        tokio::pin!(pump);
+        let outcome = tokio::select! {
+            _ = tx.closed() => {
+                LiveRunRegistry::cancel_run(session_id, agent_id);
+                return;
+            }
+            _ = wait_for_optional_deadline(empty_turn_deadline) => {
+                forward_empty_turn_deadline(
+                    tx,
+                    session_id,
+                    agent_id,
+                    last_empty_turn_error
+                        .as_deref()
+                        .unwrap_or("Cursor empty-turn recovery timed out"),
+                )
+                .await;
+                return;
+            }
+            outcome = &mut pump => outcome,
+        };
+        match outcome {
+            LivePumpOutcome::ClientGone => {
+                LiveRunRegistry::cancel_run(session_id, agent_id);
+                return;
+            }
+            LivePumpOutcome::Retry(error) => {
+                let empty_turn = live_error_is_empty_turn_retry(&error);
+                let retry_index = if empty_turn {
+                    empty_turn_retries
+                } else {
+                    transient_retries
+                };
+                let retry_limit = live_late_retry_limit(&error, policy);
+                if retry_index >= retry_limit {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+                if empty_turn {
+                    last_empty_turn_error = Some(error.clone());
+                    let deadline = *empty_turn_deadline
+                        .get_or_insert(episode_started + policy.empty_turn_episode);
+                    if tokio::time::Instant::now() >= deadline {
+                        forward_empty_turn_deadline(
+                            tx,
+                            session_id,
+                            agent_id,
+                            last_empty_turn_error.as_deref().unwrap_or(&error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                let slot_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
+                loop {
+                    match LiveRunRegistry::probe_run(session_id, agent_id) {
+                        LiveRunProbe::Free => break,
+                        LiveRunProbe::TerminalError(terminal)
+                            if live_probe_error_blocks_new_run(&terminal) =>
+                        {
+                            let _ = tx.send(Err(terminal)).await;
+                            return;
+                        }
+                        LiveRunProbe::TerminalError(_) => break,
+                        LiveRunProbe::Occupied if Instant::now() < slot_deadline => {
+                            tokio::select! {
+                                _ = tx.closed() => {
+                                    LiveRunRegistry::cancel_run(session_id, agent_id);
+                                    return;
+                                }
+                                _ = wait_for_optional_deadline(empty_turn_deadline) => {
+                                    forward_empty_turn_deadline(
+                                        tx,
+                                        session_id,
+                                        agent_id,
+                                        last_empty_turn_error
+                                            .as_deref()
+                                            .unwrap_or(&error),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
+                        }
+                        LiveRunProbe::Occupied => {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                    }
+                }
+                let wait = same_request_retry_wait_ms(retry_index, &error);
+                tokio::select! {
+                    _ = tx.closed() => {
+                        LiveRunRegistry::cancel_run(session_id, agent_id);
+                        return;
+                    }
+                    _ = wait_for_optional_deadline(empty_turn_deadline) => {
+                        forward_empty_turn_deadline(
+                            tx,
+                            session_id,
+                            agent_id,
+                            last_empty_turn_error.as_deref().unwrap_or(&error),
+                        )
+                        .await;
+                        return;
+                    }
+                    _ = crate::retry::sleep(wait) => {}
+                }
+                if empty_turn {
+                    empty_turn_retries += 1;
+                } else {
+                    transient_retries += 1;
+                }
+                let start = restart(error);
+                tokio::pin!(start);
+                events = match tokio::select! {
+                    _ = tx.closed() => {
+                        LiveRunRegistry::cancel_run(session_id, agent_id);
+                        return;
+                    }
+                    _ = wait_for_optional_deadline(empty_turn_deadline) => {
+                        forward_empty_turn_deadline(
+                            tx,
+                            session_id,
+                            agent_id,
+                            last_empty_turn_error
+                                .as_deref()
+                                .unwrap_or("Cursor empty-turn recovery timed out"),
+                        )
+                        .await;
+                        return;
+                    }
+                    result = &mut start => result,
+                } {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.client_message())).await;
+                        return;
+                    }
+                };
+            }
+            LivePumpOutcome::Done => return,
+        }
+    }
+}
+
+fn spawn_live_events_with_late_retries(
+    start: LiveRetryStart,
+    initial_reservation: Option<LiveRunReservation>,
+    initial_events: Option<mpsc::Receiver<LiveEventResult>>,
+) -> mpsc::Receiver<LiveEventResult> {
+    let (tx, rx) = mpsc::channel(512);
+    let session_id = start.session_id.clone();
+    let agent_id = start.agent_id.clone();
+    tokio::spawn(async move {
+        let events = match initial_events {
+            Some(events) => events,
+            None => {
+                let first = start.start(initial_reservation);
+                tokio::pin!(first);
+                match tokio::select! {
+                    _ = tx.closed() => {
+                        LiveRunRegistry::cancel_run(&session_id, agent_id.as_deref());
+                        return;
+                    }
+                    result = &mut first => result,
+                } {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.client_message())).await;
+                        return;
+                    }
+                }
+            }
+        };
+        let retry_start = start.clone();
+        forward_live_events_with_retries(
+            &tx,
+            events,
+            &session_id,
+            agent_id.as_deref(),
+            move |error| {
+                let retry_start = retry_start.clone();
+                async move { retry_start.start_after_error(&error).await }
+            },
+            LiveLateRetryPolicy::from_env(),
+        )
+        .await;
+    });
+    rx
 }
 
 async fn live_downstream_response(
@@ -737,7 +1034,7 @@ fn continuation_for_request(
 }
 
 enum LiveResumeOutcome {
-    Resumed(Response),
+    Resumed(mpsc::Receiver<LiveEventResult>),
     TerminalError(String),
     MissingTools(Vec<String>),
     ResumeError(CursorError),
@@ -822,11 +1119,11 @@ async fn await_live_run_resume(
     session_id: &str,
     agent_id: Option<&str>,
     body: &MessagesRequest,
-    message_id: String,
-    wire_model: String,
-    estimated_input: u64,
-    monitor: Option<(crate::monitor::MonitorHandle, String)>,
-    want_stream: bool,
+    _message_id: String,
+    _wire_model: String,
+    _estimated_input: u64,
+    _monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    _want_stream: bool,
 ) -> LiveResumeOutcome {
     let has_tool_results = request_has_current_tool_result(body);
     let fingerprint =
@@ -894,18 +1191,7 @@ async fn await_live_run_resume(
             match collect_live_tool_results(body, &pending) {
                 Ok(tool_results) => match run.resume_batch(tool_results).await {
                     Ok(events) => {
-                        return LiveResumeOutcome::Resumed(
-                            live_downstream_response(
-                                want_stream,
-                                session_id,
-                                events,
-                                message_id,
-                                wire_model,
-                                estimated_input,
-                                monitor,
-                            )
-                            .await,
-                        );
+                        return LiveResumeOutcome::Resumed(events);
                     }
                     Err(error) if live_resume_error_is_dead_driver(&error) => {
                         return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
@@ -978,18 +1264,7 @@ async fn await_live_run_resume(
         match collect_live_tool_results(body, &pending) {
             Ok(tool_results) => match run.resume_batch(tool_results).await {
                 Ok(events) => {
-                    return LiveResumeOutcome::Resumed(
-                        live_downstream_response(
-                            want_stream,
-                            session_id,
-                            events,
-                            message_id,
-                            wire_model,
-                            estimated_input,
-                            monitor,
-                        )
-                        .await,
-                    );
+                    return LiveResumeOutcome::Resumed(events);
                 }
                 Err(error) if live_resume_error_is_dead_driver(&error) => {
                     return LiveResumeOutcome::SupersedeRunning(
@@ -1106,22 +1381,6 @@ fn collect_live_tool_results(
         .collect())
 }
 
-fn current_user_blocks(body: &MessagesRequest) -> Vec<&serde_json::Value> {
-    for message in body.messages.iter().rev() {
-        if message.role == "assistant" {
-            break;
-        }
-        if message.role != "user" {
-            continue;
-        }
-        let serde_json::Value::Array(blocks) = &message.content else {
-            return Vec::new();
-        };
-        return blocks.iter().collect();
-    }
-    Vec::new()
-}
-
 fn request_has_current_tool_result(body: &MessagesRequest) -> bool {
     current_user_blocks(body).iter().any(|block| {
         block.get("type").and_then(|value| value.as_str()) == Some("tool_result")
@@ -1221,6 +1480,7 @@ impl Provider for CursorProvider {
         // Route the matching tool_result back onto that exact request stream
         // instead of replaying the whole conversation as a fresh Cursor run.
         let mut preclaimed_live_reservation = None;
+        let mut resumed_live_events = None;
         if let Some(session_id) = ctx.session_id.as_deref() {
             let agent_id = claude_agent_id(&ctx);
             let fingerprint =
@@ -1258,12 +1518,14 @@ impl Provider for CursorProvider {
                         message_id.clone(),
                         wire_model.clone(),
                         estimated_input,
-                        monitor.clone(),
+                        monitor,
                         want_stream,
                     )
                     .await
                     {
-                        LiveResumeOutcome::Resumed(response) => return response,
+                        LiveResumeOutcome::Resumed(events) => {
+                            resumed_live_events = Some(events);
+                        }
                         LiveResumeOutcome::TerminalError(error)
                             if live_probe_error_blocks_new_run(&error) =>
                         {
@@ -1469,6 +1731,43 @@ impl Provider for CursorProvider {
         }
         let mut token = auth.access_token.clone();
 
+        if let Some(events) = resumed_live_events.take() {
+            let sid = session_id.expect("a resumed live run requires a session id");
+            let identity = live_run_identity(sid, &ctx);
+            let estimated_input = estimate_request_input_tokens(&body);
+            let monitor = ctx
+                .monitor
+                .clone()
+                .map(|handle| (handle, ctx.req_id.clone()));
+            let retry_start = LiveRetryStart {
+                client: client.clone(),
+                token,
+                user_text: user_text.to_string(),
+                model: model.to_string(),
+                images,
+                custom_system: custom_system.map(str::to_string),
+                session_id: sid.to_string(),
+                agent_id: identity.agent_id.map(str::to_string),
+                parent_agent_id: identity.parent_agent_id.map(str::to_string),
+                allowed: advertised_tool_names(&body),
+                mcp_tools: claude_local_mcp_tools(&body),
+                request_context: cursor_request_context(&body),
+                fingerprint: serde_json::to_vec(&body.messages).unwrap_or_default(),
+                has_refresh: auth.refresh_token.is_some(),
+            };
+            let events = spawn_live_events_with_late_retries(retry_start, None, Some(events));
+            return live_downstream_response(
+                want_stream,
+                sid,
+                events,
+                message_id,
+                wire_model,
+                estimated_input,
+                monitor,
+            )
+            .await;
+        }
+
         // Prefer long-lived BiDi/RunSSE whenever we have a session. Claude Code's
         // non-streaming fallback (`stream=false`) still uses live; we collect the
         // same events into one JSON body instead of SSE.
@@ -1539,24 +1838,26 @@ impl Provider for CursorProvider {
                     monitor,
                 );
             }
-            match start_live_events_with_retries(
-                client.clone(),
+            let retry_start = LiveRetryStart {
+                client: client.clone(),
                 token,
-                user_text,
-                model,
-                &images,
-                custom_system,
-                identity,
+                user_text: user_text.to_string(),
+                model: model.to_string(),
+                images,
+                custom_system: custom_system.map(str::to_string),
+                session_id: sid.to_string(),
+                agent_id: identity.agent_id.map(str::to_string),
+                parent_agent_id: identity.parent_agent_id.map(str::to_string),
                 allowed,
                 mcp_tools,
                 request_context,
                 fingerprint,
-                initial_reservation,
                 has_refresh,
-            )
-            .await
-            {
+            };
+            match retry_start.start(initial_reservation).await {
                 Ok(events) => {
+                    let events =
+                        spawn_live_events_with_late_retries(retry_start, None, Some(events));
                     return live_downstream_response(
                         want_stream,
                         sid,
@@ -1980,6 +2281,124 @@ mod tests {
     }
 
     #[test]
+    fn responses_multi_tool_outputs_resume_one_live_batch() {
+        let body = crate::openai::responses_to_messages(&serde_json::json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "input": [
+                {"type": "message", "role": "user", "content": "read both files"},
+                {"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call-2", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "first"},
+                {"type": "function_call_output", "call_id": "call-2", "output": "second"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "<system-reminder>Background work completed.</system-reminder>"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert!(
+            request_has_current_tool_result(&body),
+            "split Responses outputs must be classified as a live resume"
+        );
+        assert!(
+            latest_user_is_only_tool_results(&body),
+            "the same logical result turn must disable checkpoint delta replay after restart"
+        );
+        let delta = render_cursor_prompt_parts_with(
+            &body,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: true,
+            },
+        );
+        assert!(delta.user_text.contains("first"));
+        assert!(delta.user_text.contains("second"));
+        assert!(!delta.user_text.contains("Background work completed"));
+        let matched = collect_live_tool_results(&body, &[pending("call-1"), pending("call-2")])
+            .expect("separate Responses outputs must resume the same live tool batch");
+        assert_eq!(
+            matched
+                .iter()
+                .map(|(tool_use_id, _)| tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            ["call-1", "call-2"]
+        );
+    }
+
+    #[test]
+    fn live_resume_preserves_multi_message_tool_batch_boundaries() {
+        let native: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call-1", "content": "first"},
+                {"type": "tool_result", "tool_use_id": "call-2", "content": "second"}
+            ]}]
+        }))
+        .unwrap();
+        let matched = collect_live_tool_results(&native, &[pending("call-1"), pending("call-2")])
+            .expect("one Anthropic user message must retain every tool result");
+        assert_eq!(
+            matched
+                .iter()
+                .map(|(tool_use_id, _)| tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            ["call-1", "call-2"]
+        );
+
+        let interrupted_by_reminder: MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "cursor-grok-4.5-high-fast",
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "call-1", "name": "read_file", "input": {}},
+                        {"type": "tool_use", "id": "call-2", "name": "read_file", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "first"}
+                    ]},
+                    {"role": "user", "content": "<system-reminder>Background work completed.</system-reminder>"},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call-2", "content": "second"}
+                    ]}
+                ]
+            }))
+            .unwrap();
+        let matched = collect_live_tool_results(
+            &interrupted_by_reminder,
+            &[pending("call-1"), pending("call-2")],
+        )
+        .expect("a standalone reminder must not split one tool-result batch");
+        assert_eq!(matched.len(), 2);
+
+        let interrupted_by_user: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.5-high-fast",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call-1", "name": "read_file", "input": {}},
+                    {"type": "tool_use", "id": "call-2", "name": "read_file", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-1", "content": "first"}
+                ]},
+                {"role": "user", "content": "start different work"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-2", "content": "second"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let missing = collect_live_tool_results(
+            &interrupted_by_user,
+            &[pending("call-1"), pending("call-2")],
+        )
+        .expect_err("fresh user content must split adjacent tool-result batches");
+        assert_eq!(missing, ["call-1"]);
+    }
+
+    #[test]
     fn live_resume_ignores_historical_tool_results_on_a_new_user_turn() {
         let body: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-fable-5",
@@ -2011,6 +2430,40 @@ mod tests {
             ["old-tool"],
             "a historical result must never satisfy the current pending batch"
         );
+    }
+
+    #[test]
+    fn live_resume_looks_through_trailing_system_reminder_for_current_tool_results() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [
+                {"role": "user", "content": "read the file"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "expected-tool",
+                    "name": "read_file",
+                    "input": {"target_file": "/tmp/input"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "expected-tool",
+                    "content": "file contents"
+                }]},
+                {"role": "user", "content": [{
+                    "type": "text",
+                    "text": "<system-reminder>\nBackground work completed.\n</system-reminder>"
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        assert!(
+            request_has_current_tool_result(&body),
+            "a trailing synthetic reminder must not turn a tool continuation into a fresh run"
+        );
+        let matched = collect_live_tool_results(&body, &[pending("expected-tool")])
+            .expect("the immediately preceding tool result is still the current live batch");
+        assert_eq!(matched[0].0, "expected-tool");
     }
 
     #[test]
@@ -2234,6 +2687,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_empty_turn_defers_to_the_dedicated_late_retry_policy() {
+        let error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
+                     (stale Cursor conversation reset; retry this message to continue)";
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(error.into())).await.unwrap();
+        drop(tx);
+        let LiveStartPeek::Ready(mut events) = peek_live_start_for_stale_reset(rx).await else {
+            panic!("empty turns must not consume the generic start retry budget");
+        };
+        assert_eq!(events.recv().await.unwrap().unwrap_err(), error);
+    }
+
+    #[test]
+    fn empty_turn_retry_budget_is_separate_from_transport_retries() {
+        let policy = LiveLateRetryPolicy::default();
+        assert_eq!(
+            live_late_retry_limit(
+                "Cursor upstream finished this turn without text or tool calls; retry this turn",
+                policy
+            ),
+            1
+        );
+        assert_eq!(
+            live_late_retry_limit(
+                "Connect error 502: ERROR_OPENAI: Unable to reach the model provider [unavailable]",
+                policy
+            ),
+            crate::retry::MAX_RATE_LIMIT_RETRIES
+        );
+    }
+
+    #[tokio::test]
     async fn pre_output_openai_502_is_retried_not_forwarded() {
         let provider_502 = "Connect error 502: ERROR_OPENAI: Unable to reach the model provider — We're having trouble connecting to the model provider. This might be temporary - please try again in a moment. [unavailable]";
         assert_eq!(
@@ -2272,8 +2757,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_http_empty_turn_retries_without_forwarding_failure() {
+        let (first_tx, first_rx) = mpsc::channel(8);
+        first_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                text: "first attempt".into(),
+            })))
+            .await
+            .unwrap();
+        first_tx
+            .send(Err(
+                "Cursor upstream finished this turn without text or tool calls; retry this turn \
+                 (stale Cursor conversation reset; retry this message to continue)"
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        drop(first_tx);
+
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-held-http-empty-retry",
+            None,
+            move |_| {
+                restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (retry_tx, retry_rx) = mpsc::channel(8);
+                retry_tx
+                    .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                        text: "recovered".into(),
+                    })))
+                    .unwrap();
+                retry_tx
+                    .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+                    .unwrap();
+                drop(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut saw_thinking = false;
+        let mut saw_recovered = false;
+        while let Ok(item) = out_rx.try_recv() {
+            match item {
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta { .. })) => {
+                    saw_thinking = true;
+                }
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                    saw_recovered |= text == "recovered";
+                }
+                Err(error) => panic!("internal retry leaked to the client: {error}"),
+                _ => {}
+            }
+        }
+        assert!(saw_thinking);
+        assert!(saw_recovered);
+    }
+
+    #[test]
+    fn empty_after_tool_results_retries_with_checkpoint_nudge() {
+        let original = "<tool_result tool_use_id=\"read-1\">done</tool_result>";
+        let checkpoint_error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
+             (completed tool results retained in Cursor checkpoint; continue without replaying tools)";
+        assert_eq!(
+            live_retry_user_text(original, checkpoint_error),
+            EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT
+        );
+        assert_eq!(
+            live_retry_user_text(
+                original,
+                "Cursor upstream finished this turn without text or tool calls; retry this turn \
+                 (stale Cursor conversation reset; retry this message to continue)"
+            ),
+            original,
+            "a reset conversation still needs the full original retry payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_http_empty_turn_gets_one_internal_retry_then_fails() {
+        let error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
+                     (stale Cursor conversation reset; retry this message to continue)";
+        let (first_tx, first_rx) = mpsc::channel(1);
+        first_tx.send(Err(error.into())).await.unwrap();
+        drop(first_tx);
+
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-held-http-empty-exhausted",
+            None,
+            move |_| {
+                restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (retry_tx, retry_rx) = mpsc::channel(1);
+                retry_tx.try_send(Err(error.into())).unwrap();
+                drop(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(
+            restarts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "empty turns must not reuse the three-attempt transport retry budget"
+        );
+        let final_error = out_rx
+            .try_recv()
+            .expect("one exhausted retry error")
+            .expect_err("the retry budget must end as a failure");
+        assert!(live_error_is_empty_turn_retry(&final_error));
+        assert!(
+            out_rx.try_recv().is_err(),
+            "only the final failure may reach the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_conversation_retains_the_transport_retry_budget() {
+        let error = "Connect error 502: Conversation data missing \
+                     (stale Cursor conversation reset; retry this message to continue)";
+        let (first_tx, first_rx) = mpsc::channel(1);
+        first_tx.send(Err(error.into())).await.unwrap();
+        drop(first_tx);
+
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-missing-conversation-budget",
+            None,
+            move |_| {
+                restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (retry_tx, retry_rx) = mpsc::channel(1);
+                retry_tx.try_send(Err(error.into())).unwrap();
+                drop(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(
+            restarts.load(std::sync::atomic::Ordering::SeqCst),
+            crate::retry::MAX_RATE_LIMIT_RETRIES as usize
+        );
+        assert!(out_rx.try_recv().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_turn_retry_respects_one_cross_attempt_deadline() {
+        let error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
+                     (stale Cursor conversation reset; retry this message to continue)";
+        let (first_tx, first_rx) = mpsc::channel(1);
+        first_tx.send(Err(error.into())).await.unwrap();
+        drop(first_tx);
+
+        let held_senders = Arc::new(Mutex::new(Vec::new()));
+        let restart_senders = Arc::clone(&held_senders);
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let started = Instant::now();
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-empty-turn-episode-deadline",
+            None,
+            move |_| {
+                restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (retry_tx, retry_rx) = mpsc::channel(1);
+                restart_senders
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy {
+                empty_turn_episode: Duration::from_millis(50),
+                ..LiveLateRetryPolicy::default()
+            },
+        )
+        .await;
+
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the retry inherited a fresh long idle window"
+        );
+        let final_error = out_rx
+            .try_recv()
+            .expect("deadline failure")
+            .expect_err("the hollow retry must fail");
+        assert!(
+            final_error.contains("empty-turn recovery deadline exhausted"),
+            "{final_error}"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_or_billing_live_error_is_forwarded() {
         let billing = "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]";
+        let empty_turn =
+            "Cursor upstream finished this turn without text or tool calls; retry this turn";
         assert_eq!(
             classify_live_pump_item(false, &Err(billing.into())),
             LivePumpAction::Forward
@@ -2287,6 +2985,11 @@ mod tests {
                 )
             ),
             LivePumpAction::Forward
+        );
+        assert_eq!(
+            classify_live_pump_item(true, &Err(empty_turn.into())),
+            LivePumpAction::Retry,
+            "thinking-only output must not expose a failed empty turn"
         );
 
         let (src_tx, src_rx) = mpsc::channel(8);

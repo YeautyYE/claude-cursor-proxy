@@ -1364,6 +1364,28 @@ data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
     }
 
     #[test]
+    fn anthropic_to_responses_reasoning_only_eof_emits_terminal_event() {
+        let mut translator =
+            AnthropicToResponses::new("resp_reasoning".into(), "cursor-grok-4.5-high-fast".into());
+        translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.5-high-fast"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"working"}}
+
+"#,
+        );
+        let rest = String::from_utf8(translator.finish()).unwrap();
+        assert!(
+            rest.contains("\"type\":\"response.completed\""),
+            "reasoning must not end as bare EOF: {rest}"
+        );
+        assert!(rest.contains("data: [DONE]"), "{rest}");
+        assert!(!rest.contains("\"type\":\"response.failed\""), "{rest}");
+    }
+
+    #[test]
     fn anthropic_ping_emits_responses_in_progress() {
         let mut translator =
             AnthropicToResponses::new("resp_ping".into(), "cursor-grok-4.6".into());

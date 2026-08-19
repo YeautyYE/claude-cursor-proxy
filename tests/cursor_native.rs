@@ -2813,6 +2813,228 @@ fn bridge_shell_stream_result_has_correct_shape() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cursor_live_generations_queue_at_configured_limit() {
+    use axum::{Router, body::Body, response::Response, routing::post};
+    use bytes::Bytes;
+    use claude_cursor_proxy::providers::cursor::connect::{FLAG_END, encode_connect_frame};
+    use claude_cursor_proxy::providers::cursor::proto::*;
+    use prost::Message;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+
+    #[derive(Default)]
+    struct HeldRuns {
+        accepted: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        releases: Mutex<Vec<oneshot::Sender<()>>>,
+    }
+
+    fn server_frame(message: AgentServerMessage) -> Bytes {
+        let mut payload = Vec::new();
+        message.encode(&mut payload).unwrap();
+        encode_connect_frame(payload, 0)
+    }
+
+    fn successful_turn_bytes() -> Bytes {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                text_delta: Some(TextDelta { text: "OK".into() }),
+                token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
+                turn_ended: None,
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        }));
+        bytes.extend_from_slice(&server_frame(AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                tool_call_started: None,
+                tool_call_completed: None,
+                thinking_delta: None,
+                thinking_completed: None,
+                text_delta: None,
+                token_delta: None,
+                partial_tool_call: None,
+                tool_call_delta: None,
+                turn_ended: Some(TurnEnded {
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                }),
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        }));
+        bytes.extend_from_slice(&encode_connect_frame([], FLAG_END));
+        Bytes::from(bytes)
+    }
+
+    async fn wait_for_accepted(held: &HeldRuns, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while held.accepted.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "only {} Cursor runs reached the mock upstream; expected {expected}",
+                held.accepted.load(Ordering::SeqCst)
+            )
+        });
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let held = Arc::new(HeldRuns::default());
+    let upstream_held = Arc::clone(&held);
+    let upstream_app = Router::new().fallback(post(move || {
+        let held = Arc::clone(&upstream_held);
+        async move {
+            held.accepted.fetch_add(1, Ordering::SeqCst);
+            let active = held.active.fetch_add(1, Ordering::SeqCst) + 1;
+            held.peak.fetch_max(active, Ordering::SeqCst);
+            let (release_tx, release_rx) = oneshot::channel();
+            held.releases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(release_tx);
+            let body_held = Arc::clone(&held);
+            let response_stream = futures_util::stream::once(async move {
+                let _ = release_rx.await;
+                body_held.active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(successful_turn_bytes())
+            });
+            Response::builder()
+                .status(200)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/connect+proto",
+                )
+                .body(Body::from_stream(response_stream))
+                .unwrap()
+        }
+    }));
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_url = format!("http://{upstream_addr}");
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", &upstream_url);
+        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "live-concurrency-token");
+        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "live-concurrency-test");
+        std::env::set_var("CCP_CURSOR_BIDI", "1");
+        std::env::set_var("CCP_CURSOR_HEARTBEAT_SECS", "60");
+        std::env::set_var("CCP_CURSOR_LIVE_CONCURRENCY", "1");
+    }
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_handle = tokio::spawn(async move {
+        claude_cursor_proxy::server::serve_listener(proxy_listener, None, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let client = reqwest::Client::new();
+    let mut requests = Vec::new();
+    for index in 0..2 {
+        let client = client.clone();
+        requests.push(tokio::spawn(async move {
+            client
+                .post(format!("http://{proxy_addr}/v1/messages"))
+                .header("authorization", "Bearer ignored")
+                .header("anthropic-version", "2023-06-01")
+                .header(
+                    "x-claude-code-session-id",
+                    format!("cursor-live-concurrency-{index}"),
+                )
+                .json(&serde_json::json!({
+                    "model": "cursor:grok-4.5",
+                    "max_tokens": 32,
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Reply OK"}]
+                }))
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+
+    wait_for_accepted(&held, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let initially_accepted = held.accepted.load(Ordering::SeqCst);
+
+    if let Some(release) = held
+        .releases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop()
+    {
+        let _ = release.send(());
+    }
+    wait_for_accepted(&held, 2).await;
+
+    let releases = std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner()));
+    for release in releases {
+        let _ = release.send(());
+    }
+    for request in requests {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("proxy request remained queued after a generation slot was released")
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
+            .await
+            .expect("Cursor response did not finish");
+    }
+
+    let peak = held.peak.load(Ordering::SeqCst);
+    let _ = shutdown_tx.send(());
+    upstream_handle.abort();
+    proxy_handle.abort();
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
+        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
+        std::env::remove_var("CCP_CURSOR_BIDI");
+        std::env::remove_var("CCP_CURSOR_HEARTBEAT_SECS");
+        std::env::remove_var("CCP_CURSOR_LIVE_CONCURRENCY");
+    }
+
+    assert_eq!(
+        initially_accepted, 1,
+        "the second live generation reached Cursor instead of waiting"
+    );
+    assert_eq!(peak, 1, "live generation concurrency exceeded its cap");
+}
+
 // ---------------------------------------------------------------------------
 // No TypeScript sidecar
 // ---------------------------------------------------------------------------
