@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.53 (2026-08-20)
+
+- Resume every parallel OpenAI Responses function output as one logical Cursor tool-result batch, even when outputs are split across user messages or followed by a standalone `<system-reminder>`. This prevents missing-result failures, repeated tool calls, and high-fanout subagent retry loops.
+- Bound empty-turn recovery to one internal retry and one five-minute episode. Stale hollow checkpoints are rotated, while checkpoints that already consumed completed tool results are preserved and continued without replaying those tools. Reasoning-only Responses streams now still emit a terminal event at EOF.
+- Limit active Cursor generations to 16 by default, release capacity between tool segments, and prioritize tool-result resumptions over unrelated new starts. `CCP_CURSOR_LIVE_CONCURRENCY` and `CCP_CURSOR_LIVE_QUEUE_SECS` remain configurable.
+
 ## v0.1.52 (2026-08-19)
 
 - Quarantine malformed or unadvertised Cursor control XML instead of leaking or reconstructing it in grok transcripts. Preserve each client's exact advertised `workflow`/`Workflow` and `skill`/`Skill` names so the bridge neither intercepts nor invents tools.
