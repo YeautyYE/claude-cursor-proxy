@@ -4276,7 +4276,7 @@ fn release_generation_permit_between_segments(
     generation_permit: &mut Option<LiveGenerationPermit>,
 ) {
     if sink.is_none() {
-        drop(generation_permit.take());
+        generation_permit.take();
     }
 }
 
