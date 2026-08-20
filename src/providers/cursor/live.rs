@@ -306,7 +306,7 @@ impl CursorLiveRunHandle {
             .store(fingerprint, Ordering::Release);
     }
 
-    fn request_fingerprint(&self) -> u64 {
+    pub(crate) fn request_fingerprint(&self) -> u64 {
         self.request_fingerprint.load(Ordering::Acquire)
     }
 
@@ -403,7 +403,7 @@ impl CursorLiveRunHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
                 CursorError::new(
-                    409,
+                    429,
                     "Another tool-result resume is already in flight for this Cursor run",
                     None,
                 )
@@ -411,22 +411,27 @@ impl CursorLiveRunHandle {
         let permit = LiveResumePermit {
             in_flight: Arc::clone(&self.resume_in_flight),
         };
+        // Admission can legitimately queue behind other active generations.
+        // Only the command/ack handoff below is bounded by dispatch_timeout.
+        let generation_permit = acquire_live_generation_resume_permit(
+            &self.cancel_requested,
+            &self.completed,
+            &self.command_tx,
+        )
+        .await?;
+        if self.cancel_requested.load(Ordering::Acquire)
+            || self.completed.load(Ordering::Acquire)
+            || self.command_tx.is_closed()
+        {
+            return Err(resume_admission_closed_error());
+        }
         let dispatch_state = Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING));
         let _wait_guard = LiveResumeWaitGuard {
             state: Arc::clone(&dispatch_state),
         };
         let command_tx = self.command_tx.clone();
         let command_dispatch_state = Arc::clone(&dispatch_state);
-        let cancel_requested = Arc::clone(&self.cancel_requested);
         let dispatch = async move {
-            let generation_permit = acquire_live_generation_resume_permit().await?;
-            if cancel_requested.load(Ordering::Acquire) {
-                return Err(CursorError::new(
-                    409,
-                    "Cursor live run was cancelled while waiting for generation capacity",
-                    None,
-                ));
-            }
             // Match start_live_agent capacity — post-tool thinking bursts must not
             // trip the old 64-slot ceiling (silent drop under try_send timeout).
             let (sink, events) = mpsc::channel(LIVE_EVENT_CHANNEL_CAP);
@@ -2513,7 +2518,10 @@ const LIVE_OPEN_SOFT_START: usize = 4;
 const LIVE_OPEN_MAX: usize = 128;
 const LIVE_GENERATION_DEFAULT_MAX: usize = 16;
 const LIVE_GENERATION_MAX: usize = 128;
-const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 60;
+/// Overflow waiters must fail fast. A 240s queue made grok-build look frozen
+/// while 16 heartbeat-only holders occupied the gate; grok already retries 429.
+const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 8;
+const LIVE_GENERATION_DEFAULT_CONTENDED_IDLE_SECS: u64 = 30;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -2620,8 +2628,29 @@ fn live_generation_queue_secs(raw: Option<&str>) -> u64 {
         .clamp(1, 3600)
 }
 
+fn live_contended_idle_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(LIVE_GENERATION_DEFAULT_CONTENDED_IDLE_SECS)
+        .clamp(10, 120)
+}
+
+fn live_heartbeat_thinking_budget(stream_idle: Duration, contended: bool) -> Duration {
+    if contended {
+        Duration::from_secs(live_contended_idle_secs(
+            std::env::var("CCP_CURSOR_CONTENDED_IDLE_SECS")
+                .ok()
+                .as_deref(),
+        ))
+    } else {
+        stream_idle.saturating_mul(2)
+    }
+}
+
 fn live_generation_saturated_error() -> CursorError {
-    CursorError::new(429, "Cursor live generation concurrency saturated", None)
+    let mut err = CursorError::new(429, "Cursor live generation concurrency saturated", None);
+    err.retry_after = Some("2".into());
+    err
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2685,6 +2714,11 @@ impl LiveGenerationGate {
 
     fn limit(&self) -> usize {
         self.inner.limit
+    }
+
+    fn is_contended(&self) -> bool {
+        self.inner.inflight.load(Ordering::SeqCst) >= self.inner.limit
+            || self.inner.resume_waiters.load(Ordering::SeqCst) > 0
     }
 
     #[cfg(test)]
@@ -2836,8 +2870,31 @@ async fn acquire_live_generation_permit(
     acquire_live_generation_permit_with_priority(cancel, LiveGenerationPriority::Start).await
 }
 
-async fn acquire_live_generation_resume_permit() -> Result<LiveGenerationPermit, CursorError> {
-    acquire_live_generation_permit_with_priority(None, LiveGenerationPriority::Resume).await
+fn resume_admission_closed_error() -> CursorError {
+    CursorError::internal("Cursor live run already closed while waiting for generation capacity")
+}
+
+async fn acquire_live_generation_resume_permit(
+    cancel_requested: &AtomicBool,
+    completed: &AtomicBool,
+    command_tx: &mpsc::Sender<RunCommand>,
+) -> Result<LiveGenerationPermit, CursorError> {
+    let admission =
+        acquire_live_generation_permit_with_priority(None, LiveGenerationPriority::Resume);
+    tokio::pin!(admission);
+    loop {
+        if cancel_requested.load(Ordering::Acquire)
+            || completed.load(Ordering::Acquire)
+            || command_tx.is_closed()
+        {
+            return Err(resume_admission_closed_error());
+        }
+        tokio::select! {
+            result = &mut admission => return result,
+            _ = command_tx.closed() => return Err(resume_admission_closed_error()),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
 }
 
 fn live_open_soft_start(max: usize) -> usize {
@@ -3227,13 +3284,16 @@ fn live_idle_stall_message(
     since_liveness: Duration,
     setup_idle: Duration,
     stream_idle: Duration,
+    thinking_idle: Duration,
 ) -> Option<&'static str> {
     // Dead stream: no frames at all (including server heartbeats).
     if !useful && since_liveness >= setup_idle {
         return Some("Cursor stream produced no useful progress");
     }
-    // Alive heartbeat-only thinking (Fable high) — wait 2× stream idle, not 45s.
-    if !useful && since_progress >= stream_idle.saturating_mul(2) {
+    // Alive heartbeat-only thinking. `thinking_idle` is 2× stream idle when
+    // the generation gate has spare capacity, and a short contended budget
+    // when 16 holders would otherwise convoy overflow waiters for minutes.
+    if !useful && since_progress >= thinking_idle {
         return Some("Cursor stream produced no useful progress");
     }
     if useful && !saw_text && since_progress >= stream_idle && !tools_advertised {
@@ -4823,6 +4883,7 @@ async fn drive_live_run(
             last_liveness.elapsed(),
             setup_idle,
             stream_idle,
+            live_heartbeat_thinking_budget(stream_idle, LIVE_GENERATION_GATE.is_contended()),
         ) {
             let can_resume = live_reconnect_resume_state(
                 &latest_checkpoint,
@@ -7841,6 +7902,9 @@ mod tests {
     use super::*;
     use prost::Message;
 
+    static LIVE_GENERATION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     fn pending_exec(id: u32, tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
             id,
@@ -8035,6 +8099,166 @@ mod tests {
             .expect("driver did not stop")
             .expect("driver join");
         assert_eq!(generation_gate.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_generation_admission_does_not_spend_driver_dispatch_timeout() {
+        let _gate_test = LIVE_GENERATION_TEST_LOCK.lock().await;
+        let gate = &*LIVE_GENERATION_GATE;
+        let mut held = Vec::with_capacity(gate.limit());
+        for _ in 0..gate.limit() {
+            held.push(
+                gate.acquire(LiveGenerationPriority::Resume, None, Duration::from_secs(2))
+                    .await
+                    .expect("hold every generation slot"),
+            );
+        }
+
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "resume-admission-budget".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        let driver = tokio::spawn(async move {
+            let RunCommand::ResumeBatch {
+                ack,
+                dispatch_state,
+                ..
+            } = command_rx.recv().await.expect("resume command")
+            else {
+                panic!("expected resume command");
+            };
+            dispatch_state
+                .compare_exchange(
+                    RESUME_DISPATCH_WAITING,
+                    RESUME_DISPATCH_STARTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .expect("accept resume command");
+            ack.send(Ok(())).expect("acknowledge resume");
+        });
+
+        let resume_handle = Arc::clone(&handle);
+        let resume = tokio::spawn(async move {
+            resume_handle
+                .resume_batch_within(
+                    vec![(
+                        "tool-1".into(),
+                        serde_json::json!({"type":"tool_result","content":"done"}),
+                    )],
+                    Duration::from_millis(50),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held.pop());
+
+        let events = tokio::time::timeout(Duration::from_secs(1), resume)
+            .await
+            .expect("resume did not finish after generation admission")
+            .expect("resume task")
+            .expect("generation queue wait must not consume the driver dispatch budget");
+        drop(events);
+        driver.await.expect("mock driver");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_is_retryable_capacity_error() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = CursorLiveRunHandle {
+            run_id: "concurrent-resume".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(true)),
+            request_fingerprint: AtomicU64::new(0),
+        };
+
+        let error = handle
+            .resume_batch_within(
+                vec![(
+                    "tool-1".into(),
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )],
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a concurrent resume must be rejected");
+        assert_eq!(
+            error.status, 429,
+            "an alive resume is local capacity contention, not an invalid request"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_generation_admission_stops_when_driver_is_cancelled() {
+        let _gate_test = LIVE_GENERATION_TEST_LOCK.lock().await;
+        let gate = &*LIVE_GENERATION_GATE;
+        let mut held = Vec::with_capacity(gate.limit());
+        for _ in 0..gate.limit() {
+            held.push(
+                gate.acquire(LiveGenerationPriority::Resume, None, Duration::from_secs(2))
+                    .await
+                    .expect("hold every generation slot"),
+            );
+        }
+
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "cancelled-resume-admission".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: AtomicU64::new(0),
+        });
+        let resume_handle = Arc::clone(&handle);
+        let mut resume = tokio::spawn(async move {
+            resume_handle
+                .resume_batch_within(
+                    vec![(
+                        "tool-1".into(),
+                        serde_json::json!({"type":"tool_result","content":"done"}),
+                    )],
+                    Duration::from_millis(50),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        handle.cancel_requested.store(true, Ordering::Release);
+
+        let error = match tokio::time::timeout(Duration::from_millis(250), &mut resume).await {
+            Ok(result) => result
+                .expect("resume task")
+                .expect_err("cancelled admission must not dispatch"),
+            Err(_) => {
+                resume.abort();
+                let _ = resume.await;
+                panic!("generation admission did not observe driver cancellation");
+            }
+        };
+        assert_eq!(error.status, 502);
+        assert!(
+            live_resume_error_is_dead_driver(&error),
+            "a closed driver must transition the caller to replacement handling"
+        );
+        assert!(
+            !handle.resume_in_flight.load(Ordering::Acquire),
+            "cancellation must release the exact-once resume guard"
+        );
+        drop(held);
     }
 
     #[test]
@@ -8910,18 +9134,56 @@ mod tests {
 
     #[test]
     fn live_generation_queue_timeout_is_decoupled_from_run_lifetime() {
-        assert_eq!(live_generation_queue_secs(None), 60);
+        assert_eq!(live_generation_queue_secs(None), 8);
         assert_eq!(live_generation_queue_secs(Some("15")), 15);
-        assert_eq!(live_generation_queue_secs(Some("0")), 60);
+        assert_eq!(live_generation_queue_secs(Some("0")), 8);
         assert_eq!(live_generation_queue_secs(Some("9999")), 3600);
-        assert_eq!(live_generation_queue_secs(Some("nope")), 60);
+        assert_eq!(live_generation_queue_secs(Some("nope")), 8);
     }
 
     #[test]
     fn live_generation_saturation_is_retryable_without_ambiguous_acceptance() {
         let err = live_generation_saturated_error();
         assert_eq!(err.status, 429);
+        assert_eq!(err.retry_after.as_deref(), Some("2"));
         assert!(!is_ambiguous_live_open_timeout(&err));
+    }
+
+    #[test]
+    fn heartbeat_only_thinking_budget_shrinks_under_contention() {
+        let idle = Duration::from_secs(120);
+        assert_eq!(
+            live_heartbeat_thinking_budget(idle, false),
+            idle.saturating_mul(2),
+            "a lone Fable turn may think for 2x stream idle"
+        );
+        assert_eq!(
+            live_heartbeat_thinking_budget(idle, true),
+            Duration::from_secs(30),
+            "a full generation gate must not hold slots for 4 minutes of heartbeats"
+        );
+    }
+
+    #[test]
+    fn generation_gate_is_contended_at_limit_or_with_resume_waiters() {
+        let gate = LiveGenerationGate::new(1);
+        assert!(
+            !gate.is_contended(),
+            "an empty gate must keep the generous thinking budget"
+        );
+        let permit = gate
+            .try_acquire(LiveGenerationPriority::Start)
+            .expect("hold the only slot");
+        assert!(
+            gate.is_contended(),
+            "a full gate is contended even without waiters"
+        );
+        drop(permit);
+        let _waiter = gate.register_resume_waiter();
+        assert!(
+            gate.is_contended(),
+            "resume waiters must shrink holder thinking so tool results can run"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9194,40 +9456,83 @@ mod tests {
         let setup = Duration::from_secs(45);
         let idle = Duration::from_secs(120);
         let fresh = Duration::from_millis(200);
+        let generous = idle * 2;
+        let stall = |useful, saw_text, tools, pending_empty, since_progress, since_liveness| {
+            live_idle_stall_message(
+                useful,
+                saw_text,
+                tools,
+                pending_empty,
+                since_progress,
+                since_liveness,
+                setup,
+                idle,
+                generous,
+            )
+        };
         assert_eq!(
-            live_idle_stall_message(false, false, true, true, setup, setup, setup, idle),
+            stall(false, false, true, true, setup, setup),
             Some("Cursor stream produced no useful progress"),
             "a stream with no frames at all still dies at setup_idle"
         );
         assert!(
-            live_idle_stall_message(false, false, true, true, setup, fresh, setup, idle).is_none(),
+            stall(false, false, true, true, setup, fresh).is_none(),
             "heartbeat-only Fable thinking must not die at 45s setup_idle"
         );
         assert_eq!(
-            live_idle_stall_message(false, false, true, true, idle * 2, fresh, setup, idle),
+            stall(false, false, true, true, idle * 2, fresh),
             Some("Cursor stream produced no useful progress"),
             "heartbeat-only thinking still stalls at 2× stream idle"
         );
+        assert_eq!(
+            live_idle_stall_message(
+                false,
+                false,
+                true,
+                true,
+                Duration::from_secs(30),
+                fresh,
+                setup,
+                idle,
+                Duration::from_secs(30),
+            ),
+            Some("Cursor stream produced no useful progress"),
+            "contended holders must stall at the short thinking budget"
+        );
         assert!(
-            live_idle_stall_message(true, false, true, true, idle, fresh, setup, idle).is_none(),
+            live_idle_stall_message(
+                false,
+                false,
+                true,
+                true,
+                Duration::from_secs(29),
+                fresh,
+                setup,
+                idle,
+                Duration::from_secs(30),
+            )
+            .is_none(),
+            "contended thinking still has a 30s first-useful-output window"
+        );
+        assert!(
+            stall(true, false, true, true, idle, fresh).is_none(),
             "tools advertised: 120s of thinking-only is still allowed"
         );
         assert_eq!(
-            live_idle_stall_message(true, false, true, true, idle * 2, fresh, setup, idle),
+            stall(true, false, true, true, idle * 2, fresh),
             Some("Cursor stream stalled after partial progress")
         );
         assert_eq!(
-            live_idle_stall_message(true, true, true, true, idle * 2, fresh, setup, idle),
+            stall(true, true, true, true, idle * 2, fresh),
             Some("Cursor stream stalled after partial progress"),
             "heartbeat-only silence after text must ResumeAction or error, not wait 1800s"
         );
         assert!(
-            live_idle_stall_message(true, true, true, true, idle, fresh, setup, idle).is_none(),
+            stall(true, true, true, true, idle, fresh).is_none(),
             "one stream-idle window of quiet thinking after text is still allowed"
         );
         assert!(
-            live_idle_stall_message(true, false, true, false, idle * 2, fresh, setup, idle)
-                .is_none(),
+            stall(true, false, true, false, idle * 2, fresh).is_none(),
             "do not stall while Claude still owes native tool_results"
         );
     }
@@ -10920,6 +11225,70 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn duplicate_start_for_running_generation_is_retryable_busy() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("running-start-busy-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(dummy_handle("running-generation"))
+            .expect("insert running");
+
+        let error = super::super::start_live_events_with_retries(
+            CursorHttpClient::new(),
+            "test-token".into(),
+            "same request",
+            "cursor-grok-4.6-xhigh-fast",
+            &[],
+            None,
+            LiveRunIdentity::parent(&session),
+            None,
+            None,
+            RequestContext::default(),
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("a duplicate start must not replace the running generation");
+        assert_eq!(error.status, 429);
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ambiguous_start_remains_non_retryable_to_prevent_duplicate_execution() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("ambiguous-start-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .seal_ambiguous(Instant::now() + Duration::from_secs(60));
+
+        let error = super::super::start_live_events_with_retries(
+            CursorHttpClient::new(),
+            "test-token".into(),
+            "same request",
+            "cursor-grok-4.6-xhigh-fast",
+            &[],
+            None,
+            LiveRunIdentity::parent(&session),
+            None,
+            None,
+            RequestContext::default(),
+            Vec::new(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("ambiguous acceptance must not be retried automatically");
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("duplicate execution"));
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn tool_result_waiter_does_not_attach_to_a_replacement_run() {
         let _registry = lock_live_registry_for_test();
         let session = format!("result-generation-{}", uuid::Uuid::new_v4());
@@ -10973,6 +11342,104 @@ mod tests {
         assert!(
             matches!(outcome, super::super::LiveResumeOutcome::Conflict),
             "an old result waiter must 409 when the registry generation changes"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tool_result_waiter_for_starting_generation_stays_retryable() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("result-starting-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve starting run");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "same generation result"
+                }]}]
+            }))
+            .unwrap();
+
+        let running = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let run = dummy_handle("starting-generation");
+            run.set_request_fingerprint(live_request_fingerprint(
+                &serde_json::to_vec(&body.messages).unwrap_or_default(),
+            ));
+            run.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(pending_exec(1, "tool-1"));
+            reservation.insert(run).expect("insert running generation");
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_starting_result".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, running);
+
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("a starting live generation must remain retryable");
+        };
+        assert_eq!(error.status, 429);
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stale_tool_result_waiter_for_different_starting_generation_stays_conflict() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("stale-result-starting-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve starting run");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "belongs to another generation"
+                }]}]
+            }))
+            .unwrap();
+
+        let running = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let run = dummy_handle("different-starting-generation");
+            run.set_request_fingerprint(1);
+            run.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(pending_exec(1, "tool-1"));
+            reservation.insert(run).expect("insert running generation");
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_stale_starting_result".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, running);
+
+        assert!(
+            matches!(outcome, super::super::LiveResumeOutcome::Conflict),
+            "a result for an unobserved generation must not attach to its replacement"
         );
         LiveRunRegistry::clear();
     }

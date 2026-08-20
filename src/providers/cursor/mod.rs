@@ -321,6 +321,25 @@ fn commit_streaming_live_sse_before_start_live(want_stream: bool, hold_http: boo
     want_stream && !hold_http
 }
 
+const LIVE_RUN_BUSY_MESSAGE: &str =
+    "A Cursor live run is already active for this session; retry after it advances";
+
+fn live_run_busy_error() -> CursorError {
+    CursorError::new(429, LIVE_RUN_BUSY_MESSAGE, None)
+}
+
+fn live_replacement_conflict_error(has_tool_results: bool) -> CursorError {
+    if has_tool_results {
+        CursorError::new(
+            409,
+            "A Cursor live run is already active for this session",
+            None,
+        )
+    } else {
+        live_run_busy_error()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_live_events_with_retries(
     client: CursorHttpClient,
@@ -345,14 +364,21 @@ async fn start_live_events_with_retries(
         } else {
             match LiveRunRegistry::try_claim_run(identity.session_id, identity.agent_id) {
                 LiveSlotClaim::Reserved(reservation) => reservation,
-                LiveSlotClaim::Starting | LiveSlotClaim::Ambiguous => {
+                LiveSlotClaim::Starting => {
                     if Instant::now() >= conflict_deadline {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
-                LiveSlotClaim::Running => break,
+                LiveSlotClaim::Ambiguous => {
+                    return Err(CursorError::new(
+                        409,
+                        "Cursor live run acceptance is ambiguous; retrying could duplicate execution",
+                        None,
+                    ));
+                }
+                LiveSlotClaim::Running => return Err(live_run_busy_error()),
             }
         };
 
@@ -443,11 +469,7 @@ async fn start_live_events_with_retries(
         }
     }
 
-    Err(CursorError::new(
-        409,
-        "A Cursor live run is already active for this session",
-        None,
-    ))
+    Err(live_run_busy_error())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,10 +1177,13 @@ async fn await_live_run_resume(
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         };
+        if has_tool_results && run.request_fingerprint() == fingerprint {
+            return LiveResumeOutcome::ResumeError(live_run_busy_error());
+        }
         if observed_non_running_slot {
             // A Starting slot became Running. Tool-result waiters must not
-            // attach to a generation they did not own. A fresh compact/next
-            // turn must take it over — 409 is non-retryable for grok-build.
+            // attach to a different generation. An identical request is the
+            // owner already starting above and was handled as retryable busy.
             if has_tool_results {
                 return LiveResumeOutcome::Conflict;
             }
@@ -1227,6 +1252,9 @@ async fn await_live_run_resume(
         }
         return LiveResumeOutcome::Conflict;
     };
+    if has_tool_results && run.request_fingerprint() == fingerprint {
+        return LiveResumeOutcome::ResumeError(live_run_busy_error());
+    }
     if observed_non_running_slot {
         if has_tool_results {
             return LiveResumeOutcome::Conflict;
@@ -1549,11 +1577,10 @@ impl Provider for CursorProvider {
                                 session_id, agent_id, &run_id,
                             ) {
                                 LiveReplacementClaim::Conflict => {
-                                    return json_error(
-                                        StatusCode::CONFLICT,
-                                        "invalid_request_error",
-                                        "A Cursor live run is already active for this session",
+                                    let error = live_replacement_conflict_error(
+                                        request_has_current_tool_result(&body),
                                     );
+                                    return map_cursor_error_to_response(&error);
                                 }
                                 LiveReplacementClaim::Reserved {
                                     mut reservation,
@@ -1586,11 +1613,7 @@ impl Provider for CursorProvider {
                                 session_id, agent_id,
                             ) {
                                 LiveReplacementClaim::Conflict => {
-                                    return json_error(
-                                        StatusCode::CONFLICT,
-                                        "invalid_request_error",
-                                        "A Cursor live run is already active for this session",
-                                    );
+                                    return map_cursor_error_to_response(&live_run_busy_error());
                                 }
                                 LiveReplacementClaim::Reserved { reservation, .. } => {
                                     preclaimed_live_reservation = Some(reservation);
@@ -2206,6 +2229,12 @@ mod tests {
                 range_applied: false,
             },
         }
+    }
+
+    #[test]
+    fn replacement_conflicts_retry_only_fresh_turns() {
+        assert_eq!(live_replacement_conflict_error(false).status, 429);
+        assert_eq!(live_replacement_conflict_error(true).status, 409);
     }
 
     #[test]

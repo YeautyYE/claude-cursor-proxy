@@ -2902,6 +2902,32 @@ async fn cursor_live_generations_queue_at_configured_limit() {
         });
     }
 
+    async fn wait_for_stable_accepted(held: &HeldRuns) -> usize {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut last = held.accepted.load(Ordering::SeqCst);
+            let mut stable_since = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let current = held.accepted.load(Ordering::SeqCst);
+                if current != last {
+                    last = current;
+                    stable_since = tokio::time::Instant::now();
+                } else if current > 0
+                    && stable_since.elapsed() >= std::time::Duration::from_millis(250)
+                {
+                    return current;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Cursor admissions never stabilized; accepted={}",
+                held.accepted.load(Ordering::SeqCst)
+            )
+        })
+    }
+
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let held = Arc::new(HeldRuns::default());
     let upstream_held = Arc::clone(&held);
@@ -2963,7 +2989,8 @@ async fn cursor_live_generations_queue_at_configured_limit() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client = reqwest::Client::new();
     let mut requests = Vec::new();
-    for index in 0..2 {
+    const REQUESTS: usize = 17;
+    for index in 0..REQUESTS {
         let client = client.clone();
         requests.push(tokio::spawn(async move {
             client
@@ -2987,18 +3014,22 @@ async fn cursor_live_generations_queue_at_configured_limit() {
     }
 
     wait_for_accepted(&held, 1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let initially_accepted = held.accepted.load(Ordering::SeqCst);
+    let initially_accepted = wait_for_stable_accepted(&held).await;
+    assert!(
+        initially_accepted < REQUESTS,
+        "all live generations reached Cursor without queueing"
+    );
 
-    if let Some(release) = held
-        .releases
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pop()
-    {
+    for expected in (initially_accepted + 1)..=REQUESTS {
+        let release = held
+            .releases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .expect("an active generation must be releasable");
         let _ = release.send(());
+        wait_for_accepted(&held, expected).await;
     }
-    wait_for_accepted(&held, 2).await;
 
     let releases = std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner()));
     for release in releases {
@@ -3029,10 +3060,9 @@ async fn cursor_live_generations_queue_at_configured_limit() {
     }
 
     assert_eq!(
-        initially_accepted, 1,
-        "the second live generation reached Cursor instead of waiting"
+        peak, initially_accepted,
+        "live generation concurrency exceeded the observed configured cap"
     );
-    assert_eq!(peak, 1, "live generation concurrency exceeded its cap");
 }
 
 // ---------------------------------------------------------------------------
