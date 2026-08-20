@@ -3,6 +3,15 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.55 (2026-08-20)
+
+- Fail-fast when the 16 live-generation slots are full: overflow waits 8 seconds, then returns retryable 429 with `Retry-After: 2` instead of holding grok HTTP for 4 minutes. Lone Fable turns still get a 240-second heartbeat-only thinking window; a saturated gate cuts that to 30 seconds so hung holders cannot convoy the rest of a fan-out.
+
+## v0.1.54 (2026-08-20)
+
+- Separate tool-result generation admission from the 20-second live-driver acknowledgement budget, keep resume requests ahead of new starts, and allow a bounded 240-second local queue while retaining the 16-generation upstream cap. Cancelled or completed drivers now leave that queue immediately.
+- Treat duplicate active requests and fresh-turn replacement races as retryable 429 contention instead of invalid-request 409. Request fingerprints still keep stale tool results and ambiguous upstream acceptance fail-closed, preventing retries from attaching to a different generation or duplicating execution.
+
 ## v0.1.53 (2026-08-20)
 
 - Resume every parallel OpenAI Responses function output as one logical Cursor tool-result batch, even when outputs are split across user messages or followed by a standalone `<system-reminder>`. This prevents missing-result failures, repeated tool calls, and high-fanout subagent retry loops.

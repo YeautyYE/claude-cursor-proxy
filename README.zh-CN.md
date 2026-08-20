@@ -285,7 +285,7 @@ claude-cursor-proxy cursor auth status
 | grok-build 报 `Conflict (409) - error sending request` / `live open timed out after 20s`，或 Claude Code 报 `Agent type 'gemini-3.6-flash-high' not found` | 升级到 ≥0.1.50 并重启 serve。H2/连不上会先在同一次请求里改走 HTTP/1，用尽才 409；High Load 429 不再连着重试；Agent/Task 的模型 slug 会改写成 `general-purpose`。 |
 | grok-build 把 `<tool_use>` / `<parameter>` XML 打到正文，或报 `Cursor auth failed: /usr/bin/security: Too many open files` | 升级到 ≥0.1.51 并重启 serve。带 named parameter 的 XML 会收成工具；XML `spawn_subagent` 等到 turn 结束再一批发出；serve 会抬高 macOS 256 文件上限。 |
 | grok-build 以 `Cursor finished this turn without text or tool calls` 莫名结束，或提示 `workflow` 被桥接拦截/改名 | 升级到 ≥0.1.52 并重启 serve。Cursor 空回合会重试，不再伪装成成功文本；畸形控制 XML 会被隔离；workflow/skill 保留客户端声明的精确大小写。 |
-| grok-build/Grok 4.6 扇出时大量子代理失败、重复执行已完成工具，或卡住不返回 token | 升级到 ≥0.1.53 并重启 serve。拆开的并行工具结果会作为一个批次恢复；空回合恢复有总时限；活跃生成受并发保护，工具结果续跑优先。升级后请新开 Grok session。 |
+| grok-build/Grok 4.6 扇出时大量子代理失败、重复执行已完成工具、卡住不返回 token，或报 live-run 409/429 | 升级到 ≥0.1.55 并重启 serve。生成槽位满时不再空等 4 分钟；门满时无输出思考会在 30 秒内让出槽位。升级后请新开 Grok session。 |
 | Claude Code 的 Bash 标题是整段 `python3 -c` 脚本 | 升级到 ≥0.1.48 并重启 serve。Cursor Shell 没有 description，代理会补一行短标题。 |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 后台工具结果恢复前出现 `Stream idle timeout - no chunks received` | 升级到 ≥0.1.45 并重启 serve。live 工具结果在 HTTP 响应前的分类等待由 30 秒缩短到最多 5 秒；HTTP SSE 建立后仍会每 15 秒发送 Anthropic ping，保护长时间静默思考。 |
