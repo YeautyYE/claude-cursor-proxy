@@ -20,7 +20,7 @@ use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use prost::Message;
 use rand::Rng;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
@@ -1057,6 +1057,7 @@ enum LiveRunEntry {
     /// The previous Run completed successfully. Identical request retries must
     /// not start a second Run before the client could have observed `message_end`.
     Succeeded {
+        run_id: String,
         fingerprint: u64,
         until: Instant,
     },
@@ -1113,7 +1114,7 @@ pub struct LiveRunReservation {
     session_id: String,
     reservation_id: String,
     committed: bool,
-    seal_on_drop: bool,
+    seal_on_drop: Arc<AtomicBool>,
     cancel: watch::Sender<bool>,
 }
 
@@ -1129,8 +1130,14 @@ impl LiveRunReservation {
     /// Once an upstream open or replacement teardown has started, dropping
     /// the owning request future cannot prove that no Cursor Run survived.
     /// Keep the slot tombstoned instead of making it available to a retry.
-    pub fn protect_on_drop(&mut self) {
-        self.seal_on_drop = true;
+    pub fn protect_on_drop(&self) {
+        self.seal_on_drop.store(true, Ordering::Release);
+    }
+
+    /// Shared boundary marker set by the live client immediately before it
+    /// begins the first operation that can reach Cursor.
+    pub(crate) fn upstream_open_guard(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.seal_on_drop)
     }
 
     /// Release a reservation after a definitive pre-acceptance failure.
@@ -1191,6 +1198,7 @@ impl LiveRunReservation {
             runs.insert_key(
                 self.session_id.clone(),
                 LiveRunEntry::Succeeded {
+                    run_id: handle.run_id().to_string(),
                     fingerprint: handle.request_fingerprint(),
                     until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
                 },
@@ -1216,7 +1224,7 @@ impl Drop for LiveRunReservation {
                 if reservation_id == &self.reservation_id
         );
         if owns_reservation {
-            if self.seal_on_drop {
+            if self.seal_on_drop.load(Ordering::Acquire) {
                 runs.insert_key(
                     self.session_id.clone(),
                     LiveRunEntry::Ambiguous {
@@ -1342,7 +1350,7 @@ impl LiveRunRegistry {
                     }
                 }
             }
-            Some(LiveRunEntry::Succeeded { .. } | LiveRunEntry::Ambiguous { .. }) => {
+            Some(LiveRunEntry::Succeeded { run_id, .. }) if run_id == expected_run_id => {
                 runs.remove_key(&key);
                 match Self::reserve_key(&mut runs, key) {
                     Some(reservation) => LiveReplacementClaim::Reserved {
@@ -1351,6 +1359,9 @@ impl LiveRunRegistry {
                     },
                     None => LiveReplacementClaim::Conflict,
                 }
+            }
+            Some(LiveRunEntry::Succeeded { .. } | LiveRunEntry::Ambiguous { .. }) => {
+                LiveReplacementClaim::Conflict
             }
             Some(LiveRunEntry::Starting { .. } | LiveRunEntry::Running(_)) => {
                 LiveReplacementClaim::Conflict
@@ -1379,14 +1390,7 @@ impl LiveRunRegistry {
             Some(LiveRunEntry::Running(_)) => LiveReplacementClaim::Conflict,
             Some(LiveRunEntry::Starting { .. }) => LiveReplacementClaim::Conflict,
             Some(LiveRunEntry::Succeeded { .. } | LiveRunEntry::Ambiguous { .. }) => {
-                runs.remove_key(&key);
-                match Self::reserve_key(&mut runs, key) {
-                    Some(reservation) => LiveReplacementClaim::Reserved {
-                        reservation,
-                        superseded: None,
-                    },
-                    None => LiveReplacementClaim::Conflict,
-                }
+                LiveReplacementClaim::Conflict
             }
             None => match Self::reserve_key(&mut runs, key) {
                 Some(reservation) => LiveReplacementClaim::Reserved {
@@ -1439,7 +1443,7 @@ impl LiveRunRegistry {
             session_id: key,
             reservation_id,
             committed: false,
-            seal_on_drop: true,
+            seal_on_drop: Arc::new(AtomicBool::new(false)),
             cancel,
         })
     }
@@ -1744,6 +1748,7 @@ impl LiveRunRegistry {
                 runs.insert_key(
                     key,
                     LiveRunEntry::Succeeded {
+                        run_id: run_id.to_string(),
                         fingerprint,
                         until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
                     },
@@ -1765,6 +1770,7 @@ impl LiveRunRegistry {
             Some(LiveRunEntry::Succeeded {
                 fingerprint: stored,
                 until,
+                ..
             }) if Instant::now() < *until && *stored == fingerprint => {}
             Some(LiveRunEntry::Succeeded { .. }) => {
                 runs.remove_key(&key);
@@ -1844,7 +1850,40 @@ impl CursorHttpClient {
         mcp_tools: Option<super::proto::McpTools>,
         request_context: super::proto::RequestContext,
         original_request_id: Option<&str>,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<LiveRunStart, CursorError> {
+        self.start_live_agent_with_identity_guarded(
+            token,
+            prompt,
+            model,
+            images,
+            custom_system_prompt,
+            identity,
+            allowed_tool_names,
+            mcp_tools,
+            request_context,
+            original_request_id,
+            cancel,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_live_agent_with_identity_guarded(
+        &self,
+        token: &str,
+        prompt: &str,
+        model: &str,
+        images: &[CursorSelectedImage],
+        custom_system_prompt: Option<&str>,
+        identity: LiveRunIdentity<'_>,
+        allowed_tool_names: Option<BTreeSet<String>>,
+        mcp_tools: Option<super::proto::McpTools>,
+        request_context: super::proto::RequestContext,
+        original_request_id: Option<&str>,
         mut cancel: Option<watch::Receiver<bool>>,
+        upstream_open_guard: Option<Arc<AtomicBool>>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -1899,6 +1938,12 @@ impl CursorHttpClient {
         };
 
         let cursor_identity = LiveIdentityHeaders::build(token);
+        if let Some(guard) = upstream_open_guard.as_ref() {
+            // Admission waiting is still wholly local. Cross the ambiguous
+            // acceptance boundary only immediately before constructing the
+            // first upstream open future.
+            guard.store(true, Ordering::Release);
+        }
         let open = http.open_live_transport(
             token,
             &request_id,
@@ -1954,6 +1999,7 @@ impl CursorHttpClient {
             continuation.pre_fetched_blobs.into_iter().collect();
         let reconnect = LiveReconnectContext {
             http,
+            recovery_open_gate: Arc::clone(&LIVE_RECOVERY_OPEN_GATE),
             token: token.to_string(),
             identity: cursor_identity,
             original_request_id,
@@ -2377,7 +2423,6 @@ impl LiveIdentityHeaders {
 struct LiveRecoveryEpisode {
     started: Option<Instant>,
     opens: u32,
-    last_was_hollow: bool,
     on_probation: bool,
 }
 
@@ -2389,13 +2434,6 @@ impl LiveRecoveryEpisode {
     fn begin(&mut self, now: Instant) {
         if self.started.is_none() {
             self.started = Some(now);
-        }
-    }
-
-    fn note_delayed_hollow_if_probation(&mut self) {
-        if self.on_probation {
-            self.last_was_hollow = true;
-            self.on_probation = false;
         }
     }
 
@@ -2421,6 +2459,7 @@ impl LiveRecoveryEpisode {
 /// Context needed to reopen AgentService/Run with `ResumeAction` after a stall.
 struct LiveReconnectContext {
     http: CursorHttpClient,
+    recovery_open_gate: Arc<Semaphore>,
     token: String,
     identity: LiveIdentityHeaders,
     original_request_id: String,
@@ -2576,13 +2615,20 @@ fn reconnect_prefers_http1(force_http1: bool) -> bool {
     force_http1
 }
 
-pub(crate) const LIVE_H2_OPEN_ATTEMPT: Duration = Duration::from_secs(20);
+pub(crate) const LIVE_H2_OPEN_ATTEMPT: Duration = Duration::from_secs(90);
 const LIVE_H1_OPEN_ATTEMPT: Duration = Duration::from_secs(90);
 pub(crate) const LIVE_AMBIGUOUS_OPEN_TTL: Duration = Duration::from_secs(90);
 const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
 const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
 const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
+const LIVE_GENERATION_DEFAULT_MAX: usize = 32;
+const LIVE_GENERATION_MAX: usize = 128;
+const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 15;
+const LIVE_GENERATION_DEFAULT_RESUME_RESERVE: usize = 4;
+const LIVE_GENERATION_RESUME_RESERVE_MAX: usize = 16;
+const LIVE_RECOVERY_OPEN_DEFAULT_MAX: usize = 4;
+const LIVE_RECOVERY_OPEN_MAX: usize = 16;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -2616,7 +2662,7 @@ fn live_h2_open_attempt_timeout() -> Duration {
             "CCP_CURSOR_LIVE_H2_OPEN_SECS",
             LIVE_H2_OPEN_ATTEMPT.as_secs(),
         )
-        .clamp(10, 60),
+        .clamp(10, 180),
     )
 }
 
@@ -2660,22 +2706,185 @@ pub(crate) fn local_overload_retry_after() -> String {
     rand::thread_rng().gen_range(1..=3).to_string()
 }
 
+fn live_generation_concurrency_max(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(LIVE_GENERATION_MAX))
+        .unwrap_or(LIVE_GENERATION_DEFAULT_MAX)
+}
+
+fn live_generation_queue_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LIVE_GENERATION_DEFAULT_QUEUE_SECS)
+        .clamp(1, 300)
+}
+
+fn live_generation_resume_reserve(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(LIVE_GENERATION_DEFAULT_RESUME_RESERVE)
+        .min(LIVE_GENERATION_RESUME_RESERVE_MAX)
+}
+
+fn live_generation_queue_timeout_error() -> CursorError {
+    let mut error = CursorError::new(
+        503,
+        "Cursor live generation admission queue timed out",
+        None,
+    );
+    error.retry_after = Some(local_overload_retry_after());
+    error
+}
+
 #[derive(Debug, Default)]
-struct LiveGenerationPermit;
+struct LiveGenerationPermit {
+    _total_permit: Option<OwnedSemaphorePermit>,
+    _start_permit: Option<OwnedSemaphorePermit>,
+}
+
+struct LiveGenerationGate {
+    total: Arc<Semaphore>,
+    starts: Arc<Semaphore>,
+    limit: usize,
+    resume_reserve: usize,
+}
+
+impl LiveGenerationGate {
+    fn new(limit: usize, resume_reserve: usize) -> Self {
+        let limit = limit.clamp(1, LIVE_GENERATION_MAX);
+        let resume_reserve = resume_reserve.min(LIVE_GENERATION_RESUME_RESERVE_MAX);
+        Self {
+            total: Arc::new(Semaphore::new(limit + resume_reserve)),
+            starts: Arc::new(Semaphore::new(limit)),
+            limit,
+            resume_reserve,
+        }
+    }
+
+    async fn acquire_one(
+        semaphore: Arc<Semaphore>,
+        cancel: Option<&mut watch::Receiver<bool>>,
+        wait: Duration,
+    ) -> Result<OwnedSemaphorePermit, CursorError> {
+        if cancel.as_deref().is_some_and(|rx| *rx.borrow()) {
+            return Err(CursorError::new(
+                409,
+                "Cursor live start superseded while waiting for generation capacity",
+                None,
+            ));
+        }
+
+        let acquire = semaphore.acquire_owned();
+        tokio::pin!(acquire);
+        let permit = if let Some(cancel) = cancel {
+            tokio::select! {
+                result = &mut acquire => result,
+                _ = cancel.wait_for(|aborted| *aborted) => {
+                    return Err(CursorError::new(
+                        409,
+                        "Cursor live start superseded while waiting for generation capacity",
+                        None,
+                    ));
+                }
+                _ = tokio::time::sleep(wait) => {
+                    return Err(live_generation_queue_timeout_error());
+                }
+            }
+        } else {
+            match tokio::time::timeout(wait, &mut acquire).await {
+                Ok(result) => result,
+                Err(_) => return Err(live_generation_queue_timeout_error()),
+            }
+        }
+        .map_err(|_| CursorError::internal("Cursor live generation admission gate closed"))?;
+
+        Ok(permit)
+    }
+
+    async fn acquire_start(
+        &self,
+        mut cancel: Option<&mut watch::Receiver<bool>>,
+        wait: Duration,
+    ) -> Result<LiveGenerationPermit, CursorError> {
+        let started = Instant::now();
+        let start_permit =
+            Self::acquire_one(Arc::clone(&self.starts), cancel.as_deref_mut(), wait).await?;
+        let remaining = wait.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(live_generation_queue_timeout_error());
+        }
+        let total_permit = Self::acquire_one(Arc::clone(&self.total), cancel, remaining).await?;
+        Ok(LiveGenerationPermit {
+            _total_permit: Some(total_permit),
+            _start_permit: Some(start_permit),
+        })
+    }
+
+    async fn acquire_resume(&self, wait: Duration) -> Result<LiveGenerationPermit, CursorError> {
+        let total_permit = Self::acquire_one(Arc::clone(&self.total), None, wait).await?;
+        Ok(LiveGenerationPermit {
+            _total_permit: Some(total_permit),
+            _start_permit: None,
+        })
+    }
+}
+
+static LIVE_GENERATION_GATE: LazyLock<LiveGenerationGate> = LazyLock::new(|| {
+    LiveGenerationGate::new(
+        live_generation_concurrency_max(
+            std::env::var("CCP_CURSOR_LIVE_CONCURRENCY").ok().as_deref(),
+        ),
+        live_generation_resume_reserve(
+            std::env::var("CCP_CURSOR_LIVE_RESUME_RESERVE")
+                .ok()
+                .as_deref(),
+        ),
+    )
+});
+
+fn live_recovery_open_max(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LIVE_RECOVERY_OPEN_DEFAULT_MAX)
+        .min(LIVE_RECOVERY_OPEN_MAX)
+}
+
+static LIVE_RECOVERY_OPEN_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(live_recovery_open_max(
+        std::env::var("CCP_CURSOR_LIVE_RECOVERY_OPENS")
+            .ok()
+            .as_deref(),
+    )))
+});
 
 async fn acquire_live_generation_permit(
     cancel: Option<&mut watch::Receiver<bool>>,
 ) -> Result<LiveGenerationPermit, CursorError> {
-    if let Some(rx) = cancel
-        && *rx.borrow()
-    {
-        return Err(CursorError::new(
-            409,
-            "Cursor live start superseded while waiting for generation capacity",
-            None,
-        ));
+    let wait = Duration::from_secs(live_generation_queue_secs(
+        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
+    ));
+    let queued_at = Instant::now();
+    let permit = LIVE_GENERATION_GATE.acquire_start(cancel, wait).await?;
+    if queued_at.elapsed() >= Duration::from_millis(100) {
+        crate::logging::create_logger("cursor").info(
+            "live_generation_admitted",
+            Some(serde_json::Map::from_iter([
+                (
+                    "queuedMs".into(),
+                    serde_json::json!(queued_at.elapsed().as_millis()),
+                ),
+                (
+                    "limit".into(),
+                    serde_json::json!(LIVE_GENERATION_GATE.limit),
+                ),
+                (
+                    "resumeReserve".into(),
+                    serde_json::json!(LIVE_GENERATION_GATE.resume_reserve),
+                ),
+            ])),
+        );
     }
-    Ok(LiveGenerationPermit)
+    Ok(permit)
 }
 
 fn resume_admission_closed_error() -> CursorError {
@@ -2687,13 +2896,24 @@ async fn acquire_live_generation_resume_permit(
     completed: &AtomicBool,
     command_tx: &mpsc::Sender<RunCommand>,
 ) -> Result<LiveGenerationPermit, CursorError> {
-    if cancel_requested.load(Ordering::Acquire)
-        || completed.load(Ordering::Acquire)
-        || command_tx.is_closed()
-    {
-        return Err(resume_admission_closed_error());
+    let wait = Duration::from_secs(live_generation_queue_secs(
+        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
+    ));
+    let admission = LIVE_GENERATION_GATE.acquire_resume(wait);
+    tokio::pin!(admission);
+    loop {
+        if cancel_requested.load(Ordering::Acquire)
+            || completed.load(Ordering::Acquire)
+            || command_tx.is_closed()
+        {
+            return Err(resume_admission_closed_error());
+        }
+        tokio::select! {
+            result = &mut admission => return result,
+            _ = command_tx.closed() => return Err(resume_admission_closed_error()),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
     }
-    Ok(LiveGenerationPermit)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2947,14 +3167,33 @@ fn live_cancel_is_ambiguous(
     sent_upstream_frames || (unresolved && !hollow_resume_can_rotate(saw_text, pending_empty))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hollow_resume_terminal_message(
     session_id: &str,
     saw_text: bool,
     pending_empty: bool,
+    retain_completed_tool_checkpoint: bool,
+    post_tool_checkpoint_confirmed: bool,
     latest_checkpoint: &mut Option<Vec<u8>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     fallback: impl Into<String>,
 ) -> String {
+    // Merely sending tool results does not prove Cursor committed them: the
+    // checkpoint already present when they were submitted may describe the
+    // pre-tool state. Only a newer checkpoint observed after submission is a
+    // safe dedupe boundary for a retry that must not replay completed tools.
+    if retain_completed_tool_checkpoint {
+        if post_tool_checkpoint_confirmed
+            && !saw_text
+            && pending_empty
+            && latest_checkpoint.is_some()
+        {
+            return format!("{EMPTY_TURN_RETRY_NOTE} ({EMPTY_TURN_CHECKPOINT_RETRY_NOTE})");
+        }
+        // Results may already have crossed the upstream boundary. Without a
+        // post-submit checkpoint, neither resetting nor replaying is safe.
+        return fallback.into();
+    }
     // A hollow ResumeAction that never exposed assistant text or tools can be
     // retried on a fresh Cursor conversation. Thinking-only frames must not
     // 409 grok-build; 409 is fail-closed only when retrying could duplicate
@@ -3111,6 +3350,7 @@ fn is_local_live_overload(err: &CursorError) -> bool {
     let message = err.client_message().to_ascii_lowercase();
     message.contains("cursor live generation concurrency saturated")
         || message.contains("cursor live open concurrency saturated")
+        || message.contains("cursor live generation admission queue timed out")
 }
 
 fn live_open_should_retry_http1(err: &CursorError) -> bool {
@@ -3379,7 +3619,7 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
     {
         return false;
     }
-    if text.contains("concurrency saturated") || err.message.contains("concurrency saturated") {
+    if is_local_live_overload(err) {
         return false;
     }
     if is_initial_bidiappend_timeout(err) {
@@ -3529,7 +3769,6 @@ fn live_reconnect_skip_reason(
 }
 
 /// Full jitter from attempt 1: sleep ∈ [0, min(8s, 1s×2^(n-1), remaining/2)].
-/// Hollow (HTTP 200 then zero-byte RST) retries stay at 0ms.
 fn live_reconnect_backoff_ceiling_ms(attempt: u32, remaining_ms: u64) -> u64 {
     if attempt == 0 || remaining_ms == 0 {
         return 0;
@@ -3541,10 +3780,7 @@ fn live_reconnect_backoff_ceiling_ms(attempt: u32, remaining_ms: u64) -> u64 {
         .min(remaining_ms / 2)
 }
 
-fn live_reconnect_backoff_ms_for(attempt: u32, hollow: bool, remaining_ms: u64) -> u64 {
-    if hollow {
-        return 0;
-    }
+fn live_reconnect_backoff_ms_for(attempt: u32, remaining_ms: u64) -> u64 {
     let ceiling = live_reconnect_backoff_ceiling_ms(attempt, remaining_ms);
     if ceiling == 0 {
         return 0;
@@ -3745,7 +3981,6 @@ async fn try_live_reconnect(
 
     let mut closed_collecting = false;
     let mut last_fail: Option<String> = None;
-    reconnect.recovery.note_delayed_hollow_if_probation();
     reconnect.recovery.begin(Instant::now());
     loop {
         if cancel_requested.load(Ordering::Acquire) {
@@ -3856,11 +4091,7 @@ async fn try_live_reconnect(
             .remaining(Instant::now(), reconnect.force_http1)
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let delay_ms = live_reconnect_backoff_ms_for(
-            *reconnect_attempts,
-            reconnect.recovery.last_was_hollow,
-            remaining_ms,
-        );
+        let delay_ms = live_reconnect_backoff_ms_for(*reconnect_attempts, remaining_ms);
         if delay_ms > 0 {
             tokio::select! {
                 _ = wait_for_live_cancel(cancel_requested) => {
@@ -3872,9 +4103,72 @@ async fn try_live_reconnect(
                 _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
             }
         }
-        reconnect.recovery.last_was_hollow = false;
+        let now = Instant::now();
+        let recovery_gate_wait = hard_deadline
+            .saturating_duration_since(now)
+            .min(reconnect.recovery.remaining(now, reconnect.force_http1));
+        if recovery_gate_wait.is_zero() {
+            let outcome = LiveReconnectOutcome::Failed(
+                last_fail.unwrap_or_else(|| "recovery deadline exhausted".into()),
+            );
+            log_live_reconnect(
+                &outcome,
+                *reconnect_attempts,
+                max_reconnects,
+                &reconnect.http,
+                &reconnect.last_trigger,
+            );
+            return outcome;
+        }
+        let recovery_open = Arc::clone(&reconnect.recovery_open_gate).acquire_owned();
+        let _recovery_open_permit = tokio::select! {
+            _ = wait_for_live_cancel(cancel_requested) => {
+                return reconnect_cancelled_ambiguous(
+                    terminal_error,
+                    "recovery while waiting for transport-open capacity",
+                );
+            }
+            result = tokio::time::timeout(recovery_gate_wait, recovery_open) => {
+                match result {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        let outcome =
+                            LiveReconnectOutcome::Failed("recovery open gate closed".into());
+                        log_live_reconnect(
+                            &outcome,
+                            *reconnect_attempts,
+                            max_reconnects,
+                            &reconnect.http,
+                            &reconnect.last_trigger,
+                        );
+                        return outcome;
+                    }
+                    Err(_) => {
+                        let outcome = LiveReconnectOutcome::Failed(
+                            last_fail.unwrap_or_else(|| {
+                                "recovery deadline exhausted while waiting for transport-open capacity"
+                                    .into()
+                            }),
+                        );
+                        log_live_reconnect(
+                            &outcome,
+                            *reconnect_attempts,
+                            max_reconnects,
+                            &reconnect.http,
+                            &reconnect.last_trigger,
+                        );
+                        return outcome;
+                    }
+                }
+            }
+        };
+        let base_url = reconnect.http.base_url.clone();
         reconnect.http =
             CursorHttpClient::with_prefer_http1(reconnect_prefers_http1(reconnect.force_http1));
+        // A recovery episode must stay on the endpoint selected when the Run
+        // started. Re-reading a changed environment here can silently move an
+        // accepted conversation to a different upstream.
+        reconnect.http.base_url = base_url;
 
         let cont = super::conversation::RunContinuation {
             conversation_id: reconnect.conversation_id.clone(),
@@ -4039,7 +4333,6 @@ async fn try_live_reconnect(
                     }
                     Err(msg) => {
                         last_fail = Some(msg.clone());
-                        reconnect.recovery.last_was_hollow = true;
                         record_transport_failure(reconnect, Instant::now());
                         match live_reconnect_on_hollow_body(
                             reconnect.force_http1,
@@ -4263,9 +4556,36 @@ async fn control_close_collecting_natives(
     Ok(all_ok)
 }
 
+#[derive(Debug, Default)]
+struct PostToolCheckpointEvidence {
+    baseline: Option<Vec<u8>>,
+    submitted: bool,
+    confirmed: bool,
+}
+
+impl PostToolCheckpointEvidence {
+    fn begin(baseline: Option<Vec<u8>>) -> Self {
+        Self {
+            baseline,
+            submitted: true,
+            confirmed: false,
+        }
+    }
+
+    fn observe_checkpoint(&mut self, user_prompt: &str, checkpoint: &[u8]) {
+        if self.submitted
+            && user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT
+            && self.baseline.as_deref() != Some(checkpoint)
+        {
+            self.confirmed = true;
+        }
+    }
+}
+
 struct LiveTurnCtx<'a> {
     session_id: &'a str,
     user_prompt: &'a str,
+    post_tool_checkpoint: &'a mut PostToolCheckpointEvidence,
     request_context: &'a RequestContext,
     decode_failures: &'a mut u32,
     coalescer: &'a mut LiveDeltaCoalescer,
@@ -4308,6 +4628,8 @@ async fn drive_live_run(
     let mut decoder = ConnectFrameDecoder::new();
     let mut kv_blobs = seeded_blobs;
     let mut latest_checkpoint = reconnect.opening_checkpoint.clone();
+    let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
+    let mut prefetched_upstream = VecDeque::<Result<Option<Bytes>, String>>::new();
     let mut cancel_ack = None;
     let mut was_cancelled = false;
     let mut saw_text = false;
@@ -4381,11 +4703,12 @@ async fn drive_live_run(
                 let mut turn = LiveTurnCtx {
                     session_id: &session_id,
                     user_prompt: &user_prompt,
+                    post_tool_checkpoint: &mut post_tool_checkpoint,
                     request_context: &request_context,
                     decode_failures: &mut decode_failures,
                     coalescer: &mut coalescer,
                 };
-                if !process_live_frame(
+                let frame_kept_running = process_live_frame(
                     frame,
                     &outbound,
                     &mut sink,
@@ -4404,8 +4727,8 @@ async fn drive_live_run(
                     &mut xml_parser,
                     Some(&mut turn),
                 )
-                .await
-                {
+                .await;
+                if !frame_kept_running {
                     keep_running = false;
                     break;
                 }
@@ -4490,6 +4813,8 @@ async fn drive_live_run(
                 &session_id,
                 saw_text,
                 pending.is_empty(),
+                user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                post_tool_checkpoint.confirmed,
                 &mut latest_checkpoint,
                 &mut kv_blobs,
                 "Cursor resume produced no progress before the recovery deadline",
@@ -4587,6 +4912,8 @@ async fn drive_live_run(
                     &session_id,
                     saw_text,
                     pending.is_empty(),
+                    user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                    post_tool_checkpoint.confirmed,
                     &mut latest_checkpoint,
                     &mut kv_blobs,
                     fallback,
@@ -4712,6 +5039,60 @@ async fn drive_live_run(
                         // replaying Anthropic history and executing the tools
                         // again.
                         user_prompt = EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT.to_string();
+                        // The command arm is biased. Absorb already-queued
+                        // upstream bytes before snapshotting the baseline, or a
+                        // pre-submit checkpoint can later look like post-tool
+                        // proof.
+                        loop {
+                            match upstream.try_recv() {
+                                Ok(Ok(Some(chunk))) => {
+                                    let frames = match decoder.push(&chunk) {
+                                        Ok(frames) => frames,
+                                        Err(error) => {
+                                            report_terminal_error(
+                                                &mut sink,
+                                                &terminal_error,
+                                                format!("Cursor frame decode: {error}"),
+                                            )
+                                            .await;
+                                            break 'driver;
+                                        }
+                                    };
+                                    if let Some(error) = frames.iter().find_map(|frame| {
+                                        (frame.flags & FLAG_END != 0)
+                                            .then(|| parse_connect_error(&frame.payload))
+                                            .flatten()
+                                    }) {
+                                        let message = annotate_connect_end_error(
+                                            &session_id,
+                                            error,
+                                            Some((&mut latest_checkpoint, &mut kv_blobs)),
+                                        );
+                                        report_terminal_error(
+                                            &mut sink,
+                                            &terminal_error,
+                                            message,
+                                        )
+                                        .await;
+                                        break 'driver;
+                                    }
+                                    if !process_driver_frames!(frames) {
+                                        break 'driver;
+                                    }
+                                }
+                                Ok(other) => {
+                                    prefetched_upstream.push_back(other);
+                                    break;
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    prefetched_upstream.push_back(Ok(None));
+                                    break;
+                                }
+                            }
+                        }
+                        post_tool_checkpoint =
+                            PostToolCheckpointEvidence::begin(latest_checkpoint.clone());
                         logical_tools_waiting.clear();
                         last_progress = Instant::now();
                         last_liveness = last_progress;
@@ -4921,7 +5302,13 @@ async fn drive_live_run(
             // Prefer draining Cursor InteractionUpdates (thinking/text) over
             // keepalive ticks whenever both are ready — max-effort thinking
             // should not wait behind a heartbeat interval edge.
-            item = upstream.recv() => {
+            item = async {
+                if let Some(item) = prefetched_upstream.pop_front() {
+                    Some(item)
+                } else {
+                    upstream.recv().await
+                }
+            } => {
                 match item {
                     Some(Ok(Some(chunk))) => {
                         last_liveness = Instant::now();
@@ -5181,6 +5568,8 @@ async fn drive_live_run(
                                 &session_id,
                                 saw_text,
                                 pending.is_empty(),
+                                user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                                post_tool_checkpoint.confirmed,
                                 &mut latest_checkpoint,
                                 &mut kv_blobs,
                                 fallback,
@@ -5250,6 +5639,8 @@ async fn drive_live_run(
                             &session_id,
                             saw_text,
                             pending.is_empty(),
+                            user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                            post_tool_checkpoint.confirmed,
                             &mut latest_checkpoint,
                             &mut kv_blobs,
                             fallback,
@@ -5463,6 +5854,9 @@ async fn process_live_frame(
             terminal_error,
             allowed_tool_names,
             turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
+            turn_ctx
+                .as_ref()
+                .is_some_and(|ctx| ctx.post_tool_checkpoint.confirmed),
             turn_ctx.as_ref().map(|ctx| ctx.session_id),
             latest_checkpoint,
             kv_blobs,
@@ -5517,6 +5911,10 @@ async fn process_live_frame(
 
     if let Some(checkpoint) = message.conversation_checkpoint_update {
         if !checkpoint.is_empty() {
+            if let Some(ctx) = turn_ctx.as_deref_mut() {
+                ctx.post_tool_checkpoint
+                    .observe_checkpoint(ctx.user_prompt, &checkpoint);
+            }
             *latest_checkpoint = Some(checkpoint);
         }
         return true;
@@ -6095,6 +6493,9 @@ async fn process_interaction_update(
             terminal_error,
             allowed_tool_names,
             turn_ctx.as_ref().map(|ctx| ctx.user_prompt).unwrap_or(""),
+            turn_ctx
+                .as_ref()
+                .is_some_and(|ctx| ctx.post_tool_checkpoint.confirmed),
             turn_ctx.as_ref().map(|ctx| ctx.session_id),
             latest_checkpoint,
             kv_blobs,
@@ -6146,6 +6547,7 @@ async fn recover_empty_turn_if_needed(
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
     allowed_tool_names: Option<&BTreeSet<String>>,
     user_prompt: &str,
+    post_tool_checkpoint_confirmed: bool,
     session_id: Option<&str>,
     latest_checkpoint: &mut Option<Vec<u8>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -6154,17 +6556,19 @@ async fn recover_empty_turn_if_needed(
     if *saw_text || sink.is_none() {
         return true;
     }
-    if user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT && latest_checkpoint.is_some() {
-        let mut fields = serde_json::Map::new();
-        fields.insert("reason".into(), serde_json::json!(reason));
-        fields.insert("recovery".into(), serde_json::json!("checkpoint_continue"));
-        crate::logging::create_logger("cursor").warn("empty_turn_retry", Some(fields));
-        report_terminal_error(
-            sink,
-            terminal_error,
-            format!("{EMPTY_TURN_RETRY_NOTE} ({EMPTY_TURN_CHECKPOINT_RETRY_NOTE})"),
-        )
-        .await;
+    if user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT {
+        let message = if post_tool_checkpoint_confirmed && latest_checkpoint.is_some() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("reason".into(), serde_json::json!(reason));
+            fields.insert("recovery".into(), serde_json::json!("checkpoint_continue"));
+            crate::logging::create_logger("cursor").warn("empty_turn_retry", Some(fields));
+            format!("{EMPTY_TURN_RETRY_NOTE} ({EMPTY_TURN_CHECKPOINT_RETRY_NOTE})")
+        } else {
+            "Cursor produced an empty turn after tool results without a newer checkpoint; \
+             acceptance is ambiguous"
+                .to_string()
+        };
+        report_terminal_error(sink, terminal_error, message).await;
         return false;
     }
     // Claude Code `Workflow` only. grok-cli advertises lowercase `workflow`
@@ -7594,6 +7998,7 @@ mod tests {
     fn test_reconnect_context() -> LiveReconnectContext {
         LiveReconnectContext {
             http: CursorHttpClient::new(),
+            recovery_open_gate: Arc::clone(&LIVE_RECOVERY_OPEN_GATE),
             token: "test-token".into(),
             identity: LiveIdentityHeaders {
                 client_type: "cli".into(),
@@ -7617,12 +8022,12 @@ mod tests {
     }
 
     fn test_generation_permit() -> LiveGenerationPermit {
-        LiveGenerationPermit
+        LiveGenerationPermit::default()
     }
 
     #[test]
     fn generation_permit_releases_between_segments_before_native_batch_exposure() {
-        let mut generation_permit = Some(LiveGenerationPermit);
+        let mut generation_permit = Some(LiveGenerationPermit::default());
         let mut pending = PendingExecState::for_run("between-segments-run");
         assert!(pending.queue(pending_exec(1, "read-call"), Duration::from_secs(30)));
         assert!(
@@ -7641,7 +8046,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_permit_releases_after_native_tool_handoff() {
-        let generation_permit = LiveGenerationPermit;
+        let generation_permit = LiveGenerationPermit::default();
         let (upstream_tx, upstream_rx) = mpsc::channel(4);
         let (request_tx, _request_rx) = mpsc::channel(8);
         let (command_tx, command_rx) = mpsc::channel(4);
@@ -7713,7 +8118,7 @@ mod tests {
             1
         );
 
-        let resume_generation_permit = LiveGenerationPermit;
+        let resume_generation_permit = LiveGenerationPermit::default();
         let (resume_sink, _resume_events) = mpsc::channel(8);
         let (ack_tx, ack_rx) = oneshot::channel();
         command_tx
@@ -7977,8 +8382,12 @@ mod tests {
     }
 
     #[test]
-    fn initial_h2_open_fails_fast_http1_keeps_upload_budget() {
-        assert_eq!(LIVE_H2_OPEN_ATTEMPT.as_secs(), 20);
+    fn initial_h2_open_waits_for_cursor_under_fanout() {
+        assert_eq!(
+            LIVE_H2_OPEN_ATTEMPT.as_secs(),
+            90,
+            "a proxy-local 20s deadline must not cut off Cursor's upstream queue"
+        );
         assert_eq!(LIVE_H1_OPEN_ATTEMPT.as_secs(), 90);
     }
 
@@ -8213,6 +8622,8 @@ mod tests {
             session_id,
             false,
             true,
+            false,
+            false,
             &mut latest_checkpoint,
             &mut kv_blobs,
             "Cursor resume produced no progress before the recovery deadline",
@@ -8242,13 +8653,20 @@ mod tests {
             super::super::conversation::continuation_for(Some(session_id)).conversation_id;
         let fallback = "Cursor resume produced no progress before the recovery deadline";
 
-        for (saw_text, pending_empty) in [(true, true), (false, false)] {
+        for (saw_text, pending_empty, retain_checkpoint, checkpoint_confirmed) in [
+            (true, true, false, false),
+            (false, false, false, false),
+            (true, true, true, true),
+            (false, false, true, true),
+        ] {
             let mut latest_checkpoint = Some(vec![0x08, 0x01]);
             let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
             let message = hollow_resume_terminal_message(
                 session_id,
                 saw_text,
                 pending_empty,
+                retain_checkpoint,
+                checkpoint_confirmed,
                 &mut latest_checkpoint,
                 &mut kv_blobs,
                 fallback,
@@ -8288,6 +8706,8 @@ mod tests {
             session_id,
             false,
             true,
+            false,
+            false,
             &mut latest_checkpoint,
             &mut kv_blobs,
             "Cursor resume produced no progress before the recovery deadline",
@@ -8302,6 +8722,128 @@ mod tests {
         assert_ne!(
             super::super::conversation::continuation_for(Some(session_id)).conversation_id,
             original
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn probation_expiry_after_tool_results_without_new_checkpoint_stays_ambiguous() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-probation-after-tool-results";
+        let checkpoint = vec![0x08, 0x01];
+        let blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, checkpoint.clone());
+        super::super::conversation::merge_blobs(session_id, &blobs);
+
+        let (_upstream_tx, upstream_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _events) = mpsc::channel(4);
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let mut reconnect = test_reconnect_context();
+        reconnect.session_id = session_id.into();
+        reconnect.conversation_id = original.clone();
+        reconnect.opening_checkpoint = Some(checkpoint);
+        reconnect.recovery = LiveRecoveryEpisode {
+            started: Some(Instant::now() - LIVE_RECOVERY_DEADLINE),
+            on_probation: true,
+            ..LiveRecoveryEpisode::default()
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drive_live_run(
+                upstream_rx,
+                mpsc::channel(1).0,
+                tokio::spawn(std::future::pending::<()>()),
+                ClientOutbound::Bidi(request_tx),
+                command_rx,
+                event_tx,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::clone(&terminal_error),
+                completed,
+                cancel_requested,
+                None,
+                session_id.into(),
+                "probation-after-tool-results-run".into(),
+                blobs.clone(),
+                EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT.into(),
+                RequestContext::default(),
+                reconnect,
+                test_generation_permit(),
+            ),
+        )
+        .await
+        .expect("expired probation must terminate immediately");
+
+        let message = terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .expect("probation expiry must store a terminal outcome")
+            .message
+            .clone();
+        assert!(
+            terminal_error_is_ambiguous_accept(&message),
+            "a pre-tool checkpoint cannot prove Cursor accepted the tool results: {message}"
+        );
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            409
+        );
+        let retained = super::super::conversation::continuation_for(Some(session_id));
+        assert_eq!(retained.conversation_id, original);
+        assert!(retained.has_checkpoint);
+        assert_eq!(
+            retained.pre_fetched_blobs,
+            blobs.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hollow_resume_after_confirmed_post_tool_checkpoint_is_retryable() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-confirmed-post-tool-checkpoint";
+        let checkpoint = vec![0x08, 0x02];
+        let blobs = HashMap::from([(vec![0xaa], vec![0xcc])]);
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, checkpoint.clone());
+        super::super::conversation::merge_blobs(session_id, &blobs);
+        let mut latest_checkpoint = Some(checkpoint);
+        let mut kv_blobs = blobs.clone();
+
+        let message = hollow_resume_terminal_message(
+            session_id,
+            false,
+            true,
+            true,
+            true,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+            "Cursor resume produced no progress before the recovery deadline",
+        );
+
+        assert!(
+            message.contains(EMPTY_TURN_CHECKPOINT_RETRY_NOTE),
+            "{message}"
+        );
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            502
+        );
+        let retained = super::super::conversation::continuation_for(Some(session_id));
+        assert_eq!(retained.conversation_id, original);
+        assert!(retained.has_checkpoint);
+        assert_eq!(
+            retained.pre_fetched_blobs,
+            blobs.into_iter().collect::<Vec<_>>()
         );
     }
 
@@ -8651,6 +9193,95 @@ mod tests {
         assert!(stored.contains("ambiguous"), "{stored}");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_open_wave_is_bounded_process_wide() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled H2 server");
+        let address = listener.local_addr().expect("server address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.expect("accept H2 reconnect");
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+
+        let recovery_open_gate = Arc::new(Semaphore::new(4));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let mut reconnects = Vec::new();
+        for index in 0..8u8 {
+            let cancel_requested = Arc::clone(&cancel_requested);
+            let recovery_open_gate = Arc::clone(&recovery_open_gate);
+            reconnects.push(tokio::spawn(async move {
+                let mut reconnect = test_reconnect_context();
+                reconnect.http.base_url = format!("http://{address}");
+                reconnect.recovery_open_gate = recovery_open_gate;
+                reconnect.session_id = format!("reconnect-wave-{index}");
+                reconnect.conversation_id = Some(format!("conversation-{index}"));
+                reconnect.opening_checkpoint = Some(vec![0x08, index]);
+                let (request_tx, _request_rx) = mpsc::channel(1);
+                let mut outbound = ClientOutbound::Bidi(request_tx);
+                let (upstream_tx, mut upstream) = mpsc::channel(1);
+                let mut driver_upstream_tx = upstream_tx;
+                let mut upstream_pump = tokio::spawn(std::future::pending::<()>());
+                let terminal_error = Arc::new(Mutex::new(None));
+                let mut decoder = ConnectFrameDecoder::new();
+                let latest_checkpoint = Some(vec![0x08, index]);
+                let mut pending = PendingExecState::default();
+                let mut reconnect_attempts = 0;
+                let mut last_progress = Instant::now();
+                let mut resume_grace_until = None;
+                try_live_reconnect(
+                    &mut reconnect,
+                    &mut outbound,
+                    &mut upstream,
+                    &mut driver_upstream_tx,
+                    &mut upstream_pump,
+                    cancel_requested.as_ref(),
+                    &terminal_error,
+                    &mut decoder,
+                    &latest_checkpoint,
+                    &HashMap::new(),
+                    &mut pending,
+                    &mut reconnect_attempts,
+                    10,
+                    &mut last_progress,
+                    &mut resume_grace_until,
+                    Duration::from_secs(1),
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while accepted.load(Ordering::SeqCst) < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("four reconnect opens must reach the local gate");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let opened = accepted.load(Ordering::SeqCst);
+        assert_eq!(
+            opened, 4,
+            "a shared H2 failure must hold later opens behind the process gate"
+        );
+
+        cancel_requested.store(true, Ordering::Release);
+        for reconnect in reconnects {
+            let _ = tokio::time::timeout(Duration::from_secs(1), reconnect).await;
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn reconnect_open_does_not_h1_fallback_inside_one_send() {
         let ctx = test_reconnect_context();
@@ -8745,10 +9376,8 @@ mod tests {
             400,
             "sleep at most half the remaining recovery window"
         );
-        assert_eq!(live_reconnect_backoff_ms_for(10, true, u64::MAX), 0);
-
         let samples: Vec<u64> = (0..40)
-            .map(|_| live_reconnect_backoff_ms_for(1, false, u64::MAX))
+            .map(|_| live_reconnect_backoff_ms_for(1, u64::MAX))
             .collect();
         assert!(
             samples.iter().all(|&ms| ms <= 1_000),
@@ -8759,7 +9388,7 @@ mod tests {
             "attempt 1 must not stay at 0ms or reconnect storms collide: {samples:?}"
         );
         for _ in 0..20 {
-            let ms = live_reconnect_backoff_ms_for(2, false, u64::MAX);
+            let ms = live_reconnect_backoff_ms_for(2, u64::MAX);
             assert!(ms <= 2_000, "{ms}");
         }
     }
@@ -8866,18 +9495,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_generation_admission_never_invents_a_rate_limit() {
-        let mut tasks = Vec::new();
-        for _ in 0..64 {
-            tasks.push(tokio::spawn(async {
-                acquire_live_generation_permit(None)
-                    .await
-                    .expect("upstream Cursor is the only concurrency owner")
-            }));
+    async fn local_generation_admission_queues_above_normal_grok_fanout() {
+        const NORMAL_GROK_FANOUT: usize = 32;
+        let gate = LiveGenerationGate::new(NORMAL_GROK_FANOUT, 4);
+        let mut permits = Vec::with_capacity(NORMAL_GROK_FANOUT);
+        for _ in 0..NORMAL_GROK_FANOUT {
+            permits.push(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    gate.acquire_start(None, Duration::from_secs(1)),
+                )
+                .await
+                .expect("normal Grok fanout must not queue")
+                .expect("normal Grok fanout must be admitted"),
+            );
         }
-        for task in tasks {
-            task.await.expect("fanout task");
-        }
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                gate.acquire_start(None, Duration::from_secs(1))
+            )
+            .await
+            .is_err(),
+            "the 33rd generation must queue instead of joining an unbounded upstream wave"
+        );
+
+        drop(permits.pop());
+        let replacement = tokio::time::timeout(
+            Duration::from_secs(1),
+            gate.acquire_start(None, Duration::from_secs(1)),
+        )
+        .await
+        .expect("a released generation slot must wake one waiter")
+        .expect("a released generation slot must be reusable");
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn local_generation_queue_timeout_is_retryable_503_without_tombstone() {
+        let gate = LiveGenerationGate::new(1, 1);
+        let _held = gate
+            .acquire_start(None, Duration::from_secs(1))
+            .await
+            .expect("first generation permit");
+        let error = gate
+            .acquire_start(None, Duration::from_millis(10))
+            .await
+            .expect_err("second generation must time out while capacity is held");
+
+        assert_eq!(error.status, 503);
+        assert!(matches!(
+            error.retry_after.as_deref(),
+            Some("1" | "2" | "3")
+        ));
+        assert!(is_local_live_overload(&error));
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&error),
+            "the bounded local queue must return control to the HTTP client instead of looping internally"
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&error),
+            "local admission never crossed Cursor's acceptance boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_admission_uses_capacity_reserved_from_new_starts() {
+        let gate = LiveGenerationGate::new(2, 1);
+        let _first = gate
+            .acquire_start(None, Duration::from_secs(1))
+            .await
+            .expect("first start");
+        let _second = gate
+            .acquire_start(None, Duration::from_secs(1))
+            .await
+            .expect("second start");
+
+        let _resume = gate
+            .acquire_resume(Duration::from_millis(50))
+            .await
+            .expect("a paused Run must be able to resume while new-start capacity is full");
+        assert!(
+            gate.acquire_start(None, Duration::from_millis(10))
+                .await
+                .is_err(),
+            "reserved resume capacity must not admit an extra new Run"
+        );
+    }
+
+    #[test]
+    fn generation_admission_defaults_cover_normal_fanout_and_bound_configuration() {
+        assert_eq!(
+            live_generation_concurrency_max(None),
+            LIVE_GENERATION_DEFAULT_MAX
+        );
+        assert_eq!(live_generation_concurrency_max(Some("0")), 32);
+        assert_eq!(live_generation_concurrency_max(Some("999")), 128);
+        assert_eq!(
+            live_generation_queue_secs(None),
+            LIVE_GENERATION_DEFAULT_QUEUE_SECS
+        );
+        assert_eq!(live_generation_queue_secs(Some("999")), 300);
+        assert_eq!(live_generation_resume_reserve(None), 4);
+        assert_eq!(live_generation_resume_reserve(Some("0")), 0);
+        assert_eq!(live_generation_resume_reserve(Some("999")), 16);
+        assert_eq!(live_recovery_open_max(None), 4);
+        assert_eq!(live_recovery_open_max(Some("999")), 16);
     }
 
     #[test]
@@ -8937,21 +9661,6 @@ mod tests {
         assert_eq!(
             episode.skip_reason(now, true),
             Some("recovery deadline exhausted")
-        );
-    }
-
-    #[test]
-    fn delayed_hollow_eof_keeps_hollow_flag_across_resume_attempts() {
-        let mut episode = LiveRecoveryEpisode {
-            on_probation: true,
-            ..LiveRecoveryEpisode::default()
-        };
-        episode.note_delayed_hollow_if_probation();
-        assert!(episode.last_was_hollow);
-        assert!(!episode.on_probation);
-        assert_eq!(
-            live_reconnect_backoff_ms_for(8, episode.last_was_hollow, u64::MAX),
-            0
         );
     }
 
@@ -9272,9 +9981,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id,
             user_prompt: "continue",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -10480,20 +11191,31 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_uncommitted_reservation_seals_ambiguous() {
+    fn dropping_a_pre_dispatch_reservation_releases_the_slot() {
         let _registry = lock_live_registry_for_test();
-        let session = format!("drop-seal-{}", uuid::Uuid::new_v4());
+        let session = format!("drop-before-dispatch-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         drop(reservation);
         assert!(
-            LiveRunRegistry::is_ambiguous_run(&session, None),
-            "dropping a Starting reservation must not free the slot"
+            !LiveRunRegistry::is_occupied(&session),
+            "cancelling while queued locally must not create an ambiguous upstream tombstone"
         );
-        assert!(matches!(
-            LiveRunRegistry::try_claim_run(&session, None),
-            LiveSlotClaim::Ambiguous
-        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn dropping_a_dispatched_reservation_seals_ambiguous() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("drop-after-dispatch-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.protect_on_drop();
+        drop(reservation);
+        assert!(
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "once an upstream open can have been accepted, cancellation must seal the slot"
+        );
         LiveRunRegistry::clear();
     }
 
@@ -10631,6 +11353,26 @@ mod tests {
     }
 
     #[test]
+    fn stale_generation_claim_cannot_clear_an_ambiguous_tombstone() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("stale-claim-amb-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .seal_ambiguous(Instant::now() + Duration::from_secs(60));
+
+        assert!(matches!(
+            LiveRunRegistry::claim_replacement_for_run(&session, None, "stale-generation"),
+            LiveReplacementClaim::Conflict
+        ));
+        assert!(
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "a stale waiter must not erase a newer ambiguous open"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
     fn insert_adopts_a_vacant_slot_after_starting_was_removed() {
         let _registry = lock_live_registry_for_test();
         let session = format!("insert-adopt-{}", uuid::Uuid::new_v4());
@@ -10657,7 +11399,7 @@ mod tests {
             session_id: session.clone(),
             reservation_id: "stale".into(),
             committed: false,
-            seal_on_drop: false,
+            seal_on_drop: Arc::new(AtomicBool::new(false)),
             cancel,
         };
         assert!(
@@ -10796,7 +11538,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn ambiguous_start_remains_non_retryable_to_prevent_duplicate_execution() {
+    async fn later_start_against_ambiguous_slot_fails_closed_without_dispatch() {
         let _registry = lock_live_registry_for_test();
         let session = format!("ambiguous-start-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -10820,15 +11562,19 @@ mod tests {
             false,
         )
         .await
-        .expect_err("ambiguous acceptance must not be retried automatically");
+        .expect_err("an ambiguous occupant must keep the later POST local");
         assert_eq!(error.status, 409);
-        assert!(error.message.contains("duplicate execution"));
+        assert!(terminal_error_is_ambiguous_accept(&error.message));
+        assert!(
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "fail-closed ambiguity must not clear or replay the unresolved Run"
+        );
         LiveRunRegistry::clear();
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn tool_result_waiter_does_not_attach_to_a_replacement_run() {
+    async fn tool_result_waiter_retries_without_attaching_to_a_replacement_run() {
         let _registry = lock_live_registry_for_test();
         let session = format!("result-generation-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -10878,10 +11624,10 @@ mod tests {
         );
         let (outcome, ()) = tokio::join!(wait, replacement);
 
-        assert!(
-            matches!(outcome, super::super::LiveResumeOutcome::Conflict),
-            "an old result waiter must 409 when the registry generation changes"
-        );
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("an unsent stale result must fail closed when the registry generation changes");
+        };
+        assert_eq!(error.status, 409);
         LiveRunRegistry::clear();
     }
 
@@ -10937,7 +11683,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn stale_tool_result_waiter_for_different_starting_generation_stays_conflict() {
+    async fn stale_tool_result_waiter_for_different_starting_generation_fails_closed() {
         let _registry = lock_live_registry_for_test();
         let session = format!("stale-result-starting-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -10976,10 +11722,10 @@ mod tests {
         );
         let (outcome, ()) = tokio::join!(wait, running);
 
-        assert!(
-            matches!(outcome, super::super::LiveResumeOutcome::Conflict),
-            "a result for an unobserved generation must not attach to its replacement"
-        );
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("an unsent result for an unobserved generation must fail closed");
+        };
+        assert_eq!(error.status, 409);
         LiveRunRegistry::clear();
     }
 
@@ -11266,7 +12012,7 @@ mod tests {
             .insert(Arc::clone(&handle))
             .expect("insert");
         let LiveReplacementClaim::Reserved {
-            mut reservation,
+            reservation,
             superseded: Some(superseded),
         } = LiveRunRegistry::claim_replacement_for_run(&session, None, "amb-generation")
         else {
@@ -11303,7 +12049,7 @@ mod tests {
             .insert(Arc::clone(&handle))
             .expect("insert");
         let LiveReplacementClaim::Reserved {
-            mut reservation,
+            reservation,
             superseded: Some(superseded),
         } = LiveRunRegistry::claim_replacement_for_run(&session, None, "amb-tool-generation")
         else {
@@ -11331,7 +12077,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn fresh_request_cannot_clear_ambiguous_tombstone() {
+    async fn fresh_request_fails_closed_without_clearing_ambiguous_tombstone() {
         let _registry = lock_live_registry_for_test();
         let session = format!("amb-tombstone-compact-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -11361,10 +12107,10 @@ mod tests {
             true,
         )
         .await;
-        assert!(
-            matches!(outcome, super::super::LiveResumeOutcome::Conflict),
-            "a new POST must not replay a Run while prior acceptance is unresolved"
-        );
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("a new POST must fail closed while prior acceptance is unresolved");
+        };
+        assert_eq!(error.status, 409);
         assert!(
             LiveRunRegistry::is_ambiguous_run(&session, None),
             "the unresolved Run must remain sealed until its TTL"
@@ -11565,6 +12311,14 @@ mod tests {
             .expect("insert");
         LiveRunRegistry::seal_success_if(&session, "finished-generation");
         assert!(LiveRunRegistry::is_occupied(&session));
+        assert!(matches!(
+            LiveRunRegistry::claim_replacement_for_run(&session, None, "stale-generation"),
+            LiveReplacementClaim::Conflict
+        ));
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "a stale waiter must not clear a newer success tombstone"
+        );
 
         let LiveReplacementClaim::Reserved {
             reservation,
@@ -13199,9 +13953,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-ws",
             user_prompt: "search",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -13291,9 +14047,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-wrap",
             user_prompt: "fan-out",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -13771,9 +14529,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-task",
             user_prompt: "spawn a child",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -14500,9 +15260,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-sib",
             user_prompt: "spawn two",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -14596,9 +15358,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-xml-spawn",
             user_prompt: "spawn 64",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -14941,9 +15705,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-test",
             user_prompt: prompt,
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -15025,9 +15791,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id,
             user_prompt: "用 workflow 按原 nonce 一次扇出 64 人",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
@@ -15116,6 +15884,7 @@ mod tests {
                 "Continue from the completed tool results in this Cursor conversation. \
                  Produce the final answer requested by the user now. \
                  Do not repeat completed tool calls.",
+                true,
                 Some(session_id),
                 &mut latest_checkpoint,
                 &mut kv_blobs,
@@ -15144,6 +15913,219 @@ mod tests {
                 .pre_fetched_blobs
                 .contains(&(vec![0xcc], vec![0xdd]))
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_continue_without_post_tool_confirmation_fails_closed() {
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let mut sink = Some(event_tx);
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let checkpoint = vec![0x08, 0x01];
+        let mut latest_checkpoint = Some(checkpoint.clone());
+        let mut kv_blobs = HashMap::new();
+
+        assert!(
+            !recover_empty_turn_if_needed(
+                &mut saw_text,
+                &mut useful,
+                &mut sink,
+                &mut pending,
+                &pending_shared,
+                &terminal_error,
+                None,
+                EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                false,
+                Some("sess-unconfirmed-checkpoint"),
+                &mut latest_checkpoint,
+                &mut kv_blobs,
+                "turn_ended",
+            )
+            .await
+        );
+
+        let error = event_rx
+            .recv()
+            .await
+            .expect("fail-closed checkpoint error")
+            .expect_err("an unconfirmed post-tool checkpoint must not succeed");
+        assert!(terminal_error_is_ambiguous_accept(&error), "{error}");
+        assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 409);
+        assert_eq!(latest_checkpoint, Some(checkpoint));
+    }
+
+    async fn run_post_tool_checkpoint_scenario(
+        prefetch_before_resume: bool,
+        new_checkpoint_after_submit: bool,
+    ) -> String {
+        let (upstream_tx, upstream_rx) = mpsc::channel(8);
+        let (request_tx, mut request_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let completed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let mut reconnect = test_reconnect_context();
+        reconnect.opening_checkpoint = Some(vec![1_u8, 2, 3]);
+
+        let driver = tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::clone(&pending_shared),
+            Arc::clone(&terminal_error),
+            Arc::clone(&completed),
+            cancel_requested,
+            Some(BTreeSet::from(["Read".into()])),
+            "session-causal-checkpoint".into(),
+            "run-causal-checkpoint".into(),
+            HashMap::new(),
+            "read the file".into(),
+            RequestContext::default(),
+            reconnect,
+            test_generation_permit(),
+        ));
+
+        let mut tool_payload = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_message: Some(ExecServerMessage {
+                id: 1,
+                exec_id: Some("read-exec".into()),
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/input.txt".into(),
+                    tool_call_id: "read-call".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut tool_payload)
+        .expect("encode read tool");
+        upstream_tx
+            .send(Ok(Some(encode_connect_frame(tool_payload, 0))))
+            .await
+            .expect("send read tool");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("native tool was not exposed")
+            .expect("native tool event");
+        let tool_use_id = match event {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => tools[0].tool_use_id.clone(),
+            other => panic!("expected native tool batch, got {other:?}"),
+        };
+
+        if prefetch_before_resume {
+            let mut checkpoint_payload = Vec::new();
+            proto::AgentServerMessage {
+                conversation_checkpoint_update: Some(vec![4_u8, 5, 6]),
+                ..Default::default()
+            }
+            .encode(&mut checkpoint_payload)
+            .expect("encode prefetched checkpoint");
+            upstream_tx
+                .send(Ok(Some(encode_connect_frame(checkpoint_payload, 0))))
+                .await
+                .expect("queue pre-submit checkpoint");
+            tokio::task::yield_now().await;
+        }
+
+        let (resume_sink, _resume_events) = mpsc::channel(8);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        command_tx
+            .send(RunCommand::ResumeBatch {
+                tool_results: vec![(
+                    tool_use_id,
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )],
+                sink: resume_sink,
+                ack: ack_tx,
+                permit: LiveResumePermit {
+                    in_flight: Arc::new(AtomicBool::new(true)),
+                },
+                generation_permit: test_generation_permit(),
+                dispatch_state: Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING)),
+                accepted_fingerprint: None,
+            })
+            .await
+            .expect("dispatch resume");
+        ack_rx
+            .await
+            .expect("resume acknowledgement")
+            .expect("resume accepted");
+        tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("tool result was not submitted")
+            .expect("request stream remains open")
+            .expect("tool result frame");
+
+        let mut terminal_chunk = Vec::new();
+        if new_checkpoint_after_submit {
+            let mut checkpoint_payload = Vec::new();
+            proto::AgentServerMessage {
+                conversation_checkpoint_update: Some(vec![7_u8, 8, 9]),
+                ..Default::default()
+            }
+            .encode(&mut checkpoint_payload)
+            .expect("encode post-submit checkpoint");
+            terminal_chunk.extend_from_slice(&encode_connect_frame(checkpoint_payload, 0));
+        }
+        terminal_chunk.extend_from_slice(&encode_connect_frame(Vec::new(), FLAG_END));
+        upstream_tx
+            .send(Ok(Some(Bytes::from(terminal_chunk))))
+            .await
+            .expect("send checkpoint and end");
+
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver did not stop")
+            .expect("driver join");
+
+        let message = terminal_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("terminal outcome");
+        assert!(completed.load(Ordering::Acquire));
+        message
+    }
+
+    #[tokio::test]
+    async fn queued_checkpoint_before_tool_result_submit_is_absorbed_into_baseline() {
+        let message = run_post_tool_checkpoint_scenario(true, false).await;
+        assert!(
+            terminal_error_is_ambiguous_accept(&message),
+            "a pre-submit checkpoint must not later look like post-tool proof: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_checkpoint_after_tool_result_submit_allows_checkpoint_retry() {
+        let message = run_post_tool_checkpoint_scenario(false, true).await;
+        assert!(
+            message.contains(EMPTY_TURN_CHECKPOINT_RETRY_NOTE),
+            "{message}"
+        );
+        assert!(!terminal_error_is_ambiguous_accept(&message), "{message}");
+    }
+
+    #[test]
+    fn same_checkpoint_as_submit_baseline_is_not_post_tool_proof() {
+        let mut evidence = PostToolCheckpointEvidence::begin(Some(vec![1_u8]));
+        evidence.observe_checkpoint(EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, &[1_u8]);
+        assert!(!evidence.confirmed);
+        evidence.observe_checkpoint(EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, &[2_u8]);
+        assert!(evidence.confirmed);
     }
 
     #[tokio::test]
@@ -15506,9 +16488,11 @@ mod tests {
         let request_context = RequestContext::default();
         let mut decode_failures = 0;
         let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
         let mut turn = LiveTurnCtx {
             session_id: "sess-test",
             user_prompt: prompt,
+            post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,

@@ -235,6 +235,11 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | 开 | 设 `0` / `false` 可关闭 Keychain 回退 |
 | `CCP_CURSOR_EMBED_SYSTEM` | 关 | 把 Anthropic `system` 塞进 Cursor（可能触发 Fable 注入防御） |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | 关 | 强制倾倒全部 tools schema；BiDi 已默认保留 `Workflow`/`Skill` 等 |
+| `CCP_CURSOR_LIVE_CONCURRENCY` | `32` | 活跃 Cursor generation 的公平并发上限（1–128） |
+| `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | 本地准入最多等待多久后返回可重试 HTTP 503（1–300 秒） |
+| `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | 为暂停后需要提交工具结果的 Run 额外保留的容量（0–16） |
+| `CCP_CURSOR_H2_SHARDS` | `4` | 隔离并发 conversation 的稳定 H2 客户端池数量（1–16） |
+| `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `4` | 进程内同时打开 ResumeAction 替代连接的上限（1–16） |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `15` | 下游 keep-alive 间隔（秒） |
 | `CCP_CURSOR_NO_PROXY` | 关 | 对 Cursor API 跳过 HTTP(S)_PROXY（`1` / `true`） |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | 未设置 | 调试日志 |
@@ -281,11 +286,13 @@ claude-cursor-proxy cursor auth status
 | 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 | grok-build 在未付款账单或不支持的国家/区域时报 `Server error (500) - Something went wrong on our side` | 升级到 ≥0.1.47 并重启 serve。未付款是 HTTP 429 并带发票原文；地区限制是 HTTP 403 并带国家/区域原文。 |
 | grok-build 在 `Cursor live open timed out` 后报 `Server error (500)` / 重复开 Cursor Run | 升级到 ≥0.1.57 并重启 serve。没有响应、接受状态不明的 live open 会 fail-closed 为 HTTP 409；本地打开槽饱和改为带抖动的 HTTP 503。 |
-| Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。代理不再本地限制 live open 并发。 |
+| Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。 |
 | grok-build 报 `Conflict (409) - error sending request` / `live open timed out after 20s`，或 Claude Code 报 `Agent type 'gemini-3.6-flash-high' not found` | 升级到 ≥0.1.57 并重启 serve。只有可证明尚未连接的失败才会切换传输；没有响应的 send 不再重放。Agent/Task 的模型 slug 会改写成 `general-purpose`。 |
 | grok-build 把 `<tool_use>` / `<parameter>` XML 打到正文，或报 `Cursor auth failed: /usr/bin/security: Too many open files` | 升级到 ≥0.1.51 并重启 serve。带 named parameter 的 XML 会收成工具；XML `spawn_subagent` 等到 turn 结束再一批发出；serve 会抬高 macOS 256 文件上限。 |
 | grok-build 以 `Cursor finished this turn without text or tool calls` 莫名结束，或提示 `workflow` 被桥接拦截/改名 | 升级到 ≥0.1.52 并重启 serve。Cursor 空回合会重试，不再伪装成成功文本；畸形控制 XML 会被隔离；workflow/skill 保留客户端声明的精确大小写。 |
-| grok-build/Grok 4.6 扇出时大量子代理失败、重复执行已完成工具、卡住不返回 token，或报 `rate_limit_error: Cursor live generation concurrency saturated` | 升级到 ≥0.1.58 并重启 serve。代理不再自设 generation/open 闸门，并发完全交给 Cursor 上游。升级后请新开 Grok session。 |
+| grok-build/Grok 4.6 扇出时大量子代理失败、重复执行已完成工具、卡住不返回 token，或报 `rate_limit_error: Cursor live generation concurrency saturated` | 升级到 ≥0.1.60 并重启 serve。正常 32 路扇出直接准入，另为工具结果恢复保留 4 个槽位；溢出公平排队后返回可重试 503；conversation 分布到四个 H2 池，替代连接打开也有界。升级后请新开 Grok session。 |
+| grok-build 先报 `Conflict (409) - Cursor live open timed out after 20s`，随后大量 `A Cursor live run is already active` | 升级到 ≥0.1.60 并重启 serve。H2 首次打开等待 90 秒；能够确定只是 Starting/Running 的本地占用会返回 HTTP 503 + `Retry-After`。若无响应的 open 是否已被上游接受无法判断，仍会 fail-closed 为 409，避免重复创建 Run。升级后请新开 Grok session。 |
+| grok-build 在工具结果后报 `Conflict (409) - Cursor resume produced no progress before the recovery deadline` | 升级到 ≥0.1.60 并重启 serve。只有 Cursor 在收到这些工具结果后发出了更新的 checkpoint，且没有新文本/工具暴露给客户端，代理才会在不重放工具的前提下重试；没有这项证明时保留 409，因为自动重放可能重复执行。 |
 | Claude Code 的 Bash 标题是整段 `python3 -c` 脚本 | 升级到 ≥0.1.48 并重启 serve。Cursor Shell 没有 description，代理会补一行短标题。 |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 后台工具结果恢复前出现 `Stream idle timeout - no chunks received` | 升级到 ≥0.1.45 并重启 serve。live 工具结果在 HTTP 响应前的分类等待由 30 秒缩短到最多 5 秒；HTTP SSE 建立后仍会每 15 秒发送 Anthropic ping，保护长时间静默思考。 |

@@ -73,23 +73,64 @@ use crate::providers::cursor::tool_bridge::{
 // Provider
 // ---------------------------------------------------------------------------
 
-/// Process-wide HTTP client so TLS/H2 connections to api2.cursor.sh are reused
-/// across Claude Code turns. Rebuilds when `CCP_CURSOR_BASE_URL` changes (tests
-/// and mock upstreams flip this between runs).
-fn shared_cursor_http_client() -> CursorHttpClient {
+const CURSOR_HTTP_SHARDS_DEFAULT: usize = 4;
+const CURSOR_HTTP_SHARDS_MAX: usize = 16;
+
+struct SharedCursorHttpClients {
+    base_url: String,
+    clients: Vec<CursorHttpClient>,
+}
+
+fn cursor_http_shard_count(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CURSOR_HTTP_SHARDS_DEFAULT)
+        .min(CURSOR_HTTP_SHARDS_MAX)
+}
+
+fn cursor_http_shard_index(key: &str, shard_count: usize) -> usize {
+    // Stable FNV-1a keeps every conversation on one pool while UUIDv7 siblings
+    // spread by their random suffix. Avoid RandomState so retries cannot move
+    // between H2 failure domains within one process.
+    let hash = key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    (hash as usize) % shard_count.max(1)
+}
+
+/// Process-wide sharded HTTP clients reuse TLS/H2 connections without putting
+/// every concurrent Grok conversation on one H2 failure domain. Rebuilds when
+/// the base URL or configured shard count changes.
+fn shared_cursor_http_client(conversation_key: Option<&str>) -> CursorHttpClient {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<CursorHttpClient>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Option<SharedCursorHttpClients>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let base = crate::config::cursor_base_url();
+    let shard_count =
+        cursor_http_shard_count(std::env::var("CCP_CURSOR_H2_SHARDS").ok().as_deref());
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = guard.as_ref()
-        && existing.base_url() == base.as_str()
+        && existing.base_url == base
+        && existing.clients.len() == shard_count
     {
-        return existing.clone();
+        let index = conversation_key
+            .map(|key| cursor_http_shard_index(key, shard_count))
+            .unwrap_or(0);
+        return existing.clients[index].clone();
     }
-    let fresh = CursorHttpClient::new();
-    *guard = Some(fresh.clone());
-    fresh
+    let clients: Vec<_> = (0..shard_count).map(|_| CursorHttpClient::new()).collect();
+    let index = conversation_key
+        .map(|key| cursor_http_shard_index(key, shard_count))
+        .unwrap_or(0);
+    let selected = clients[index].clone();
+    *guard = Some(SharedCursorHttpClients {
+        base_url: base,
+        clients,
+    });
+    selected
 }
 
 const MAX_SESSION_USAGE: usize = 10_000;
@@ -330,13 +371,19 @@ fn live_run_busy_error() -> CursorError {
     error
 }
 
+fn live_ambiguous_accept_error() -> CursorError {
+    CursorError::new(
+        409,
+        "Cursor live run acceptance is ambiguous; retrying could duplicate execution",
+        None,
+    )
+}
+
 fn live_replacement_conflict_error(has_tool_results: bool) -> CursorError {
     if has_tool_results {
-        CursorError::new(
-            409,
-            "A Cursor live run is already active for this session",
-            None,
-        )
+        // Tool ids are scoped to one Run generation. Retrying after the slot
+        // changed could deliver stale results to a replacement Run.
+        live_ambiguous_accept_error()
     } else {
         live_run_busy_error()
     }
@@ -362,7 +409,7 @@ async fn start_live_events_with_retries(
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let mut transient_retries = 0_u32;
     loop {
-        let mut reservation = if let Some(reservation) = initial_reservation.take() {
+        let reservation = if let Some(reservation) = initial_reservation.take() {
             reservation
         } else {
             match LiveRunRegistry::try_claim_run(identity.session_id, identity.agent_id) {
@@ -375,19 +422,15 @@ async fn start_live_events_with_retries(
                     continue;
                 }
                 LiveSlotClaim::Ambiguous => {
-                    return Err(CursorError::new(
-                        409,
-                        "Cursor live run acceptance is ambiguous; retrying could duplicate execution",
-                        None,
-                    ));
+                    return Err(live_ambiguous_accept_error());
                 }
                 LiveSlotClaim::Running => return Err(live_run_busy_error()),
             }
         };
 
-        reservation.protect_on_drop();
+        let upstream_open_guard = reservation.upstream_open_guard();
         let start = match client
-            .start_live_agent_with_identity(
+            .start_live_agent_with_identity_guarded(
                 &token,
                 user_text,
                 model,
@@ -399,6 +442,7 @@ async fn start_live_events_with_retries(
                 request_context.clone(),
                 Some(&original_request_id),
                 Some(reservation.cancelled()),
+                Some(Arc::clone(&upstream_open_guard)),
             )
             .await
         {
@@ -407,7 +451,7 @@ async fn start_live_events_with_retries(
                 Ok(Some(refreshed)) => {
                     token = refreshed.access_token;
                     client
-                        .start_live_agent_with_identity(
+                        .start_live_agent_with_identity_guarded(
                             &token,
                             user_text,
                             model,
@@ -419,6 +463,7 @@ async fn start_live_events_with_retries(
                             request_context.clone(),
                             Some(&original_request_id),
                             Some(reservation.cancelled()),
+                            Some(upstream_open_guard),
                         )
                         .await
                 }
@@ -1094,7 +1139,8 @@ fn unresolved_live_tools_outcome(
 }
 
 /// Classify a slot that `get_run` hides. A dying Running generation is
-/// superseded. Ambiguous stays fail-closed until its TTL. A Succeeded
+/// superseded. Ambiguous stays occupied until its TTL and fails closed because
+/// retrying cannot prove whether the prior Run was accepted. A Succeeded
 /// tombstone with a *new* fingerprint is released so compact/next-turn can
 /// start. Starting and same-fingerprint Succeeded stay occupied.
 fn resume_when_slot_has_no_runnable_handle(
@@ -1110,7 +1156,7 @@ fn resume_when_slot_has_no_runnable_handle(
         return Some(LiveResumeOutcome::SupersedeRunning(run_id));
     }
     if LiveRunRegistry::is_ambiguous_run(session_id, agent_id) {
-        return Some(LiveResumeOutcome::Conflict);
+        return Some(LiveResumeOutcome::ResumeError(live_ambiguous_accept_error()));
     }
     LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
     if !LiveRunRegistry::is_occupied_run(session_id, agent_id) {
@@ -1216,16 +1262,18 @@ async fn await_live_run_resume_for_operation(
         }
         if observed_non_running_slot {
             // A Starting slot became Running. Tool-result waiters must not
-            // attach to a different generation. An identical request is the
-            // owner already starting above and was handled as retryable busy.
+            // attach to an unobserved generation. This waiter was never sent
+            // upstream, so shed it as retryable busy rather than fatal 409.
             if has_tool_results {
-                return LiveResumeOutcome::Conflict;
+                return LiveResumeOutcome::ResumeError(live_replacement_conflict_error(true));
             }
             return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
         }
         match observed_run_id.as_deref() {
             Some(observed) if observed != run.run_id() => {
-                return LiveResumeOutcome::Conflict;
+                return LiveResumeOutcome::ResumeError(live_replacement_conflict_error(
+                    has_tool_results,
+                ));
             }
             None => observed_run_id = Some(run.run_id().to_string()),
             _ => {}
@@ -1284,23 +1332,22 @@ async fn await_live_run_resume_for_operation(
         if let Some(run_id) = observed_run_id {
             return LiveResumeOutcome::SupersedeRunning(run_id);
         }
-        if !has_tool_results {
-            return LiveResumeOutcome::ResumeError(live_run_busy_error());
-        }
-        return LiveResumeOutcome::Conflict;
+        return LiveResumeOutcome::ResumeError(live_run_busy_error());
     };
     if run.request_fingerprint() == fingerprint {
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     }
     if observed_non_running_slot {
         if has_tool_results {
-            return LiveResumeOutcome::Conflict;
+            return LiveResumeOutcome::ResumeError(live_replacement_conflict_error(true));
         }
         return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
     }
     match observed_run_id.as_deref() {
         Some(observed) if observed != run.run_id() => {
-            return LiveResumeOutcome::Conflict;
+            return LiveResumeOutcome::ResumeError(live_replacement_conflict_error(
+                has_tool_results,
+            ));
         }
         None => observed_run_id = Some(run.run_id().to_string()),
         _ => {}
@@ -1369,6 +1416,17 @@ fn strip_cursor_run_generation(id: &str) -> &str {
     id.split("__cursor_run_").next().unwrap_or(id)
 }
 
+fn cursor_run_generation(id: &str) -> Option<&str> {
+    id.rsplit_once("__cursor_run_")
+        .map(|(_, generation)| generation)
+        .and_then(|generation| {
+            generation
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .next()
+        })
+        .filter(|generation| !generation.is_empty())
+}
+
 fn tool_id_match_tokens(id: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     for raw in id.split(|c: char| c.is_whitespace() || c == ',') {
@@ -1386,6 +1444,11 @@ fn tool_id_match_tokens(id: &str) -> Vec<&str> {
 }
 
 fn tool_use_ids_equivalent(left: &str, right: &str) -> bool {
+    match (cursor_run_generation(left), cursor_run_generation(right)) {
+        (Some(left), Some(right)) if left == right => {}
+        (None, None) => {}
+        _ => return false,
+    }
     let left_tokens = tool_id_match_tokens(left);
     let right_tokens = tool_id_match_tokens(right);
     left_tokens.iter().any(|left| {
@@ -1620,7 +1683,7 @@ impl Provider for CursorProvider {
                                     return map_cursor_error_to_response(&error);
                                 }
                                 LiveReplacementClaim::Reserved {
-                                    mut reservation,
+                                    reservation,
                                     superseded,
                                 } => {
                                     if let Some(handle) = superseded {
@@ -1773,7 +1836,7 @@ impl Provider for CursorProvider {
         let custom_system = parts.custom_system_prompt.as_deref();
         let user_text = parts.user_text.as_str();
 
-        let client = shared_cursor_http_client();
+        let client = shared_cursor_http_client(continuation_key.as_deref());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -2267,9 +2330,32 @@ mod tests {
     }
 
     #[test]
-    fn replacement_conflicts_retry_only_fresh_turns() {
+    fn local_replacement_conflicts_distinguish_fresh_prompts_from_tool_results() {
         assert_eq!(live_replacement_conflict_error(false).status, 503);
-        assert_eq!(live_replacement_conflict_error(true).status, 409);
+        assert_eq!(
+            live_replacement_conflict_error(true).status,
+            409,
+            "a stale tool-result POST must fail closed instead of rebinding to another Run"
+        );
+    }
+
+    #[test]
+    fn h2_shard_index_is_stable_and_spreads_nested_agent_keys() {
+        let key = "session::agent::agent-a";
+        assert_eq!(
+            cursor_http_shard_index(key, 4),
+            cursor_http_shard_index(key, 4),
+            "retries for one conversation must stay in the same H2 failure domain"
+        );
+
+        let shards = (0..32)
+            .map(|index| cursor_http_shard_index(&format!("session::agent::agent-{index}"), 4))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            shards.len(),
+            4,
+            "nested agents sharing a Claude session must fan out across all configured shards"
+        );
     }
 
     #[test]
@@ -2613,6 +2699,29 @@ mod tests {
             "a tool_result without tool_use_id is not an unrelated resume batch"
         );
         assert!(!request_has_current_tool_result(&empty_id));
+    }
+
+    #[test]
+    fn live_tool_result_never_crosses_cursor_run_generation() {
+        let pending_id = "recycled-id__cursor_run_generation-b";
+        let stale: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok-4.6-xhigh-fast",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "recycled-id__cursor_run_generation-a",
+                "content": "belongs to generation A"
+            }]}]
+        }))
+        .unwrap();
+
+        assert!(
+            collect_live_tool_results(&stale, &[pending(pending_id)]).is_err(),
+            "alias normalization must not strip the Run generation fence"
+        );
+        assert!(!tool_use_ids_equivalent(
+            pending_id,
+            "recycled-id__cursor_run_generation-a"
+        ));
     }
 
     #[test]

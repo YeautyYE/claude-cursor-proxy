@@ -2814,17 +2814,39 @@ fn bridge_shell_stream_result_has_correct_shape() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn cursor_live_generations_pass_through_without_local_limit() {
-    use axum::{Router, body::Body, response::Response, routing::post};
+// Normal Grok fanout must pass through, but not share one H2 failure domain.
+// Draining every request body is required to keep per-connection flow control
+// from starving later streams.
+#[tokio::test]
+async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
+    use axum::{
+        Router, body::Body, extract::ConnectInfo, http::Request, response::Response, routing::post,
+    };
     use bytes::Bytes;
     use claude_cursor_proxy::providers::cursor::connect::{FLAG_END, encode_connect_frame};
     use claude_cursor_proxy::providers::cursor::proto::*;
+    use futures_util::StreamExt;
     use prost::Message;
+    use std::collections::HashSet;
     use std::convert::Infallible;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
+
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     #[derive(Default)]
     struct HeldRuns {
@@ -2832,6 +2854,7 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
         active: AtomicUsize,
         peak: AtomicUsize,
         releases: Mutex<Vec<oneshot::Sender<()>>>,
+        peers: Mutex<HashSet<SocketAddr>>,
     }
 
     fn server_frame(message: AgentServerMessage) -> Bytes {
@@ -2888,57 +2911,94 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
         Bytes::from(bytes)
     }
 
-    async fn wait_for_accepted(held: &HeldRuns, expected: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    async fn wait_for_accepted(held: &HeldRuns, expected: usize) -> Result<(), usize> {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while held.accepted.load(Ordering::SeqCst) < expected {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "only {} Cursor runs reached the mock upstream; expected {expected}",
-                held.accepted.load(Ordering::SeqCst)
-            )
-        });
+        .map_err(|_| held.accepted.load(Ordering::SeqCst))
     }
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore_env = RestoreEnv(
+        [
+            "CCP_CURSOR_BASE_URL",
+            "CCP_CURSOR_AUTH_TOKEN",
+            "CCP_CURSOR_CLIENT_VERSION",
+            "CCP_CURSOR_BIDI",
+            "CCP_CURSOR_HEARTBEAT_SECS",
+            "CCP_CURSOR_LIVE_CONCURRENCY",
+            "CCP_CURSOR_LIVE_QUEUE_SECS",
+            "CCP_CURSOR_LIVE_RESUME_RESERVE",
+            "CCP_CURSOR_H2_SHARDS",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect(),
+    );
     let held = Arc::new(HeldRuns::default());
     let upstream_held = Arc::clone(&held);
-    let upstream_app = Router::new().fallback(post(move || {
-        let held = Arc::clone(&upstream_held);
-        async move {
-            held.accepted.fetch_add(1, Ordering::SeqCst);
-            let active = held.active.fetch_add(1, Ordering::SeqCst) + 1;
-            held.peak.fetch_max(active, Ordering::SeqCst);
-            let (release_tx, release_rx) = oneshot::channel();
-            held.releases
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(release_tx);
-            let body_held = Arc::clone(&held);
-            let response_stream = futures_util::stream::once(async move {
-                let _ = release_rx.await;
-                body_held.active.fetch_sub(1, Ordering::SeqCst);
-                Ok::<_, Infallible>(successful_turn_bytes())
-            });
-            Response::builder()
-                .status(200)
-                .header(
-                    axum::http::header::CONTENT_TYPE,
-                    "application/connect+proto",
-                )
-                .body(Body::from_stream(response_stream))
-                .unwrap()
-        }
-    }));
+    // Match the other live BiDi fixtures: Connect H2 prior-knowledge hits
+    // `/agent.v1.AgentService/Run`. A method-filtered `fallback(post)` never
+    // sees those streams, so this contract used to time out at 0 accepts.
+    let upstream_app = Router::new().route(
+        "/agent.v1.AgentService/Run",
+        post(move |request: Request<Body>| {
+            let held = Arc::clone(&upstream_held);
+            async move {
+                if let Some(ConnectInfo(peer)) =
+                    request.extensions().get::<ConnectInfo<SocketAddr>>()
+                {
+                    held.peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(*peer);
+                }
+                held.accepted.fetch_add(1, Ordering::SeqCst);
+                let active = held.active.fetch_add(1, Ordering::SeqCst) + 1;
+                held.peak.fetch_max(active, Ordering::SeqCst);
+                let (release_tx, release_rx) = oneshot::channel();
+                held.releases
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(release_tx);
+                // Drain the Connect request body. Holding 16 streams without
+                // reading them fills the HTTP/2 connection window and the
+                // remaining Runs never reach this handler.
+                tokio::spawn(async move {
+                    let mut body = request.into_body().into_data_stream();
+                    while body.next().await.is_some() {}
+                });
+                let body_held = Arc::clone(&held);
+                let response_stream = futures_util::stream::once(async move {
+                    let _ = release_rx.await;
+                    body_held.active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>(successful_turn_bytes())
+                });
+                Response::builder()
+                    .status(200)
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/connect+proto",
+                    )
+                    .body(Body::from_stream(response_stream))
+                    .unwrap()
+            }
+        }),
+    );
 
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream_url = format!("http://{upstream_addr}");
     let upstream_handle = tokio::spawn(async move {
-        axum::serve(upstream_listener, upstream_app).await.unwrap();
+        axum::serve(
+            upstream_listener,
+            upstream_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     unsafe {
@@ -2947,6 +3007,10 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
         std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "live-concurrency-test");
         std::env::set_var("CCP_CURSOR_BIDI", "1");
         std::env::set_var("CCP_CURSOR_HEARTBEAT_SECS", "60");
+        std::env::set_var("CCP_CURSOR_LIVE_CONCURRENCY", "32");
+        std::env::set_var("CCP_CURSOR_LIVE_QUEUE_SECS", "1");
+        std::env::set_var("CCP_CURSOR_LIVE_RESUME_RESERVE", "4");
+        std::env::set_var("CCP_CURSOR_H2_SHARDS", "4");
     }
 
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2963,7 +3027,7 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client = reqwest::Client::new();
     let mut requests = Vec::new();
-    const REQUESTS: usize = 16;
+    const REQUESTS: usize = 32;
     for index in 0..REQUESTS {
         let client = client.clone();
         requests.push(tokio::spawn(async move {
@@ -2976,7 +3040,7 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
                     format!("cursor-live-concurrency-{index}"),
                 )
                 .json(&serde_json::json!({
-                    "model": "cursor:grok-4.5",
+                    "model": "cursor:gpt-5.5",
                     "max_tokens": 32,
                     "stream": true,
                     "messages": [{"role": "user", "content": "Reply OK"}]
@@ -2987,11 +3051,66 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
         }));
     }
 
-    wait_for_accepted(&held, REQUESTS).await;
+    if let Err(accepted) = wait_for_accepted(&held, REQUESTS).await {
+        let mut early_responses = Vec::new();
+        let mut index = 0;
+        while index < requests.len() {
+            if requests[index].is_finished() {
+                let request = requests.swap_remove(index);
+                match request.await {
+                    Ok(response) => {
+                        early_responses.push(response.status().to_string());
+                    }
+                    Err(error) => early_responses.push(format!("join error: {error}")),
+                }
+            } else {
+                index += 1;
+            }
+        }
+        panic!(
+            "only {accepted} Cursor runs reached the mock upstream; expected {REQUESTS}; early responses: {early_responses:?}"
+        );
+    }
     assert_eq!(
         held.peak.load(Ordering::SeqCst),
         REQUESTS,
-        "the proxy must not invent a local generation cap in front of Cursor"
+        "normal Grok fanout must fit within the default generation admission"
+    );
+    assert!(
+        held.peers.lock().unwrap_or_else(|e| e.into_inner()).len() >= 4,
+        "live runs must span at least four H2 connections so one reset cannot drop every subagent"
+    );
+
+    let overflow_session = "cursor-live-concurrency-overflow";
+    let overflow = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("authorization", "Bearer ignored")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-claude-code-session-id", overflow_session)
+            .json(&serde_json::json!({
+                "model": "cursor:gpt-5.5",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{"role": "user", "content": "Reply OK"}]
+            }))
+            .send(),
+    )
+    .await
+    .expect("the queued 33rd generation must fail within its bounded wait")
+    .unwrap();
+    assert_eq!(overflow.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        overflow
+            .headers()
+            .contains_key(reqwest::header::RETRY_AFTER),
+        "local generation admission must advertise retry timing"
+    );
+    assert_eq!(
+        held.accepted.load(Ordering::SeqCst),
+        REQUESTS,
+        "the queued request must not reach Cursor before admission"
     );
 
     let releases = std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3004,21 +3123,49 @@ async fn cursor_live_generations_pass_through_without_local_limit() {
             .expect("proxy request did not finish")
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
             .await
-            .expect("Cursor response did not finish");
+            .expect("Cursor response did not finish")
+            .unwrap();
+        assert!(body.contains("OK"), "unexpected live response: {body}");
     }
+
+    let retry_client = client.clone();
+    let retry = tokio::spawn(async move {
+        retry_client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("authorization", "Bearer ignored")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-claude-code-session-id", overflow_session)
+            .json(&serde_json::json!({
+                "model": "cursor:gpt-5.5",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{"role": "user", "content": "Reply OK"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_accepted(&held, REQUESTS + 1)
+        .await
+        .expect("retried overflow request reached Cursor");
+    for release in std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner())) {
+        let _ = release.send(());
+    }
+    let retry_response = tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+        .await
+        .expect("retry after queue timeout did not finish")
+        .unwrap();
+    assert_eq!(retry_response.status(), reqwest::StatusCode::OK);
+    assert!(
+        retry_response.text().await.unwrap().contains("OK"),
+        "a pre-dispatch queue timeout must not leave a session tombstone"
+    );
 
     let _ = shutdown_tx.send(());
     upstream_handle.abort();
     proxy_handle.abort();
-    unsafe {
-        std::env::remove_var("CCP_CURSOR_BASE_URL");
-        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
-        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
-        std::env::remove_var("CCP_CURSOR_BIDI");
-        std::env::remove_var("CCP_CURSOR_HEARTBEAT_SECS");
-    }
 }
 
 // ---------------------------------------------------------------------------

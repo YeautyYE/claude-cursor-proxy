@@ -567,9 +567,12 @@ fn display_session_id(session_id: Option<&str>) -> &str {
         return "no-session";
     };
     if uuid::Uuid::parse_str(session_id).is_ok() {
+        // UUIDv7 puts its timestamp in the first eight characters, so sibling
+        // agents created together share that prefix. The final eight hex
+        // characters come from the random portion and still fit ID_WIDTH.
         return session_id
-            .split_once('-')
-            .map_or(session_id, |(first, _)| first);
+            .get(session_id.len().saturating_sub(8)..)
+            .unwrap_or(session_id);
     }
     session_id
 }
@@ -2048,7 +2051,19 @@ mod tests {
     fn display_session_id_shortens_uuids() {
         assert_eq!(
             display_session_id(Some("57c7c914-ada4-4f40-9672-985f950fbb66")),
-            "57c7c914"
+            "950fbb66"
+        );
+    }
+
+    #[test]
+    fn display_session_id_distinguishes_uuidv7_with_shared_timestamp_prefix() {
+        let first = "01a01f40-7a01-7000-8000-000000000001";
+        let second = "01a01f40-7a01-7000-8000-000000000002";
+
+        assert_ne!(
+            display_session_id(Some(first)),
+            display_session_id(Some(second)),
+            "nearby UUIDv7 subagents must not collide in the eight-character ID column"
         );
     }
 

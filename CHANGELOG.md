@@ -3,6 +3,19 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.60 (2026-08-21)
+
+- Bound Grok fan-out without reviving the old 429 failure mode: admit 32 new generations fairly, reserve four additional slots for paused tool-result resumes, release capacity between tool segments, and return HTTP 503 with jittered `Retry-After` after a 15-second overflow queue.
+- Isolate shared transport failures across four stable H2 client pools keyed by full conversation/agent identity, cap simultaneous ResumeAction replacement opens at four, and retain full jitter before retryable reconnect opens. A hollow HTTP 200 remains fail-closed because replaying ResumeAction could duplicate execution.
+- Continue after a hollow post-tool ResumeAction only when a newer checkpoint arrives after the tool results are submitted. Already-queued pre-submit checkpoints are absorbed into the baseline first so they cannot later look like post-tool proof. The confirmed checkpoint is retained without replaying tools; an old checkpoint, stale tool-result generation, partial output, or unresolved acceptance remains fail-closed as 409.
+- Release a live-slot reservation when its HTTP future is cancelled in the local admission queue; start sealing the slot only when the first upstream open is about to begin.
+- Show the random UUID suffix in eight-character TUI session columns so nearby UUIDv7 subagents no longer appear to be the same session.
+
+## v0.1.59 (2026-08-20)
+
+- Wait 90s for the first HTTP/2 live open (`CCP_CURSOR_LIVE_H2_OPEN_SECS`, clamp 10–180) so a proxy-local 20s deadline does not cut Cursor off under Grok fan-out.
+- Later unsent POSTs against a Starting, Ambiguous, or otherwise busy live slot return HTTP 503 with jittered `Retry-After` instead of a fatal Grok 409. The ambiguous open still fail-closes the same send as 409 and still tombstones the slot for 90s, so a retry cannot start a second Cursor Run.
+
 ## v0.1.58 (2026-08-20)
 
 - Remove the proxy's local live-generation and live-open admission gates. Cursor upstream is the only concurrency owner; a Grok fan-out no longer dies with `rate_limit_error: Cursor live generation concurrency saturated`. Per-conversation live slots remain so the same Grok conversation cannot start two Runs.
