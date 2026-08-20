@@ -3,6 +3,21 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.58 (2026-08-20)
+
+- Remove the proxy's local live-generation and live-open admission gates. Cursor upstream is the only concurrency owner; a Grok fan-out no longer dies with `rate_limit_error: Cursor live generation concurrency saturated`. Per-conversation live slots remain so the same Grok conversation cannot start two Runs.
+
+## v0.1.57 (2026-08-20)
+
+- Align Grok identity with its actual protocol: `x-grok-conv-id` is the Cursor conversation boundary, `x-grok-req-id` is the idempotent operation key, and the install-wide `x-grok-agent-id` no longer collapses unrelated subagents into one live slot.
+- Treat local admission pressure as HTTP 503 with server-jittered `Retry-After` instead of 429, raise the default active-generation limit to Grok's 32-way fan-out, and keep tool-result resumes ahead of new starts.
+- Preserve one `x-original-request-id` across transport fallback and reconnect while generating a fresh `x-request-id` for every Run/BidiAppend attempt. Definite pre-connect and explicit upstream 5xx failures remain retryable and no longer poison the slot as 409; ambiguous sends still fail closed.
+- Recover from the one-way transport circuit seen in runtime logs: when circuit-selected HTTP/1 cannot connect its initial BidiAppend, safely half-open HTTP/2 unless the operator explicitly forced HTTP/1.
+
+## v0.1.56 (2026-08-20)
+
+- Treat thinking-only or checkpoint-less hollow ResumeAction as a retryable conversation reset instead of a non-retryable 409. Grok fan-out no longer dies after Fable thinking when Cursor produces no text or tools. Cancellation without client-visible output is 502 so the next POST can continue.
+
 ## v0.1.55 (2026-08-20)
 
 - Fail-fast when the 16 live-generation slots are full: overflow waits 8 seconds, then returns retryable 429 with `Retry-After: 2` instead of holding grok HTTP for 4 minutes. Lone Fable turns still get a 240-second heartbeat-only thinking window; a saturated gate cuts that to 30 seconds so hung holders cannot convoy the rest of a fan-out.

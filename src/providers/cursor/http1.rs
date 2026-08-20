@@ -30,6 +30,7 @@ pub struct BidiAppendSession {
     base_url: String,
     token: String,
     request_id: String,
+    original_request_id: String,
     seqno: Arc<AtomicI64>,
     in_flight: Arc<Semaphore>,
     identity_headers: Arc<Vec<(String, String)>>,
@@ -43,11 +44,31 @@ impl BidiAppendSession {
         request_id: String,
         identity_headers: Vec<(String, String)>,
     ) -> Self {
+        let original_request_id = request_id.clone();
+        Self::new_with_original(
+            client,
+            base_url,
+            token,
+            request_id,
+            original_request_id,
+            identity_headers,
+        )
+    }
+
+    pub fn new_with_original(
+        client: reqwest::Client,
+        base_url: String,
+        token: String,
+        request_id: String,
+        original_request_id: String,
+        identity_headers: Vec<(String, String)>,
+    ) -> Self {
         Self {
             client,
             base_url,
             token,
             request_id,
+            original_request_id,
             seqno: Arc::new(AtomicI64::new(0)),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             identity_headers: Arc::new(identity_headers),
@@ -80,6 +101,7 @@ impl BidiAppendSession {
             "requestId": { "requestId": self.request_id },
             "appendSeqno": seq.to_string(),
         });
+        let http_request_id = uuid::Uuid::new_v4().to_string();
 
         let mut req = self
             .client
@@ -88,8 +110,8 @@ impl BidiAppendSession {
             .header("content-type", "application/json")
             .header("connect-protocol-version", "1")
             .header("user-agent", "connect-es/1.6.1")
-            .header("x-request-id", &self.request_id)
-            .header("x-original-request-id", &self.request_id)
+            .header("x-request-id", http_request_id)
+            .header("x-original-request-id", &self.original_request_id)
             .json(&body);
 
         for (name, value) in self.identity_headers.iter() {
@@ -270,6 +292,83 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "an acknowledged-or-ambiguous append failure must never be replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn bidi_append_uses_fresh_http_ids_with_stable_run_lineage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock BidiAppend server");
+        let address = listener.local_addr().expect("mock server address");
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept BidiAppend");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 2048];
+                    let bytes_read = socket.read(&mut chunk).await.expect("read request");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..bytes_read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .await
+                    .expect("capture request");
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("reply");
+            }
+        });
+        let session = BidiAppendSession::new_with_original(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "token".into(),
+            "logical-run-id".into(),
+            "original-operation-id".into(),
+            vec![],
+        );
+
+        session.append_raw(b"\x3a\x00").await.expect("first append");
+        session
+            .append_raw(b"\x3a\x00")
+            .await
+            .expect("second append");
+        let first = request_rx.recv().await.expect("first request");
+        let second = request_rx.recv().await.expect("second request");
+        server.await.expect("mock server");
+
+        let header = |request: &str, name: &str| {
+            request
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+                .unwrap_or_else(|| panic!("missing {name} in {request}"))
+        };
+        let first_request_id = header(&first, "x-request-id");
+        let second_request_id = header(&second, "x-request-id");
+        assert_ne!(
+            first_request_id, second_request_id,
+            "each unary append is a distinct HTTP attempt"
+        );
+        assert_eq!(
+            header(&first, "x-original-request-id"),
+            "original-operation-id"
+        );
+        assert_eq!(
+            header(&second, "x-original-request-id"),
+            "original-operation-id",
+            "all appends must retain the logical Run lineage"
         );
     }
 

@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use prost::Message;
 use rand::Rng;
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
@@ -278,6 +278,7 @@ enum RunCommand {
         permit: LiveResumePermit,
         generation_permit: LiveGenerationPermit,
         dispatch_state: Arc<AtomicU8>,
+        accepted_fingerprint: Option<(Arc<AtomicU64>, u64)>,
     },
     Cancel {
         ack: Option<oneshot::Sender<()>>,
@@ -293,7 +294,7 @@ pub struct CursorLiveRunHandle {
     completed: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
     resume_in_flight: Arc<AtomicBool>,
-    request_fingerprint: AtomicU64,
+    request_fingerprint: Arc<AtomicU64>,
 }
 
 impl CursorLiveRunHandle {
@@ -391,10 +392,33 @@ impl CursorLiveRunHandle {
             .await
     }
 
+    pub(crate) async fn resume_batch_for_operation(
+        &self,
+        tool_results: Vec<(String, serde_json::Value)>,
+        fingerprint: u64,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        self.resume_batch_within_operation(
+            tool_results,
+            resume_dispatch_timeout(),
+            Some(fingerprint),
+        )
+        .await
+    }
+
     async fn resume_batch_within(
         &self,
         tool_results: Vec<(String, serde_json::Value)>,
         dispatch_timeout: Duration,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        self.resume_batch_within_operation(tool_results, dispatch_timeout, None)
+            .await
+    }
+
+    async fn resume_batch_within_operation(
+        &self,
+        tool_results: Vec<(String, serde_json::Value)>,
+        dispatch_timeout: Duration,
+        operation_fingerprint: Option<u64>,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
         let pending = self.pending_tools();
         validate_tool_result_batch(&pending, &tool_results)
@@ -402,10 +426,8 @@ impl CursorLiveRunHandle {
         self.resume_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
-                CursorError::new(
-                    429,
+                resume_dispatch_retryable_error(
                     "Another tool-result resume is already in flight for this Cursor run",
-                    None,
                 )
             })?;
         let permit = LiveResumePermit {
@@ -444,6 +466,8 @@ impl CursorLiveRunHandle {
                     permit,
                     generation_permit,
                     dispatch_state: command_dispatch_state,
+                    accepted_fingerprint: operation_fingerprint
+                        .map(|fingerprint| (Arc::clone(&self.request_fingerprint), fingerprint)),
                 })
                 .await
                 .map_err(|_| CursorError::internal("Cursor live run already closed"))?;
@@ -1353,17 +1377,7 @@ impl LiveRunRegistry {
         Self::prune_finished(&mut runs);
         match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(_)) => LiveReplacementClaim::Conflict,
-            Some(LiveRunEntry::Starting { cancel, .. }) => {
-                let _ = cancel.send_replace(true);
-                runs.remove_key(&key);
-                match Self::reserve_key(&mut runs, key) {
-                    Some(reservation) => LiveReplacementClaim::Reserved {
-                        reservation,
-                        superseded: None,
-                    },
-                    None => LiveReplacementClaim::Conflict,
-                }
-            }
+            Some(LiveRunEntry::Starting { .. }) => LiveReplacementClaim::Conflict,
             Some(LiveRunEntry::Succeeded { .. } | LiveRunEntry::Ambiguous { .. }) => {
                 runs.remove_key(&key);
                 match Self::reserve_key(&mut runs, key) {
@@ -1400,7 +1414,10 @@ pub(crate) fn finish_replacement_after_cancel(
 ) -> Result<LiveRunReservation, CursorError> {
     match cancel_result {
         Ok(()) => Ok(reservation),
-        Err(_error) => Ok(reservation),
+        Err(error) => {
+            reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
+            Err(error)
+        }
     }
 }
 
@@ -1628,22 +1645,6 @@ impl LiveRunRegistry {
         )
     }
 
-    /// Clear an Ambiguous tombstone for a next-turn POST (compact / new
-    /// inference). Starting reservations and Running handles are left alone so
-    /// an in-flight open cannot be aborted by a concurrent waiter.
-    pub fn take_ambiguous_tombstone(session_id: &str, agent_id: Option<&str>) -> bool {
-        let key = live_run_key(session_id, agent_id);
-        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        Self::prune_finished(&mut runs);
-        match runs.runs.get(&key) {
-            Some(LiveRunEntry::Ambiguous { .. }) => {
-                runs.remove_key(&key);
-                true
-            }
-            _ => false,
-        }
-    }
-
     pub fn take_terminal_error(session_id: &str) -> Option<String> {
         Self::take_terminal_error_run(session_id, None)
     }
@@ -1822,6 +1823,7 @@ impl CursorHttpClient {
             mcp_tools,
             super::proto::RequestContext::default(),
             None,
+            None,
         )
         .await
     }
@@ -1841,6 +1843,7 @@ impl CursorHttpClient {
         allowed_tool_names: Option<BTreeSet<String>>,
         mcp_tools: Option<super::proto::McpTools>,
         request_context: super::proto::RequestContext,
+        original_request_id: Option<&str>,
         mut cancel: Option<watch::Receiver<bool>>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
@@ -1859,6 +1862,7 @@ impl CursorHttpClient {
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
         let request_id = uuid::Uuid::new_v4().to_string();
+        let original_request_id = original_request_id.unwrap_or(&request_id).to_string();
         let worker_session = live_run_key_for(identity);
         let continuation = super::conversation::continuation_for(Some(&worker_session));
         if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
@@ -1898,6 +1902,7 @@ impl CursorHttpClient {
         let open = http.open_live_transport(
             token,
             &request_id,
+            &original_request_id,
             &first_message,
             &cursor_identity,
             force_http1,
@@ -1942,7 +1947,7 @@ impl CursorHttpClient {
             completed: Arc::clone(&completed),
             cancel_requested: Arc::clone(&cancel_requested),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
 
         let seeded_blobs: HashMap<Vec<u8>, Vec<u8>> =
@@ -1951,6 +1956,7 @@ impl CursorHttpClient {
             http,
             token: token.to_string(),
             identity: cursor_identity,
+            original_request_id,
             session_id: worker_session.clone(),
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
@@ -2000,6 +2006,7 @@ impl CursorHttpClient {
         &self,
         token: &str,
         request_id: &str,
+        original_request_id: &str,
         first_message: &AgentClientMessage,
         identity: &LiveIdentityHeaders,
         force_http1: bool,
@@ -2008,17 +2015,68 @@ impl CursorHttpClient {
         h1_timeout: Duration,
     ) -> Result<(ClientOutbound, reqwest::Response), CursorError> {
         if force_http1 {
-            return with_live_open_timeout(
+            let h1_result = with_live_open_timeout(
                 h1_timeout,
-                self.open_http1_run_sse(token, request_id, first_message, identity),
+                self.open_http1_run_sse(
+                    token,
+                    request_id,
+                    original_request_id,
+                    first_message,
+                    identity,
+                ),
             )
             .await;
+            return match h1_result {
+                Err(h1_error)
+                    if h1_failure_should_probe_h2(http1::prefer_http1_agent(), &h1_error) =>
+                {
+                    crate::logging::create_logger("cursor").warn(
+                        "live_h1_preconnect_h2_probe",
+                        Some(serde_json::Map::from_iter([(
+                            "reason".into(),
+                            serde_json::json!(h1_error.client_message()),
+                        )])),
+                    );
+                    let h2 = CursorHttpClient::with_prefer_http1(false);
+                    let probe_request_id = uuid::Uuid::new_v4().to_string();
+                    match with_live_open_timeout(
+                        h2_timeout,
+                        h2.open_h2_bidi_run(
+                            token,
+                            &probe_request_id,
+                            original_request_id,
+                            first_message,
+                            identity,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(pair) => {
+                            note_process_h2_open_success();
+                            Ok(pair)
+                        }
+                        Err(h2_error) => {
+                            if is_ambiguous_live_open_timeout(&h2_error) {
+                                note_process_h2_open_timeout();
+                            }
+                            Err(h2_half_open_error(h1_error, h2_error))
+                        }
+                    }
+                }
+                result => result,
+            };
         }
 
         let started = Instant::now();
         match with_live_open_timeout(
             h2_timeout,
-            self.open_h2_bidi_run(token, request_id, first_message, identity),
+            self.open_h2_bidi_run(
+                token,
+                request_id,
+                original_request_id,
+                first_message,
+                identity,
+            ),
         )
         .await
         {
@@ -2045,9 +2103,16 @@ impl CursorHttpClient {
                     );
                 }
                 let h1 = CursorHttpClient::with_prefer_http1(true);
+                let fallback_request_id = uuid::Uuid::new_v4().to_string();
                 match with_live_open_timeout(
                     wait,
-                    h1.open_http1_run_sse(token, request_id, first_message, identity),
+                    h1.open_http1_run_sse(
+                        token,
+                        &fallback_request_id,
+                        original_request_id,
+                        first_message,
+                        identity,
+                    ),
                 )
                 .await
                 {
@@ -2069,6 +2134,7 @@ impl CursorHttpClient {
         &self,
         token: &str,
         request_id: &str,
+        original_request_id: &str,
         first_message: &AgentClientMessage,
         identity: &LiveIdentityHeaders,
     ) -> Result<(ClientOutbound, reqwest::Response), CursorError> {
@@ -2090,7 +2156,7 @@ impl CursorHttpClient {
             .header("x-ghost-mode", &identity.ghost_mode)
             .header("x-request-id", request_id)
             .header("x-cursor-streaming", "true")
-            .header("x-original-request-id", request_id);
+            .header("x-original-request-id", original_request_id);
         for (name, value) in &identity.headers {
             if name.starts_with("x-cursor-client-device")
                 || name.starts_with("x-cursor-client-os")
@@ -2120,11 +2186,12 @@ impl CursorHttpClient {
             ));
         }
 
-        let append = BidiAppendSession::new(
+        let append = BidiAppendSession::new_with_original(
             self.client.clone(),
             self.base_url.clone(),
             token.to_string(),
             request_id.to_string(),
+            original_request_id.to_string(),
             identity.headers.clone(),
         );
         append
@@ -2138,6 +2205,7 @@ impl CursorHttpClient {
         &self,
         token: &str,
         request_id: &str,
+        original_request_id: &str,
         first_message: &AgentClientMessage,
         identity: &LiveIdentityHeaders,
     ) -> Result<(ClientOutbound, reqwest::Response), CursorError> {
@@ -2183,7 +2251,7 @@ impl CursorHttpClient {
             .header("x-cursor-client-version", &identity.client_version)
             .header("x-ghost-mode", &identity.ghost_mode)
             .header("x-request-id", request_id)
-            .header("x-original-request-id", request_id);
+            .header("x-original-request-id", original_request_id);
 
         if identity.ide_profile {
             request = request
@@ -2355,6 +2423,7 @@ struct LiveReconnectContext {
     http: CursorHttpClient,
     token: String,
     identity: LiveIdentityHeaders,
+    original_request_id: String,
     session_id: String,
     model_id: String,
     conversation_id: Option<String>,
@@ -2514,14 +2583,6 @@ const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
 const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
 const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
-const LIVE_OPEN_SOFT_START: usize = 4;
-const LIVE_OPEN_MAX: usize = 128;
-const LIVE_GENERATION_DEFAULT_MAX: usize = 16;
-const LIVE_GENERATION_MAX: usize = 128;
-/// Overflow waiters must fail fast. A 240s queue made grok-build look frozen
-/// while 16 heartbeat-only holders occupied the gate; grok already retries 429.
-const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 8;
-const LIVE_GENERATION_DEFAULT_CONTENDED_IDLE_SECS: u64 = 30;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -2578,296 +2639,43 @@ async fn with_live_open_timeout<T>(
     per_attempt: Duration,
     fut: impl std::future::Future<Output = Result<T, CursorError>>,
 ) -> Result<T, CursorError> {
-    let _permit = LIVE_OPEN_GATE.acquire(per_attempt).await?;
     match tokio::time::timeout(per_attempt, fut).await {
-        Ok(Ok(value)) => {
-            LIVE_OPEN_GATE.on_success();
-            Ok(value)
-        }
-        Ok(Err(err)) => {
-            if live_open_should_shrink(&err) {
-                LIVE_OPEN_GATE.on_failure();
-            }
-            Err(err)
-        }
-        Err(_) => {
-            LIVE_OPEN_GATE.on_failure();
-            Err(CursorError::new(
-                504,
-                format!(
-                    "Cursor live open timed out after {}s",
-                    per_attempt.as_secs()
-                ),
-                None,
-            ))
-        }
+        Ok(result) => result,
+        Err(_) => Err(CursorError::new(
+            504,
+            format!(
+                "Cursor live open timed out after {}s",
+                per_attempt.as_secs()
+            ),
+            None,
+        )),
     }
 }
 
-fn live_open_concurrency_max(raw: Option<&str>) -> usize {
-    if let Some(n) = raw
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-    {
-        return n.min(LIVE_OPEN_MAX);
-    }
-    LIVE_OPEN_MAX
+fn live_heartbeat_thinking_budget(stream_idle: Duration) -> Duration {
+    stream_idle.saturating_mul(2)
 }
 
-fn live_generation_concurrency_max(raw: Option<&str>) -> usize {
-    raw.and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .map(|n| n.min(LIVE_GENERATION_MAX))
-        .unwrap_or(LIVE_GENERATION_DEFAULT_MAX)
+pub(crate) fn local_overload_retry_after() -> String {
+    rand::thread_rng().gen_range(1..=3).to_string()
 }
 
-fn live_generation_queue_secs(raw: Option<&str>) -> u64 {
-    raw.and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(LIVE_GENERATION_DEFAULT_QUEUE_SECS)
-        .clamp(1, 3600)
-}
-
-fn live_contended_idle_secs(raw: Option<&str>) -> u64 {
-    raw.and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(LIVE_GENERATION_DEFAULT_CONTENDED_IDLE_SECS)
-        .clamp(10, 120)
-}
-
-fn live_heartbeat_thinking_budget(stream_idle: Duration, contended: bool) -> Duration {
-    if contended {
-        Duration::from_secs(live_contended_idle_secs(
-            std::env::var("CCP_CURSOR_CONTENDED_IDLE_SECS")
-                .ok()
-                .as_deref(),
-        ))
-    } else {
-        stream_idle.saturating_mul(2)
-    }
-}
-
-fn live_generation_saturated_error() -> CursorError {
-    let mut err = CursorError::new(429, "Cursor live generation concurrency saturated", None);
-    err.retry_after = Some("2".into());
-    err
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LiveGenerationPriority {
-    Start,
-    Resume,
-}
-
-#[derive(Clone)]
-struct LiveGenerationGate {
-    inner: Arc<LiveGenerationGateInner>,
-}
-
-struct LiveGenerationGateInner {
-    limit: usize,
-    inflight: AtomicUsize,
-    resume_waiters: AtomicUsize,
-    notify: Notify,
-}
-
-struct LiveGenerationPermit {
-    inner: Arc<LiveGenerationGateInner>,
-}
-
-impl std::fmt::Debug for LiveGenerationPermit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveGenerationPermit")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for LiveGenerationPermit {
-    fn drop(&mut self) {
-        self.inner.inflight.fetch_sub(1, Ordering::SeqCst);
-        self.inner.notify.notify_waiters();
-    }
-}
-
-struct LiveGenerationResumeWaiter {
-    inner: Arc<LiveGenerationGateInner>,
-}
-
-impl Drop for LiveGenerationResumeWaiter {
-    fn drop(&mut self) {
-        self.inner.resume_waiters.fetch_sub(1, Ordering::SeqCst);
-        self.inner.notify.notify_waiters();
-    }
-}
-
-impl LiveGenerationGate {
-    fn new(limit: usize) -> Self {
-        Self {
-            inner: Arc::new(LiveGenerationGateInner {
-                limit: limit.clamp(1, LIVE_GENERATION_MAX),
-                inflight: AtomicUsize::new(0),
-                resume_waiters: AtomicUsize::new(0),
-                notify: Notify::new(),
-            }),
-        }
-    }
-
-    fn limit(&self) -> usize {
-        self.inner.limit
-    }
-
-    fn is_contended(&self) -> bool {
-        self.inner.inflight.load(Ordering::SeqCst) >= self.inner.limit
-            || self.inner.resume_waiters.load(Ordering::SeqCst) > 0
-    }
-
-    #[cfg(test)]
-    fn available_permits(&self) -> usize {
-        self.inner
-            .limit
-            .saturating_sub(self.inner.inflight.load(Ordering::SeqCst))
-    }
-
-    #[cfg(test)]
-    fn resume_waiters(&self) -> usize {
-        self.inner.resume_waiters.load(Ordering::SeqCst)
-    }
-
-    fn register_resume_waiter(&self) -> LiveGenerationResumeWaiter {
-        self.inner.resume_waiters.fetch_add(1, Ordering::SeqCst);
-        LiveGenerationResumeWaiter {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-
-    fn try_acquire(&self, priority: LiveGenerationPriority) -> Option<LiveGenerationPermit> {
-        loop {
-            if priority == LiveGenerationPriority::Start
-                && self.inner.resume_waiters.load(Ordering::SeqCst) > 0
-            {
-                return None;
-            }
-            let inflight = self.inner.inflight.load(Ordering::SeqCst);
-            if inflight >= self.inner.limit {
-                return None;
-            }
-            if self
-                .inner
-                .inflight
-                .compare_exchange(inflight, inflight + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                continue;
-            }
-            if priority == LiveGenerationPriority::Start
-                && self.inner.resume_waiters.load(Ordering::SeqCst) > 0
-            {
-                self.inner.inflight.fetch_sub(1, Ordering::SeqCst);
-                self.inner.notify.notify_waiters();
-                return None;
-            }
-            return Some(LiveGenerationPermit {
-                inner: Arc::clone(&self.inner),
-            });
-        }
-    }
-
-    async fn acquire(
-        &self,
-        priority: LiveGenerationPriority,
-        mut cancel: Option<&mut watch::Receiver<bool>>,
-        wait: Duration,
-    ) -> Result<LiveGenerationPermit, CursorError> {
-        let _resume_waiter =
-            (priority == LiveGenerationPriority::Resume).then(|| self.register_resume_waiter());
-        let deadline = Instant::now() + wait;
-        loop {
-            if let Some(permit) = self.try_acquire(priority) {
-                return Ok(permit);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(live_generation_saturated_error());
-            }
-            let notified = self.inner.notify.notified();
-            if let Some(permit) = self.try_acquire(priority) {
-                return Ok(permit);
-            }
-            if let Some(cancel) = cancel.as_deref_mut() {
-                tokio::select! {
-                    _ = cancel.wait_for(|aborted| *aborted) => {
-                        return Err(CursorError::new(
-                            409,
-                            "Cursor live start superseded while waiting for generation capacity",
-                            None,
-                        ));
-                    }
-                    _ = notified => {}
-                    _ = tokio::time::sleep(remaining) => {
-                        if let Some(permit) = self.try_acquire(priority) {
-                            return Ok(permit);
-                        }
-                        return Err(live_generation_saturated_error());
-                    }
-                }
-            } else {
-                tokio::select! {
-                    _ = notified => {}
-                    _ = tokio::time::sleep(remaining) => {
-                        if let Some(permit) = self.try_acquire(priority) {
-                            return Ok(permit);
-                        }
-                        return Err(live_generation_saturated_error());
-                    }
-                }
-            }
-        }
-    }
-}
-
-static LIVE_GENERATION_GATE: LazyLock<LiveGenerationGate> = LazyLock::new(|| {
-    let limit = live_generation_concurrency_max(
-        std::env::var("CCP_CURSOR_LIVE_CONCURRENCY").ok().as_deref(),
-    );
-    LiveGenerationGate::new(limit)
-});
-
-async fn acquire_live_generation_permit_with_priority(
-    cancel: Option<&mut watch::Receiver<bool>>,
-    priority: LiveGenerationPriority,
-) -> Result<LiveGenerationPermit, CursorError> {
-    let gate = &*LIVE_GENERATION_GATE;
-    let wait = Duration::from_secs(live_generation_queue_secs(
-        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
-    ));
-    let queued_at = Instant::now();
-    let permit = gate.acquire(priority, cancel, wait).await?;
-    if queued_at.elapsed() >= Duration::from_millis(100) {
-        crate::logging::create_logger("cursor").info(
-            "live_generation_admitted",
-            Some(serde_json::Map::from_iter([
-                (
-                    "queuedMs".into(),
-                    serde_json::json!(queued_at.elapsed().as_millis()),
-                ),
-                ("limit".into(), serde_json::json!(gate.limit())),
-                (
-                    "priority".into(),
-                    serde_json::json!(match priority {
-                        LiveGenerationPriority::Start => "start",
-                        LiveGenerationPriority::Resume => "resume",
-                    }),
-                ),
-            ])),
-        );
-    }
-    Ok(permit)
-}
+#[derive(Debug, Default)]
+struct LiveGenerationPermit;
 
 async fn acquire_live_generation_permit(
     cancel: Option<&mut watch::Receiver<bool>>,
 ) -> Result<LiveGenerationPermit, CursorError> {
-    acquire_live_generation_permit_with_priority(cancel, LiveGenerationPriority::Start).await
+    if let Some(rx) = cancel
+        && *rx.borrow()
+    {
+        return Err(CursorError::new(
+            409,
+            "Cursor live start superseded while waiting for generation capacity",
+            None,
+        ));
+    }
+    Ok(LiveGenerationPermit)
 }
 
 fn resume_admission_closed_error() -> CursorError {
@@ -2879,207 +2687,14 @@ async fn acquire_live_generation_resume_permit(
     completed: &AtomicBool,
     command_tx: &mpsc::Sender<RunCommand>,
 ) -> Result<LiveGenerationPermit, CursorError> {
-    let admission =
-        acquire_live_generation_permit_with_priority(None, LiveGenerationPriority::Resume);
-    tokio::pin!(admission);
-    loop {
-        if cancel_requested.load(Ordering::Acquire)
-            || completed.load(Ordering::Acquire)
-            || command_tx.is_closed()
-        {
-            return Err(resume_admission_closed_error());
-        }
-        tokio::select! {
-            result = &mut admission => return result,
-            _ = command_tx.closed() => return Err(resume_admission_closed_error()),
-            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-        }
+    if cancel_requested.load(Ordering::Acquire)
+        || completed.load(Ordering::Acquire)
+        || command_tx.is_closed()
+    {
+        return Err(resume_admission_closed_error());
     }
+    Ok(LiveGenerationPermit)
 }
-
-fn live_open_soft_start(max: usize) -> usize {
-    LIVE_OPEN_SOFT_START.min(max.max(1))
-}
-
-fn live_open_grow(current: usize, max: usize) -> usize {
-    if current >= max {
-        return max;
-    }
-    current
-        .saturating_mul(2)
-        .max(current.saturating_add(1))
-        .min(max)
-}
-
-fn live_open_shrink(current: usize, min: usize) -> usize {
-    let min = min.max(1);
-    if current <= min {
-        return min;
-    }
-    (current / 2).max(min)
-}
-
-fn live_open_should_shrink(err: &CursorError) -> bool {
-    err.status == 504 || err.message.to_ascii_lowercase().contains("timed out")
-}
-
-fn live_open_saturated_error() -> CursorError {
-    CursorError::new(429, "Cursor live open concurrency saturated", None)
-}
-
-struct AdaptiveLiveOpenGate {
-    inner: Arc<AdaptiveLiveOpenInner>,
-}
-
-struct AdaptiveLiveOpenInner {
-    min: usize,
-    max: usize,
-    limit: AtomicUsize,
-    inflight: AtomicUsize,
-    notify: Notify,
-}
-
-struct LiveOpenPermit {
-    inner: Arc<AdaptiveLiveOpenInner>,
-}
-
-impl std::fmt::Debug for LiveOpenPermit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveOpenPermit").finish_non_exhaustive()
-    }
-}
-
-impl Drop for LiveOpenPermit {
-    fn drop(&mut self) {
-        self.inner.inflight.fetch_sub(1, Ordering::SeqCst);
-        self.inner.notify.notify_waiters();
-    }
-}
-
-impl AdaptiveLiveOpenGate {
-    fn new(max: usize) -> Self {
-        let max = max.clamp(1, LIVE_OPEN_MAX);
-        Self::with_bounds(live_open_soft_start(max), max)
-    }
-
-    fn with_bounds(min: usize, max: usize) -> Self {
-        let max = max.clamp(1, LIVE_OPEN_MAX);
-        let min = min.clamp(1, max);
-        Self {
-            inner: Arc::new(AdaptiveLiveOpenInner {
-                min,
-                max,
-                limit: AtomicUsize::new(min),
-                inflight: AtomicUsize::new(0),
-                notify: Notify::new(),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    fn limit(&self) -> usize {
-        self.inner.limit.load(Ordering::SeqCst)
-    }
-
-    fn on_success(&self) {
-        loop {
-            let cur = self.inner.limit.load(Ordering::SeqCst);
-            let next = live_open_grow(cur, self.inner.max);
-            if next == cur {
-                return;
-            }
-            if self
-                .inner
-                .limit
-                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.inner.notify.notify_waiters();
-                return;
-            }
-        }
-    }
-
-    fn on_failure(&self) {
-        loop {
-            let cur = self.inner.limit.load(Ordering::SeqCst);
-            let next = live_open_shrink(cur, self.inner.min);
-            if next == cur {
-                return;
-            }
-            if self
-                .inner
-                .limit
-                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return;
-            }
-        }
-    }
-
-    fn try_acquire(&self) -> Option<LiveOpenPermit> {
-        loop {
-            let inflight = self.inner.inflight.load(Ordering::SeqCst);
-            let limit = self.inner.limit.load(Ordering::SeqCst);
-            if inflight >= limit {
-                return None;
-            }
-            if self
-                .inner
-                .inflight
-                .compare_exchange(inflight, inflight + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some(LiveOpenPermit {
-                    inner: Arc::clone(&self.inner),
-                });
-            }
-        }
-    }
-
-    async fn acquire(&self, wait: Duration) -> Result<LiveOpenPermit, CursorError> {
-        let deadline = Instant::now() + wait;
-        loop {
-            if let Some(permit) = self.try_acquire() {
-                return Ok(permit);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(live_open_saturated_error());
-            }
-            let notified = self.inner.notify.notified();
-            if let Some(permit) = self.try_acquire() {
-                return Ok(permit);
-            }
-            tokio::select! {
-                _ = notified => {}
-                _ = tokio::time::sleep(remaining) => {
-                    if let Some(permit) = self.try_acquire() {
-                        return Ok(permit);
-                    }
-                    return Err(live_open_saturated_error());
-                }
-            }
-        }
-    }
-}
-
-/// Soft-starts at 4 so a cold process does not stampede H2, then doubles on
-/// successful opens up to 128 (grok-cli fan-out). The env var is an optional
-/// cap, not something operators have to set for parallelism.
-static LIVE_OPEN_GATE: LazyLock<AdaptiveLiveOpenGate> = LazyLock::new(|| {
-    let max = live_open_concurrency_max(
-        std::env::var("CCP_CURSOR_LIVE_OPEN_CONCURRENCY")
-            .ok()
-            .as_deref(),
-    );
-    if cfg!(test) {
-        AdaptiveLiveOpenGate::with_bounds(max, max)
-    } else {
-        AdaptiveLiveOpenGate::new(max)
-    }
-});
 
 #[derive(Debug, Default, Clone)]
 struct ProcessH2Circuit {
@@ -3317,21 +2932,34 @@ fn live_probation_expired(on_probation: bool, got_progress: bool, remaining: Dur
     on_probation && !got_progress && remaining.is_zero()
 }
 
+fn hollow_resume_can_rotate(saw_text: bool, pending_empty: bool) -> bool {
+    // Thinking deltas set `useful` but are discarded when grok-build retries
+    // the HTTP request. Duplicate danger is client-visible text or exposed tools.
+    !saw_text && pending_empty
+}
+
+fn live_cancel_is_ambiguous(
+    unresolved: bool,
+    saw_text: bool,
+    pending_empty: bool,
+    sent_upstream_frames: bool,
+) -> bool {
+    sent_upstream_frames || (unresolved && !hollow_resume_can_rotate(saw_text, pending_empty))
+}
+
 fn hollow_resume_terminal_message(
     session_id: &str,
-    opened_with_checkpoint: bool,
-    useful: bool,
+    saw_text: bool,
     pending_empty: bool,
     latest_checkpoint: &mut Option<Vec<u8>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     fallback: impl Into<String>,
 ) -> String {
-    // A checkpoint-backed turn that emitted nothing before an accepted
-    // ResumeAction also went hollow has no useful state to preserve. Rotate
-    // that binding once so the client retry replays its full history. Fresh
-    // runs and partially emitted turns remain 409/ambiguous to avoid duplicate
-    // execution when Cursor may still be working upstream.
-    if opened_with_checkpoint && !useful && pending_empty {
+    // A hollow ResumeAction that never exposed assistant text or tools can be
+    // retried on a fresh Cursor conversation. Thinking-only frames must not
+    // 409 grok-build; 409 is fail-closed only when retrying could duplicate
+    // client-visible output.
+    if hollow_resume_can_rotate(saw_text, pending_empty) {
         super::conversation::reset(session_id);
         *latest_checkpoint = None;
         kv_blobs.clear();
@@ -3479,22 +3107,33 @@ fn live_reconnect_on_hollow_body(
     )
 }
 
+fn is_local_live_overload(err: &CursorError) -> bool {
+    let message = err.client_message().to_ascii_lowercase();
+    message.contains("cursor live generation concurrency saturated")
+        || message.contains("cursor live open concurrency saturated")
+}
+
 fn live_open_should_retry_http1(err: &CursorError) -> bool {
     if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
+    if is_local_live_overload(err) {
         return false;
     }
     if crate::retry::is_billing_block(&err.message) || crate::retry::is_capacity_shed(&err.message)
     {
         return false;
     }
-    is_explicit_http1_required(err)
-        || is_pre_connect_failure(err)
-        || is_ambiguous_live_open_timeout(err)
+    is_explicit_http1_required(err) || is_pre_connect_failure(err)
 }
 
-/// After this POST already retried a transport miss, fail closed as 409 so
-/// grok-build does not 5xx-retry on top of the proxy loop.
+/// Keep definite pre-connect/rejection failures retryable for grok-build.
+/// Fail closed only when a Run may have crossed the upstream acceptance
+/// boundary; retrying that operation could execute it twice.
 pub(crate) fn exhausted_live_start_error(err: CursorError, attempted_retries: u32) -> CursorError {
+    if is_initial_bidiappend_timeout(&err) || is_response_less_send_error(&err) {
+        return CursorError::new(409, err.message, err.detail);
+    }
     if attempted_retries == 0 {
         return err;
     }
@@ -3509,12 +3148,8 @@ pub(crate) fn exhausted_live_start_error(err: CursorError, attempted_retries: u3
     if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
         return err;
     }
-    if is_pre_connect_failure(&err)
-        || is_initial_bidiappend_timeout(&err)
-        || err.message.contains("error sending request")
-        || matches!(err.status, 0 | 502 | 503 | 504)
-    {
-        return CursorError::new(409, err.message, err.detail);
+    if is_pre_connect_failure(&err) {
+        return err;
     }
     err
 }
@@ -3534,17 +3169,7 @@ fn is_explicit_http1_required(err: &CursorError) -> bool {
 
 #[cfg(test)]
 fn is_http1_fallback_error(err: &CursorError) -> bool {
-    if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
-        return false;
-    }
-    is_explicit_http1_required(err)
-        || matches!(err.status, 408 | 502 | 503 | 504)
-        || err.message.contains("error sending request")
-        || err.message.contains("connection")
-        || is_h2_stream_reset(&err.message)
-        || err.detail.as_deref().is_some_and(|d| {
-            d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi") || is_h2_stream_reset(d)
-        })
+    live_open_should_retry_http1(err)
 }
 
 fn live_send_failure_is_terminal(err: &CursorError) -> bool {
@@ -3582,6 +3207,10 @@ fn live_control_close_message(unresolved: bool) -> &'static str {
 
 pub(crate) fn is_ambiguous_live_open_timeout(err: &CursorError) -> bool {
     err.status == 504
+        && err
+            .client_message()
+            .to_ascii_lowercase()
+            .contains("cursor live open timed out after")
 }
 
 fn is_initial_bidiappend_timeout(err: &CursorError) -> bool {
@@ -3600,6 +3229,18 @@ fn is_pre_connect_failure(err: &CursorError) -> bool {
         && !lower.contains("connection reset")
         && !lower.contains("connection closed")
         && !is_h2_stream_reset(&blob)
+}
+
+fn h1_failure_should_probe_h2(explicit_http1: bool, err: &CursorError) -> bool {
+    !explicit_http1 && is_pre_connect_failure(err)
+}
+
+fn h2_half_open_error(h1_error: CursorError, h2_error: CursorError) -> CursorError {
+    if is_explicit_http1_required(&h2_error) {
+        h1_error
+    } else {
+        h2_error
+    }
 }
 
 fn is_response_less_send_error(err: &CursorError) -> bool {
@@ -3621,6 +3262,9 @@ fn is_response_less_send_error(err: &CursorError) -> bool {
 }
 
 pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
+    if is_local_live_overload(err) {
+        return false;
+    }
     if terminal_error_allows_fresh_retry(&err.message) {
         return false;
     }
@@ -3633,10 +3277,7 @@ pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
     if is_pre_connect_failure(err) {
         return false;
     }
-    matches!(err.status, 0 | 502 | 503 | 504)
-        || err.message.contains("timed out")
-        || err.message.contains("connection")
-        || err.message.contains("reset")
+    is_initial_bidiappend_timeout(err) || is_response_less_send_error(err)
 }
 
 pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
@@ -3651,7 +3292,7 @@ pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
 /// Probe `TerminalError` that must 502 the current POST. Ambiguous accept and
 /// same-request-retryable errors must not brick grok-build's next turn.
 pub(crate) fn live_probe_error_blocks_new_run(error: &str) -> bool {
-    !live_error_is_same_request_retryable(error) && !terminal_error_is_ambiguous_accept(error)
+    terminal_error_is_ambiguous_accept(error) || !live_error_is_same_request_retryable(error)
 }
 
 fn terminal_error_allows_fresh_retry(message: &str) -> bool {
@@ -3742,7 +3383,7 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
         return false;
     }
     if is_initial_bidiappend_timeout(err) {
-        return true;
+        return false;
     }
     if cursor_connect_error_is_missing_conversation_data(&text)
         || err
@@ -3798,6 +3439,9 @@ fn partial_tool_result_send_error(
 /// transport — that burns quota and can duplicate an already-accepted run.
 pub(crate) fn is_retryable_live_transport_error(err: &CursorError) -> bool {
     if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
+    if is_local_live_overload(err) {
         return false;
     }
     matches!(err.status, 0 | 408 | 421 | 464 | 502 | 503 | 504)
@@ -4285,6 +3929,7 @@ async fn try_live_reconnect(
         let open = reconnect.http.open_live_transport(
             &reconnect.token,
             &request_id,
+            &reconnect.original_request_id,
             &first_message,
             &reconnect.identity,
             reconnect.force_http1,
@@ -4723,6 +4368,7 @@ async fn drive_live_run(
     let mut reconnect_attempts: u32 = 0;
     let mut got_chunk_since_reconnect = false;
     let mut accepted_resume_unconfirmed = false;
+    let mut tool_results_sent_unconfirmed = false;
     // A normal turn_ended is not authoritative until Connect END/EOF. Holding
     // it prevents a later, separately chunked END error from being masked by a
     // fabricated successful Anthropic end_turn.
@@ -4779,10 +4425,15 @@ async fn drive_live_run(
             mark_live_cancelled(
                 &mut sink,
                 &terminal_error,
-                live_acceptance_unresolved(
-                    !held_turn_end_frames.is_empty(),
-                    accepted_resume_unconfirmed,
-                    reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                live_cancel_is_ambiguous(
+                    live_acceptance_unresolved(
+                        !held_turn_end_frames.is_empty(),
+                        accepted_resume_unconfirmed,
+                        reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                    ),
+                    saw_text,
+                    pending.is_empty(),
+                    tool_results_sent_unconfirmed,
                 ),
             );
             break 'driver;
@@ -4837,8 +4488,7 @@ async fn drive_live_run(
         ) {
             let message = hollow_resume_terminal_message(
                 &session_id,
-                reconnect.opening_checkpoint.is_some(),
-                useful,
+                saw_text,
                 pending.is_empty(),
                 &mut latest_checkpoint,
                 &mut kv_blobs,
@@ -4883,7 +4533,7 @@ async fn drive_live_run(
             last_liveness.elapsed(),
             setup_idle,
             stream_idle,
-            live_heartbeat_thinking_budget(stream_idle, LIVE_GENERATION_GATE.is_contended()),
+            live_heartbeat_thinking_budget(stream_idle),
         ) {
             let can_resume = live_reconnect_resume_state(
                 &latest_checkpoint,
@@ -4935,8 +4585,7 @@ async fn drive_live_run(
                 let fallback = format!("{message}{}", reconnect_note(&reconnect_outcome));
                 let message = hollow_resume_terminal_message(
                     &session_id,
-                    reconnect.opening_checkpoint.is_some(),
-                    useful,
+                    saw_text,
                     pending.is_empty(),
                     &mut latest_checkpoint,
                     &mut kv_blobs,
@@ -4968,10 +4617,15 @@ async fn drive_live_run(
                         mark_live_cancelled(
                             &mut sink,
                             &terminal_error,
-                            live_acceptance_unresolved(
-                                !held_turn_end_frames.is_empty(),
-                                accepted_resume_unconfirmed,
-                                reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                            live_cancel_is_ambiguous(
+                                live_acceptance_unresolved(
+                                    !held_turn_end_frames.is_empty(),
+                                    accepted_resume_unconfirmed,
+                                    reconnect.recovery.on_probation && !got_chunk_since_reconnect,
+                                ),
+                                saw_text,
+                                pending.is_empty(),
+                                tool_results_sent_unconfirmed,
                             ),
                         );
                         break 'driver;
@@ -4997,6 +4651,7 @@ async fn drive_live_run(
                         permit: _resume_permit,
                         generation_permit: resume_generation_permit,
                         dispatch_state,
+                        accepted_fingerprint,
                     }) => {
                         if dispatch_state
                             .compare_exchange(
@@ -5007,10 +4662,8 @@ async fn drive_live_run(
                             )
                             .is_err()
                         {
-                            let _ = ack.send(Err(CursorError::new(
-                                409,
+                            let _ = ack.send(Err(resume_dispatch_retryable_error(
                                 "Cursor live resume dispatch was cancelled before driver acceptance",
-                                None,
                             )));
                             continue;
                         }
@@ -5037,7 +4690,17 @@ async fn drive_live_run(
                         // transport/reconnect work. Send failures are delivered
                         // on this event stream instead of leaving the POST
                         // silent while the driver recovers.
+                        let previous_fingerprint = accepted_fingerprint.as_ref().map(
+                            |(target, fingerprint)| {
+                                target.swap(*fingerprint, Ordering::AcqRel)
+                            },
+                        );
                         if ack.send(Ok(())).is_err() {
+                            if let (Some((target, _)), Some(previous)) =
+                                (accepted_fingerprint.as_ref(), previous_fingerprint)
+                            {
+                                target.store(previous, Ordering::Release);
+                            }
                             continue;
                         }
                         sink = Some(next_sink);
@@ -5060,6 +4723,7 @@ async fn drive_live_run(
                             match outbound.send_connect_frame(frame.clone()).await {
                                 Ok(()) => {
                                     sent_frames += 1;
+                                    tool_results_sent_unconfirmed = true;
                                 }
                                 Err(err) if sent_frames > 0 => {
                                     terminal_send = Some(partial_tool_result_send_error(
@@ -5093,13 +4757,17 @@ async fn drive_live_run(
                             mark_live_cancelled(
                                 &mut sink,
                                 &terminal_error,
-                                sent_frames > 0
-                                    || live_acceptance_unresolved(
+                                live_cancel_is_ambiguous(
+                                    live_acceptance_unresolved(
                                         !held_turn_end_frames.is_empty(),
                                         accepted_resume_unconfirmed,
                                         reconnect.recovery.on_probation
                                             && !got_chunk_since_reconnect,
                                     ),
+                                    saw_text,
+                                    pending.is_empty(),
+                                    tool_results_sent_unconfirmed || sent_frames > 0,
+                                ),
                             );
                             break 'driver;
                         }
@@ -5151,6 +4819,7 @@ async fn drive_live_run(
                                     match outbound.send_connect_frame(frame.clone()).await {
                                         Ok(()) => {
                                             resent_frames += 1;
+                                            tool_results_sent_unconfirmed = true;
                                         }
                                         Err(err) if resent_frames > 0 => {
                                             let err = annotate_live_cursor_error(
@@ -5191,11 +4860,16 @@ async fn drive_live_run(
                                 mark_live_cancelled(
                                     &mut sink,
                                     &terminal_error,
-                                    live_acceptance_unresolved(
-                                        !held_turn_end_frames.is_empty(),
-                                        accepted_resume_unconfirmed,
-                                        reconnect.recovery.on_probation
-                                            && !got_chunk_since_reconnect,
+                                    live_cancel_is_ambiguous(
+                                        live_acceptance_unresolved(
+                                            !held_turn_end_frames.is_empty(),
+                                            accepted_resume_unconfirmed,
+                                            reconnect.recovery.on_probation
+                                                && !got_chunk_since_reconnect,
+                                        ),
+                                        saw_text,
+                                        pending.is_empty(),
+                                        tool_results_sent_unconfirmed,
                                     ),
                                 );
                                 break 'driver;
@@ -5282,6 +4956,7 @@ async fn drive_live_run(
                         if live_reconnect_should_reset_budget(&frames) {
                             got_chunk_since_reconnect = true;
                             accepted_resume_unconfirmed = false;
+                            tool_results_sent_unconfirmed = false;
                             reconnect_attempts = 0;
                             record_transport_success(&mut reconnect);
                             reconnect.recovery.reset();
@@ -5504,8 +5179,7 @@ async fn drive_live_run(
                             );
                             let message = hollow_resume_terminal_message(
                                 &session_id,
-                                reconnect.opening_checkpoint.is_some(),
-                                useful,
+                                saw_text,
                                 pending.is_empty(),
                                 &mut latest_checkpoint,
                                 &mut kv_blobs,
@@ -5574,8 +5248,7 @@ async fn drive_live_run(
                         );
                         let message = hollow_resume_terminal_message(
                             &session_id,
-                            reconnect.opening_checkpoint.is_some(),
-                            useful,
+                            saw_text,
                             pending.is_empty(),
                             &mut latest_checkpoint,
                             &mut kv_blobs,
@@ -7532,7 +7205,9 @@ fn resume_dispatch_timeout() -> Duration {
 }
 
 fn resume_dispatch_retryable_error(message: &str) -> CursorError {
-    CursorError::new(429, message, None)
+    let mut error = CursorError::new(503, message, None);
+    error.retry_after = Some(local_overload_retry_after());
+    error
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -7902,9 +7577,6 @@ mod tests {
     use super::*;
     use prost::Message;
 
-    static LIVE_GENERATION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
-
     fn pending_exec(id: u32, tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
             id,
@@ -7930,6 +7602,7 @@ mod tests {
                 ide_profile: false,
                 headers: vec![],
             },
+            original_request_id: "original-test-request".into(),
             session_id: "sess-test".into(),
             model_id: "composer-2.5".into(),
             conversation_id: Some("conv-test".into()),
@@ -7944,19 +7617,12 @@ mod tests {
     }
 
     fn test_generation_permit() -> LiveGenerationPermit {
-        LiveGenerationGate::new(1)
-            .try_acquire(LiveGenerationPriority::Start)
-            .expect("test generation permit")
+        LiveGenerationPermit
     }
 
     #[test]
     fn generation_permit_releases_between_segments_before_native_batch_exposure() {
-        let generation_gate = LiveGenerationGate::new(1);
-        let mut generation_permit = Some(
-            generation_gate
-                .try_acquire(LiveGenerationPriority::Start)
-                .expect("initial generation permit"),
-        );
+        let mut generation_permit = Some(LiveGenerationPermit);
         let mut pending = PendingExecState::for_run("between-segments-run");
         assert!(pending.queue(pending_exec(1, "read-call"), Duration::from_secs(30)));
         assert!(
@@ -7969,17 +7635,13 @@ mod tests {
 
         assert!(
             generation_permit.is_none(),
-            "a driver without a downstream segment must not retain generation capacity"
+            "a driver without a downstream segment must drop its unused start token"
         );
-        assert_eq!(generation_gate.available_permits(), 1);
     }
 
     #[tokio::test]
     async fn generation_permit_releases_after_native_tool_handoff() {
-        let generation_gate = LiveGenerationGate::new(1);
-        let generation_permit = generation_gate
-            .try_acquire(LiveGenerationPriority::Start)
-            .expect("initial generation permit");
+        let generation_permit = LiveGenerationPermit;
         let (upstream_tx, upstream_rx) = mpsc::channel(4);
         let (request_tx, _request_rx) = mpsc::channel(8);
         let (command_tx, command_rx) = mpsc::channel(4);
@@ -8039,16 +7701,9 @@ mod tests {
             Ok(LiveRunEvent::NativeToolBatch(tools)) => tools[0].tool_use_id.clone(),
             other => panic!("expected native tool batch, got {other:?}"),
         };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while generation_gate.available_permits() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("generation permit stayed held while waiting for local tool results");
         assert!(
             !completed.load(Ordering::Acquire),
-            "the live driver must remain resumable after releasing generation capacity"
+            "the live driver must remain resumable after exposing native tools"
         );
         assert_eq!(
             pending_shared
@@ -8058,9 +7713,7 @@ mod tests {
             1
         );
 
-        let resume_generation_permit = generation_gate
-            .try_acquire(LiveGenerationPriority::Resume)
-            .expect("resume must reacquire generation capacity");
+        let resume_generation_permit = LiveGenerationPermit;
         let (resume_sink, _resume_events) = mpsc::channel(8);
         let (ack_tx, ack_rx) = oneshot::channel();
         command_tx
@@ -8076,6 +7729,7 @@ mod tests {
                 },
                 generation_permit: resume_generation_permit,
                 dispatch_state: Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING)),
+                accepted_fingerprint: None,
             })
             .await
             .expect("dispatch resume");
@@ -8083,11 +7737,6 @@ mod tests {
             .await
             .expect("resume acknowledgement")
             .expect("resume accepted");
-        assert_eq!(
-            generation_gate.available_permits(),
-            0,
-            "active post-tool generation must hold capacity again"
-        );
 
         cancel_requested.store(true, Ordering::Release);
         command_tx
@@ -8098,22 +7747,10 @@ mod tests {
             .await
             .expect("driver did not stop")
             .expect("driver join");
-        assert_eq!(generation_gate.available_permits(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn resume_generation_admission_does_not_spend_driver_dispatch_timeout() {
-        let _gate_test = LIVE_GENERATION_TEST_LOCK.lock().await;
-        let gate = &*LIVE_GENERATION_GATE;
-        let mut held = Vec::with_capacity(gate.limit());
-        for _ in 0..gate.limit() {
-            held.push(
-                gate.acquire(LiveGenerationPriority::Resume, None, Duration::from_secs(2))
-                    .await
-                    .expect("hold every generation slot"),
-            );
-        }
-
         let (command_tx, mut command_rx) = mpsc::channel(1);
         let handle = Arc::new(CursorLiveRunHandle {
             run_id: "resume-admission-budget".into(),
@@ -8123,7 +7760,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let driver = tokio::spawn(async move {
             let RunCommand::ResumeBatch {
@@ -8157,17 +7794,13 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        drop(held.pop());
-
         let events = tokio::time::timeout(Duration::from_secs(1), resume)
             .await
             .expect("resume did not finish after generation admission")
             .expect("resume task")
-            .expect("generation queue wait must not consume the driver dispatch budget");
+            .expect("resume dispatch must not wait on a local generation gate");
         drop(events);
         driver.await.expect("mock driver");
-        drop(held);
     }
 
     #[tokio::test]
@@ -8181,7 +7814,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(true)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
         let error = handle
@@ -8195,60 +7828,91 @@ mod tests {
             .await
             .expect_err("a concurrent resume must be rejected");
         assert_eq!(
-            error.status, 429,
+            error.status, 503,
             "an alive resume is local capacity contention, not an invalid request"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn resume_generation_admission_stops_when_driver_is_cancelled() {
-        let _gate_test = LIVE_GENERATION_TEST_LOCK.lock().await;
-        let gate = &*LIVE_GENERATION_GATE;
-        let mut held = Vec::with_capacity(gate.limit());
-        for _ in 0..gate.limit() {
-            held.push(
-                gate.acquire(LiveGenerationPriority::Resume, None, Duration::from_secs(2))
-                    .await
-                    .expect("hold every generation slot"),
-            );
-        }
-
-        let (command_tx, _command_rx) = mpsc::channel(1);
+    #[tokio::test]
+    async fn accepted_resume_commits_its_sampling_stage_fingerprint() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
         let handle = Arc::new(CursorLiveRunHandle {
-            run_id: "cancelled-resume-admission".into(),
+            run_id: "resume-stage-fingerprint".into(),
             command_tx,
             pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(11)),
         });
-        let resume_handle = Arc::clone(&handle);
-        let mut resume = tokio::spawn(async move {
-            resume_handle
-                .resume_batch_within(
-                    vec![(
-                        "tool-1".into(),
-                        serde_json::json!({"type":"tool_result","content":"done"}),
-                    )],
-                    Duration::from_millis(50),
+        let driver = tokio::spawn(async move {
+            let Some(RunCommand::ResumeBatch {
+                ack,
+                dispatch_state,
+                accepted_fingerprint,
+                ..
+            }) = command_rx.recv().await
+            else {
+                panic!("expected resume command");
+            };
+            dispatch_state
+                .compare_exchange(
+                    RESUME_DISPATCH_WAITING,
+                    RESUME_DISPATCH_STARTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 )
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        handle.cancel_requested.store(true, Ordering::Release);
-
-        let error = match tokio::time::timeout(Duration::from_millis(250), &mut resume).await {
-            Ok(result) => result
-                .expect("resume task")
-                .expect_err("cancelled admission must not dispatch"),
-            Err(_) => {
-                resume.abort();
-                let _ = resume.await;
-                panic!("generation admission did not observe driver cancellation");
+                .expect("accept resume");
+            if let Some((target, fingerprint)) = accepted_fingerprint {
+                target.store(fingerprint, Ordering::Release);
             }
-        };
+            ack.send(Ok(())).expect("ack resume");
+        });
+
+        let events = handle
+            .resume_batch_for_operation(
+                vec![(
+                    "tool-1".into(),
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )],
+                22,
+            )
+            .await
+            .expect("accepted resume");
+        drop(events);
+        driver.await.expect("driver");
+        assert_eq!(
+            handle.request_fingerprint(),
+            22,
+            "an exact retry of the tool-result sampling stage must not execute twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_generation_admission_stops_when_driver_is_cancelled() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "cancelled-resume-admission".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "tool-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+        });
+        let error = handle
+            .resume_batch_within(
+                vec![(
+                    "tool-1".into(),
+                    serde_json::json!({"type":"tool_result","content":"done"}),
+                )],
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("cancelled admission must not dispatch");
         assert_eq!(error.status, 502);
         assert!(
             live_resume_error_is_dead_driver(&error),
@@ -8258,7 +7922,6 @@ mod tests {
             !handle.resume_in_flight.load(Ordering::Acquire),
             "cancellation must release the exact-once resume guard"
         );
-        drop(held);
     }
 
     #[test]
@@ -8335,11 +7998,11 @@ mod tests {
     }
 
     #[test]
-    fn live_open_retries_http1_on_same_request_before_409() {
+    fn live_open_retries_http1_only_before_acceptance() {
         let timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
         assert!(
-            live_open_should_retry_http1(&timeout),
-            "H2 open timeout must try HTTP/1 on this same request_id before 409"
+            !live_open_should_retry_http1(&timeout),
+            "a response-less H2 timeout may have accepted Run and must not be replayed"
         );
         let connect = CursorError::new(502, "Cursor upstream connect failed", None);
         assert!(
@@ -8364,12 +8027,12 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_start_retries_surface_original_as_409() {
+    fn exhausted_preconnect_retries_remain_retryable_for_grok() {
         let connect = CursorError::new(502, "Cursor upstream connect failed", None);
         let exhausted = exhausted_live_start_error(connect.clone(), 3);
         assert_eq!(
-            exhausted.status, 409,
-            "after proxy-internal retries grok-build must see 409, not 5xx-retry"
+            exhausted.status, 502,
+            "a request that never connected is safe for grok-build's jittered retry budget"
         );
         assert_eq!(exhausted.message, "Cursor upstream connect failed");
         let first = exhausted_live_start_error(connect, 0);
@@ -8380,8 +8043,24 @@ mod tests {
         let timeout = CursorError::new(504, "Cursor live open timed out after 20s", None);
         let still_timeout = exhausted_live_start_error(timeout, 0);
         assert_eq!(
-            still_timeout.status, 504,
-            "H2 timeout is retried as HTTP/1 on the same request_id, not a new Run"
+            still_timeout.status, 409,
+            "a response-less open timeout must fail closed on its first occurrence"
+        );
+        let ambiguous_timeout = CursorError::new(
+            504,
+            "Cursor live open timed out after 20s; acceptance is ambiguous",
+            None,
+        );
+        assert_eq!(
+            exhausted_live_start_error(ambiguous_timeout, 3).status,
+            409,
+            "a response-less open can still be executing and must fail closed"
+        );
+        let rejected = CursorError::new(503, "Cursor upstream HTTP 503", None);
+        assert_eq!(
+            exhausted_live_start_error(rejected, 3).status,
+            503,
+            "an explicit upstream rejection did not accept a Run"
         );
         let shed = CursorError::new(
             429,
@@ -8421,11 +8100,11 @@ mod tests {
     }
 
     #[test]
-    fn live_open_timeout_is_an_http1_fallback() {
+    fn live_open_timeout_is_not_an_http1_fallback() {
         let err = CursorError::new(504, "Cursor live open timed out after 90s", None);
         assert!(
-            is_http1_fallback_error(&err),
-            "reconnect may retry the same episode after a 504"
+            !is_http1_fallback_error(&err),
+            "a response-less open timeout may have landed and must not be replayed"
         );
         assert!(
             !is_explicit_http1_required(&err),
@@ -8532,7 +8211,6 @@ mod tests {
 
         let message = hollow_resume_terminal_message(
             session_id,
-            true,
             false,
             true,
             &mut latest_checkpoint,
@@ -8564,17 +8242,12 @@ mod tests {
             super::super::conversation::continuation_for(Some(session_id)).conversation_id;
         let fallback = "Cursor resume produced no progress before the recovery deadline";
 
-        for (opened_with_checkpoint, useful, pending_empty) in [
-            (false, false, true),
-            (true, true, true),
-            (true, false, false),
-        ] {
+        for (saw_text, pending_empty) in [(true, true), (false, false)] {
             let mut latest_checkpoint = Some(vec![0x08, 0x01]);
             let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
             let message = hollow_resume_terminal_message(
                 session_id,
-                opened_with_checkpoint,
-                useful,
+                saw_text,
                 pending_empty,
                 &mut latest_checkpoint,
                 &mut kv_blobs,
@@ -8598,6 +8271,58 @@ mod tests {
                 original
             );
         }
+    }
+
+    #[test]
+    fn hollow_resume_after_thinking_only_rotates_and_is_retryable() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-hollow-thinking";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+        let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+
+        let message = hollow_resume_terminal_message(
+            session_id,
+            false,
+            true,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+            "Cursor resume produced no progress before the recovery deadline",
+        );
+
+        assert!(message.contains(CONVERSATION_RESET_RETRY_NOTE), "{message}");
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            502,
+            "thinking-only hollow resume must be retryable for grok-build"
+        );
+        assert_ne!(
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id,
+            original
+        );
+    }
+
+    #[test]
+    fn cancel_without_client_visible_output_stays_retryable() {
+        assert!(
+            !live_cancel_is_ambiguous(true, false, true, false),
+            "unconfirmed ResumeAction with no text/tools must 502 so grok retries"
+        );
+        assert!(
+            live_cancel_is_ambiguous(true, true, true, false),
+            "streamed assistant text stays fail-closed"
+        );
+        assert!(
+            live_cancel_is_ambiguous(true, false, false, false),
+            "exposed tools stay fail-closed"
+        );
+        assert!(
+            live_cancel_is_ambiguous(false, false, true, true),
+            "partially sent tool results stay fail-closed"
+        );
     }
 
     #[test]
@@ -8720,8 +8445,8 @@ mod tests {
         assert!(is_ambiguous_live_open_timeout(&timeout));
         let gateway = CursorError::new(504, "Gateway Timeout", None);
         assert!(
-            is_ambiguous_live_open_timeout(&gateway),
-            "any HTTP 504 is an ambiguous accept"
+            !is_ambiguous_live_open_timeout(&gateway),
+            "an explicit upstream 504 response is distinct from a response-less local timeout"
         );
         assert!(!is_ambiguous_live_open_timeout(&rate));
         let mapped_reset = CursorError::new(
@@ -9081,6 +8806,38 @@ mod tests {
     }
 
     #[test]
+    fn h1_preconnect_failure_half_opens_h2_unless_user_forced_h1() {
+        let preconnect = CursorError::new(
+            502,
+            "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)",
+            None,
+        );
+        assert!(
+            h1_failure_should_probe_h2(false, &preconnect),
+            "a circuit-selected H1 path cannot stay pinned when BidiAppend never connects"
+        );
+        assert!(
+            !h1_failure_should_probe_h2(true, &preconnect),
+            "CCP_CURSOR_HTTP1 is an explicit operator transport choice"
+        );
+        let ambiguous = CursorError::new(
+            504,
+            "Cursor BidiAppend timed out; acceptance is ambiguous",
+            None,
+        );
+        assert!(
+            !h1_failure_should_probe_h2(false, &ambiguous),
+            "a possibly accepted append must never be replayed over H2"
+        );
+        let h1_required = CursorError::new(421, "HTTP_1_1_REQUIRED", None);
+        let selected = h2_half_open_error(preconnect.clone(), h1_required);
+        assert_eq!(
+            selected.message, preconnect.message,
+            "an H2 capability rejection must preserve the retryable H1 pre-connect failure"
+        );
+    }
+
+    #[test]
     fn process_h2_circuit_trips_on_first_midstream_reset() {
         let mut circuit = ProcessH2Circuit::default();
         let t0 = Instant::now();
@@ -9108,247 +8865,19 @@ mod tests {
         assert!(live_open_prefers_http1_from(false, true));
     }
 
-    #[test]
-    fn live_open_max_defaults_to_grok_cli_parallelism() {
-        assert_eq!(
-            live_open_concurrency_max(None),
-            128,
-            "grok-cli can fan out to 128; do not require CCP_CURSOR_LIVE_OPEN_CONCURRENCY"
-        );
-        assert_eq!(live_open_concurrency_max(Some("16")), 16);
-        assert_eq!(live_open_concurrency_max(Some("1")), 1);
-        assert_eq!(live_open_concurrency_max(Some("0")), 128);
-        assert_eq!(live_open_concurrency_max(Some("999")), 128);
-        assert_eq!(live_open_concurrency_max(Some("nope")), 128);
-    }
-
-    #[test]
-    fn live_generation_max_defaults_to_safe_parallelism() {
-        assert_eq!(live_generation_concurrency_max(None), 16);
-        assert_eq!(live_generation_concurrency_max(Some("8")), 8);
-        assert_eq!(live_generation_concurrency_max(Some("1")), 1);
-        assert_eq!(live_generation_concurrency_max(Some("0")), 16);
-        assert_eq!(live_generation_concurrency_max(Some("999")), 128);
-        assert_eq!(live_generation_concurrency_max(Some("nope")), 16);
-    }
-
-    #[test]
-    fn live_generation_queue_timeout_is_decoupled_from_run_lifetime() {
-        assert_eq!(live_generation_queue_secs(None), 8);
-        assert_eq!(live_generation_queue_secs(Some("15")), 15);
-        assert_eq!(live_generation_queue_secs(Some("0")), 8);
-        assert_eq!(live_generation_queue_secs(Some("9999")), 3600);
-        assert_eq!(live_generation_queue_secs(Some("nope")), 8);
-    }
-
-    #[test]
-    fn live_generation_saturation_is_retryable_without_ambiguous_acceptance() {
-        let err = live_generation_saturated_error();
-        assert_eq!(err.status, 429);
-        assert_eq!(err.retry_after.as_deref(), Some("2"));
-        assert!(!is_ambiguous_live_open_timeout(&err));
-    }
-
-    #[test]
-    fn heartbeat_only_thinking_budget_shrinks_under_contention() {
-        let idle = Duration::from_secs(120);
-        assert_eq!(
-            live_heartbeat_thinking_budget(idle, false),
-            idle.saturating_mul(2),
-            "a lone Fable turn may think for 2x stream idle"
-        );
-        assert_eq!(
-            live_heartbeat_thinking_budget(idle, true),
-            Duration::from_secs(30),
-            "a full generation gate must not hold slots for 4 minutes of heartbeats"
-        );
-    }
-
-    #[test]
-    fn generation_gate_is_contended_at_limit_or_with_resume_waiters() {
-        let gate = LiveGenerationGate::new(1);
-        assert!(
-            !gate.is_contended(),
-            "an empty gate must keep the generous thinking budget"
-        );
-        let permit = gate
-            .try_acquire(LiveGenerationPriority::Start)
-            .expect("hold the only slot");
-        assert!(
-            gate.is_contended(),
-            "a full gate is contended even without waiters"
-        );
-        drop(permit);
-        let _waiter = gate.register_resume_waiter();
-        assert!(
-            gate.is_contended(),
-            "resume waiters must shrink holder thinking so tool results can run"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn queued_resume_overtakes_queued_new_generation() {
-        let gate = LiveGenerationGate::new(1);
-        let held = gate
-            .try_acquire(LiveGenerationPriority::Start)
-            .expect("hold the generation slot");
-
-        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
-        let (admitted_tx, mut admitted_rx) = mpsc::unbounded_channel();
-        let start_ready = ready_tx.clone();
-        let start_admitted = admitted_tx.clone();
-        let start_gate = gate.clone();
-        let queued_start = tokio::spawn(async move {
-            start_ready.send("start").expect("announce queued start");
-            let _permit = start_gate
-                .acquire(LiveGenerationPriority::Start, None, Duration::from_secs(1))
-                .await
-                .expect("queued start permit");
-            start_admitted
-                .send("start")
-                .expect("announce admitted start");
-        });
-        assert_eq!(ready_rx.recv().await, Some("start"));
-        tokio::task::yield_now().await;
-
-        let resume_ready = ready_tx.clone();
-        let resume_admitted = admitted_tx.clone();
-        let resume_gate = gate.clone();
-        let queued_resume = tokio::spawn(async move {
-            resume_ready.send("resume").expect("announce queued resume");
-            let _permit = resume_gate
-                .acquire(LiveGenerationPriority::Resume, None, Duration::from_secs(1))
-                .await
-                .expect("queued resume permit");
-            resume_admitted
-                .send("resume")
-                .expect("announce admitted resume");
-        });
-        assert_eq!(ready_rx.recv().await, Some("resume"));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while gate.resume_waiters() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("resume waiter should register before capacity is released");
-
-        drop(held);
-        let first = tokio::time::timeout(Duration::from_secs(1), admitted_rx.recv())
-            .await
-            .expect("one queued generation should be admitted");
-        assert_eq!(
-            first,
-            Some("resume"),
-            "tool-result continuation must not sit behind unrelated new starts"
-        );
-
-        queued_start.await.expect("queued start task");
-        queued_resume.await.expect("queued resume task");
-    }
-
-    #[test]
-    fn live_open_limit_grows_to_128_and_shrinks_to_soft_start() {
-        let mut n = live_open_soft_start(128);
-        assert_eq!(
-            n, 4,
-            "first wave stays small so H2 handshakes do not stampede"
-        );
-        while n < 128 {
-            let next = live_open_grow(n, 128);
-            assert!(next > n, "must grow from {n}");
-            n = next;
-        }
-        assert_eq!(n, 128);
-        assert_eq!(live_open_grow(128, 128), 128);
-        assert_eq!(
-            live_open_grow(100, 16),
-            16,
-            "optional env still caps the max"
-        );
-
-        n = live_open_shrink(128, 4);
-        assert_eq!(n, 64);
-        while n > 4 {
-            n = live_open_shrink(n, 4);
-        }
-        assert_eq!(n, 4);
-        assert_eq!(live_open_shrink(4, 4), 4);
-    }
-
     #[tokio::test]
-    async fn adaptive_live_open_waits_instead_of_instant_429() {
-        let gate = AdaptiveLiveOpenGate::new(4);
-        let mut held = Vec::new();
-        for i in 0..4 {
-            held.push(
-                gate.try_acquire()
-                    .unwrap_or_else(|| panic!("soft-start slot {i}")),
-            );
+    async fn local_generation_admission_never_invents_a_rate_limit() {
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            tasks.push(tokio::spawn(async {
+                acquire_live_generation_permit(None)
+                    .await
+                    .expect("upstream Cursor is the only concurrency owner")
+            }));
         }
-        let started = Instant::now();
-        let err = gate
-            .acquire(Duration::from_millis(80))
-            .await
-            .expect_err("full gate must 429 after waiting");
-        assert_eq!(err.status, 429);
-        assert!(
-            started.elapsed() >= Duration::from_millis(50),
-            "must queue behind in-flight opens, not fail immediately: {:?}",
-            started.elapsed()
-        );
-        drop(held);
-    }
-
-    #[tokio::test]
-    async fn adaptive_live_open_grows_so_a_burst_does_not_need_an_env_var() {
-        let gate = AdaptiveLiveOpenGate::new(128);
-        assert_eq!(gate.limit(), 4);
-        gate.on_success();
-        assert_eq!(gate.limit(), 8);
-        gate.on_success();
-        assert_eq!(gate.limit(), 16);
-        let mut held = Vec::new();
-        for i in 0..16 {
-            held.push(
-                gate.try_acquire()
-                    .unwrap_or_else(|| panic!("admit {i} after growth")),
-            );
+        for task in tasks {
+            task.await.expect("fanout task");
         }
-        assert!(
-            gate.try_acquire().is_none(),
-            "limit 16 must still bound a stampede"
-        );
-        drop(held);
-        gate.on_failure();
-        assert_eq!(gate.limit(), 8, "open timeouts shrink the window");
-    }
-
-    #[test]
-    fn live_open_saturation_is_429_so_grok_retries() {
-        let err = live_open_saturated_error();
-        assert_eq!(
-            err.status, 429,
-            "saturation never sent a Run; grok-build must retry 429, not treat 409 as invalid_request"
-        );
-        assert!(!is_ambiguous_live_open_timeout(&err));
-        assert!(!crate::retry::is_ambiguous_live_accept(&err.message));
-        assert_eq!(
-            crate::retry::classify_proxy_error_status(err.status, &err.message),
-            429
-        );
-        assert!(
-            crate::retry::should_retry_status(err.status),
-            "grok-build retries 429; a fifth concurrent open must not fail closed"
-        );
-        assert!(
-            !cursor_start_error_is_same_request_retryable(&err),
-            "saturation never sent a Run; do not replay it inside the same POST"
-        );
-        assert!(
-            !live_start_error_seals_tombstone(&err),
-            "saturation must not tombstone the live slot"
-        );
     }
 
     #[test]
@@ -9818,7 +9347,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(session_id)
             .expect("fresh registry slot")
@@ -9850,7 +9379,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -10478,12 +10007,22 @@ mod tests {
         let connect = CursorError::new(502, "Cursor upstream connect failed", None);
         assert!(
             cursor_start_error_is_same_request_retryable(&connect),
-            "a refused connect must retry inside this POST before returning 409"
+            "a refused connect must retry inside this POST"
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&connect),
+            "a request that never connected cannot leave an accepted Run"
+        );
+
+        let rejected = CursorError::new(503, "Cursor upstream HTTP 503", None);
+        assert!(
+            !live_start_error_seals_tombstone(&rejected),
+            "an explicit upstream rejection must not poison the next grok retry"
         );
     }
 
     #[test]
-    fn initial_bidiappend_timeout_retries_inside_post_then_409() {
+    fn initial_bidiappend_timeout_fails_closed_without_replay() {
         let initial = ambiguous_http1_append_error(
             CursorError::new(408, "BidiAppend timed out", None),
             "initial Run",
@@ -10493,17 +10032,17 @@ mod tests {
             "Cursor BidiAppend initial Run failed; acceptance is ambiguous: BidiAppend timed out"
         );
         assert!(
-            cursor_start_error_is_same_request_retryable(&initial),
-            "first-open BidiAppend timeout must retry this POST before 409"
+            !cursor_start_error_is_same_request_retryable(&initial),
+            "a timed-out BidiAppend may have accepted the Run and must not be replayed"
         );
         assert!(
             live_start_error_seals_tombstone(&initial),
             "exhausted retries still seal Starting so the next POST is not a duplicate"
         );
-        let exhausted = exhausted_live_start_error(initial.clone(), 3);
+        let exhausted = exhausted_live_start_error(initial.clone(), 0);
         assert_eq!(
             exhausted.status, 409,
-            "after proxy-internal retries grok-build must see 409, not 408"
+            "the first ambiguous send must immediately fail closed as 409"
         );
         assert_eq!(exhausted.message, initial.message);
 
@@ -10817,16 +10356,16 @@ mod tests {
         )));
         assert!(
             !live_resume_error_is_dead_driver(&CursorError::new(
-                429,
+                503,
                 "Cursor live resume dispatch timed out before driver acceptance; retry this tool result",
                 None
             )),
-            "a late driver is still alive; 429 must retry the same tool result, not supersede"
+            "a late driver is still alive; 503 must retry the same tool result, not supersede"
         );
     }
 
     #[test]
-    fn resume_dispatch_timeout_is_retryable_rate_limit() {
+    fn resume_dispatch_timeout_is_retryable_service_overload() {
         if std::env::var("CCP_CURSOR_LIVE_RESUME_DISPATCH_MS").is_err() {
             assert_eq!(
                 resume_dispatch_timeout(),
@@ -10836,14 +10375,14 @@ mod tests {
         let err = resume_dispatch_retryable_error(
             "Cursor live resume dispatch timed out before driver acceptance; retry this tool result",
         );
-        assert_eq!(err.status, 429);
+        assert_eq!(err.status, 503);
         assert_eq!(
             crate::retry::classify_proxy_error_status(err.status, &err.message),
-            429
+            503
         );
         assert_eq!(
             crate::retry::anthropic_error_kind_for_status(err.status, &err.message),
-            "rate_limit_error"
+            "api_error"
         );
         assert!(!crate::retry::is_ambiguous_live_accept(&err.message));
     }
@@ -10858,7 +10397,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -11251,7 +10790,7 @@ mod tests {
         )
         .await
         .expect_err("a duplicate start must not replace the running generation");
-        assert_eq!(error.status, 429);
+        assert_eq!(error.status, 503);
         LiveRunRegistry::clear();
     }
 
@@ -11392,7 +10931,7 @@ mod tests {
         let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
             panic!("a starting live generation must remain retryable");
         };
-        assert_eq!(error.status, 429);
+        assert_eq!(error.status, 503);
         LiveRunRegistry::clear();
     }
 
@@ -11565,7 +11104,7 @@ mod tests {
             completed: Arc::clone(&completed),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -11717,7 +11256,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_request_keeps_reservation_when_cancel_is_ambiguous() {
+    fn fresh_request_never_replaces_a_run_when_cancel_is_ambiguous() {
         let _registry = lock_live_registry_for_test();
         let session = format!("fresh-amb-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -11739,19 +11278,22 @@ mod tests {
             "Cursor live run ended in an ambiguous upstream state; replacement blocked: acceptance is ambiguous",
             None,
         );
-        let kept = finish_replacement_after_cancel(reservation, superseded, false, Err(error))
-            .expect("a fresh turn must keep the Starting reservation");
+        let error =
+            match finish_replacement_after_cancel(reservation, superseded, false, Err(error)) {
+                Err(error) => error,
+                Ok(_) => panic!("an unresolved old Run must block a replacement"),
+            };
+        assert_eq!(error.status, 409);
         assert!(
-            LiveRunRegistry::is_starting_run(&session, None),
-            "re-inserting the dying handle would 409 grok-build's next turn"
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "the slot must stay sealed until the old Run's acceptance is resolved"
         );
         assert!(LiveRunRegistry::running_generation(&session, None).is_none());
-        kept.release();
         LiveRunRegistry::clear();
     }
 
     #[test]
-    fn tool_result_request_keeps_reservation_when_cancel_is_ambiguous() {
+    fn tool_result_request_never_replaces_a_run_when_cancel_is_ambiguous() {
         let _registry = lock_live_registry_for_test();
         let session = format!("tool-amb-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -11773,20 +11315,23 @@ mod tests {
             "Cursor live run ended in an ambiguous upstream state; replacement blocked: acceptance is ambiguous",
             None,
         );
-        let kept = finish_replacement_after_cancel(reservation, superseded, true, Err(error))
-            .expect("a superseded tool-result turn must keep the Starting reservation");
+        let error = match finish_replacement_after_cancel(reservation, superseded, true, Err(error))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unresolved old Run must block tool-result replay"),
+        };
+        assert_eq!(error.status, 409);
         assert!(
-            LiveRunRegistry::is_starting_run(&session, None),
-            "re-inserting the dying handle 409s grok-build after compact/tool batches"
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "the slot must stay sealed so tool results cannot reach two Runs"
         );
         assert!(LiveRunRegistry::running_generation(&session, None).is_none());
-        kept.release();
         LiveRunRegistry::clear();
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn fresh_request_clears_ambiguous_tombstone_instead_of_409() {
+    async fn fresh_request_cannot_clear_ambiguous_tombstone() {
         let _registry = lock_live_registry_for_test();
         let session = format!("amb-tombstone-compact-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -11817,16 +11362,16 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(outcome, super::super::LiveResumeOutcome::Free),
-            "compact's next POST must clear the Ambiguous tombstone, not 409 after 1.5s"
+            matches!(outcome, super::super::LiveResumeOutcome::Conflict),
+            "a new POST must not replay a Run while prior acceptance is unresolved"
         );
         assert!(
-            !LiveRunRegistry::is_ambiguous_run(&session, None),
-            "the next turn must remove the tombstone so start_live can claim"
+            LiveRunRegistry::is_ambiguous_run(&session, None),
+            "the unresolved Run must remain sealed until its TTL"
         );
         assert!(
-            !LiveRunRegistry::is_occupied(&session),
-            "cleared tombstone must look Free to try_claim_run"
+            LiveRunRegistry::is_occupied(&session),
+            "an ambiguous tombstone must stay occupied"
         );
         LiveRunRegistry::clear();
     }
@@ -11936,7 +11481,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn compact_claims_starting_slot_after_nested_wait() {
+    async fn compact_never_cancels_an_in_flight_starting_open() {
         let _registry = lock_live_registry_for_test();
         let session = format!("compact-starting-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
@@ -11953,18 +11498,57 @@ mod tests {
             true,
         )
         .await;
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("a Starting open must be shed as retryable overload");
+        };
+        assert_eq!(error.status, 503);
         assert!(
-            !matches!(outcome, super::super::LiveResumeOutcome::Conflict),
-            "compact must not 409 a Starting occupant after the nested wait"
-        );
-        assert!(
-            !matches!(
+            matches!(
                 LiveRunRegistry::claim_replacement_for_occupied_slot(&session, None),
                 LiveReplacementClaim::Conflict
             ),
-            "Starting after nested wait must be claimable for a fresh compact"
+            "an in-flight .send() must never be cancelled and replaced"
         );
         drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn identical_retry_never_supersedes_its_running_generation() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("identical-running-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let body = compact_turn_body();
+        let fingerprint =
+            live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+        let handle = dummy_handle("identical-running-generation");
+        handle.set_request_fingerprint(fingerprint);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert running");
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_identical_running".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("an identical HTTP retry must wait for the existing generation");
+        };
+        assert_eq!(error.status, 503);
+        assert_eq!(
+            LiveRunRegistry::running_generation(&session, None).as_deref(),
+            Some("identical-running-generation")
+        );
         LiveRunRegistry::clear();
     }
 
@@ -12022,32 +11606,30 @@ mod tests {
     }
 
     #[test]
-    fn take_ambiguous_tombstone_does_not_abort_starting() {
+    fn ambiguous_tombstone_stays_fail_closed_until_expiry() {
         let _registry = lock_live_registry_for_test();
         let session = format!("take-starting-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
-        assert!(
-            !LiveRunRegistry::take_ambiguous_tombstone(&session, None),
-            "Starting is not a tombstone"
-        );
         assert!(LiveRunRegistry::is_starting_run(&session, None));
         reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
-        assert!(LiveRunRegistry::take_ambiguous_tombstone(&session, None));
-        assert!(!LiveRunRegistry::is_occupied(&session));
-        assert!(!LiveRunRegistry::take_ambiguous_tombstone(&session, None));
+        assert!(LiveRunRegistry::is_ambiguous_run(&session, None));
+        assert!(
+            LiveRunRegistry::is_occupied(&session),
+            "no subsequent POST may replay a Run whose acceptance is unresolved"
+        );
         LiveRunRegistry::clear();
     }
 
     #[test]
-    fn ambiguous_cancel_probe_error_does_not_block_new_run() {
+    fn ambiguous_cancel_probe_error_blocks_new_run() {
         assert!(
-            !live_probe_error_blocks_new_run(
+            live_probe_error_blocks_new_run(
                 "Cursor live cancellation interrupted an operation whose completion is unresolved; acceptance is ambiguous"
             ),
-            "compact's next POST must not 502 an ambiguous cancel"
+            "an ambiguous cancel must remain fail-closed"
         );
-        assert!(!live_probe_error_blocks_new_run(
+        assert!(live_probe_error_blocks_new_run(
             "Cursor live run ended in an ambiguous upstream state; replacement blocked: acceptance is ambiguous"
         ));
         assert!(
@@ -12161,7 +11743,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -16023,7 +15605,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -16176,7 +15758,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve("terminal-session").expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -16207,7 +15789,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -16378,7 +15960,7 @@ mod tests {
             completed,
             cancel_requested,
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
         upstream_tx
@@ -16599,7 +16181,7 @@ mod tests {
             completed: Arc::clone(&completed),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
         let driver = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -16637,7 +16219,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
         let error = handle
@@ -16662,7 +16244,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
         assert!(
@@ -16722,7 +16304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_resume_probation_blocks_replacement() {
+    async fn cancellation_during_resume_probation_allows_replacement_without_client_output() {
         let (upstream_tx, upstream_rx) = mpsc::channel(1);
         let (request_tx, _request_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::channel(1);
@@ -16763,15 +16345,13 @@ mod tests {
             completed,
             cancel_requested,
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
-        let error = handle
+        handle
             .cancel_and_wait()
             .await
-            .expect_err("accepted ResumeAction probation must block replacement");
-        assert_eq!(error.status, 409);
-        assert!(error.message.contains("ambiguous"), "{}", error.message);
+            .expect("thinking-only ResumeAction probation must not 409 grok's replacement POST");
         driver.await.expect("probation driver");
     }
 
@@ -16786,7 +16366,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let resume_handle = Arc::clone(&handle);
         let resume = tokio::spawn(async move {
@@ -16826,7 +16406,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
         let error = tokio::time::timeout(
@@ -16843,12 +16423,12 @@ mod tests {
         .expect("resume dispatch must finish before downstream stream-idle")
         .expect_err("an unprocessed command must return a bounded retryable error");
         assert_eq!(
-            error.status, 429,
-            "a busy driver is transient; grok-build retries 429 and treats 409 as invalid_request"
+            error.status, 503,
+            "a busy driver is transient; grok-build gives 503 the general retry budget"
         );
         assert_eq!(
             crate::retry::anthropic_error_kind_for_status(error.status, &error.message),
-            "rate_limit_error"
+            "api_error"
         );
         let queued = command_rx.recv().await.expect("cancelled queued command");
         let RunCommand::ResumeBatch { dispatch_state, .. } = &queued else {
@@ -16918,7 +16498,7 @@ mod tests {
             completed: Arc::clone(&completed),
             cancel_requested,
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
         handle
@@ -16978,7 +16558,7 @@ mod tests {
             completed: Arc::clone(&completed),
             cancel_requested,
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
 
         let mut payload = Vec::new();
@@ -17054,7 +16634,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(Arc::clone(&handle)).is_err() {
@@ -17088,7 +16668,7 @@ mod tests {
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(AtomicBool::new(false)),
-            request_fingerprint: AtomicU64::new(0),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(handle).is_err() {

@@ -51,7 +51,7 @@ use crate::providers::cursor::live::{
     live_error_is_same_request_retryable, live_error_needs_checkpoint_continue,
     live_pending_must_supersede, live_probe_error_blocks_new_run, live_request_fingerprint,
     live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
-    live_start_error_seals_tombstone, same_request_retry_wait_ms,
+    live_start_error_seals_tombstone, local_overload_retry_after, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
@@ -325,7 +325,9 @@ const LIVE_RUN_BUSY_MESSAGE: &str =
     "A Cursor live run is already active for this session; retry after it advances";
 
 fn live_run_busy_error() -> CursorError {
-    CursorError::new(429, LIVE_RUN_BUSY_MESSAGE, None)
+    let mut error = CursorError::new(503, LIVE_RUN_BUSY_MESSAGE, None);
+    error.retry_after = Some(local_overload_retry_after());
+    error
 }
 
 fn live_replacement_conflict_error(has_tool_results: bool) -> CursorError {
@@ -357,6 +359,7 @@ async fn start_live_events_with_retries(
     has_refresh: bool,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
     let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
+    let original_request_id = uuid::Uuid::new_v4().to_string();
     let mut transient_retries = 0_u32;
     loop {
         let mut reservation = if let Some(reservation) = initial_reservation.take() {
@@ -394,6 +397,7 @@ async fn start_live_events_with_retries(
                 allowed.clone(),
                 mcp_tools.clone(),
                 request_context.clone(),
+                Some(&original_request_id),
                 Some(reservation.cancelled()),
             )
             .await
@@ -413,6 +417,7 @@ async fn start_live_events_with_retries(
                             allowed.clone(),
                             mcp_tools.clone(),
                             request_context.clone(),
+                            Some(&original_request_id),
                             Some(reservation.cancelled()),
                         )
                         .await
@@ -994,15 +999,10 @@ fn reset_session_usage_for_test() {
 static SESSION_USAGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn log_live_start_claude_headers(ctx: &RequestContext, session_id: &str) {
-    if ctx.claude_code.agent_id.is_none()
-        && ctx.claude_code.parent_agent_id.is_none()
-        && ctx.claude_code.app.is_none()
-    {
-        return;
-    }
     create_logger("cursor").info(
-        "live_start_nested_headers",
+        "live_start_identity",
         Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
             ("sessionId".to_string(), serde_json::json!(session_id)),
             (
                 "agentId".to_string(),
@@ -1038,6 +1038,20 @@ fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRu
     }
 }
 
+fn live_operation_fingerprint_payload(
+    body: &MessagesRequest,
+    client_request_id: Option<&str>,
+) -> Vec<u8> {
+    if let Some(request_id) = client_request_id.filter(|value| !value.is_empty()) {
+        let mut payload = b"x-grok-req-id\0".to_vec();
+        payload.extend_from_slice(request_id.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&serde_json::to_vec(body).unwrap_or_default());
+        return payload;
+    }
+    serde_json::to_vec(&body.messages).unwrap_or_default()
+}
+
 /// Cursor conversation key for prompt compaction (`delta_only` / checkpoint).
 ///
 /// Must match [`live_run_key_for`] used by the BiDi worker. Nested agents share
@@ -1061,9 +1075,6 @@ enum LiveResumeOutcome {
     MissingTools(Vec<String>),
     ResumeError(CursorError),
     SupersedeRunning(String),
-    /// Fresh compact/next-turn spent the nested wait on Starting / same-
-    /// fingerprint Succeeded. Claim that slot; do not 409.
-    TakeOccupiedSlot,
     Conflict,
     Free,
 }
@@ -1083,9 +1094,9 @@ fn unresolved_live_tools_outcome(
 }
 
 /// Classify a slot that `get_run` hides. A dying Running generation is
-/// superseded. Ambiguous is cleared. A Succeeded tombstone with a *new*
-/// fingerprint is released so compact/next-turn can start. Starting and
-/// same-fingerprint Succeeded stay Occupied until the nested wait expires.
+/// superseded. Ambiguous stays fail-closed until its TTL. A Succeeded
+/// tombstone with a *new* fingerprint is released so compact/next-turn can
+/// start. Starting and same-fingerprint Succeeded stay occupied.
 fn resume_when_slot_has_no_runnable_handle(
     session_id: &str,
     agent_id: Option<&str>,
@@ -1098,11 +1109,8 @@ fn resume_when_slot_has_no_runnable_handle(
         // must be superseded, not 409'd.
         return Some(LiveResumeOutcome::SupersedeRunning(run_id));
     }
-    if LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id) {
-        if let Some(run_id) = observed_run_id {
-            return Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()));
-        }
-        return Some(LiveResumeOutcome::Free);
+    if LiveRunRegistry::is_ambiguous_run(session_id, agent_id) {
+        return Some(LiveResumeOutcome::Conflict);
     }
     LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
     if !LiveRunRegistry::is_occupied_run(session_id, agent_id) {
@@ -1116,7 +1124,6 @@ fn resume_when_slot_has_no_runnable_handle(
             Some(LiveResumeOutcome::TerminalError(error))
         }
         LiveRunProbe::TerminalError(_) => {
-            let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
             if let Some(run_id) = observed_run_id {
                 Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
             } else {
@@ -1136,6 +1143,7 @@ fn resume_when_slot_has_no_runnable_handle(
 
 /// Wait for an in-flight BiDi run to expose pending tools (and resume), finish,
 /// or fail — instead of immediately 409'ing concurrent same-session POSTs.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn await_live_run_resume(
     session_id: &str,
@@ -1147,9 +1155,35 @@ async fn await_live_run_resume(
     _monitor: Option<(crate::monitor::MonitorHandle, String)>,
     _want_stream: bool,
 ) -> LiveResumeOutcome {
+    await_live_run_resume_for_operation(
+        session_id,
+        agent_id,
+        body,
+        _message_id,
+        _wire_model,
+        _estimated_input,
+        _monitor,
+        _want_stream,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn await_live_run_resume_for_operation(
+    session_id: &str,
+    agent_id: Option<&str>,
+    body: &MessagesRequest,
+    _message_id: String,
+    _wire_model: String,
+    _estimated_input: u64,
+    _monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    _want_stream: bool,
+    client_request_id: Option<&str>,
+) -> LiveResumeOutcome {
     let has_tool_results = request_has_current_tool_result(body);
     let fingerprint =
-        live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+        live_request_fingerprint(&live_operation_fingerprint_payload(body, client_request_id));
     // Tool-result resumes: wait for pending tools to appear (race with expose).
     // Keep this below downstream stream-idle: no Anthropic response exists yet,
     // so SSE pings cannot protect this pre-response window.
@@ -1177,7 +1211,7 @@ async fn await_live_run_resume(
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         };
-        if has_tool_results && run.request_fingerprint() == fingerprint {
+        if run.request_fingerprint() == fingerprint {
             return LiveResumeOutcome::ResumeError(live_run_busy_error());
         }
         if observed_non_running_slot {
@@ -1214,7 +1248,10 @@ async fn await_live_run_resume(
                 continue;
             }
             match collect_live_tool_results(body, &pending) {
-                Ok(tool_results) => match run.resume_batch(tool_results).await {
+                Ok(tool_results) => match run
+                    .resume_batch_for_operation(tool_results, fingerprint)
+                    .await
+                {
                     Ok(events) => {
                         return LiveResumeOutcome::Resumed(events);
                     }
@@ -1248,11 +1285,11 @@ async fn await_live_run_resume(
             return LiveResumeOutcome::SupersedeRunning(run_id);
         }
         if !has_tool_results {
-            return LiveResumeOutcome::TakeOccupiedSlot;
+            return LiveResumeOutcome::ResumeError(live_run_busy_error());
         }
         return LiveResumeOutcome::Conflict;
     };
-    if has_tool_results && run.request_fingerprint() == fingerprint {
+    if run.request_fingerprint() == fingerprint {
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     }
     if observed_non_running_slot {
@@ -1290,7 +1327,10 @@ async fn await_live_run_resume(
             return unresolved_live_tools_outcome(false, missing, observed_run_id.as_deref());
         }
         match collect_live_tool_results(body, &pending) {
-            Ok(tool_results) => match run.resume_batch(tool_results).await {
+            Ok(tool_results) => match run
+                .resume_batch_for_operation(tool_results, fingerprint)
+                .await
+            {
                 Ok(events) => {
                     return LiveResumeOutcome::Resumed(events);
                 }
@@ -1511,18 +1551,16 @@ impl Provider for CursorProvider {
         let mut resumed_live_events = None;
         if let Some(session_id) = ctx.session_id.as_deref() {
             let agent_id = claude_agent_id(&ctx);
-            let fingerprint =
-                live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+            let fingerprint_payload =
+                live_operation_fingerprint_payload(&body, ctx.client_request_id.as_deref());
+            let fingerprint = live_request_fingerprint(&fingerprint_payload);
             LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
             match LiveRunRegistry::probe_run(session_id, agent_id) {
                 LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
                     return json_error_from_cursor_message(error);
                 }
                 LiveRunProbe::TerminalError(_) => {
-                    // Ambiguous cancel / retryable probe already sealed or
-                    // cleared the handle. A next-turn POST must not 502; drop
-                    // the tombstone so start_live can claim.
-                    let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
+                    // Retryable terminal failures are removed by probe_run.
                 }
                 LiveRunProbe::Free => {
                     if reject_orphaned_native_results_when_live_slot_is_free(&body) {
@@ -1539,7 +1577,7 @@ impl Provider for CursorProvider {
                         .monitor
                         .clone()
                         .map(|handle| (handle, ctx.req_id.clone()));
-                    match await_live_run_resume(
+                    match await_live_run_resume_for_operation(
                         session_id,
                         agent_id,
                         &body,
@@ -1548,6 +1586,7 @@ impl Provider for CursorProvider {
                         estimated_input,
                         monitor,
                         want_stream,
+                        ctx.client_request_id.as_deref(),
                     )
                     .await
                     {
@@ -1559,9 +1598,7 @@ impl Provider for CursorProvider {
                         {
                             return json_error_from_cursor_message(error);
                         }
-                        LiveResumeOutcome::TerminalError(_) => {
-                            let _ = LiveRunRegistry::take_ambiguous_tombstone(session_id, agent_id);
-                        }
+                        LiveResumeOutcome::TerminalError(_) => {}
                         LiveResumeOutcome::MissingTools(missing) => {
                             return json_error(
                                 StatusCode::BAD_REQUEST,
@@ -1605,18 +1642,6 @@ impl Provider for CursorProvider {
                                     } else {
                                         preclaimed_live_reservation = Some(reservation);
                                     }
-                                }
-                            }
-                        }
-                        LiveResumeOutcome::TakeOccupiedSlot => {
-                            match LiveRunRegistry::claim_replacement_for_occupied_slot(
-                                session_id, agent_id,
-                            ) {
-                                LiveReplacementClaim::Conflict => {
-                                    return map_cursor_error_to_response(&live_run_busy_error());
-                                }
-                                LiveReplacementClaim::Reserved { reservation, .. } => {
-                                    preclaimed_live_reservation = Some(reservation);
                                 }
                             }
                         }
@@ -1775,7 +1800,10 @@ impl Provider for CursorProvider {
                 allowed: advertised_tool_names(&body),
                 mcp_tools: claude_local_mcp_tools(&body),
                 request_context: cursor_request_context(&body),
-                fingerprint: serde_json::to_vec(&body.messages).unwrap_or_default(),
+                fingerprint: live_operation_fingerprint_payload(
+                    &body,
+                    ctx.client_request_id.as_deref(),
+                ),
                 has_refresh: auth.refresh_token.is_some(),
             };
             let events = spawn_live_events_with_late_retries(retry_start, None, Some(events));
@@ -1831,7 +1859,8 @@ impl Provider for CursorProvider {
             // may supersede only the exact generation it observed above, where
             // replacement was atomically preclaimed. Never blindly replace a
             // Running/Starting slot discovered here.
-            let fingerprint = serde_json::to_vec(&body.messages).unwrap_or_default();
+            let fingerprint =
+                live_operation_fingerprint_payload(&body, ctx.client_request_id.as_deref());
             let request_context = cursor_request_context(&body);
             let has_refresh = auth.refresh_token.is_some();
             let initial_reservation = preclaimed_live_reservation.take();
@@ -2111,6 +2140,12 @@ Re-running `cursor auth login` usually will not help."
             let headers = [(http::header::RETRY_AFTER, retry_after)];
             (headers, resp).into_response()
         }
+        503 => {
+            let retry_after = err.retry_after.as_deref().unwrap_or("1");
+            let resp = json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", detail);
+            let headers = [(http::header::RETRY_AFTER, retry_after)];
+            (headers, resp).into_response()
+        }
         other if (400..500).contains(&other) => json_error(
             StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_REQUEST),
             crate::retry::anthropic_error_kind_for_status(other, detail),
@@ -2233,7 +2268,7 @@ mod tests {
 
     #[test]
     fn replacement_conflicts_retry_only_fresh_turns() {
-        assert_eq!(live_replacement_conflict_error(false).status, 429);
+        assert_eq!(live_replacement_conflict_error(false).status, 503);
         assert_eq!(live_replacement_conflict_error(true).status, 409);
     }
 
@@ -3187,6 +3222,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn local_503_overload_preserves_status_and_retry_after() {
+        let mut err =
+            client::CursorError::new(503, "Cursor live generation concurrency saturated", None);
+        err.retry_after = Some("2".into());
+
+        let response = map_cursor_error_to_response(&err);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
     #[test]
     fn streaming_live_commits_sse_before_start_live() {
         assert!(
@@ -3239,6 +3297,37 @@ mod tests {
     }
 
     #[test]
+    fn grok_request_id_is_the_idempotency_boundary() {
+        let body = hello_body();
+        let mut tool_result_stage = hello_body();
+        tool_result_stage.messages.push(
+            serde_json::from_value(serde_json::json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "done"}]
+            }))
+            .unwrap(),
+        );
+        let retry_a = live_operation_fingerprint_payload(&body, Some("req-a"));
+        let retry_a_again = live_operation_fingerprint_payload(&body, Some("req-a"));
+        let distinct_turn = live_operation_fingerprint_payload(&body, Some("req-b"));
+        assert_eq!(retry_a, retry_a_again);
+        assert_ne!(
+            retry_a,
+            live_operation_fingerprint_payload(&tool_result_stage, Some("req-a")),
+            "Grok reuses one request id across initial and tool-result sampling stages"
+        );
+        assert_ne!(
+            retry_a, distinct_turn,
+            "identical user text in a later Grok operation must start a new Run"
+        );
+        assert_ne!(
+            retry_a,
+            live_operation_fingerprint_payload(&body, None),
+            "legacy body fingerprints remain a fallback only"
+        );
+    }
+
+    #[test]
     fn count_tokens_uses_current_request_body_not_previous_turn() {
         let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
         reset_session_usage_for_test();
@@ -3278,6 +3367,7 @@ mod tests {
     fn nested_agent_headers_keep_parent_session_id_for_live_start() {
         let ctx = RequestContext {
             req_id: "req".into(),
+            client_request_id: None,
             session_id: Some("parent-session".into()),
             session_seq: None,
             provider: "cursor".into(),
@@ -3306,6 +3396,7 @@ mod tests {
         );
         let nested = RequestContext {
             req_id: "req".into(),
+            client_request_id: None,
             session_id: Some(session.clone()),
             session_seq: None,
             provider: "cursor".into(),
@@ -3326,6 +3417,7 @@ mod tests {
 
         let parent = RequestContext {
             req_id: "req".into(),
+            client_request_id: None,
             session_id: Some(session.clone()),
             session_seq: None,
             provider: "cursor".into(),

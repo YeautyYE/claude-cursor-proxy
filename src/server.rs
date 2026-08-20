@@ -351,6 +351,14 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
         "request",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), json!(&req_id)),
+            (
+                "clientRequestId".to_string(),
+                json!(header_text(&headers, "x-grok-req-id")),
+            ),
+            (
+                "grokConversationId".to_string(),
+                json!(header_text(&headers, "x-grok-conv-id")),
+            ),
             ("method".to_string(), json!("POST")),
             ("path".to_string(), json!("/v1/responses")),
             ("query".to_string(), json!({})),
@@ -393,8 +401,10 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
         state_dir_override: None,
     })
     .map(Arc::new);
+    let client_request_id = header_text(&headers, "x-grok-req-id");
     let context = RequestContext {
         req_id: req_id.clone(),
+        client_request_id: client_request_id.clone(),
         session_id,
         session_seq: None,
         provider: provider.name().to_string(),
@@ -700,6 +710,14 @@ async fn dispatch_request(
         "request",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), json!(&req_id)),
+            (
+                "clientRequestId".to_string(),
+                json!(header_text(&headers, "x-grok-req-id")),
+            ),
+            (
+                "grokConversationId".to_string(),
+                json!(header_text(&headers, "x-grok-conv-id")),
+            ),
             ("method".to_string(), json!(method.as_str())),
             ("path".to_string(), json!(&path)),
             ("query".to_string(), json!(&query)),
@@ -1028,15 +1046,17 @@ async fn dispatch_request(
         );
     }
 
+    let client_request_id = header_text(&headers, "x-grok-req-id");
     let context = RequestContext {
         req_id: req_id.clone(),
+        client_request_id: client_request_id.clone(),
         session_id,
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
         traffic,
         monitor: state.monitor.clone(),
         claude_code,
-        hold_http_until_live_open: false,
+        hold_http_until_live_open: client_request_id.is_some(),
     };
 
     let response = if count_tokens {
@@ -1360,8 +1380,8 @@ fn start_request_monitor(
 /// grok chat hashed to the same fallback live slot and 409'd each other.
 const CLAUDE_SESSION_ID_HEADERS: &[&str] = &[
     "x-claude-code-session-id",
-    "x-grok-session-id",
     "x-grok-conv-id",
+    "x-grok-session-id",
 ];
 
 struct ResolvedSessionId {
@@ -1579,8 +1599,7 @@ fn header_text(headers: &http::HeaderMap, name: &str) -> Option<String> {
 
 fn claude_code_headers_from(headers: &http::HeaderMap) -> ClaudeCodeAgentHeaders {
     ClaudeCodeAgentHeaders {
-        agent_id: header_text(headers, "x-claude-code-agent-id")
-            .or_else(|| header_text(headers, "x-grok-agent-id")),
+        agent_id: header_text(headers, "x-claude-code-agent-id"),
         parent_agent_id: header_text(headers, "x-claude-code-parent-agent-id"),
         app: header_text(headers, "x-app"),
     }
@@ -1747,13 +1766,14 @@ mod tests {
         both.insert("x-grok-conv-id", "grok-conv-9".parse().unwrap());
         assert_eq!(
             session_id_from_headers(&both).as_deref(),
-            Some("grok-sess-1"),
-            "session id is more stable than conv id across tool turns"
+            Some("grok-conv-9"),
+            "the sampling conversation, not its owning session, is the live-run boundary"
         );
 
         let mut claude_wins = http::HeaderMap::new();
         claude_wins.insert("x-claude-code-session-id", "claude-sess".parse().unwrap());
         claude_wins.insert("x-grok-session-id", "grok-sess-1".parse().unwrap());
+        claude_wins.insert("x-grok-conv-id", "grok-conv-9".parse().unwrap());
         assert_eq!(
             session_id_from_headers(&claude_wins).as_deref(),
             Some("claude-sess")
@@ -1975,14 +1995,13 @@ mod tests {
     }
 
     #[test]
-    fn grok_agent_id_header_populates_live_identity() {
+    fn grok_machine_agent_id_is_not_a_nested_agent_identity() {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-grok-agent-id", "agent/child-9".parse().unwrap());
         let mapped = claude_code_headers_from(&headers);
-        assert_eq!(
-            mapped.agent_id.as_deref(),
-            Some("agent/child-9"),
-            "grok subagents must get their own live run key when session fallback collides"
+        assert!(
+            mapped.agent_id.is_none(),
+            "x-grok-agent-id is install-wide telemetry metadata; x-grok-conv-id isolates runs"
         );
     }
 

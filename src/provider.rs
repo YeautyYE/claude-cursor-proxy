@@ -48,6 +48,9 @@ pub struct ClaudeCodeAgentHeaders {
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub req_id: String,
+    /// Stable client operation id, currently `x-grok-req-id`.
+    /// Unlike `req_id`, this survives HTTP retries of the same logical turn.
+    pub client_request_id: Option<String>,
     pub session_id: Option<String>,
     pub session_seq: Option<u64>,
     pub provider: String,

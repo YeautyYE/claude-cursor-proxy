@@ -1069,6 +1069,7 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
 
     let ctx = RequestContext {
         req_id: "test-req".into(),
+        client_request_id: None,
         session_id: None,
         session_seq: None,
         provider: "cursor".into(),
@@ -2814,7 +2815,7 @@ fn bridge_shell_stream_result_has_correct_shape() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cursor_live_generations_queue_at_configured_limit() {
+async fn cursor_live_generations_pass_through_without_local_limit() {
     use axum::{Router, body::Body, response::Response, routing::post};
     use bytes::Bytes;
     use claude_cursor_proxy::providers::cursor::connect::{FLAG_END, encode_connect_frame};
@@ -2902,32 +2903,6 @@ async fn cursor_live_generations_queue_at_configured_limit() {
         });
     }
 
-    async fn wait_for_stable_accepted(held: &HeldRuns) -> usize {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut last = held.accepted.load(Ordering::SeqCst);
-            let mut stable_since = tokio::time::Instant::now();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let current = held.accepted.load(Ordering::SeqCst);
-                if current != last {
-                    last = current;
-                    stable_since = tokio::time::Instant::now();
-                } else if current > 0
-                    && stable_since.elapsed() >= std::time::Duration::from_millis(250)
-                {
-                    return current;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "Cursor admissions never stabilized; accepted={}",
-                held.accepted.load(Ordering::SeqCst)
-            )
-        })
-    }
-
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let held = Arc::new(HeldRuns::default());
     let upstream_held = Arc::clone(&held);
@@ -2972,7 +2947,6 @@ async fn cursor_live_generations_queue_at_configured_limit() {
         std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "live-concurrency-test");
         std::env::set_var("CCP_CURSOR_BIDI", "1");
         std::env::set_var("CCP_CURSOR_HEARTBEAT_SECS", "60");
-        std::env::set_var("CCP_CURSOR_LIVE_CONCURRENCY", "1");
     }
 
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2989,7 +2963,7 @@ async fn cursor_live_generations_queue_at_configured_limit() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client = reqwest::Client::new();
     let mut requests = Vec::new();
-    const REQUESTS: usize = 17;
+    const REQUESTS: usize = 16;
     for index in 0..REQUESTS {
         let client = client.clone();
         requests.push(tokio::spawn(async move {
@@ -3013,23 +2987,12 @@ async fn cursor_live_generations_queue_at_configured_limit() {
         }));
     }
 
-    wait_for_accepted(&held, 1).await;
-    let initially_accepted = wait_for_stable_accepted(&held).await;
-    assert!(
-        initially_accepted < REQUESTS,
-        "all live generations reached Cursor without queueing"
+    wait_for_accepted(&held, REQUESTS).await;
+    assert_eq!(
+        held.peak.load(Ordering::SeqCst),
+        REQUESTS,
+        "the proxy must not invent a local generation cap in front of Cursor"
     );
-
-    for expected in (initially_accepted + 1)..=REQUESTS {
-        let release = held
-            .releases
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .expect("an active generation must be releasable");
-        let _ = release.send(());
-        wait_for_accepted(&held, expected).await;
-    }
 
     let releases = std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner()));
     for release in releases {
@@ -3038,7 +3001,7 @@ async fn cursor_live_generations_queue_at_configured_limit() {
     for request in requests {
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
             .await
-            .expect("proxy request remained queued after a generation slot was released")
+            .expect("proxy request did not finish")
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
@@ -3046,7 +3009,6 @@ async fn cursor_live_generations_queue_at_configured_limit() {
             .expect("Cursor response did not finish");
     }
 
-    let peak = held.peak.load(Ordering::SeqCst);
     let _ = shutdown_tx.send(());
     upstream_handle.abort();
     proxy_handle.abort();
@@ -3056,13 +3018,7 @@ async fn cursor_live_generations_queue_at_configured_limit() {
         std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
         std::env::remove_var("CCP_CURSOR_BIDI");
         std::env::remove_var("CCP_CURSOR_HEARTBEAT_SECS");
-        std::env::remove_var("CCP_CURSOR_LIVE_CONCURRENCY");
     }
-
-    assert_eq!(
-        peak, initially_accepted,
-        "live generation concurrency exceeded the observed configured cap"
-    );
 }
 
 // ---------------------------------------------------------------------------

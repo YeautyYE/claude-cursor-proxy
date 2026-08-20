@@ -1312,6 +1312,7 @@ mod tests {
     fn http_test_context() -> RequestContext {
         RequestContext {
             req_id: "http-body-test".into(),
+            client_request_id: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
@@ -1691,6 +1692,7 @@ mod tests {
         };
         let ctx = RequestContext {
             req_id: "r".into(),
+            client_request_id: None,
             session_id: Some("s".into()),
             session_seq: None,
             provider: "codex".into(),
@@ -1717,6 +1719,7 @@ mod tests {
         };
         let ctx = RequestContext {
             req_id: "r".into(),
+            client_request_id: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
@@ -1746,6 +1749,7 @@ mod tests {
         };
         let ctx = RequestContext {
             req_id: "r".into(),
+            client_request_id: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
@@ -1769,6 +1773,7 @@ mod tests {
         };
         let ctx = RequestContext {
             req_id: "r".into(),
+            client_request_id: None,
             session_id: Some("bad\nsession".into()),
             session_seq: None,
             provider: "codex".into(),
@@ -1826,6 +1831,7 @@ mod tests {
     fn websocket_pool_key_tracks_continuation_opt_in() {
         let ctx = RequestContext {
             req_id: "r".into(),
+            client_request_id: None,
             session_id: Some("session".into()),
             session_seq: None,
             provider: "codex".into(),
@@ -1903,6 +1909,7 @@ mod tests {
         };
         let ctx = RequestContext {
             req_id: "r".into(),
+            client_request_id: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
