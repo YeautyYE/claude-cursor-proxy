@@ -230,8 +230,10 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 | --- | --- |
 | `PORT` | `18765` | 监听端口 |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | 监听地址（默认只本机） |
+| `CCP_ADVERTISED_MODELS` | 未设置 | `GET /v1/models` 的可选逗号白名单，适合托管桌面端模型选择器 |
 | `CCP_CURSOR_AUTH_TOKEN` | 未设置 | 手动覆盖 Cursor 登录令牌 |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API 地址 |
+| `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Anthropic `haiku` 别名和桌面端小模型探针实际使用的 Cursor 模型 id |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | 开 | 设 `0` / `false` 可关闭 Keychain 回退 |
 | `CCP_CURSOR_EMBED_SYSTEM` | 关 | 把 Anthropic `system` 塞进 Cursor（可能触发 Fable 注入防御） |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | 关 | 强制倾倒全部 tools schema；BiDi 已默认保留 `Workflow`/`Skill` 等 |
@@ -284,6 +286,7 @@ claude-cursor-proxy cursor auth status
 | 工具调用重复 | 加上 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
 | `/deep-research` 只用 Bash/curl | 升级代理；transcript 应有 `Workflow`；必要时 `enableWorkflows: true` |
 | 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| 附带图片立即报 502 `Image not found [internal]` | 升级到把内联 `SelectedImage.data` 编码为 Protobuf 字段 8 bytes 的版本；当前 Cursor CLI 中字段 1 是 blob id。 |
 | grok-build 在未付款账单或不支持的国家/区域时报 `Server error (500) - Something went wrong on our side` | 升级到 ≥0.1.47 并重启 serve。未付款是 HTTP 429 并带发票原文；地区限制是 HTTP 403 并带国家/区域原文。 |
 | grok-build 在 `Cursor live open timed out` 后报 `Server error (500)` / 重复开 Cursor Run | 升级到 ≥0.1.57 并重启 serve。没有响应、接受状态不明的 live open 会 fail-closed 为 HTTP 409；本地打开槽饱和改为带抖动的 HTTP 503。 |
 | Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。 |

@@ -483,7 +483,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(image.data, "aGVsbG8=");
+    assert_eq!(image.data, b"hello");
     assert_eq!(image.uuid, "image-id");
     assert_eq!(image.path, "claude-image-1.png");
     assert_eq!(image.mime_type, "image/png");
