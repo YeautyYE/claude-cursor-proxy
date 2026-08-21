@@ -147,7 +147,8 @@ const ASK_USER_QUESTION_HEADER_MAX: usize = 12;
 /// rotated). The nested difference is additive headers
 /// `x-claude-code-agent-id` + `x-claude-code-parent-agent-id`. Concurrent live
 /// runs are keyed by `(session_id, agent_id)` — never a new session UUID.
-const AGENT_RUN_MARK: &str = "::agent::";
+const PARENT_RUN_PREFIX: &str = "p:";
+const AGENT_RUN_PREFIX: &str = "a:";
 
 /// Identity for a Claude Code Messages POST that may be a nested agent.
 ///
@@ -183,13 +184,16 @@ impl<'a> LiveRunIdentity<'a> {
 
 /// Registry / Cursor-conversation key for a live run.
 ///
-/// `None` / empty `agent_id` → `session_id` (one run per Claude session).
-/// Nested agent → `{session_id}::agent::{agent_id}` so it cannot supersede
-/// the parent that shares `X-Claude-Code-Session-Id`.
+/// Components are length-prefixed so arbitrary session/agent strings cannot
+/// collide with a parent key or with each other.
 pub fn live_run_key(session_id: &str, agent_id: Option<&str>) -> String {
     match agent_id.map(str::trim).filter(|id| !id.is_empty()) {
-        Some(agent) => format!("{session_id}{AGENT_RUN_MARK}{agent}"),
-        None => session_id.to_string(),
+        Some(agent) => format!(
+            "{AGENT_RUN_PREFIX}{}:{session_id}{}:{agent}",
+            session_id.len(),
+            agent.len()
+        ),
+        None => format!("{PARENT_RUN_PREFIX}{}:{session_id}", session_id.len()),
     }
 }
 
@@ -198,7 +202,19 @@ pub fn live_run_key_for(identity: LiveRunIdentity<'_>) -> String {
 }
 
 fn claude_session_of(run_key: &str) -> &str {
-    run_key.split(AGENT_RUN_MARK).next().unwrap_or(run_key)
+    let encoded = run_key
+        .strip_prefix(PARENT_RUN_PREFIX)
+        .or_else(|| run_key.strip_prefix(AGENT_RUN_PREFIX));
+    let Some(encoded) = encoded else {
+        return run_key;
+    };
+    let Some((length, remainder)) = encoded.split_once(':') else {
+        return run_key;
+    };
+    let Ok(length) = length.parse::<usize>() else {
+        return run_key;
+    };
+    remainder.get(..length).unwrap_or(run_key)
 }
 
 fn channel_backpressured(remaining: usize, cap: usize) -> bool {
@@ -242,12 +258,142 @@ pub struct LiveRunStart {
 }
 
 struct LiveResumePermit {
-    in_flight: Arc<AtomicBool>,
+    in_flight: Arc<ResumeAdmission>,
 }
 
 impl Drop for LiveResumePermit {
     fn drop(&mut self) {
-        self.in_flight.store(false, Ordering::Release);
+        self.in_flight.release();
+    }
+}
+
+const RESUME_ADMISSION_IDLE: u8 = 0;
+const RESUME_ADMISSION_IN_FLIGHT: u8 = 1;
+const RESUME_ADMISSION_EXPIRED: u8 = 2;
+const RESUME_ADMISSION_STATE_MASK: u64 = 0b11;
+static LIVE_MONOTONIC_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+#[derive(Debug, Default)]
+struct ResumeAdmission {
+    packed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeAdmissionError {
+    InFlight,
+    Expired,
+}
+
+impl ResumeAdmission {
+    fn ticks_at(instant: Instant) -> u64 {
+        instant
+            .saturating_duration_since(*LIVE_MONOTONIC_ORIGIN)
+            .as_nanos()
+            .min(u128::from(u64::MAX >> 2)) as u64
+    }
+
+    fn pack(deadline_ticks: u64, state: u8) -> u64 {
+        (deadline_ticks << 2) | u64::from(state)
+    }
+
+    fn unpack(raw: u64) -> (u64, u8) {
+        (raw >> 2, (raw & RESUME_ADMISSION_STATE_MASK) as u8)
+    }
+
+    fn set_deadline(&self, deadline: Instant) {
+        self.packed.store(
+            Self::pack(Self::ticks_at(deadline), RESUME_ADMISSION_IDLE),
+            Ordering::Release,
+        );
+    }
+
+    fn try_admit(&self, now: Instant) -> Result<(), ResumeAdmissionError> {
+        let now_ticks = Self::ticks_at(now);
+        let mut current = self.packed.load(Ordering::Acquire);
+        loop {
+            let (deadline, state) = Self::unpack(current);
+            match state {
+                RESUME_ADMISSION_IN_FLIGHT => return Err(ResumeAdmissionError::InFlight),
+                RESUME_ADMISSION_EXPIRED => return Err(ResumeAdmissionError::Expired),
+                RESUME_ADMISSION_IDLE => {}
+                _ => return Err(ResumeAdmissionError::Expired),
+            }
+            if deadline != 0 && now_ticks >= deadline {
+                let expired = Self::pack(deadline, RESUME_ADMISSION_EXPIRED);
+                match self.packed.compare_exchange(
+                    current,
+                    expired,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Err(ResumeAdmissionError::Expired),
+                    Err(actual) => {
+                        current = actual;
+                        continue;
+                    }
+                }
+            }
+            let admitted = Self::pack(deadline, RESUME_ADMISSION_IN_FLIGHT);
+            match self.packed.compare_exchange(
+                current,
+                admitted,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn claim_expired(&self) -> bool {
+        let mut current = self.packed.load(Ordering::Acquire);
+        loop {
+            let (deadline, state) = Self::unpack(current);
+            if state != RESUME_ADMISSION_IDLE {
+                return false;
+            }
+            match self.packed.compare_exchange(
+                current,
+                Self::pack(deadline, RESUME_ADMISSION_EXPIRED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut current = self.packed.load(Ordering::Acquire);
+        loop {
+            let (deadline, state) = Self::unpack(current);
+            if state != RESUME_ADMISSION_IN_FLIGHT {
+                return;
+            }
+            match self.packed.compare_exchange(
+                current,
+                Self::pack(deadline, RESUME_ADMISSION_IDLE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_state(state: u8) -> Self {
+        Self {
+            packed: AtomicU64::new(Self::pack(0, state)),
+        }
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> u8 {
+        Self::unpack(self.packed.load(Ordering::Acquire)).1
     }
 }
 
@@ -293,7 +439,7 @@ pub struct CursorLiveRunHandle {
     terminal_error: Arc<Mutex<Option<TerminalOutcome>>>,
     completed: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
-    resume_in_flight: Arc<AtomicBool>,
+    resume_in_flight: Arc<ResumeAdmission>,
     request_fingerprint: Arc<AtomicU64>,
 }
 
@@ -424,11 +570,15 @@ impl CursorLiveRunHandle {
         validate_tool_result_batch(&pending, &tool_results)
             .map_err(|message| CursorError::new(400, message, None))?;
         self.resume_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                resume_dispatch_retryable_error(
-                    "Another tool-result resume is already in flight for this Cursor run",
-                )
+            .try_admit(Instant::now())
+            .map_err(|error| {
+                if error == ResumeAdmissionError::Expired {
+                    CursorError::new(409, "Cursor tool result wait expired", None)
+                } else {
+                    resume_dispatch_retryable_error(
+                        "Another tool-result resume is already in flight for this Cursor run",
+                    )
+                }
             })?;
         let permit = LiveResumePermit {
             in_flight: Arc::clone(&self.resume_in_flight),
@@ -625,6 +775,8 @@ struct PendingExecState {
     awaiting_since: Option<Instant>,
     collecting_since: Option<Instant>,
     collect_deadline: Option<tokio::time::Instant>,
+    resume_admission: Option<Arc<ResumeAdmission>>,
+    tool_ttl: Option<Duration>,
 }
 
 impl PendingExecState {
@@ -745,14 +897,10 @@ impl PendingExecState {
             }
             self.collecting = native;
             self.awaiting = client_only;
-            self.awaiting_since = Some(Instant::now());
             return self.awaiting.clone();
         }
         self.awaiting = std::mem::take(&mut self.collecting);
-        self.awaiting_since = self
-            .collecting_since
-            .take()
-            .or_else(|| Some(Instant::now()));
+        self.collecting_since = None;
         self.collect_deadline = None;
         self.awaiting.clone()
     }
@@ -779,15 +927,29 @@ impl PendingExecState {
             return Vec::new();
         }
         self.awaiting = native;
-        self.awaiting_since = self
-            .collecting_since
-            .take()
-            .or_else(|| Some(Instant::now()));
         if !self.collecting.is_empty() {
             self.collecting_since = Some(Instant::now());
+        } else {
+            self.collecting_since = None;
         }
         self.collect_deadline = None;
         self.awaiting.clone()
+    }
+
+    fn mark_exposed_at(&mut self, now: Instant) {
+        if !self.awaiting.is_empty() {
+            self.awaiting_since = Some(now);
+            if let (Some(admission), Some(tool_ttl)) =
+                (self.resume_admission.as_ref(), self.tool_ttl)
+            {
+                admission.set_deadline(now + tool_ttl);
+            }
+        }
+    }
+
+    fn configure_resume_admission(&mut self, admission: Arc<ResumeAdmission>, tool_ttl: Duration) {
+        self.resume_admission = Some(admission);
+        self.tool_ttl = Some(tool_ttl);
     }
 
     fn complete_awaiting(&mut self) {
@@ -895,11 +1057,8 @@ impl PendingExecState {
         self.collecting.extend(natives);
     }
 
-    fn oldest_since(&self) -> Option<Instant> {
-        match (self.awaiting_since, self.collecting_since) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left, right) => left.or(right),
-        }
+    fn tool_wait_since(&self) -> Option<Instant> {
+        self.awaiting_since
     }
 }
 
@@ -1064,8 +1223,7 @@ enum LiveRunEntry {
 }
 
 struct LiveRunMap {
-    /// Registry key → entry. Key is the Claude session id, or
-    /// `{session}::agent::{agent_id}` for a nested Workflow/subagent run.
+    /// Injective, length-prefixed `(session, optional agent)` key → entry.
     runs: HashMap<String, LiveRunEntry>,
     /// Claude `X-Claude-Code-Session-Id` → all registry keys for that session.
     by_session: HashMap<String, Vec<String>>,
@@ -1116,6 +1274,31 @@ pub struct LiveRunReservation {
     committed: bool,
     seal_on_drop: Arc<AtomicBool>,
     cancel: watch::Sender<bool>,
+    operation_fingerprint: u64,
+}
+
+pub(crate) struct LiveUpstreamOpenGuard {
+    dispatched: Arc<AtomicBool>,
+    operation_key: String,
+    fingerprint: u64,
+    owner_token: String,
+}
+
+impl LiveUpstreamOpenGuard {
+    fn begin_dispatch(&self) -> std::io::Result<()> {
+        let applied = super::operation_ledger::mark_dispatched_if_owner(
+            &self.operation_key,
+            self.fingerprint,
+            &self.owner_token,
+        )?;
+        if !applied {
+            return Err(std::io::Error::other(
+                "Cursor operation dispatch owner changed before upstream open",
+            ));
+        }
+        self.dispatched.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 impl LiveRunReservation {
@@ -1134,23 +1317,54 @@ impl LiveRunReservation {
         self.seal_on_drop.store(true, Ordering::Release);
     }
 
+    pub fn disarm_on_drop(&self) {
+        self.seal_on_drop.store(false, Ordering::Release);
+    }
+
     /// Shared boundary marker set by the live client immediately before it
     /// begins the first operation that can reach Cursor.
-    pub(crate) fn upstream_open_guard(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.seal_on_drop)
+    pub(crate) fn upstream_open_guard(&self) -> Arc<LiveUpstreamOpenGuard> {
+        Arc::new(LiveUpstreamOpenGuard {
+            dispatched: Arc::clone(&self.seal_on_drop),
+            operation_key: self.session_id.clone(),
+            fingerprint: self.operation_fingerprint,
+            owner_token: self.reservation_id.clone(),
+        })
+    }
+
+    pub(crate) fn set_operation_fingerprint(&mut self, fingerprint: u64) {
+        self.operation_fingerprint = fingerprint;
+    }
+
+    pub(crate) fn begin_durable_operation(&self) -> super::operation_ledger::OperationAdmission {
+        super::operation_ledger::claim(
+            &self.session_id,
+            self.operation_fingerprint,
+            &self.reservation_id,
+        )
     }
 
     /// Release a reservation after a definitive pre-acceptance failure.
     pub fn release(mut self) {
         self.abort();
-        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        let owns_reservation = matches!(
-            runs.runs.get(&self.session_id),
-            Some(LiveRunEntry::Starting { reservation_id, .. })
-                if reservation_id == &self.reservation_id
-        );
-        if owns_reservation {
-            runs.remove_key(&self.session_id);
+        let released = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let owns_reservation = matches!(
+                runs.runs.get(&self.session_id),
+                Some(LiveRunEntry::Starting { reservation_id, .. })
+                    if reservation_id == &self.reservation_id
+            );
+            if owns_reservation {
+                runs.remove_key(&self.session_id);
+            }
+            owns_reservation
+        };
+        if released {
+            clear_durable_operation(
+                &self.session_id,
+                self.operation_fingerprint,
+                &self.reservation_id,
+            );
         }
         self.committed = true;
     }
@@ -1158,14 +1372,27 @@ impl LiveRunReservation {
     /// Keep the slot occupied after an ambiguous open timeout so another POST
     /// cannot start a second Run.
     pub fn seal_ambiguous(mut self, until: Instant) {
-        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        let owns_reservation = matches!(
-            runs.runs.get(&self.session_id),
-            Some(LiveRunEntry::Starting { reservation_id, .. })
-                if reservation_id == &self.reservation_id
-        );
-        if owns_reservation {
-            runs.insert_key(self.session_id.clone(), LiveRunEntry::Ambiguous { until });
+        let persisted_key = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let owns_reservation = matches!(
+                runs.runs.get(&self.session_id),
+                Some(LiveRunEntry::Starting { reservation_id, .. })
+                    if reservation_id == &self.reservation_id
+            );
+            if owns_reservation {
+                runs.insert_key(self.session_id.clone(), LiveRunEntry::Ambiguous { until });
+                Some(self.session_id.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(key) = persisted_key {
+            persist_ambiguous_operation(
+                &key,
+                self.operation_fingerprint,
+                &self.reservation_id,
+                "Cursor live open acceptance is ambiguous",
+            );
         }
         self.committed = true;
     }
@@ -1180,33 +1407,91 @@ impl LiveRunReservation {
         mut self,
         handle: Arc<CursorLiveRunHandle>,
     ) -> Result<(), Arc<CursorLiveRunHandle>> {
-        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        LiveRunRegistry::prune_finished(&mut runs);
-        let owns_reservation = matches!(
-            runs.runs.get(&self.session_id),
-            Some(LiveRunEntry::Starting { reservation_id, .. })
-                if reservation_id == &self.reservation_id
-        );
-        if !owns_reservation && LiveRunRegistry::key_occupied(&runs, &self.session_id) {
+        // Owned Starting slots publish normally. A vacant slot (cancel removed
+        // Starting while the open was in flight) must adopt the accepted Run:
+        // dropping it would let a retry open a second Run for the same turn.
+        let claim_allows_publication = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            LiveRunRegistry::prune_finished(&mut runs);
+            match runs.runs.get(&self.session_id) {
+                Some(LiveRunEntry::Starting { reservation_id, .. }) => {
+                    reservation_id == &self.reservation_id
+                }
+                None => true,
+                Some(_) => false,
+            }
+        };
+        if !claim_allows_publication {
+            persist_ambiguous_operation(
+                &self.session_id,
+                self.operation_fingerprint,
+                &self.reservation_id,
+                "Cursor live Run opened after its reservation owner changed; completion is ambiguous",
+            );
+            self.committed = true;
             return Err(handle);
         }
-        // The worker can finish (and set `completed`) before this reservation
-        // is published. A completed success must become a fingerprint tombstone
-        // here — `seal_success_if` only sees Running entries, and prune would
-        // otherwise drop the handle and allow a same-prompt retry to duplicate.
-        if handle.is_completed() && !handle.has_terminal_error() {
-            runs.insert_key(
-                self.session_id.clone(),
-                LiveRunEntry::Succeeded {
-                    run_id: handle.run_id().to_string(),
-                    fingerprint: handle.request_fingerprint(),
-                    until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
-                },
+
+        let transferred = super::operation_ledger::transfer_owner_if(
+            &self.session_id,
+            self.operation_fingerprint,
+            &self.reservation_id,
+            handle.run_id(),
+        );
+        if !matches!(transferred, Ok(true)) {
+            let reason = match transferred {
+                Ok(false) => "durable operation owner changed before Run insertion".to_string(),
+                Err(error) => error.to_string(),
+                Ok(true) => unreachable!(),
+            };
+            store_terminal_error(
+                &handle.terminal_error,
+                &format!(
+                    "Cursor Run opened but durable ownership transfer failed; completion is ambiguous: {reason}"
+                ),
             );
-        } else {
-            runs.insert_key(self.session_id.clone(), LiveRunEntry::Running(handle));
+            persist_ambiguous_operation(
+                &self.session_id,
+                self.operation_fingerprint,
+                &self.reservation_id,
+                "Cursor Run opened but durable ownership transfer failed; completion is ambiguous",
+            );
+            self.committed = true;
+            return Err(handle);
         }
+
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let still_allows_publication = match runs.runs.get(&self.session_id) {
+            Some(LiveRunEntry::Starting { reservation_id, .. }) => {
+                reservation_id == &self.reservation_id
+            }
+            None => true,
+            Some(_) => false,
+        };
+        if !still_allows_publication {
+            drop(runs);
+            persist_ambiguous_operation(
+                &self.session_id,
+                self.operation_fingerprint,
+                handle.run_id(),
+                "Cursor Run owner changed during durable insertion; completion is ambiguous",
+            );
+            self.committed = true;
+            return Err(handle);
+        }
+        runs.insert_key(
+            self.session_id.clone(),
+            LiveRunEntry::Running(Arc::clone(&handle)),
+        );
         self.committed = true;
+        drop(runs);
+
+        // The worker may finish before publication. Re-run the normal terminal
+        // transition after insertion so success is durably sealed exactly as it
+        // is for a later driver completion.
+        if handle.is_completed() && !handle.has_terminal_error() {
+            LiveRunRegistry::seal_success_if(&self.session_id, handle.run_id());
+        }
         Ok(())
     }
 }
@@ -1217,23 +1502,42 @@ impl Drop for LiveRunReservation {
             return;
         }
         self.abort();
-        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        let owns_reservation = matches!(
-            runs.runs.get(&self.session_id),
-            Some(LiveRunEntry::Starting { reservation_id, .. })
-                if reservation_id == &self.reservation_id
-        );
-        if owns_reservation {
-            if self.seal_on_drop.load(Ordering::Acquire) {
+        let seal = self.seal_on_drop.load(Ordering::Acquire);
+        let (persisted_key, clear_marker) = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let owns_reservation = matches!(
+                runs.runs.get(&self.session_id),
+                Some(LiveRunEntry::Starting { reservation_id, .. })
+                    if reservation_id == &self.reservation_id
+            );
+            if owns_reservation && seal {
                 runs.insert_key(
                     self.session_id.clone(),
                     LiveRunEntry::Ambiguous {
                         until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
                     },
                 );
-            } else {
+                (Some(self.session_id.clone()), false)
+            } else if owns_reservation {
                 runs.remove_key(&self.session_id);
+                (None, true)
+            } else {
+                (None, false)
             }
+        };
+        if let Some(key) = persisted_key {
+            persist_ambiguous_operation(
+                &key,
+                self.operation_fingerprint,
+                &self.reservation_id,
+                "Cursor live request owner was dropped after upstream dispatch; completion is ambiguous",
+            );
+        } else if clear_marker {
+            clear_durable_operation(
+                &self.session_id,
+                self.operation_fingerprint,
+                &self.reservation_id,
+            );
         }
     }
 }
@@ -1412,13 +1716,27 @@ impl LiveRunRegistry {
 /// strands grok-build, which treats 409 as non-retryable.
 pub(crate) fn finish_replacement_after_cancel(
     reservation: LiveRunReservation,
-    _handle: Arc<CursorLiveRunHandle>,
+    handle: Arc<CursorLiveRunHandle>,
     _has_current_tool_results: bool,
     cancel_result: Result<(), CursorError>,
 ) -> Result<LiveRunReservation, CursorError> {
     match cancel_result {
-        Ok(()) => Ok(reservation),
+        Ok(()) => {
+            clear_durable_operation(
+                &reservation.session_id,
+                handle.request_fingerprint(),
+                handle.run_id(),
+            );
+            reservation.disarm_on_drop();
+            Ok(reservation)
+        }
         Err(error) => {
+            persist_ambiguous_operation(
+                &reservation.session_id,
+                handle.request_fingerprint(),
+                handle.run_id(),
+                &error.client_message(),
+            );
             reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
             Err(error)
         }
@@ -1445,6 +1763,7 @@ impl LiveRunRegistry {
             committed: false,
             seal_on_drop: Arc::new(AtomicBool::new(false)),
             cancel,
+            operation_fingerprint: 0,
         })
     }
 
@@ -1671,20 +1990,25 @@ impl LiveRunRegistry {
         expected_run_id: Option<&str>,
     ) -> Option<String> {
         let key = live_run_key(session_id, agent_id);
+        let operation_key = key.clone();
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        let error = match runs.runs.get(&key) {
+        let (error, fingerprint, owner_token) = match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(handle))
                 if handle.is_completed()
                     && expected_run_id.is_none_or(|expected| handle.run_id() == expected) =>
             {
-                handle.take_terminal_error()
+                (
+                    handle.take_terminal_error(),
+                    handle.request_fingerprint(),
+                    handle.run_id().to_string(),
+                )
             }
             Some(LiveRunEntry::Starting { .. })
             | Some(LiveRunEntry::Ambiguous { .. })
             | Some(LiveRunEntry::Succeeded { .. })
-            | None => None,
-            Some(LiveRunEntry::Running(_)) => None,
+            | None => (None, 0, String::new()),
+            Some(LiveRunEntry::Running(_)) => (None, 0, String::new()),
         };
         let allows_fresh_retry = error
             .as_deref()
@@ -1702,6 +2026,14 @@ impl LiveRunRegistry {
                 );
             } else {
                 runs.remove_key(&key);
+            }
+        }
+        drop(runs);
+        if let Some(message) = error.as_deref() {
+            if terminal_error_is_ambiguous_accept(message) {
+                persist_ambiguous_operation(&operation_key, fingerprint, &owner_token, message);
+            } else {
+                clear_durable_operation(&operation_key, fingerprint, &owner_token);
             }
         }
         if allows_fresh_retry { None } else { error }
@@ -1731,30 +2063,60 @@ impl LiveRunRegistry {
     }
 
     fn seal_success_if(session_id: &str, run_id: &str) {
-        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = runs.keys_for(claude_session_of(session_id));
-        let mut extra = Vec::new();
-        if !keys.iter().any(|k| k == session_id) {
-            extra.push(session_id.to_string());
-        }
-        for key in keys.into_iter().chain(extra) {
-            let fingerprint = match runs.runs.get(&key) {
-                Some(LiveRunEntry::Running(handle)) if handle.run_id == run_id => {
-                    Some(handle.request_fingerprint())
-                }
-                _ => None,
-            };
-            if let Some(fingerprint) = fingerprint {
-                runs.insert_key(
-                    key,
-                    LiveRunEntry::Succeeded {
-                        run_id: run_id.to_string(),
-                        fingerprint,
-                        until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
-                    },
-                );
-                return;
+        let candidate = {
+            let runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let keys = runs.keys_for(claude_session_of(session_id));
+            let mut extra = Vec::new();
+            if !keys.iter().any(|key| key == session_id) {
+                extra.push(session_id.to_string());
             }
+            keys.into_iter().chain(extra).find_map(|key| {
+                let LiveRunEntry::Running(handle) = runs.runs.get(&key)? else {
+                    return None;
+                };
+                (handle.run_id == run_id)
+                    .then(|| (key, Arc::clone(handle), handle.request_fingerprint()))
+            })
+        };
+        let Some((key, handle, fingerprint)) = candidate else {
+            return;
+        };
+        // Zero is the unpublished sentinel. A Run that wins the start/insert
+        // race keeps its durable InFlight marker until insert observes the
+        // published fingerprint and records completion.
+        if fingerprint == 0 {
+            return;
+        }
+        let completion =
+            super::operation_ledger::mark_completed_if_owner(&key, fingerprint, run_id);
+        if !matches!(completion, Ok(true)) {
+            let error = match completion {
+                Ok(false) => "durable operation owner changed before completion".to_string(),
+                Err(error) => error.to_string(),
+                Ok(true) => unreachable!(),
+            };
+            let message = format!(
+                "Cursor operation completion could not be durably recorded; completion is ambiguous: {error}"
+            );
+            store_terminal_error(&handle.terminal_error, &message);
+            persist_ambiguous_operation(&key, fingerprint, run_id, &message);
+            return;
+        }
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let still_current = matches!(
+            runs.runs.get(&key),
+            Some(LiveRunEntry::Running(current))
+                if current.run_id == run_id && Arc::ptr_eq(current, &handle)
+        );
+        if still_current {
+            runs.insert_key(
+                key,
+                LiveRunEntry::Succeeded {
+                    run_id: run_id.to_string(),
+                    fingerprint,
+                    until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                },
+            );
         }
     }
 
@@ -1789,6 +2151,55 @@ impl LiveRunRegistry {
         }
         runs.runs.clear();
         runs.by_session.clear();
+    }
+}
+
+async fn race_initial_live_operation<T>(
+    cancel: Option<&mut watch::Receiver<bool>>,
+    upstream_open_guard: Option<&Arc<LiveUpstreamOpenGuard>>,
+    operation: impl Future<Output = Result<T, CursorError>>,
+) -> Result<T, CursorError> {
+    let guarded_operation = async {
+        if let Some(guard) = upstream_open_guard {
+            // This future is polled only after the cancellation-first select
+            // establishes that no already-ready cancellation won.
+            guard.begin_dispatch().map_err(|error| {
+                CursorError::new(
+                    503,
+                    format!(
+                        "Cursor operation ledger could not commit dispatch; request was not sent: {error}"
+                    ),
+                    None,
+                )
+            })?;
+        }
+        operation.await
+    };
+    tokio::pin!(guarded_operation);
+
+    let Some(cancel) = cancel else {
+        return guarded_operation.await;
+    };
+    if *cancel.borrow() {
+        return Err(CursorError::new(
+            409,
+            "Cursor live start superseded before upstream open",
+            None,
+        ));
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|aborted| *aborted) => {
+            let message = if upstream_open_guard
+                .is_some_and(|guard| guard.dispatched.load(Ordering::Acquire))
+            {
+                "Cursor live open superseded; acceptance is ambiguous"
+            } else {
+                "Cursor live start superseded before upstream open"
+            };
+            Err(CursorError::new(409, message, None))
+        }
+        result = &mut guarded_operation => result,
     }
 }
 
@@ -1865,6 +2276,7 @@ impl CursorHttpClient {
             original_request_id,
             cancel,
             None,
+            None,
         )
         .await
     }
@@ -1883,20 +2295,63 @@ impl CursorHttpClient {
         request_context: super::proto::RequestContext,
         original_request_id: Option<&str>,
         mut cancel: Option<watch::Receiver<bool>>,
-        upstream_open_guard: Option<Arc<AtomicBool>>,
+        upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
+        pre_admission: Option<LiveGenerationPermit>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
                 "Cursor live agent is disabled for this transport",
             ));
         }
-        let generation_permit = acquire_live_generation_permit(cancel.as_mut()).await?;
+        let mut generation_permit = match pre_admission {
+            Some(permit) => permit,
+            None => {
+                let run_permit = acquire_live_run_permit(cancel.as_mut()).await?;
+                let mut permit = acquire_live_generation_permit(model, cancel.as_mut()).await?;
+                permit._run_permit = Some(run_permit);
+                permit
+            }
+        };
 
-        let force_http1 = live_open_prefers_http1();
-        let http = if force_http1 && !self.prefers_http1() {
-            CursorHttpClient::with_prefer_http1(true)
-        } else {
-            self.clone()
+        let cursor_identity = LiveIdentityHeaders::build(token);
+        let mut h2_probe_guard = None;
+        let mut process_h2_epoch = process_h2_circuit_epoch();
+        let (http, force_http1) = match live_open_circuit_route() {
+            H2CircuitRoute::Http2(epoch) => {
+                process_h2_epoch = epoch;
+                (
+                    if self.prefers_http1() {
+                        CursorHttpClient::with_prefer_http1(false)
+                    } else {
+                        self.clone()
+                    },
+                    false,
+                )
+            }
+            H2CircuitRoute::Http1 => (
+                if self.prefers_http1() {
+                    self.clone()
+                } else {
+                    CursorHttpClient::with_prefer_http1(true)
+                },
+                true,
+            ),
+            H2CircuitRoute::ProbeHttp2 { probe_id, epoch } => {
+                process_h2_epoch = epoch;
+                let h2 = CursorHttpClient::with_prefer_http1(false);
+                let guard = ProcessH2ProbeGuard::new(probe_id);
+                let h2_ok = race_initial_live_operation(cancel.as_mut(), None, async {
+                    Ok(h2.probe_h2_transport(token, &cursor_identity).await)
+                })
+                .await?;
+                let still_owner = guard.transport_result(h2_ok);
+                if h2_ok && still_owner {
+                    h2_probe_guard = Some(guard);
+                    (h2, false)
+                } else {
+                    (CursorHttpClient::with_prefer_http1(true), true)
+                }
+            }
         };
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
@@ -1904,6 +2359,15 @@ impl CursorHttpClient {
         let original_request_id = original_request_id.unwrap_or(&request_id).to_string();
         let worker_session = live_run_key_for(identity);
         let continuation = super::conversation::continuation_for(Some(&worker_session));
+        let conversation_id = continuation
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| CursorError::internal("Cursor live conversation binding is missing"))?;
+        generation_permit._conversation_lease = Some(
+            super::conversation::pin(&worker_session, conversation_id).ok_or_else(|| {
+                CursorError::internal("Cursor live conversation binding changed before open")
+            })?,
+        );
         if std::env::var_os("CCP_CURSOR_DEBUG").is_some() {
             let names: Vec<&str> = mcp_tools
                 .as_ref()
@@ -1936,14 +2400,6 @@ impl CursorHttpClient {
             interaction_response: None,
             client_heartbeat: None,
         };
-
-        let cursor_identity = LiveIdentityHeaders::build(token);
-        if let Some(guard) = upstream_open_guard.as_ref() {
-            // Admission waiting is still wholly local. Cross the ambiguous
-            // acceptance boundary only immediately before constructing the
-            // first upstream open future.
-            guard.store(true, Ordering::Release);
-        }
         let open = http.open_live_transport(
             token,
             &request_id,
@@ -1951,24 +2407,15 @@ impl CursorHttpClient {
             &first_message,
             &cursor_identity,
             force_http1,
+            false,
+            h2_probe_guard.as_ref().map(ProcessH2ProbeGuard::id),
+            process_h2_epoch,
             live_reconnect_allow_h1_fallback(force_http1, false),
             live_h2_open_attempt_timeout(),
             live_h1_open_attempt_timeout(),
         );
-        let opened = if let Some(rx) = cancel.as_mut() {
-            tokio::select! {
-                _ = rx.wait_for(|aborted| *aborted) => {
-                    Err(CursorError::new(
-                        409,
-                        "Cursor live open superseded; acceptance is ambiguous",
-                        None,
-                    ))
-                }
-                result = open => result,
-            }
-        } else {
-            open.await
-        };
+        let opened =
+            race_initial_live_operation(cancel.as_mut(), upstream_open_guard.as_ref(), open).await;
         let (outbound, response) = match opened {
             Ok(pair) => pair,
             Err(err) => return Err(annotate_live_cursor_error(&worker_session, err)),
@@ -1983,6 +2430,7 @@ impl CursorHttpClient {
         let terminal_error = Arc::new(Mutex::new(None));
         let completed = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
+        let resume_in_flight = Arc::clone(&generation_permit.resume_in_flight);
         let run_id = uuid::Uuid::new_v4().to_string();
         let handle = Arc::new(CursorLiveRunHandle {
             run_id: run_id.clone(),
@@ -1991,7 +2439,7 @@ impl CursorHttpClient {
             terminal_error: Arc::clone(&terminal_error),
             completed: Arc::clone(&completed),
             cancel_requested: Arc::clone(&cancel_requested),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight,
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
 
@@ -2007,6 +2455,7 @@ impl CursorHttpClient {
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
             force_http1,
+            h2_epoch: (!force_http1).then(process_h2_circuit_epoch),
             http1_rejected: false,
             mcp_tools: mcp_tools.clone(),
             opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
@@ -2056,6 +2505,9 @@ impl CursorHttpClient {
         first_message: &AgentClientMessage,
         identity: &LiveIdentityHeaders,
         force_http1: bool,
+        allow_h2_after_h1_preconnect: bool,
+        h2_probe_id: Option<u64>,
+        process_h2_epoch: u64,
         allow_h1_fallback: bool,
         h2_timeout: Duration,
         h1_timeout: Duration,
@@ -2074,7 +2526,11 @@ impl CursorHttpClient {
             .await;
             return match h1_result {
                 Err(h1_error)
-                    if h1_failure_should_probe_h2(http1::prefer_http1_agent(), &h1_error) =>
+                    if live_h1_failure_should_probe_h2(
+                        allow_h2_after_h1_preconnect,
+                        http1::prefer_http1_agent(),
+                        &h1_error,
+                    ) =>
                 {
                     crate::logging::create_logger("cursor").warn(
                         "live_h1_preconnect_h2_probe",
@@ -2098,12 +2554,14 @@ impl CursorHttpClient {
                     .await
                     {
                         Ok(pair) => {
-                            note_process_h2_open_success();
+                            note_process_h2_open_success(h2_probe_id);
                             Ok(pair)
                         }
                         Err(h2_error) => {
                             if is_ambiguous_live_open_timeout(&h2_error) {
-                                note_process_h2_open_timeout();
+                                note_process_h2_open_timeout(process_h2_epoch);
+                            } else {
+                                note_process_h2_probe_run_failure(h2_probe_id);
                             }
                             Err(h2_half_open_error(h1_error, h2_error))
                         }
@@ -2127,12 +2585,14 @@ impl CursorHttpClient {
         .await
         {
             Ok(pair) => {
-                note_process_h2_open_success();
+                note_process_h2_open_success(h2_probe_id);
                 Ok(pair)
             }
             Err(err) if allow_h1_fallback && live_open_should_retry_http1(&err) => {
                 if is_ambiguous_live_open_timeout(&err) {
-                    note_process_h2_open_timeout();
+                    note_process_h2_open_timeout(process_h2_epoch);
+                } else {
+                    note_process_h2_probe_run_failure(h2_probe_id);
                 }
                 let wait = if is_ambiguous_live_open_timeout(&err) {
                     h1_timeout
@@ -2169,7 +2629,11 @@ impl CursorHttpClient {
             }
             Err(err) => {
                 if is_ambiguous_live_open_timeout(&err) {
-                    note_process_h2_open_timeout();
+                    note_process_h2_open_timeout(process_h2_epoch);
+                } else if h2_probe_run_error_is_transport_failure(&err) {
+                    note_process_h2_probe_run_failure(h2_probe_id);
+                } else {
+                    note_process_h2_open_success(h2_probe_id);
                 }
                 Err(err)
             }
@@ -2344,6 +2808,52 @@ impl CursorHttpClient {
         }
         Ok((ClientOutbound::Bidi(request_tx), response))
     }
+
+    /// Side-effect-free half-open check for the process H2 circuit. A user Run
+    /// must never be the probe: if its response headers time out, acceptance is
+    /// ambiguous and the conversation is poisoned with 409. GetUsableModels is
+    /// unary/read-only; any HTTP response over H2 proves transport viability.
+    async fn probe_h2_transport(&self, token: &str, identity: &LiveIdentityHeaders) -> bool {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let url = format!(
+            "{}/agent.v1.AgentService/GetUsableModels",
+            self.base_url.trim_end_matches('/')
+        );
+        let mut request = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .header("connect-protocol-version", "1")
+            .header("user-agent", "connect-es/1.6.1")
+            .header("x-cursor-client-type", &identity.client_type)
+            .header("x-cursor-client-version", &identity.client_version)
+            .header("x-ghost-mode", &identity.ghost_mode)
+            .header("x-request-id", &request_id)
+            .header("x-original-request-id", &request_id)
+            .body("{}");
+        for (name, value) in &identity.headers {
+            if name.starts_with("x-cursor-client-device")
+                || name.starts_with("x-cursor-client-os")
+                || name.starts_with("x-cursor-client-arch")
+                || name == "x-new-onboarding-completed"
+                || name == "x-cursor-timezone"
+                || name == "x-client-key"
+                || name == "x-session-id"
+            {
+                request = request.header(name, value);
+            }
+        }
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), request.send()).await,
+            Ok(Ok(response))
+                if h2_probe_response_is_viable(response.version(), response.status())
+        )
+    }
+}
+
+fn h2_probe_response_is_viable(version: reqwest::Version, status: reqwest::StatusCode) -> bool {
+    version == reqwest::Version::HTTP_2 && !matches!(status.as_u16(), 421 | 464)
 }
 
 struct LiveIdentityHeaders {
@@ -2437,6 +2947,12 @@ impl LiveRecoveryEpisode {
         }
     }
 
+    fn rebase_probation(&mut self, now: Instant) {
+        if self.on_probation {
+            self.started = Some(now);
+        }
+    }
+
     fn remaining(&self, now: Instant, force_http1: bool) -> Duration {
         let budget = live_recovery_budget(force_http1);
         let Some(started) = self.started else {
@@ -2467,6 +2983,7 @@ struct LiveReconnectContext {
     model_id: String,
     conversation_id: Option<String>,
     force_http1: bool,
+    h2_epoch: Option<u64>,
     /// Clash/Surge 464/421 while on HTTP/1. Do not oscillate back to H1.
     http1_rejected: bool,
     mcp_tools: Option<super::proto::McpTools>,
@@ -2624,9 +3141,13 @@ const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
 const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
 const LIVE_GENERATION_DEFAULT_MAX: usize = 32;
 const LIVE_GENERATION_MAX: usize = 128;
+const LIVE_RUN_DEFAULT_MAX: usize = 256;
+const LIVE_RUN_MAX: usize = 4_096;
 const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 15;
 const LIVE_GENERATION_DEFAULT_RESUME_RESERVE: usize = 4;
 const LIVE_GENERATION_RESUME_RESERVE_MAX: usize = 16;
+const LIVE_GENERATION_DEFAULT_INTERACTIVE_RESERVE: usize = 8;
+const LIVE_GENERATION_INTERACTIVE_RESERVE_MAX: usize = 32;
 const LIVE_RECOVERY_OPEN_DEFAULT_MAX: usize = 4;
 const LIVE_RECOVERY_OPEN_MAX: usize = 16;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
@@ -2676,6 +3197,112 @@ fn live_hard_timeout_secs() -> u64 {
     env_u64("CCP_CURSOR_LIVE_TIMEOUT_SECS", 1800).min(3600)
 }
 
+fn live_run_lifetime_secs(raw: Option<&str>, segment_timeout_secs: u64) -> u64 {
+    let default = segment_timeout_secs.saturating_mul(4).max(7_200);
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .clamp(segment_timeout_secs.max(1), 86_400)
+}
+
+fn live_max_segments(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(256)
+        .min(4_096)
+}
+
+fn live_tool_wait_timeout_secs(raw: Option<&str>, hard_timeout_secs: u64) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(hard_timeout_secs)
+}
+
+#[derive(Debug)]
+struct LiveGenerationBudget {
+    hard: Duration,
+    deadline: Instant,
+    paused_at: Option<Instant>,
+    absolute_deadline: Instant,
+}
+
+impl LiveGenerationBudget {
+    fn new(hard: Duration, lifetime: Duration) -> Self {
+        Self::new_at(Instant::now(), hard, lifetime)
+    }
+
+    fn new_at(now: Instant, hard: Duration, lifetime: Duration) -> Self {
+        Self {
+            hard,
+            deadline: now + hard,
+            paused_at: None,
+            absolute_deadline: now + lifetime,
+        }
+    }
+
+    fn observe_waiting(&mut self, waiting_for_tools: bool) {
+        self.observe_waiting_at(Instant::now(), waiting_for_tools);
+    }
+
+    fn observe_waiting_at(&mut self, now: Instant, waiting_for_tools: bool) {
+        match (waiting_for_tools, self.paused_at) {
+            (true, None) if now < self.deadline && now < self.absolute_deadline => {
+                self.paused_at = Some(now);
+            }
+            (false, Some(paused_at)) => {
+                self.deadline = self
+                    .deadline
+                    .checked_add(now.saturating_duration_since(paused_at))
+                    .unwrap_or(now + self.hard);
+                self.paused_at = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_next_segment(&mut self, hard: Duration) {
+        self.begin_next_segment_at(Instant::now(), hard);
+    }
+
+    fn begin_next_segment_at(&mut self, now: Instant, hard: Duration) {
+        self.hard = hard;
+        self.deadline = now + hard;
+        self.paused_at = None;
+    }
+
+    fn is_expired(&self) -> bool {
+        self.is_expired_at(Instant::now())
+    }
+
+    fn is_expired_at(&self, now: Instant) -> bool {
+        now >= self.absolute_deadline || (self.paused_at.is_none() && now >= self.deadline)
+    }
+
+    fn absolute_is_expired(&self) -> bool {
+        Instant::now() >= self.absolute_deadline
+    }
+
+    fn recovery_deadline(&self) -> Instant {
+        if self.paused_at.is_some() {
+            self.absolute_deadline
+        } else {
+            self.deadline.min(self.absolute_deadline)
+        }
+    }
+
+    #[cfg(test)]
+    fn effective_deadline_at(&self, now: Instant) -> Instant {
+        let segment_deadline = self
+            .paused_at
+            .and_then(|paused_at| {
+                self.deadline
+                    .checked_add(now.saturating_duration_since(paused_at))
+            })
+            .unwrap_or(self.deadline);
+        segment_deadline.min(self.absolute_deadline)
+    }
+}
+
 fn live_h1_fallback_budget(h1_timeout: Duration, elapsed: Duration) -> Option<Duration> {
     let leftover = h1_timeout.saturating_sub(elapsed);
     (!leftover.is_zero()).then_some(leftover)
@@ -2699,7 +3326,11 @@ async fn with_live_open_timeout<T>(
 }
 
 fn live_heartbeat_thinking_budget(stream_idle: Duration) -> Duration {
-    stream_idle.saturating_mul(2)
+    let minimum_secs = stream_idle.as_secs().saturating_mul(2).max(1);
+    let maximum_secs = 1800.max(minimum_secs);
+    Duration::from_secs(
+        env_u64("CCP_CURSOR_HEARTBEAT_PROGRESS_SECS", 600).clamp(minimum_secs, maximum_secs),
+    )
 }
 
 pub(crate) fn local_overload_retry_after() -> String {
@@ -2711,6 +3342,13 @@ fn live_generation_concurrency_max(raw: Option<&str>) -> usize {
         .filter(|value| *value > 0)
         .map(|value| value.min(LIVE_GENERATION_MAX))
         .unwrap_or(LIVE_GENERATION_DEFAULT_MAX)
+}
+
+fn live_run_max(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(LIVE_RUN_MAX))
+        .unwrap_or(LIVE_RUN_DEFAULT_MAX)
 }
 
 fn live_generation_queue_secs(raw: Option<&str>) -> u64 {
@@ -2726,6 +3364,27 @@ fn live_generation_resume_reserve(raw: Option<&str>) -> usize {
         .min(LIVE_GENERATION_RESUME_RESERVE_MAX)
 }
 
+fn live_generation_interactive_reserve(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(LIVE_GENERATION_DEFAULT_INTERACTIVE_RESERVE)
+        .min(LIVE_GENERATION_INTERACTIVE_RESERVE_MAX)
+}
+
+/// Admission class for one live start.
+///
+/// grok-build fans out many parallel `cursor-grok-*` starts against this
+/// proxy, so that model family is the bulk class bounded by `limit`. Every
+/// other model is an interactive session or subagent turn and may also draw
+/// from the protected interactive reserve (2026-08-21 incident: a 32-wide
+/// Grok batch held every ordinary slot and starved six Gemini subagents into
+/// admission-queue timeouts).
+fn live_start_is_interactive(model: &str) -> bool {
+    let id = model.trim();
+    let id = id.strip_prefix("cursor:").unwrap_or(id);
+    let id = id.strip_prefix("cursor-agent:").unwrap_or(id);
+    !id.starts_with("cursor-grok-")
+}
+
 fn live_generation_queue_timeout_error() -> CursorError {
     let mut error = CursorError::new(
         503,
@@ -2737,27 +3396,65 @@ fn live_generation_queue_timeout_error() -> CursorError {
 }
 
 #[derive(Debug, Default)]
-struct LiveGenerationPermit {
+pub(crate) struct LiveGenerationPermit {
     _total_permit: Option<OwnedSemaphorePermit>,
     _start_permit: Option<OwnedSemaphorePermit>,
+    _run_permit: Option<OwnedSemaphorePermit>,
+    _conversation_lease: Option<super::conversation::ConversationLease>,
+    resume_in_flight: Arc<ResumeAdmission>,
+}
+
+impl LiveGenerationPermit {
+    fn release_generation(&mut self) {
+        self._start_permit.take();
+        self._total_permit.take();
+    }
+
+    fn replace_generation(&mut self, mut replacement: Self) -> bool {
+        let replaced = self._total_permit.is_some() || self._start_permit.is_some();
+        self._total_permit = replacement._total_permit.take();
+        self._start_permit = replacement._start_permit.take();
+        replaced
+    }
 }
 
 struct LiveGenerationGate {
     total: Arc<Semaphore>,
     starts: Arc<Semaphore>,
+    interactive_starts: Arc<Semaphore>,
     limit: usize,
     resume_reserve: usize,
+    interactive_reserve: usize,
 }
 
 impl LiveGenerationGate {
+    #[cfg(test)]
     fn new(limit: usize, resume_reserve: usize) -> Self {
+        Self::new_with_interactive_reserve(limit, resume_reserve, 0)
+    }
+
+    /// Three admission classes over one total budget:
+    /// - ordinary starts (bulk Grok fan-out) are capped at `limit` and never
+    ///   touch either reserve;
+    /// - interactive starts prefer a free ordinary slot and fall back to a
+    ///   strict `interactive_reserve` bulkhead;
+    /// - resumes bypass both start gates and always find
+    ///   `resume_reserve` headroom inside `total`.
+    fn new_with_interactive_reserve(
+        limit: usize,
+        resume_reserve: usize,
+        interactive_reserve: usize,
+    ) -> Self {
         let limit = limit.clamp(1, LIVE_GENERATION_MAX);
         let resume_reserve = resume_reserve.min(LIVE_GENERATION_RESUME_RESERVE_MAX);
+        let interactive_reserve = interactive_reserve.min(LIVE_GENERATION_INTERACTIVE_RESERVE_MAX);
         Self {
-            total: Arc::new(Semaphore::new(limit + resume_reserve)),
+            total: Arc::new(Semaphore::new(limit + interactive_reserve + resume_reserve)),
             starts: Arc::new(Semaphore::new(limit)),
+            interactive_starts: Arc::new(Semaphore::new(interactive_reserve)),
             limit,
             resume_reserve,
+            interactive_reserve,
         }
     }
 
@@ -2801,6 +3498,58 @@ impl LiveGenerationGate {
         Ok(permit)
     }
 
+    /// Wait for whichever start-class slot frees first. `biased` polls the
+    /// ordinary pool before the reserve so interactive traffic only consumes
+    /// protected capacity while the ordinary pool is saturated.
+    async fn acquire_one_of(
+        primary: Arc<Semaphore>,
+        reserve: Arc<Semaphore>,
+        cancel: Option<&mut watch::Receiver<bool>>,
+        wait: Duration,
+    ) -> Result<OwnedSemaphorePermit, CursorError> {
+        if cancel.as_deref().is_some_and(|rx| *rx.borrow()) {
+            return Err(CursorError::new(
+                409,
+                "Cursor live start superseded while waiting for generation capacity",
+                None,
+            ));
+        }
+
+        let primary_acquire = primary.acquire_owned();
+        let reserve_acquire = reserve.acquire_owned();
+        tokio::pin!(primary_acquire);
+        tokio::pin!(reserve_acquire);
+        let permit = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                result = &mut primary_acquire => result,
+                result = &mut reserve_acquire => result,
+                _ = cancel.wait_for(|aborted| *aborted) => {
+                    return Err(CursorError::new(
+                        409,
+                        "Cursor live start superseded while waiting for generation capacity",
+                        None,
+                    ));
+                }
+                _ = tokio::time::sleep(wait) => {
+                    return Err(live_generation_queue_timeout_error());
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut primary_acquire => result,
+                result = &mut reserve_acquire => result,
+                _ = tokio::time::sleep(wait) => {
+                    return Err(live_generation_queue_timeout_error());
+                }
+            }
+        }
+        .map_err(|_| CursorError::internal("Cursor live generation admission gate closed"))?;
+
+        Ok(permit)
+    }
+
     async fn acquire_start(
         &self,
         mut cancel: Option<&mut watch::Receiver<bool>>,
@@ -2809,6 +3558,32 @@ impl LiveGenerationGate {
         let started = Instant::now();
         let start_permit =
             Self::acquire_one(Arc::clone(&self.starts), cancel.as_deref_mut(), wait).await?;
+        Self::finish_start_with_total(self, start_permit, cancel, wait, started).await
+    }
+
+    async fn acquire_interactive_start(
+        &self,
+        mut cancel: Option<&mut watch::Receiver<bool>>,
+        wait: Duration,
+    ) -> Result<LiveGenerationPermit, CursorError> {
+        let started = Instant::now();
+        let start_permit = Self::acquire_one_of(
+            Arc::clone(&self.starts),
+            Arc::clone(&self.interactive_starts),
+            cancel.as_deref_mut(),
+            wait,
+        )
+        .await?;
+        Self::finish_start_with_total(self, start_permit, cancel, wait, started).await
+    }
+
+    async fn finish_start_with_total(
+        &self,
+        start_permit: OwnedSemaphorePermit,
+        cancel: Option<&mut watch::Receiver<bool>>,
+        wait: Duration,
+        started: Instant,
+    ) -> Result<LiveGenerationPermit, CursorError> {
         let remaining = wait.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(live_generation_queue_timeout_error());
@@ -2817,6 +3592,9 @@ impl LiveGenerationGate {
         Ok(LiveGenerationPermit {
             _total_permit: Some(total_permit),
             _start_permit: Some(start_permit),
+            _run_permit: None,
+            _conversation_lease: None,
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
         })
     }
 
@@ -2825,12 +3603,15 @@ impl LiveGenerationGate {
         Ok(LiveGenerationPermit {
             _total_permit: Some(total_permit),
             _start_permit: None,
+            _run_permit: None,
+            _conversation_lease: None,
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
         })
     }
 }
 
 static LIVE_GENERATION_GATE: LazyLock<LiveGenerationGate> = LazyLock::new(|| {
-    LiveGenerationGate::new(
+    LiveGenerationGate::new_with_interactive_reserve(
         live_generation_concurrency_max(
             std::env::var("CCP_CURSOR_LIVE_CONCURRENCY").ok().as_deref(),
         ),
@@ -2839,8 +3620,68 @@ static LIVE_GENERATION_GATE: LazyLock<LiveGenerationGate> = LazyLock::new(|| {
                 .ok()
                 .as_deref(),
         ),
+        live_generation_interactive_reserve(
+            std::env::var("CCP_CURSOR_LIVE_INTERACTIVE_RESERVE")
+                .ok()
+                .as_deref(),
+        ),
     )
 });
+
+static LIVE_RUN_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(live_run_max(
+        std::env::var("CCP_CURSOR_LIVE_RUNS").ok().as_deref(),
+    )))
+});
+
+async fn acquire_live_run_permit(
+    cancel: Option<&mut watch::Receiver<bool>>,
+) -> Result<OwnedSemaphorePermit, CursorError> {
+    let wait = Duration::from_secs(live_generation_queue_secs(
+        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
+    ));
+    if cancel.as_deref().is_some_and(|rx| *rx.borrow()) {
+        return Err(CursorError::new(
+            409,
+            "Cursor live start superseded while waiting for run capacity",
+            None,
+        ));
+    }
+    let acquire = Arc::clone(&LIVE_RUN_GATE).acquire_owned();
+    tokio::pin!(acquire);
+    let permit = if let Some(cancel) = cancel {
+        tokio::select! {
+            result = &mut acquire => result.map_err(|_| CursorError::internal("Cursor live run gate closed"))?,
+            _ = cancel.wait_for(|aborted| *aborted) => {
+                return Err(CursorError::new(
+                    409,
+                    "Cursor live start superseded while waiting for run capacity",
+                    None,
+                ));
+            }
+            _ = tokio::time::sleep(wait) => {
+                let mut error = CursorError::new(
+                    503,
+                    "Cursor live run admission queue timed out",
+                    None,
+                );
+                error.retry_after = Some(local_overload_retry_after());
+                return Err(error);
+            }
+        }
+    } else {
+        tokio::time::timeout(wait, &mut acquire)
+            .await
+            .map_err(|_| {
+                let mut error =
+                    CursorError::new(503, "Cursor live run admission queue timed out", None);
+                error.retry_after = Some(local_overload_retry_after());
+                error
+            })?
+            .map_err(|_| CursorError::internal("Cursor live run gate closed"))?
+    };
+    Ok(permit)
+}
 
 fn live_recovery_open_max(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
@@ -2857,14 +3698,61 @@ static LIVE_RECOVERY_OPEN_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     )))
 });
 
+/// Admission for one live start, taken BEFORE the session slot is claimed.
+/// A request waiting in the local queue holds no session slot, so concurrent
+/// duplicates never see "already active" for a start that is merely queued.
+pub(crate) async fn admit_live_start(model: &str) -> Result<LiveGenerationPermit, CursorError> {
+    let run_permit = acquire_live_run_permit(None).await?;
+    let mut permit = acquire_live_generation_permit(model, None).await?;
+    permit._run_permit = Some(run_permit);
+    Ok(permit)
+}
+
 async fn acquire_live_generation_permit(
+    model: &str,
     cancel: Option<&mut watch::Receiver<bool>>,
 ) -> Result<LiveGenerationPermit, CursorError> {
     let wait = Duration::from_secs(live_generation_queue_secs(
         std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
     ));
+    let interactive = live_start_is_interactive(model);
     let queued_at = Instant::now();
-    let permit = LIVE_GENERATION_GATE.acquire_start(cancel, wait).await?;
+    let admission = if interactive {
+        LIVE_GENERATION_GATE
+            .acquire_interactive_start(cancel, wait)
+            .await
+    } else {
+        LIVE_GENERATION_GATE.acquire_start(cancel, wait).await
+    };
+    let permit = match admission {
+        Ok(permit) => permit,
+        Err(error) => {
+            if error.status == 503 {
+                crate::logging::create_logger("cursor").warn(
+                    "live_generation_admission_timeout",
+                    Some(serde_json::Map::from_iter([
+                        (
+                            "queuedMs".into(),
+                            serde_json::json!(queued_at.elapsed().as_millis()),
+                        ),
+                        (
+                            "limit".into(),
+                            serde_json::json!(LIVE_GENERATION_GATE.limit),
+                        ),
+                        (
+                            "interactiveReserve".into(),
+                            serde_json::json!(LIVE_GENERATION_GATE.interactive_reserve),
+                        ),
+                        (
+                            "class".into(),
+                            serde_json::json!(if interactive { "interactive" } else { "bulk" }),
+                        ),
+                    ])),
+                );
+            }
+            return Err(error);
+        }
+    };
     if queued_at.elapsed() >= Duration::from_millis(100) {
         crate::logging::create_logger("cursor").info(
             "live_generation_admitted",
@@ -2880,6 +3768,14 @@ async fn acquire_live_generation_permit(
                 (
                     "resumeReserve".into(),
                     serde_json::json!(LIVE_GENERATION_GATE.resume_reserve),
+                ),
+                (
+                    "interactiveReserve".into(),
+                    serde_json::json!(LIVE_GENERATION_GATE.interactive_reserve),
+                ),
+                (
+                    "class".into(),
+                    serde_json::json!(if interactive { "interactive" } else { "bulk" }),
                 ),
             ])),
         );
@@ -2916,44 +3812,168 @@ async fn acquire_live_generation_resume_permit(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H2CircuitRoute {
+    Http2(u64),
+    Http1,
+    ProbeHttp2 { probe_id: u64, epoch: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H2ProbePhase {
+    Transport,
+    Run,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct H2ProbeLease {
+    id: u64,
+    phase: H2ProbePhase,
+}
+
 #[derive(Debug, Default, Clone)]
 struct ProcessH2Circuit {
     consecutive_timeouts: u32,
     open_since: Option<Instant>,
+    epoch: u64,
+    next_probe_id: u64,
+    probe: Option<H2ProbeLease>,
 }
 
 impl ProcessH2Circuit {
-    fn prefers_http1(&self) -> bool {
-        self.prefers_http1_at(Instant::now())
+    #[cfg(test)]
+    fn prefers_http1_at(&self, now: Instant) -> bool {
+        self.open_since.is_some_and(|opened| {
+            self.probe.is_some()
+                || now.saturating_duration_since(opened) < TRANSPORT_BREAKER_COOLDOWN
+        })
     }
 
-    fn prefers_http1_at(&self, _now: Instant) -> bool {
-        self.open_since.is_some()
+    fn route_at(&mut self, now: Instant) -> H2CircuitRoute {
+        let Some(opened) = self.open_since else {
+            return H2CircuitRoute::Http2(self.epoch);
+        };
+        if self.probe.is_some()
+            || now.saturating_duration_since(opened) < TRANSPORT_BREAKER_COOLDOWN
+        {
+            return H2CircuitRoute::Http1;
+        }
+        self.next_probe_id = self.next_probe_id.wrapping_add(1).max(1);
+        let id = self.next_probe_id;
+        self.probe = Some(H2ProbeLease {
+            id,
+            phase: H2ProbePhase::Transport,
+        });
+        H2CircuitRoute::ProbeHttp2 {
+            probe_id: id,
+            epoch: self.epoch,
+        }
     }
 
-    fn on_h2_open_timeout(&mut self) -> bool {
-        self.on_h2_open_timeout_at(Instant::now())
+    fn advance_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
-    fn on_h2_open_timeout_at(&mut self, now: Instant) -> bool {
-        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
-        if self.open_since.is_some() {
+    fn on_h2_open_timeout(&mut self, epoch: u64) -> bool {
+        self.on_h2_open_timeout_at(Instant::now(), epoch)
+    }
+
+    fn on_h2_open_timeout_at(&mut self, now: Instant, epoch: u64) -> bool {
+        if epoch != self.epoch {
             return false;
         }
+        self.advance_epoch();
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        self.probe = None;
+        let just_opened = self.open_since.is_none();
         self.open_since = Some(now);
+        just_opened
+    }
+
+    fn on_h2_open_success(&mut self, probe_id: Option<u64>) -> bool {
+        let Some(probe_id) = probe_id else {
+            return false;
+        };
+        if !matches!(
+            self.probe,
+            Some(H2ProbeLease {
+                id,
+                phase: H2ProbePhase::Run,
+            }) if id == probe_id
+        ) {
+            return false;
+        }
+        self.advance_epoch();
+        self.consecutive_timeouts = 0;
+        self.open_since = None;
+        self.probe = None;
         true
     }
 
-    fn on_h2_open_success(&mut self) {
-        self.consecutive_timeouts = 0;
-        self.open_since = None;
+    fn on_h2_probe_transport_result(
+        &mut self,
+        now: Instant,
+        probe_id: u64,
+        succeeded: bool,
+    ) -> bool {
+        if !matches!(
+            self.probe,
+            Some(H2ProbeLease {
+                id,
+                phase: H2ProbePhase::Transport,
+            }) if id == probe_id
+        ) {
+            return false;
+        }
+        if succeeded {
+            self.probe = Some(H2ProbeLease {
+                id: probe_id,
+                phase: H2ProbePhase::Run,
+            });
+        } else {
+            self.advance_epoch();
+            self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+            self.open_since = Some(now);
+            self.probe = None;
+        }
+        true
+    }
+
+    fn release_h2_probe(&mut self, probe_id: u64) -> bool {
+        if self.probe.is_none_or(|probe| probe.id != probe_id) {
+            return false;
+        }
+        self.probe = None;
+        true
+    }
+
+    fn on_h2_probe_run_failure(&mut self, now: Instant, probe_id: u64) -> bool {
+        if !matches!(
+            self.probe,
+            Some(H2ProbeLease {
+                id,
+                phase: H2ProbePhase::Run,
+            }) if id == probe_id
+        ) {
+            return false;
+        }
+        self.advance_epoch();
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        self.open_since = Some(now);
+        self.probe = None;
+        true
     }
 
     /// Mid-stream H2 `INTERNAL_ERROR` (gemini-3.6-flash) is not an open
     /// timeout, but the next first-open must not go back to H2 or we loop
     /// RST → ResumeAction → ambiguous timeout.
-    fn on_h2_stream_reset_at(&mut self, now: Instant) -> bool {
+    fn on_h2_stream_reset_at(&mut self, now: Instant, epoch: u64) -> bool {
+        if epoch != self.epoch {
+            return false;
+        }
+        self.advance_epoch();
         self.consecutive_timeouts = TRANSPORT_BREAKER_THRESHOLD;
+        self.probe = None;
         if self.open_since.is_some() {
             self.open_since = Some(now);
             return false;
@@ -2966,37 +3986,125 @@ impl ProcessH2Circuit {
 static PROCESS_H2_CIRCUIT: Mutex<ProcessH2Circuit> = Mutex::new(ProcessH2Circuit {
     consecutive_timeouts: 0,
     open_since: None,
+    epoch: 0,
+    next_probe_id: 0,
+    probe: None,
 });
 
+#[cfg(test)]
 fn live_open_prefers_http1_from(env_http1: bool, circuit_open: bool) -> bool {
     env_http1 || circuit_open
 }
 
-fn process_h2_circuit_prefers_http1() -> bool {
+fn process_h2_circuit_route() -> H2CircuitRoute {
     if cfg!(test) {
-        return false;
+        return H2CircuitRoute::Http2(0);
     }
     PROCESS_H2_CIRCUIT
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .prefers_http1()
+        .route_at(Instant::now())
 }
 
-fn live_open_prefers_http1() -> bool {
-    live_open_prefers_http1_from(
-        http1::prefer_http1_agent(),
-        process_h2_circuit_prefers_http1(),
-    )
+fn process_h2_circuit_epoch() -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .epoch
 }
 
-fn note_process_h2_open_timeout() {
+fn live_open_circuit_route() -> H2CircuitRoute {
+    if http1::prefer_http1_agent() {
+        H2CircuitRoute::Http1
+    } else {
+        process_h2_circuit_route()
+    }
+}
+
+fn note_process_h2_probe_transport_result(probe_id: u64, succeeded: bool) -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    let accepted = PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .on_h2_probe_transport_result(Instant::now(), probe_id, succeeded);
+    if accepted {
+        crate::logging::create_logger("cursor").info(
+            "live_h2_circuit_probe",
+            Some(serde_json::Map::from_iter([(
+                "outcome".into(),
+                serde_json::json!(if succeeded {
+                    "h2_run_half_open"
+                } else {
+                    "http1"
+                }),
+            )])),
+        );
+    }
+    accepted
+}
+
+fn release_process_h2_probe(probe_id: u64) {
+    if cfg!(test) {
+        return;
+    }
+    PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .release_h2_probe(probe_id);
+}
+
+fn note_process_h2_probe_run_failure(probe_id: Option<u64>) {
+    let Some(probe_id) = probe_id else {
+        return;
+    };
+    if cfg!(test) {
+        return;
+    }
+    PROCESS_H2_CIRCUIT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .on_h2_probe_run_failure(Instant::now(), probe_id);
+}
+
+struct ProcessH2ProbeGuard {
+    probe_id: u64,
+}
+
+impl ProcessH2ProbeGuard {
+    fn new(probe_id: u64) -> Self {
+        Self { probe_id }
+    }
+
+    fn transport_result(&self, succeeded: bool) -> bool {
+        note_process_h2_probe_transport_result(self.probe_id, succeeded)
+    }
+
+    fn id(&self) -> u64 {
+        self.probe_id
+    }
+}
+
+impl Drop for ProcessH2ProbeGuard {
+    fn drop(&mut self) {
+        // Cancellation or an unrelated newer timeout only releases ownership.
+        // It is not evidence that H2 transport itself failed.
+        release_process_h2_probe(self.probe_id);
+    }
+}
+
+fn note_process_h2_open_timeout(epoch: u64) {
     if cfg!(test) {
         return;
     }
     let just_opened = PROCESS_H2_CIRCUIT
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .on_h2_open_timeout();
+        .on_h2_open_timeout(epoch);
     if just_opened {
         crate::logging::create_logger("cursor").warn(
             "live_h2_circuit_open",
@@ -3008,24 +4116,37 @@ fn note_process_h2_open_timeout() {
     }
 }
 
-fn note_process_h2_open_success() {
+fn note_process_h2_open_success(probe_id: Option<u64>) -> bool {
     if cfg!(test) {
-        return;
+        return false;
     }
-    PROCESS_H2_CIRCUIT
+    let closed = PROCESS_H2_CIRCUIT
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .on_h2_open_success();
+        .on_h2_open_success(probe_id);
+    if closed {
+        crate::logging::create_logger("cursor").info(
+            "live_h2_circuit_closed",
+            Some(serde_json::Map::from_iter([(
+                "reason".into(),
+                serde_json::json!("half_open_run_accepted"),
+            )])),
+        );
+    }
+    closed
 }
 
-fn note_process_h2_stream_reset() {
+fn note_process_h2_stream_reset(epoch: Option<u64>) {
+    let Some(epoch) = epoch else {
+        return;
+    };
     if cfg!(test) {
         return;
     }
     let just_opened = PROCESS_H2_CIRCUIT
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .on_h2_stream_reset_at(Instant::now());
+        .on_h2_stream_reset_at(Instant::now(), epoch);
     if just_opened {
         crate::logging::create_logger("cursor").warn(
             "live_h2_circuit_open",
@@ -3121,31 +4242,62 @@ fn live_idle_stall_message(
     stream_idle: Duration,
     thinking_idle: Duration,
 ) -> Option<&'static str> {
-    // Dead stream: no frames at all (including server heartbeats).
+    let _ = (saw_text, tools_advertised);
+    // Dead open: no frames at all, including server heartbeats.
     if !useful && since_liveness >= setup_idle {
         return Some("Cursor stream produced no useful progress");
     }
-    // Alive heartbeat-only thinking. `thinking_idle` is 2× stream idle when
-    // the generation gate has spare capacity, and a short contended budget
-    // when 16 holders would otherwise convoy overflow waiters for minutes.
-    if !useful && since_progress >= thinking_idle {
-        return Some("Cursor stream produced no useful progress");
+    if !pending_empty {
+        return None;
     }
-    if useful && !saw_text && since_progress >= stream_idle && !tools_advertised {
+    // Heartbeats prove transport liveness, not model progress. Give xhigh
+    // thinking a generous window, but do not let a heartbeat-only Run occupy
+    // a Grok request until the 30-minute hard deadline.
+    if since_progress >= thinking_idle {
+        return Some(if useful {
+            "Cursor stream stalled after partial progress"
+        } else {
+            "Cursor stream produced no useful progress"
+        });
+    }
+    // Live stream. Heartbeats keep Cursor thinking/tool turns alive. A
+    // progress-only ResumeAction here aborts that turn and comes back as
+    // empty `turn_ended` → conversation reset → 5-minute 502.
+    if since_liveness < stream_idle {
+        return None;
+    }
+    if useful {
         return Some("Cursor stream stalled after partial progress");
     }
-    if useful
-        && !saw_text
-        && tools_advertised
-        && pending_empty
-        && since_progress >= stream_idle.saturating_mul(2)
-    {
-        return Some("Cursor stream stalled after partial progress");
+    Some("Cursor stream produced no useful progress")
+}
+
+fn live_idle_stall_can_reconnect(
+    useful: bool,
+    since_liveness: Duration,
+    setup_idle: Duration,
+    stream_idle: Duration,
+) -> bool {
+    since_liveness >= if useful { stream_idle } else { setup_idle }
+}
+
+fn held_turn_end_wait_timed_out(
+    held_since: Option<Instant>,
+    pending_empty: bool,
+    progress_budget: Duration,
+) -> bool {
+    pending_empty && held_since.is_some_and(|since| since.elapsed() >= progress_budget)
+}
+
+fn pending_tool_wait_timed_out(
+    oldest_since: Option<Instant>,
+    tool_ttl: Duration,
+    resume_admission: &ResumeAdmission,
+) -> bool {
+    if oldest_since.is_none_or(|since| since.elapsed() < tool_ttl) {
+        return false;
     }
-    if useful && saw_text && pending_empty && since_progress >= stream_idle.saturating_mul(2) {
-        return Some("Cursor stream stalled after partial progress");
-    }
-    None
+    resume_admission.claim_expired()
 }
 
 fn live_probation_expired(on_probation: bool, got_progress: bool, remaining: Duration) -> bool {
@@ -3291,10 +4443,53 @@ fn annotate_live_cursor_error(session_id: &str, err: CursorError) -> CursorError
 }
 
 pub(crate) fn live_request_fingerprint(payload: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    payload.hash(&mut hasher);
-    hasher.finish()
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(payload);
+    let fingerprint = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 always contains at least eight bytes"),
+    );
+    // Zero is reserved as the unpublished fingerprint sentinel on live
+    // handles and reservations.
+    fingerprint.max(1)
+}
+
+fn persist_ambiguous_operation(
+    operation_key: &str,
+    fingerprint: u64,
+    owner_token: &str,
+    message: &str,
+) {
+    if let Err(error) = super::operation_ledger::mark_ambiguous_if_owner(
+        operation_key,
+        fingerprint,
+        owner_token,
+        message,
+    ) {
+        crate::logging::create_logger("cursor").error(
+            "operation_ledger_persist_failed",
+            Some(serde_json::Map::from_iter([
+                ("state".into(), serde_json::json!("ambiguous")),
+                ("error".into(), serde_json::json!(error.to_string())),
+            ])),
+        );
+    }
+}
+
+fn clear_durable_operation(operation_key: &str, fingerprint: u64, owner_token: &str) {
+    if let Err(error) =
+        super::operation_ledger::clear_if_owner(operation_key, fingerprint, owner_token)
+    {
+        crate::logging::create_logger("cursor").error(
+            "operation_ledger_clear_failed",
+            Some(serde_json::Map::from_iter([(
+                "error".into(),
+                serde_json::json!(error.to_string()),
+            )])),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3365,6 +4560,10 @@ fn live_open_should_retry_http1(err: &CursorError) -> bool {
         return false;
     }
     is_explicit_http1_required(err) || is_pre_connect_failure(err)
+}
+
+fn h2_probe_run_error_is_transport_failure(err: &CursorError) -> bool {
+    live_open_should_retry_http1(err)
 }
 
 /// Keep definite pre-connect/rejection failures retryable for grok-build.
@@ -3475,6 +4674,10 @@ fn h1_failure_should_probe_h2(explicit_http1: bool, err: &CursorError) -> bool {
     !explicit_http1 && is_pre_connect_failure(err)
 }
 
+fn live_h1_failure_should_probe_h2(allowed: bool, explicit_http1: bool, err: &CursorError) -> bool {
+    allowed && h1_failure_should_probe_h2(explicit_http1, err)
+}
+
 fn h2_half_open_error(h1_error: CursorError, h2_error: CursorError) -> CursorError {
     if is_explicit_http1_required(&h2_error) {
         h1_error
@@ -3581,6 +4784,9 @@ pub(crate) fn live_error_needs_checkpoint_continue(message: &str) -> bool {
 }
 
 pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
+    if terminal_error_is_ambiguous_accept(message) {
+        return false;
+    }
     if crate::retry::is_billing_block(message) || crate::retry::is_capacity_shed(message) {
         return false;
     }
@@ -3828,8 +5034,10 @@ fn prepare_live_reconnect(
         reconnect.http1_rejected,
         stream_error,
     ) {
+        let h2_epoch = reconnect.h2_epoch;
         reconnect.force_http1 = true;
-        note_process_h2_stream_reset();
+        reconnect.h2_epoch = None;
+        note_process_h2_stream_reset(h2_epoch);
         let mut fields = serde_json::Map::new();
         fields.insert("attempts".into(), serde_json::json!(reconnect_attempts));
         fields.insert("reason".into(), serde_json::json!("h2_stream_reset"));
@@ -4227,6 +5435,9 @@ async fn try_live_reconnect(
             &first_message,
             &reconnect.identity,
             reconnect.force_http1,
+            true,
+            None,
+            process_h2_circuit_epoch(),
             live_reconnect_open_allow_h1(reconnect, Instant::now()),
             open_wait,
             open_wait,
@@ -4314,6 +5525,8 @@ async fn try_live_reconnect(
                         let _ = (&mut *upstream_pump).await;
                         *outbound = new_outbound;
                         reconnect.force_http1 = matches!(*outbound, ClientOutbound::Http1(_));
+                        reconnect.h2_epoch =
+                            (!reconnect.force_http1).then(process_h2_circuit_epoch);
                         let pump_tx = fence_live_upstream(upstream, upstream_tx);
                         *upstream_pump = spawn_upstream_pump_prefixed(prefix, rest, pump_tx);
                         *decoder = ConnectFrameDecoder::new();
@@ -4596,7 +5809,9 @@ fn release_generation_permit_between_segments(
     generation_permit: &mut Option<LiveGenerationPermit>,
 ) {
     if sink.is_none() {
-        generation_permit.take();
+        if let Some(permit) = generation_permit {
+            permit.release_generation();
+        }
     }
 }
 
@@ -4621,6 +5836,7 @@ async fn drive_live_run(
     mut reconnect: LiveReconnectContext,
     generation_permit: LiveGenerationPermit,
 ) {
+    let resume_in_flight = Arc::clone(&generation_permit.resume_in_flight);
     let mut generation_permit = Some(generation_permit);
     let mut sink = Some(initial_sink);
     let mut pending = PendingExecState::for_run(&run_id);
@@ -4641,7 +5857,6 @@ async fn drive_live_run(
     let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
     let mut coalescer = LiveDeltaCoalescer::default();
     let mut decode_failures: u32 = 0;
-    let run_started = Instant::now();
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
     // 0 is allowed (expose on next select tick). This does NOT gate thinking/
@@ -4671,9 +5886,12 @@ async fn drive_live_run(
     // Cache idle/timeout knobs once — the 250ms idle arm used to re-parse env
     // on every tick (thousands of times during long thinking).
     let setup_idle = Duration::from_secs(env_u64("CCP_CURSOR_SETUP_IDLE_SECS", 45));
-    // CLI stall-detector failTimeoutMs default 30s; heartbeat-only thinking is
-    // 2× stream idle (240s). setup_idle is only for a stream with no frames.
+    // CLI stall-detector failTimeoutMs default 30s. Heartbeats extend valid
+    // thinking past the old 240s cutoff, but `live_heartbeat_thinking_budget`
+    // still bounds a stream with no model progress. setup_idle is only for a
+    // stream with no frames.
     let stream_idle = Duration::from_secs(env_u64("CCP_CURSOR_IDLE_SECS", 120));
+    let heartbeat_progress_idle = live_heartbeat_thinking_budget(stream_idle);
     // Live path always waits for Cursor `turn_ended` (or hard timeout). The old
     // 8s complete_idle for tool-less runs truncated Fable quiet thinking.
     let wait_for_turn_ended = true;
@@ -4681,9 +5899,26 @@ async fn drive_live_run(
         "CCP_CURSOR_COMPLETE_IDLE_MS",
         u64::MAX / 4, // disabled unless explicitly overridden
     ));
-    let hard = Duration::from_secs(live_hard_timeout_secs());
-    let hard_deadline = run_started + hard;
-    let tool_ttl = Duration::from_secs(env_u64("CCP_CURSOR_TOOL_TTL_SECS", 600));
+    let hard_timeout_secs = live_hard_timeout_secs();
+    let hard = Duration::from_secs(hard_timeout_secs);
+    let lifetime = Duration::from_secs(live_run_lifetime_secs(
+        std::env::var("CCP_CURSOR_LIVE_LIFETIME_SECS")
+            .ok()
+            .as_deref(),
+        hard_timeout_secs,
+    ));
+    let max_segments = live_max_segments(
+        std::env::var("CCP_CURSOR_LIVE_MAX_SEGMENTS")
+            .ok()
+            .as_deref(),
+    );
+    let mut segment_count = 1usize;
+    let mut generation_budget = LiveGenerationBudget::new(hard, lifetime);
+    let tool_ttl = Duration::from_secs(live_tool_wait_timeout_secs(
+        std::env::var("CCP_CURSOR_TOOL_TTL_SECS").ok().as_deref(),
+        hard.as_secs(),
+    ));
+    pending.configure_resume_admission(Arc::clone(&resume_in_flight), tool_ttl);
     // CLI transport/stall retries: 10 (prod). Keep Anthropic SSE open across
     // brief Cursor disconnects when we have a checkpoint to ResumeAction.
     let max_reconnects = env_u64("CCP_CURSOR_RECONNECT_MAX", 10) as u32;
@@ -4695,11 +5930,14 @@ async fn drive_live_run(
     // it prevents a later, separately chunked END error from being masked by a
     // fabricated successful Anthropic end_turn.
     let mut held_turn_end_frames = Vec::<ConnectFrame>::new();
+    let mut held_turn_end_since: Option<Instant> = None;
 
     macro_rules! process_driver_frames {
         ($frames:expr) => {{
             let mut keep_running = true;
             for frame in $frames {
+                let frame_may_complete = frame.flags & FLAG_END != 0
+                    || connect_frame_has_top_level_turn_ended(&frame);
                 let mut turn = LiveTurnCtx {
                     session_id: &session_id,
                     user_prompt: &user_prompt,
@@ -4729,6 +5967,21 @@ async fn drive_live_run(
                 )
                 .await;
                 if !frame_kept_running {
+                    let missing_terminal = terminal_error
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_none();
+                    if missing_terminal
+                        && (!frame_may_complete
+                            || sink.as_ref().is_some_and(mpsc::Sender::is_closed))
+                    {
+                        report_terminal_error(
+                            &mut sink,
+                            &terminal_error,
+                            "Cursor live event delivery stopped before the accepted Run reached a safely observable terminal state; completion is ambiguous".into(),
+                        )
+                        .await;
+                    }
                     keep_running = false;
                     break;
                 }
@@ -4739,6 +5992,54 @@ async fn drive_live_run(
                 }
             }
             keep_running
+        }};
+    }
+
+    macro_rules! drain_queued_upstream {
+        ($driver:lifetime) => {{
+            loop {
+                match upstream.try_recv() {
+                    Ok(Ok(Some(chunk))) => {
+                        let frames = match decoder.push(&chunk) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                report_terminal_error(
+                                    &mut sink,
+                                    &terminal_error,
+                                    format!("Cursor frame decode: {error}"),
+                                )
+                                .await;
+                                break $driver;
+                            }
+                        };
+                        if let Some(error) = frames.iter().find_map(|frame| {
+                            (frame.flags & FLAG_END != 0)
+                                .then(|| parse_connect_error(&frame.payload))
+                                .flatten()
+                        }) {
+                            let message = annotate_connect_end_error(
+                                &session_id,
+                                error,
+                                Some((&mut latest_checkpoint, &mut kv_blobs)),
+                            );
+                            report_terminal_error(&mut sink, &terminal_error, message).await;
+                            break $driver;
+                        }
+                        if !process_driver_frames!(frames) {
+                            break $driver;
+                        }
+                    }
+                    Ok(other) => {
+                        prefetched_upstream.push_back(other);
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        prefetched_upstream.push_back(Ok(None));
+                        break;
+                    }
+                }
+            }
         }};
     }
 
@@ -4770,18 +6071,12 @@ async fn drive_live_run(
             // logical_tools_waiting alone must not pin the session: those are
             // UI hints, not Anthropic-exposed pending tools.
             if pending.is_empty() {
-                if live_acceptance_unresolved(
-                    !held_turn_end_frames.is_empty(),
-                    accepted_resume_unconfirmed,
-                    reconnect.recovery.on_probation && !got_chunk_since_reconnect,
-                ) {
-                    report_terminal_error(
-                        &mut sink,
-                        &terminal_error,
-                        "Cursor downstream disconnected while upstream completion was unresolved; acceptance is ambiguous".into(),
-                    )
-                    .await;
-                }
+                report_terminal_error(
+                    &mut sink,
+                    &terminal_error,
+                    "Cursor downstream disconnected before the accepted Run reached a safely observable terminal state; completion is ambiguous".into(),
+                )
+                .await;
                 break 'driver;
             }
             sink = None;
@@ -4790,25 +6085,32 @@ async fn drive_live_run(
         // BiDi worker alive, but return scarce generation capacity until the
         // matching tool results are ready to send.
         release_generation_permit_between_segments(&sink, &mut generation_permit);
-        if run_started.elapsed() >= hard {
-            let message = if !held_turn_end_frames.is_empty() {
-                "Cursor live run timed out after an uncommitted turn_ended frame; completion is ambiguous"
+        generation_budget.observe_waiting(pending.tool_wait_since().is_some());
+        if generation_budget.is_expired() {
+            let message = if generation_budget.absolute_is_expired() {
+                "Cursor live run lifetime expired; completion is ambiguous".into()
+            } else if !held_turn_end_frames.is_empty() {
+                "Cursor live segment timed out after an uncommitted turn_ended frame; completion is ambiguous"
                     .into()
             } else if pending.is_empty() {
-                "Cursor live run hard timeout".into()
+                "Cursor live segment hard timeout; completion is ambiguous".into()
             } else {
-                "Cursor live run hard timeout with pending native tools".into()
+                "Cursor live segment hard timeout with pending native tools; completion is ambiguous"
+                    .into()
             };
             report_terminal_error(&mut sink, &terminal_error, message).await;
             break 'driver;
         }
-        if live_probation_expired(
-            reconnect.recovery.on_probation,
-            got_chunk_since_reconnect,
-            reconnect
-                .recovery
-                .remaining(Instant::now(), reconnect.force_http1),
-        ) {
+        let tool_wait_since = pending.tool_wait_since();
+        if tool_wait_since.is_none()
+            && live_probation_expired(
+                reconnect.recovery.on_probation,
+                got_chunk_since_reconnect,
+                reconnect
+                    .recovery
+                    .remaining(Instant::now(), reconnect.force_http1),
+            )
+        {
             let message = hollow_resume_terminal_message(
                 &session_id,
                 saw_text,
@@ -4822,19 +6124,34 @@ async fn drive_live_run(
             report_terminal_error(&mut sink, &terminal_error, message).await;
             break 'driver;
         }
+        if held_turn_end_wait_timed_out(
+            held_turn_end_since,
+            pending.is_empty(),
+            heartbeat_progress_idle,
+        ) {
+            report_terminal_error(
+                &mut sink,
+                &terminal_error,
+                "Cursor live run timed out with an uncommitted turn_ended frame while the upstream remained live; completion is ambiguous"
+                    .into(),
+            )
+            .await;
+            break 'driver;
+        }
+        if pending_tool_wait_timed_out(tool_wait_since, tool_ttl, &resume_in_flight) {
+            report_terminal_error(
+                &mut sink,
+                &terminal_error,
+                "Cursor tool result wait expired".into(),
+            )
+            .await;
+            break 'driver;
+        }
         if !held_turn_end_frames.is_empty() {
             // Wait for the authoritative Connect END (which may be delivered
             // in a later HTTP body chunk) before exposing success.
-        } else if let Some(since) = pending.oldest_since() {
-            if since.elapsed() >= tool_ttl {
-                report_terminal_error(
-                    &mut sink,
-                    &terminal_error,
-                    "Cursor tool result wait expired".into(),
-                )
-                .await;
-                break 'driver;
-            }
+        } else if tool_wait_since.is_some() {
+            // The matching tool result may still arrive before its TTL.
         } else if !reconnect.recovery.on_probation
             && resume_grace_until.is_some_and(|until| Instant::now() < until)
         {
@@ -4858,8 +6175,24 @@ async fn drive_live_run(
             last_liveness.elapsed(),
             setup_idle,
             stream_idle,
-            live_heartbeat_thinking_budget(stream_idle),
+            heartbeat_progress_idle,
         ) {
+            if !live_idle_stall_can_reconnect(
+                useful,
+                last_liveness.elapsed(),
+                setup_idle,
+                stream_idle,
+            ) {
+                report_terminal_error(
+                    &mut sink,
+                    &terminal_error,
+                    format!(
+                        "{message}; upstream transport remained live, so completion is ambiguous"
+                    ),
+                )
+                .await;
+                break 'driver;
+            }
             let can_resume = live_reconnect_resume_state(
                 &latest_checkpoint,
                 &reconnect.opening_checkpoint,
@@ -4894,7 +6227,7 @@ async fn drive_live_run(
                         &mut last_progress,
                         &mut resume_grace_until,
                         resume_grace,
-                        hard_deadline,
+                        generation_budget.recovery_deadline(),
                     )
                     .await
                 } else {
@@ -4994,6 +6327,14 @@ async fn drive_live_run(
                             )));
                             continue;
                         }
+                        if segment_count >= max_segments {
+                            let message = format!(
+                                "Cursor live run reached its {max_segments}-segment safety limit"
+                            );
+                            let _ = ack.send(Err(CursorError::new(409, message.clone(), None)));
+                            report_terminal_error(&mut sink, &terminal_error, message).await;
+                            break 'driver;
+                        }
                         let frames = match encode_tool_result_batch(pending.awaiting(), &tool_results) {
                             Ok(frames) => frames,
                             Err(error) => {
@@ -5001,10 +6342,9 @@ async fn drive_live_run(
                                 continue;
                             }
                         };
-                        if generation_permit
-                            .replace(resume_generation_permit)
-                            .is_some()
-                        {
+                        if generation_permit.as_mut().is_some_and(|current| {
+                            current.replace_generation(resume_generation_permit)
+                        }) {
                             crate::logging::create_logger("cursor").warn(
                                 "live_generation_lease_replaced",
                                 Some(serde_json::Map::from_iter([(
@@ -5017,20 +6357,123 @@ async fn drive_live_run(
                         // transport/reconnect work. Send failures are delivered
                         // on this event stream instead of leaving the POST
                         // silent while the driver recovers.
-                        let previous_fingerprint = accepted_fingerprint.as_ref().map(
-                            |(target, fingerprint)| {
-                                target.swap(*fingerprint, Ordering::AcqRel)
-                            },
-                        );
+                        let previous_fingerprint = if let Some((target, fingerprint)) =
+                            accepted_fingerprint.as_ref()
+                        {
+                            let previous = target.load(Ordering::Acquire);
+                            match super::operation_ledger::prepare_stage_if_owner(
+                                &session_id,
+                                &run_id,
+                                previous,
+                                *fingerprint,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let message = "Cursor durable operation owner changed before tool-result resume; acceptance is ambiguous".to_string();
+                                    let _ = ack.send(Err(CursorError::new(
+                                        409,
+                                        message.clone(),
+                                        None,
+                                    )));
+                                    report_terminal_error(
+                                        &mut sink,
+                                        &terminal_error,
+                                        message,
+                                    )
+                                    .await;
+                                    break 'driver;
+                                }
+                                Err(error) => {
+                                    let _ = ack.send(Err(CursorError::new(
+                                        503,
+                                        format!(
+                                            "Cursor operation ledger is unavailable; tool results were not dispatched: {error}"
+                                        ),
+                                        None,
+                                    )));
+                                    continue;
+                                }
+                            }
+                            match super::operation_ledger::mark_dispatched_if_owner(
+                                &session_id,
+                                *fingerprint,
+                                &run_id,
+                            ) {
+                                Ok(true) => {}
+                                result => {
+                                    let reason = match result {
+                                        Ok(false) => {
+                                            "durable operation owner changed before dispatch"
+                                                .to_string()
+                                        }
+                                        Err(error) => error.to_string(),
+                                        Ok(true) => unreachable!(),
+                                    };
+                                    let rollback = super::operation_ledger::rollback_stage_if_owner(
+                                        &session_id,
+                                        &run_id,
+                                        *fingerprint,
+                                        previous,
+                                    );
+                                    let status = if matches!(rollback, Ok(true)) {
+                                        503
+                                    } else {
+                                        409
+                                    };
+                                    let message = format!(
+                                        "Cursor operation ledger could not commit tool-result dispatch; request was not sent: {reason}"
+                                    );
+                                    let _ = ack.send(Err(CursorError::new(
+                                        status,
+                                        message.clone(),
+                                        None,
+                                    )));
+                                    if status == 409 {
+                                        report_terminal_error(
+                                            &mut sink,
+                                            &terminal_error,
+                                            message,
+                                        )
+                                        .await;
+                                        break 'driver;
+                                    }
+                                    continue;
+                                }
+                            }
+                            target.store(*fingerprint, Ordering::Release);
+                            Some(previous)
+                        } else {
+                            None
+                        };
                         if ack.send(Ok(())).is_err() {
-                            if let (Some((target, _)), Some(previous)) =
+                            if let (Some((target, fingerprint)), Some(previous)) =
                                 (accepted_fingerprint.as_ref(), previous_fingerprint)
                             {
                                 target.store(previous, Ordering::Release);
+                                if !matches!(
+                                    super::operation_ledger::rollback_stage_if_owner(
+                                        &session_id,
+                                        &run_id,
+                                        *fingerprint,
+                                        previous,
+                                    ),
+                                    Ok(true)
+                                ) {
+                                    report_terminal_error(
+                                        &mut sink,
+                                        &terminal_error,
+                                        "Cursor tool-result resume acknowledgement was abandoned and durable rollback failed; completion is ambiguous".into(),
+                                    )
+                                    .await;
+                                    break 'driver;
+                                }
                             }
                             continue;
                         }
                         sink = Some(next_sink);
+                        generation_budget.begin_next_segment(hard);
+                        segment_count += 1;
+                        reconnect.recovery.rebase_probation(Instant::now());
                         saw_text = false;
                         useful = false;
                         // The accepted ResumeBatch has already delivered these
@@ -5043,56 +6486,8 @@ async fn drive_live_run(
                         // upstream bytes before snapshotting the baseline, or a
                         // pre-submit checkpoint can later look like post-tool
                         // proof.
-                        loop {
-                            match upstream.try_recv() {
-                                Ok(Ok(Some(chunk))) => {
-                                    let frames = match decoder.push(&chunk) {
-                                        Ok(frames) => frames,
-                                        Err(error) => {
-                                            report_terminal_error(
-                                                &mut sink,
-                                                &terminal_error,
-                                                format!("Cursor frame decode: {error}"),
-                                            )
-                                            .await;
-                                            break 'driver;
-                                        }
-                                    };
-                                    if let Some(error) = frames.iter().find_map(|frame| {
-                                        (frame.flags & FLAG_END != 0)
-                                            .then(|| parse_connect_error(&frame.payload))
-                                            .flatten()
-                                    }) {
-                                        let message = annotate_connect_end_error(
-                                            &session_id,
-                                            error,
-                                            Some((&mut latest_checkpoint, &mut kv_blobs)),
-                                        );
-                                        report_terminal_error(
-                                            &mut sink,
-                                            &terminal_error,
-                                            message,
-                                        )
-                                        .await;
-                                        break 'driver;
-                                    }
-                                    if !process_driver_frames!(frames) {
-                                        break 'driver;
-                                    }
-                                }
-                                Ok(other) => {
-                                    prefetched_upstream.push_back(other);
-                                    break;
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    prefetched_upstream.push_back(Ok(None));
-                                    break;
-                                }
-                            }
-                        }
-                        post_tool_checkpoint =
-                            PostToolCheckpointEvidence::begin(latest_checkpoint.clone());
+                        post_tool_checkpoint = PostToolCheckpointEvidence::default();
+                        drain_queued_upstream!('driver);
                         logical_tools_waiting.clear();
                         last_progress = Instant::now();
                         last_liveness = last_progress;
@@ -5180,7 +6575,7 @@ async fn drive_live_run(
                                     &mut last_progress,
                                     &mut resume_grace_until,
                                     resume_grace,
-                                    hard_deadline,
+                                    generation_budget.recovery_deadline(),
                                 )
                                 .await
                             } else {
@@ -5275,6 +6670,16 @@ async fn drive_live_run(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clear();
+                        // A frame can arrive after the pre-submit drain while
+                        // the outbound send is awaiting capacity. Drain again
+                        // before establishing the commit-evidence baseline.
+                        // This intentionally absorbs even an extremely fast
+                        // post-send checkpoint: lacking a protocol sequence
+                        // number, false negatives are safer than duplicate
+                        // tool execution.
+                        drain_queued_upstream!('driver);
+                        post_tool_checkpoint =
+                            PostToolCheckpointEvidence::begin(latest_checkpoint.clone());
                         // After tool results, Cursor often thinks quietly before the
                         // next text/tool delta. Don't trip setup_idle during that gap
                         // (was the "no useful progress" hang after a healthy tool_use).
@@ -5357,6 +6762,7 @@ async fn drive_live_run(
                                 .any(|frame| frame.flags & FLAG_END != 0)
                             {
                                 frames = std::mem::take(&mut held_turn_end_frames);
+                                held_turn_end_since = None;
                             } else {
                                 continue 'driver;
                             }
@@ -5370,8 +6776,10 @@ async fn drive_live_run(
                                 .any(|frame| frame.flags & FLAG_END != 0)
                             {
                                 frames.extend(std::mem::take(&mut held_turn_end_frames));
+                                held_turn_end_since = None;
                             } else {
                                 holding_turn_end = true;
+                                held_turn_end_since = Some(Instant::now());
                             }
                         }
                         if !process_driver_frames!(frames) {
@@ -5382,10 +6790,42 @@ async fn drive_live_run(
                         }) != checkpoint_before
                         {
                             if let Some(checkpoint) = latest_checkpoint.as_ref() {
-                                super::conversation::save_checkpoint(
-                                    &session_id,
-                                    checkpoint.clone(),
-                                );
+                                let persisted = reconnect
+                                    .conversation_id
+                                    .as_deref()
+                                    .map(|conversation_id| {
+                                        super::conversation::save_checkpoint_if_current(
+                                            &session_id,
+                                            conversation_id,
+                                            checkpoint.clone(),
+                                        )
+                                    })
+                                    .unwrap_or(
+                                        super::conversation::ConditionalPersist::StaleBinding,
+                                    );
+                                match persisted {
+                                    super::conversation::ConditionalPersist::Saved => {}
+                                    super::conversation::ConditionalPersist::StaleBinding => {
+                                        report_terminal_error(
+                                            &mut sink,
+                                            &terminal_error,
+                                            "Cursor conversation binding changed while a live Run was active; completion is ambiguous".into(),
+                                        )
+                                        .await;
+                                        break 'driver;
+                                    }
+                                    super::conversation::ConditionalPersist::Failed(error) => {
+                                        report_terminal_error(
+                                            &mut sink,
+                                            &terminal_error,
+                                            format!(
+                                                "Cursor checkpoint could not be durably persisted; completion is ambiguous: {error}"
+                                            ),
+                                        )
+                                        .await;
+                                        break 'driver;
+                                    }
+                                }
                             }
                         }
                         if holding_turn_end {
@@ -5484,7 +6924,7 @@ async fn drive_live_run(
                                 &mut last_progress,
                                 &mut resume_grace_until,
                                 resume_grace,
-                                hard_deadline,
+                                generation_budget.recovery_deadline(),
                             )
                             .await
                         } else {
@@ -5618,7 +7058,7 @@ async fn drive_live_run(
                                 &mut last_progress,
                                 &mut resume_grace_until,
                                 resume_grace,
-                                hard_deadline,
+                                generation_budget.recovery_deadline(),
                             )
                             .await
                         } else {
@@ -5738,12 +7178,50 @@ async fn drive_live_run(
             .map(|outcome| outcome.message.as_str()),
     );
     if persist_continuation {
-        if client_only_teardown {
-            super::conversation::clear_checkpoint(&session_id);
-        } else if let Some(checkpoint) = latest_checkpoint.take() {
-            super::conversation::save_checkpoint(&session_id, checkpoint);
+        let persisted = reconnect
+            .conversation_id
+            .as_deref()
+            .map(|conversation_id| {
+                let checkpoint = if client_only_teardown {
+                    super::conversation::clear_checkpoint_if_current(&session_id, conversation_id)
+                } else if let Some(checkpoint) = latest_checkpoint.take() {
+                    super::conversation::save_checkpoint_if_current(
+                        &session_id,
+                        conversation_id,
+                        checkpoint,
+                    )
+                } else {
+                    super::conversation::ConditionalPersist::Saved
+                };
+                match checkpoint {
+                    super::conversation::ConditionalPersist::Saved => {
+                        super::conversation::merge_blobs_if_current(
+                            &session_id,
+                            conversation_id,
+                            &kv_blobs,
+                        )
+                    }
+                    other => other,
+                }
+            })
+            .unwrap_or(super::conversation::ConditionalPersist::StaleBinding);
+        match persisted {
+            super::conversation::ConditionalPersist::Saved => {}
+            super::conversation::ConditionalPersist::StaleBinding => {
+                store_terminal_error(
+                    &terminal_error,
+                    "Cursor conversation binding changed while a live Run was active; stale continuation was discarded and completion is ambiguous",
+                );
+            }
+            super::conversation::ConditionalPersist::Failed(error) => {
+                store_terminal_error(
+                    &terminal_error,
+                    &format!(
+                        "Cursor continuation could not be durably persisted; completion is ambiguous: {error}"
+                    ),
+                );
+            }
         }
-        super::conversation::merge_blobs(&session_id, &kv_blobs);
     }
     pending_shared
         .lock()
@@ -5866,7 +7344,15 @@ async fn process_live_frame(
         {
             return false;
         }
-        let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
+        if !emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await {
+            report_terminal_error(
+                sink,
+                terminal_error,
+                "Cursor downstream did not observe the accepted Run completion; completion is ambiguous"
+                    .into(),
+            )
+            .await;
+        }
         return false;
     }
     let message = match super::client::decode_frame_payload(&frame) {
@@ -5911,6 +7397,18 @@ async fn process_live_frame(
 
     if let Some(checkpoint) = message.conversation_checkpoint_update {
         if !checkpoint.is_empty() {
+            if checkpoint.len() > MAX_LIVE_CHECKPOINT_BYTES {
+                report_terminal_error(
+                    sink,
+                    terminal_error,
+                    format!(
+                        "Cursor checkpoint exceeded the {} byte safety limit; completion is ambiguous",
+                        MAX_LIVE_CHECKPOINT_BYTES
+                    ),
+                )
+                .await;
+                return false;
+            }
             if let Some(ctx) = turn_ctx.as_deref_mut() {
                 ctx.post_tool_checkpoint
                     .observe_checkpoint(ctx.user_prompt, &checkpoint);
@@ -6525,7 +8023,15 @@ async fn process_interaction_update(
         {
             return false;
         }
-        let _ = emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await;
+        if !emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await {
+            report_terminal_error(
+                sink,
+                terminal_error,
+                "Cursor downstream did not observe the accepted Run completion; completion is ambiguous"
+                    .into(),
+            )
+            .await;
+        }
         return false;
     }
     true
@@ -6658,11 +8164,18 @@ async fn report_terminal_error(
     // therefore left the registry entry looking "still generating" -> cascade
     // of 409s for concurrent same-session POSTs.
     store_terminal_error(terminal_error, &message);
-    // Terminal reporting must never block teardown behind a full downstream
-    // channel. If the error cannot be queued, dropping the sender makes the SSE
-    // layer emit its explicit "ended without turn_ended" error.
+    // Terminal reporting must not block teardown behind a full downstream
+    // channel, but the original typed cause must still follow already-buffered
+    // events. A detached send is bounded by the response receiver's lifetime.
     if let Some(tx) = sink.take() {
-        let _ = tx.try_send(Err(message));
+        match tx.try_send(Err(message)) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                tokio::spawn(async move {
+                    let _ = tx.send(event).await;
+                });
+            }
+        }
     }
 }
 
@@ -6699,7 +8212,7 @@ async fn expose_collected_tools(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
 ) -> bool {
     let exposed = pending.expose();
-    publish_exposed_tools(exposed, pending_shared, sink).await
+    publish_exposed_tools(pending, exposed, pending_shared, sink).await
 }
 
 async fn expose_collected_native_tools(
@@ -6708,10 +8221,11 @@ async fn expose_collected_native_tools(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
 ) -> bool {
     let exposed = pending.expose_native();
-    publish_exposed_tools(exposed, pending_shared, sink).await
+    publish_exposed_tools(pending, exposed, pending_shared, sink).await
 }
 
 async fn publish_exposed_tools(
+    pending: &mut PendingExecState,
     exposed: Vec<PendingCursorExec>,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
@@ -6731,10 +8245,23 @@ async fn publish_exposed_tools(
         })
         .collect();
 
-    *pending_shared.lock().unwrap_or_else(|e| e.into_inner()) = exposed;
-    if !send_live_event(sink, Ok(LiveRunEvent::NativeToolBatch(tools))).await {
+    let Some(tx) = sink.as_ref() else {
         return false;
-    }
+    };
+    let permit = match tokio::time::timeout(
+        Duration::from_secs(env_u64("CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_SECS", 5)),
+        tx.reserve(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return false,
+    };
+    // No await may occur between publishing the matching ids/clock and making
+    // the event receivable. This is the result-admission boundary.
+    pending.mark_exposed_at(Instant::now());
+    *pending_shared.lock().unwrap_or_else(|e| e.into_inner()) = exposed;
+    permit.send(Ok(LiveRunEvent::NativeToolBatch(tools)));
     // Closing this sender ends exactly one downstream Anthropic HTTP segment.
     *sink = None;
     // Client-only tools (Workflow/Skill/AskUserQuestion) are fulfilled by Claude
@@ -7311,6 +8838,9 @@ async fn emit_cursor_or_defer(
     emit_or_defer(sink, deferred, Ok(LiveRunEvent::Cursor(event))).await
 }
 
+const MAX_DEFERRED_LIVE_EVENTS: usize = 1_024;
+const MAX_LIVE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
+
 async fn emit_or_defer(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
@@ -7319,6 +8849,9 @@ async fn emit_or_defer(
     if sink.is_some() {
         send_live_event(sink, event).await
     } else {
+        if deferred.len() >= MAX_DEFERRED_LIVE_EVENTS {
+            return false;
+        }
         deferred.push_back(event);
         true
     }
@@ -7474,11 +9007,38 @@ fn encode_request_context_reply(
     Ok(Bytes::from(frames))
 }
 
+const MAX_LIVE_KV_BLOB_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LIVE_KV_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LIVE_KV_BLOBS: usize = 4_096;
+
 fn encode_kv_reply(
     message: &KvServerMessage,
     blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
 ) -> Result<Option<Bytes>, CursorError> {
     let reply = if let Some(args) = message.set_blob_args.as_ref() {
+        let existing_len = blobs.get(&args.blob_id).map(Vec::len).unwrap_or_default();
+        let next_count = blobs.len() + usize::from(!blobs.contains_key(&args.blob_id));
+        let current_total = blobs
+            .values()
+            .fold(0usize, |total, blob| total.saturating_add(blob.len()));
+        let next_total = current_total
+            .saturating_sub(existing_len)
+            .saturating_add(args.blob_data.len());
+        if args.blob_data.len() > MAX_LIVE_KV_BLOB_BYTES
+            || next_count > MAX_LIVE_KV_BLOBS
+            || next_total > MAX_LIVE_KV_TOTAL_BYTES
+        {
+            return Err(CursorError::new(
+                413,
+                format!(
+                    "Cursor KV blob store limit exceeded (blob={} bytes, blobs={}, total={} bytes)",
+                    args.blob_data.len(),
+                    next_count,
+                    next_total
+                ),
+                None,
+            ));
+        }
         blobs.insert(args.blob_id.clone(), args.blob_data.clone());
         KvClientMessage {
             id: message.id,
@@ -8012,6 +9572,7 @@ mod tests {
             model_id: "composer-2.5".into(),
             conversation_id: Some("conv-test".into()),
             force_http1: false,
+            h2_epoch: Some(0),
             http1_rejected: false,
             mcp_tools: None,
             opening_checkpoint: None,
@@ -8023,6 +9584,34 @@ mod tests {
 
     fn test_generation_permit() -> LiveGenerationPermit {
         LiveGenerationPermit::default()
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_initial_open_never_crosses_the_acceptance_boundary() {
+        let (_cancel_tx, mut cancel_rx) = watch::channel(true);
+        let open_guard = Arc::new(LiveUpstreamOpenGuard {
+            dispatched: Arc::new(AtomicBool::new(false)),
+            operation_key: "pre-cancelled-test".into(),
+            fingerprint: 1,
+            owner_token: "owner".into(),
+        });
+        let operation_polled = Arc::new(AtomicBool::new(false));
+        let polled = Arc::clone(&operation_polled);
+        let operation = std::future::poll_fn(move |_| {
+            polled.store(true, Ordering::Release);
+            std::task::Poll::Ready(Ok::<_, CursorError>(()))
+        });
+
+        let error = race_initial_live_operation(Some(&mut cancel_rx), Some(&open_guard), operation)
+            .await
+            .expect_err("ready cancellation must win");
+
+        assert_eq!(error.status, 409);
+        assert!(!open_guard.dispatched.load(Ordering::Acquire));
+        assert!(
+            !operation_polled.load(Ordering::Acquire),
+            "a cancelled half-open owner must not poll or send the user Run"
+        );
     }
 
     #[test]
@@ -8039,7 +9628,9 @@ mod tests {
         release_generation_permit_between_segments(&sink, &mut generation_permit);
 
         assert!(
-            generation_permit.is_none(),
+            generation_permit.as_ref().is_some_and(|permit| {
+                permit._total_permit.is_none() && permit._start_permit.is_none()
+            }),
             "a driver without a downstream segment must drop its unused start token"
         );
     }
@@ -8130,7 +9721,7 @@ mod tests {
                 sink: resume_sink,
                 ack: ack_tx,
                 permit: LiveResumePermit {
-                    in_flight: Arc::new(AtomicBool::new(true)),
+                    in_flight: Arc::new(ResumeAdmission::with_state(RESUME_ADMISSION_IN_FLIGHT)),
                 },
                 generation_permit: resume_generation_permit,
                 dispatch_state: Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING)),
@@ -8164,7 +9755,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let driver = tokio::spawn(async move {
@@ -8218,7 +9809,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(true)),
+            resume_in_flight: Arc::new(ResumeAdmission::with_state(RESUME_ADMISSION_IN_FLIGHT)),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -8248,7 +9839,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(11)),
         });
         let driver = tokio::spawn(async move {
@@ -8305,7 +9896,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(true)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let error = handle
@@ -8324,7 +9915,7 @@ mod tests {
             "a closed driver must transition the caller to replacement handling"
         );
         assert!(
-            !handle.resume_in_flight.load(Ordering::Acquire),
+            handle.resume_in_flight.state() == RESUME_ADMISSION_IDLE,
             "cancellation must release the exact-once resume guard"
         );
     }
@@ -9062,6 +10653,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn partial_tool_result_acceptance_dominates_nested_rate_limit() {
+        let partial = partial_tool_result_send_error(
+            CursorError::new(429, "ERROR_RESOURCE_EXHAUSTED", None),
+            1,
+            2,
+        );
+        let message = partial.to_string();
+
+        assert!(terminal_error_is_ambiguous_accept(&message), "{message}");
+        assert!(
+            !live_error_is_same_request_retryable(&message),
+            "a partial batch must not clear its slot even when the child error is 429: {message}"
+        );
+        assert!(
+            !terminal_error_clears_live_slot(&message),
+            "partial acceptance must remain tombstoned"
+        );
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(partial.status, &message),
+            409
+        );
+    }
+
     #[tokio::test]
     async fn auxiliary_http1_connect_refused_is_not_ambiguous_accept() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -9397,56 +11012,158 @@ mod tests {
     fn process_h2_circuit_trips_on_first_open_timeout() {
         let mut circuit = ProcessH2Circuit::default();
         let t0 = Instant::now();
+        let H2CircuitRoute::Http2(epoch) = circuit.route_at(t0) else {
+            panic!("closed circuit must route H2");
+        };
         assert!(!circuit.prefers_http1_at(t0));
         assert!(
-            circuit.on_h2_open_timeout_at(t0),
+            circuit.on_h2_open_timeout_at(t0, epoch),
             "the first H2 open timeout must pin HTTP/1; waiting for 3 consecutive 20s 409s is the grok-build loop"
         );
         assert!(circuit.prefers_http1_at(t0));
         assert!(
-            !circuit.on_h2_open_timeout_at(t0),
-            "already-open circuit must not log a second trip"
+            !circuit.on_h2_open_timeout_at(t0, epoch),
+            "a second completion from the stale epoch must be ignored"
         );
-        circuit.on_h2_open_success();
-        assert!(!circuit.prefers_http1_at(t0));
-        assert_eq!(circuit.consecutive_timeouts, 0);
-        assert!(circuit.open_since.is_none());
+        assert!(
+            !circuit.on_h2_open_success(None),
+            "a sibling H2 open that started before the timeout must not clear the circuit"
+        );
+        assert!(circuit.prefers_http1_at(t0));
     }
 
     #[test]
-    fn process_h2_circuit_stays_on_http1_until_h2_success() {
+    fn process_h2_circuit_half_opens_one_safe_probe_after_cooldown() {
         let mut circuit = ProcessH2Circuit::default();
         let t0 = Instant::now();
-        assert!(circuit.on_h2_open_timeout_at(t0));
-        assert!(
-            circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN),
-            "time-based H2 probes after 30s put a user Run on H2 and 409 after 20s"
+        let H2CircuitRoute::Http2(initial_epoch) = circuit.route_at(t0) else {
+            panic!("closed circuit must route H2");
+        };
+        assert!(circuit.on_h2_open_timeout_at(t0, initial_epoch));
+        assert_eq!(
+            circuit.route_at(t0 + Duration::from_secs(29)),
+            H2CircuitRoute::Http1
         );
-        assert!(
-            circuit.prefers_http1_at(t0 + Duration::from_secs(15 * 60)),
-            "HTTP/1 pin must last until an H2 open actually succeeds"
+        let probe_at = t0 + TRANSPORT_BREAKER_COOLDOWN;
+        let H2CircuitRoute::ProbeHttp2 {
+            probe_id: first_probe,
+            ..
+        } = circuit.route_at(probe_at)
+        else {
+            panic!("cooldown must use a side-effect-free H2 probe, not a user Run");
+        };
+        assert_eq!(
+            circuit.route_at(probe_at),
+            H2CircuitRoute::Http1,
+            "only one request may own the half-open probe"
         );
-        assert!(
-            !circuit.on_h2_open_timeout_at(t0 + TRANSPORT_BREAKER_COOLDOWN),
-            "already-open circuit must not log another trip"
+        assert!(circuit.on_h2_probe_transport_result(probe_at, first_probe, false));
+        assert_eq!(
+            circuit.route_at(probe_at + Duration::from_secs(29)),
+            H2CircuitRoute::Http1
         );
-        circuit.on_h2_open_success();
-        assert!(!circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN));
+        let retry_at = probe_at + TRANSPORT_BREAKER_COOLDOWN;
+        let H2CircuitRoute::ProbeHttp2 {
+            probe_id: second_probe,
+            ..
+        } = circuit.route_at(retry_at)
+        else {
+            panic!("failed probe must half-open again after cooldown");
+        };
+        assert!(circuit.on_h2_probe_transport_result(retry_at, second_probe, true));
+        assert_eq!(
+            circuit.route_at(retry_at),
+            H2CircuitRoute::Http1,
+            "a unary probe only admits its owner Run; it must not release H2 fan-out"
+        );
+        assert!(circuit.on_h2_open_success(Some(second_probe)));
+        assert!(
+            !circuit.on_h2_open_timeout_at(retry_at, initial_epoch),
+            "a late timeout from the pre-probe generation must not reopen a recovered circuit"
+        );
+        assert!(matches!(
+            circuit.route_at(retry_at),
+            H2CircuitRoute::Http2(_)
+        ));
     }
 
     #[test]
-    fn h1_preconnect_failure_half_opens_h2_unless_user_forced_h1() {
+    fn stale_h2_probe_cannot_overwrite_a_newer_timeout() {
+        let mut circuit = ProcessH2Circuit::default();
+        let t0 = Instant::now();
+        let H2CircuitRoute::Http2(initial_epoch) = circuit.route_at(t0) else {
+            panic!("closed circuit must route H2");
+        };
+        assert!(circuit.on_h2_open_timeout_at(t0, initial_epoch));
+        let probe_at = t0 + TRANSPORT_BREAKER_COOLDOWN;
+        let H2CircuitRoute::ProbeHttp2 {
+            probe_id: probe,
+            epoch: probe_epoch,
+        } = circuit.route_at(probe_at)
+        else {
+            panic!("expected half-open probe");
+        };
+        let newer_timeout = probe_at + Duration::from_secs(1);
+        assert!(!circuit.on_h2_open_timeout_at(newer_timeout, probe_epoch));
+        assert!(
+            !circuit.on_h2_probe_transport_result(newer_timeout, probe, true),
+            "stale unary success must be ignored"
+        );
+        assert!(
+            !circuit.on_h2_open_success(Some(probe)),
+            "stale owner Run success must be ignored"
+        );
+        assert_eq!(
+            circuit.route_at(newer_timeout + Duration::from_secs(29)),
+            H2CircuitRoute::Http1
+        );
+    }
+
+    #[test]
+    fn half_open_owner_run_rejection_restarts_cooldown() {
+        let mut circuit = ProcessH2Circuit::default();
+        let t0 = Instant::now();
+        let H2CircuitRoute::Http2(epoch) = circuit.route_at(t0) else {
+            panic!("closed circuit must route H2");
+        };
+        assert!(circuit.on_h2_open_timeout_at(t0, epoch));
+        let probe_at = t0 + TRANSPORT_BREAKER_COOLDOWN;
+        let H2CircuitRoute::ProbeHttp2 {
+            probe_id: probe, ..
+        } = circuit.route_at(probe_at)
+        else {
+            panic!("expected half-open probe");
+        };
+        assert!(circuit.on_h2_probe_transport_result(probe_at, probe, true));
+        let rejected_at = probe_at + Duration::from_secs(1);
+        assert!(circuit.on_h2_probe_run_failure(rejected_at, probe));
+        assert_eq!(
+            circuit.route_at(rejected_at + Duration::from_secs(29)),
+            H2CircuitRoute::Http1
+        );
+        assert!(matches!(
+            circuit.route_at(rejected_at + TRANSPORT_BREAKER_COOLDOWN),
+            H2CircuitRoute::ProbeHttp2 { .. }
+        ));
+    }
+
+    #[test]
+    fn initial_h1_preconnect_failure_never_bypasses_circuit_probe() {
         let preconnect = CursorError::new(
             502,
             "error sending request for url (https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend)",
             None,
         );
         assert!(
-            h1_failure_should_probe_h2(false, &preconnect),
-            "a circuit-selected H1 path cannot stay pinned when BidiAppend never connects"
+            !live_h1_failure_should_probe_h2(false, false, &preconnect),
+            "a circuit-selected H1 path must wait for the read-only half-open probe"
         );
         assert!(
-            !h1_failure_should_probe_h2(true, &preconnect),
+            live_h1_failure_should_probe_h2(true, false, &preconnect),
+            "a reconnect may switch after a provable H1 pre-connect miss"
+        );
+        assert!(
+            !live_h1_failure_should_probe_h2(true, true, &preconnect),
             "CCP_CURSOR_HTTP1 is an explicit operator transport choice"
         );
         let ambiguous = CursorError::new(
@@ -9455,7 +11172,7 @@ mod tests {
             None,
         );
         assert!(
-            !h1_failure_should_probe_h2(false, &ambiguous),
+            !live_h1_failure_should_probe_h2(true, false, &ambiguous),
             "a possibly accepted append must never be replayed over H2"
         );
         let h1_required = CursorError::new(421, "HTTP_1_1_REQUIRED", None);
@@ -9470,21 +11187,90 @@ mod tests {
     fn process_h2_circuit_trips_on_first_midstream_reset() {
         let mut circuit = ProcessH2Circuit::default();
         let t0 = Instant::now();
+        let H2CircuitRoute::Http2(epoch) = circuit.route_at(t0) else {
+            panic!("closed circuit must route H2");
+        };
         assert!(
-            circuit.on_h2_stream_reset_at(t0),
+            circuit.on_h2_stream_reset_at(t0, epoch),
             "gemini-style H2 INTERNAL_ERROR must pin HTTP/1 on the next first open"
         );
         assert!(circuit.prefers_http1_at(t0));
         assert!(
-            !circuit.on_h2_stream_reset_at(t0),
+            !circuit.on_h2_stream_reset_at(t0, epoch),
             "already-open circuit must not log a second trip"
         );
-        assert!(
-            circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN),
-            "mid-stream RST must not probe H2 on the next user open after 30s"
-        );
-        circuit.on_h2_open_success();
+        let H2CircuitRoute::ProbeHttp2 {
+            probe_id: probe, ..
+        } = circuit.route_at(t0 + TRANSPORT_BREAKER_COOLDOWN)
+        else {
+            panic!("mid-stream RST may recover only through the side-effect-free H2 probe");
+        };
+        assert!(circuit.on_h2_probe_transport_result(t0 + TRANSPORT_BREAKER_COOLDOWN, probe, true));
+        assert!(circuit.on_h2_open_success(Some(probe)));
+        assert!(!circuit.on_h2_open_timeout_at(t0 + TRANSPORT_BREAKER_COOLDOWN, epoch));
         assert!(!circuit.prefers_http1_at(t0 + TRANSPORT_BREAKER_COOLDOWN));
+    }
+
+    #[test]
+    fn stale_h2_stream_reset_cannot_reopen_a_recovered_circuit() {
+        let mut circuit = ProcessH2Circuit::default();
+        let t0 = Instant::now();
+        let H2CircuitRoute::Http2(old_epoch) = circuit.route_at(t0) else {
+            panic!("closed circuit must route H2");
+        };
+        assert!(circuit.on_h2_stream_reset_at(t0, old_epoch));
+        let probe_at = t0 + TRANSPORT_BREAKER_COOLDOWN;
+        let H2CircuitRoute::ProbeHttp2 {
+            probe_id: probe, ..
+        } = circuit.route_at(probe_at)
+        else {
+            panic!("expected half-open probe");
+        };
+        assert!(circuit.on_h2_probe_transport_result(probe_at, probe, true));
+        assert!(circuit.on_h2_open_success(Some(probe)));
+        assert!(
+            !circuit.on_h2_stream_reset_at(probe_at + Duration::from_secs(1), old_epoch),
+            "an old stream must not discard a newer successful H2 probe"
+        );
+        assert!(matches!(
+            circuit.route_at(probe_at + Duration::from_secs(1)),
+            H2CircuitRoute::Http2(_)
+        ));
+    }
+
+    #[test]
+    fn h2_probe_rejects_transport_capability_statuses() {
+        assert!(h2_probe_response_is_viable(
+            reqwest::Version::HTTP_2,
+            reqwest::StatusCode::OK
+        ));
+        assert!(!h2_probe_response_is_viable(
+            reqwest::Version::HTTP_2,
+            reqwest::StatusCode::MISDIRECTED_REQUEST
+        ));
+        assert!(!h2_probe_response_is_viable(
+            reqwest::Version::HTTP_2,
+            reqwest::StatusCode::from_u16(464).unwrap()
+        ));
+        assert!(!h2_probe_response_is_viable(
+            reqwest::Version::HTTP_11,
+            reqwest::StatusCode::OK
+        ));
+        assert!(h2_probe_run_error_is_transport_failure(&CursorError::new(
+            421,
+            "HTTP_1_1_REQUIRED",
+            None
+        )));
+        assert!(!h2_probe_run_error_is_transport_failure(&CursorError::new(
+            401,
+            "unauthorized",
+            None
+        )));
+        assert!(!h2_probe_run_error_is_transport_failure(&CursorError::new(
+            429,
+            "rate limited",
+            None
+        )));
     }
 
     #[test]
@@ -9530,6 +11316,270 @@ mod tests {
         .expect("a released generation slot must wake one waiter")
         .expect("a released generation slot must be reusable");
         drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn interactive_agent_fanout_has_capacity_reserved_from_grok_starts() {
+        const GROK_LIMIT: usize = 32;
+        const INTERACTIVE_RESERVE: usize = 8;
+        const RESUME_RESERVE: usize = 4;
+        let gate = LiveGenerationGate::new_with_interactive_reserve(
+            GROK_LIMIT,
+            RESUME_RESERVE,
+            INTERACTIVE_RESERVE,
+        );
+        let mut grok = Vec::with_capacity(GROK_LIMIT);
+        for _ in 0..GROK_LIMIT {
+            grok.push(
+                gate.acquire_start(None, Duration::from_secs(1))
+                    .await
+                    .expect("normal Grok fanout"),
+            );
+        }
+
+        let mut interactive = Vec::new();
+        for _ in 0..6 {
+            interactive.push(
+                gate.acquire_interactive_start(None, Duration::from_millis(50))
+                    .await
+                    .expect("Gemini subagent must use protected interactive capacity"),
+            );
+        }
+        assert!(
+            gate.acquire_start(None, Duration::from_millis(10))
+                .await
+                .is_err(),
+            "ordinary Grok starts must not borrow protected interactive capacity"
+        );
+        let mut resumes = Vec::new();
+        for _ in 0..RESUME_RESERVE {
+            resumes.push(
+                gate.acquire_resume(Duration::from_millis(50))
+                    .await
+                    .expect("resume capacity must remain protected from both start classes"),
+            );
+        }
+        assert_eq!(gate.interactive_reserve, INTERACTIVE_RESERVE);
+        drop(resumes);
+        drop(interactive);
+        drop(grok);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn queued_admission_does_not_occupy_the_session_slot() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("queued-admission-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+
+        let previous = std::env::var_os("CCP_CURSOR_LIVE_QUEUE_SECS");
+        unsafe {
+            std::env::set_var("CCP_CURSOR_LIVE_QUEUE_SECS", "1");
+        }
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("CCP_CURSOR_LIVE_QUEUE_SECS", value),
+                        None => std::env::remove_var("CCP_CURSOR_LIVE_QUEUE_SECS"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        // Saturate the process-wide bulk start class so the start under test
+        // must wait in the local admission queue.
+        let mut held = Vec::with_capacity(LIVE_GENERATION_GATE.limit);
+        for _ in 0..LIVE_GENERATION_GATE.limit {
+            held.push(
+                LIVE_GENERATION_GATE
+                    .acquire_start(None, Duration::from_secs(1))
+                    .await
+                    .expect("saturate bulk start class"),
+            );
+        }
+
+        let task_session = session.clone();
+        let start = tokio::spawn(async move {
+            super::super::start_live_events_with_retries(
+                CursorHttpClient::new(),
+                "test-token".into(),
+                "queued request",
+                "cursor-grok-4.6-xhigh-fast",
+                &[],
+                None,
+                LiveRunIdentity::parent(&task_session),
+                None,
+                None,
+                RequestContext::default(),
+                Vec::new(),
+                None,
+                false,
+            )
+            .await
+        });
+
+        // 2026-08-21 incident regression: while a start waits for local
+        // capacity, concurrent duplicates must never observe the session as
+        // "already active".
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !LiveRunRegistry::is_occupied_run(&session, None),
+                "a start queued for local admission must not occupy the session slot"
+            );
+        }
+
+        let error = start
+            .await
+            .expect("join queued start")
+            .expect_err("saturated admission must time out");
+        assert_eq!(error.status, 503);
+        assert!(
+            error.client_message().contains("admission queue timed out"),
+            "unexpected error: {}",
+            error.client_message()
+        );
+        assert!(
+            !LiveRunRegistry::is_occupied_run(&session, None),
+            "an admission timeout must leave the session slot free"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn local_generation_admission_drains_a_hundred_waiters_without_leaking_slots() {
+        const LIMIT: usize = 8;
+        const RESUME_RESERVE: usize = 2;
+        const WAITERS: usize = 100;
+        const RESUME_WAITERS: usize = 8;
+
+        let gate = Arc::new(LiveGenerationGate::new(LIMIT, RESUME_RESERVE));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut held = Vec::with_capacity(LIMIT);
+        for _ in 0..LIMIT {
+            held.push(
+                gate.acquire_start(None, Duration::from_secs(1))
+                    .await
+                    .expect("initial start capacity"),
+            );
+        }
+
+        let first_resume = gate
+            .acquire_resume(Duration::from_secs(1))
+            .await
+            .expect("first reserved resume");
+        let second_resume = gate
+            .acquire_resume(Duration::from_secs(1))
+            .await
+            .expect("second reserved resume");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                gate.acquire_resume(Duration::from_secs(1))
+            )
+            .await
+            .is_err(),
+            "resume traffic must also remain bounded by total capacity"
+        );
+
+        let mut waiters = tokio::task::JoinSet::new();
+        let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
+        for id in 0..WAITERS {
+            let gate = Arc::clone(&gate);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let queued_tx = queued_tx.clone();
+            waiters.spawn(async move {
+                let mut admission = Box::pin(gate.acquire_start(None, Duration::from_secs(5)));
+                let mut announced = false;
+                let permit = std::future::poll_fn(|cx| {
+                    let result = admission.as_mut().poll(cx);
+                    if result.is_pending() && !announced {
+                        announced = true;
+                        let _ = queued_tx.send(());
+                    }
+                    result
+                })
+                .await
+                .expect("queued start must eventually turn over");
+                let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(current, Ordering::AcqRel);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::AcqRel);
+                drop(permit);
+                (false, id)
+            });
+        }
+        for id in 0..RESUME_WAITERS {
+            let gate = Arc::clone(&gate);
+            let queued_tx = queued_tx.clone();
+            waiters.spawn(async move {
+                let mut admission = Box::pin(gate.acquire_resume(Duration::from_secs(5)));
+                let mut announced = false;
+                let permit = std::future::poll_fn(|cx| {
+                    let result = admission.as_mut().poll(cx);
+                    if result.is_pending() && !announced {
+                        announced = true;
+                        let _ = queued_tx.send(());
+                    }
+                    result
+                })
+                .await
+                .expect("queued resume must turn over through reserved capacity");
+                tokio::task::yield_now().await;
+                drop(permit);
+                (true, id)
+            });
+        }
+        drop(queued_tx);
+        for _ in 0..(WAITERS + RESUME_WAITERS) {
+            tokio::time::timeout(Duration::from_secs(1), queued_rx.recv())
+                .await
+                .expect("every waiter must be polled into the queue")
+                .expect("queue witness channel closed early");
+        }
+
+        drop(first_resume);
+        drop(second_resume);
+        let mut completed_resumes = HashSet::new();
+        for _ in 0..RESUME_WAITERS {
+            let (is_resume, id) = tokio::time::timeout(Duration::from_secs(1), waiters.join_next())
+                .await
+                .expect("reserved resume traffic was starved by queued starts")
+                .expect("resume waiter missing")
+                .expect("resume waiter task");
+            assert!(
+                is_resume,
+                "new starts must remain blocked while only resume reserve is released"
+            );
+            completed_resumes.insert(id);
+        }
+        assert_eq!(completed_resumes.len(), RESUME_WAITERS);
+
+        drop(held);
+        let mut completed = HashSet::new();
+        while let Some(result) = waiters.join_next().await {
+            let (is_resume, id) = result.expect("waiter task");
+            assert!(!is_resume);
+            completed.insert(id);
+        }
+
+        assert_eq!(completed.len(), WAITERS);
+        assert!(
+            peak.load(Ordering::Acquire) <= LIMIT,
+            "active starts exceeded the configured generation bound"
+        );
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(gate.starts.available_permits(), LIMIT);
+        assert_eq!(
+            gate.total.available_permits(),
+            LIMIT + RESUME_RESERVE,
+            "all start and resume permits must return after burst turnover"
+        );
     }
 
     #[tokio::test]
@@ -9600,8 +11650,95 @@ mod tests {
         assert_eq!(live_generation_resume_reserve(None), 4);
         assert_eq!(live_generation_resume_reserve(Some("0")), 0);
         assert_eq!(live_generation_resume_reserve(Some("999")), 16);
+        assert_eq!(live_generation_interactive_reserve(None), 8);
+        assert_eq!(live_generation_interactive_reserve(Some("0")), 0);
+        assert_eq!(live_generation_interactive_reserve(Some("999")), 32);
         assert_eq!(live_recovery_open_max(None), 4);
         assert_eq!(live_recovery_open_max(Some("999")), 16);
+    }
+
+    #[test]
+    fn grok_bulk_starts_are_not_classified_as_interactive() {
+        assert!(!live_start_is_interactive("cursor-grok-4.6-xhigh-fast"));
+        assert!(!live_start_is_interactive(
+            "cursor:cursor-grok-4.5-high-fast"
+        ));
+        assert!(live_start_is_interactive("gemini-3.1-pro"));
+        assert!(live_start_is_interactive("claude-fable-5-thinking-max"));
+        assert!(live_start_is_interactive("fable"));
+        assert!(live_start_is_interactive("composer-2.5-fast"));
+    }
+
+    #[test]
+    fn tool_wait_default_tracks_the_live_generation_timeout() {
+        assert_eq!(
+            live_tool_wait_timeout_secs(None, 1800),
+            1800,
+            "the default must not expire valid long-running tools at the old 600-second boundary"
+        );
+        assert_eq!(
+            live_tool_wait_timeout_secs(Some("900"), 1800),
+            900,
+            "an explicit operator override remains authoritative"
+        );
+        assert_eq!(
+            live_tool_wait_timeout_secs(Some("invalid"), 1800),
+            1800,
+            "an invalid override must fall back to the lifecycle-safe default"
+        );
+    }
+
+    #[test]
+    fn live_generation_budget_pauses_for_tools_and_resets_for_the_next_segment() {
+        let started = Instant::now();
+        let hard = Duration::from_secs(100);
+        let mut budget = LiveGenerationBudget::new_at(started, hard, Duration::from_secs(250));
+
+        budget.observe_waiting_at(started + Duration::from_secs(40), true);
+
+        assert!(
+            !budget.is_expired_at(started + Duration::from_secs(140)),
+            "downstream tool execution must not consume the active model-generation budget"
+        );
+        assert_eq!(
+            budget.effective_deadline_at(started + Duration::from_secs(140)),
+            started + Duration::from_secs(200),
+            "recovery work during a tool wait must retain the unused active budget"
+        );
+
+        budget.begin_next_segment_at(started + Duration::from_secs(140), hard);
+
+        assert!(!budget.is_expired_at(started + Duration::from_secs(239)));
+        assert!(budget.is_expired_at(started + Duration::from_secs(240)));
+    }
+
+    #[test]
+    fn live_generation_budget_cannot_pause_after_its_segment_expired() {
+        let started = Instant::now();
+        let hard = Duration::from_secs(100);
+        let mut budget = LiveGenerationBudget::new_at(started, hard, Duration::from_secs(300));
+
+        budget.observe_waiting_at(started + Duration::from_secs(101), true);
+
+        assert!(
+            budget.is_expired_at(started + Duration::from_secs(101)),
+            "late tool exposure must not revive an already-expired model segment"
+        );
+    }
+
+    #[test]
+    fn live_generation_budget_keeps_an_absolute_run_lifetime() {
+        let started = Instant::now();
+        let hard = Duration::from_secs(100);
+        let mut budget = LiveGenerationBudget::new_at(started, hard, Duration::from_secs(250));
+        budget.observe_waiting_at(started + Duration::from_secs(40), true);
+        budget.begin_next_segment_at(started + Duration::from_secs(140), hard);
+        budget.observe_waiting_at(started + Duration::from_secs(200), true);
+
+        assert!(
+            budget.is_expired_at(started + Duration::from_secs(250)),
+            "tool waits and segment resets must not create an immortal live Run"
+        );
     }
 
     #[test]
@@ -9690,11 +11827,54 @@ mod tests {
     }
 
     #[test]
+    fn live_heartbeats_block_idle_reconnect() {
+        let setup = Duration::from_secs(45);
+        let idle = Duration::from_secs(120);
+        let fresh = Duration::from_millis(200);
+        let thinking_limit = Duration::from_secs(600);
+        let stall = |useful, saw_text, since_progress, since_liveness| {
+            live_idle_stall_message(
+                useful,
+                saw_text,
+                true,
+                true,
+                since_progress,
+                since_liveness,
+                setup,
+                idle,
+                thinking_limit,
+            )
+        };
+        assert!(
+            stall(false, false, thinking_limit - Duration::from_secs(1), fresh).is_none(),
+            "ResumeAction on a live heartbeat stream aborts Fable thinking into an empty turn"
+        );
+        assert_eq!(
+            stall(false, false, thinking_limit, fresh),
+            Some("Cursor stream produced no useful progress"),
+            "heartbeats without model progress must not hold a Grok request for 30 minutes"
+        );
+        assert!(
+            !live_idle_stall_can_reconnect(false, fresh, setup, idle),
+            "a known-live heartbeat stream must fail closed instead of ResumeAction"
+        );
+        assert_eq!(
+            stall(true, true, thinking_limit, fresh),
+            Some("Cursor stream stalled after partial progress"),
+            "quiet post-text heartbeats need the same bounded progress deadline"
+        );
+        assert!(
+            live_idle_stall_can_reconnect(true, idle, setup, idle),
+            "a transport-silent stream may still use checkpoint recovery"
+        );
+    }
+
+    #[test]
     fn tool_turn_stalls_after_double_stream_idle_without_text() {
         let setup = Duration::from_secs(45);
         let idle = Duration::from_secs(120);
         let fresh = Duration::from_millis(200);
-        let generous = idle * 2;
+        let generous = Duration::from_secs(600);
         let stall = |useful, saw_text, tools, pending_empty, since_progress, since_liveness| {
             live_idle_stall_message(
                 useful,
@@ -9717,25 +11897,9 @@ mod tests {
             stall(false, false, true, true, setup, fresh).is_none(),
             "heartbeat-only Fable thinking must not die at 45s setup_idle"
         );
-        assert_eq!(
-            stall(false, false, true, true, idle * 2, fresh),
-            Some("Cursor stream produced no useful progress"),
-            "heartbeat-only thinking still stalls at 2× stream idle"
-        );
-        assert_eq!(
-            live_idle_stall_message(
-                false,
-                false,
-                true,
-                true,
-                Duration::from_secs(30),
-                fresh,
-                setup,
-                idle,
-                Duration::from_secs(30),
-            ),
-            Some("Cursor stream produced no useful progress"),
-            "contended holders must stall at the short thinking budget"
+        assert!(
+            stall(false, false, true, true, idle * 2, fresh).is_none(),
+            "heartbeat-only thinking must not ResumeAction while the stream is alive"
         );
         assert!(
             live_idle_stall_message(
@@ -9743,34 +11907,49 @@ mod tests {
                 false,
                 true,
                 true,
-                Duration::from_secs(29),
+                Duration::from_secs(30),
                 fresh,
                 setup,
                 idle,
-                Duration::from_secs(30),
+                generous,
             )
             .is_none(),
-            "contended thinking still has a 30s first-useful-output window"
+            "a live stream must use the configured long thinking budget"
         );
         assert!(
             stall(true, false, true, true, idle, fresh).is_none(),
             "tools advertised: 120s of thinking-only is still allowed"
         );
-        assert_eq!(
-            stall(true, false, true, true, idle * 2, fresh),
-            Some("Cursor stream stalled after partial progress")
+        assert!(
+            stall(true, false, true, true, idle * 2, fresh).is_none(),
+            "partial progress plus live heartbeats must keep waiting"
+        );
+        assert!(
+            stall(true, true, true, true, idle * 2, fresh).is_none(),
+            "heartbeat-only silence after text must not ResumeAction"
         );
         assert_eq!(
-            stall(true, true, true, true, idle * 2, fresh),
+            stall(true, true, true, true, idle * 2, idle),
             Some("Cursor stream stalled after partial progress"),
-            "heartbeat-only silence after text must ResumeAction or error, not wait 1800s"
+            "a dead stream after text may ResumeAction"
         );
+        let now = Instant::now();
+        assert!(held_turn_end_wait_timed_out(
+            Some(now - generous),
+            true,
+            generous
+        ));
         assert!(
-            stall(true, true, true, true, idle, fresh).is_none(),
-            "one stream-idle window of quiet thinking after text is still allowed"
+            !held_turn_end_wait_timed_out(Some(now - generous), false, generous),
+            "pending native tool results retain their dedicated TTL"
         );
+        assert!(pending_tool_wait_timed_out(
+            Some(now - generous),
+            generous,
+            &ResumeAdmission::default(),
+        ));
         assert!(
-            stall(true, false, true, false, idle * 2, fresh).is_none(),
+            stall(true, false, true, false, idle * 2, idle).is_none(),
             "do not stall while Claude still owes native tool_results"
         );
     }
@@ -10057,7 +12236,7 @@ mod tests {
             terminal_error,
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(session_id)
@@ -10089,7 +12268,7 @@ mod tests {
             }))),
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
@@ -10838,6 +13017,24 @@ mod tests {
     }
 
     #[test]
+    fn kv_blob_store_rejects_an_oversized_blob() {
+        let mut blobs = HashMap::new();
+        let set = KvServerMessage {
+            id: 73,
+            get_blob_args: None,
+            set_blob_args: Some(proto::SetBlobArgs {
+                blob_id: b"oversized".to_vec(),
+                blob_data: vec![0_u8; MAX_LIVE_KV_BLOB_BYTES + 1],
+            }),
+            span_context: None,
+        };
+
+        let error = encode_kv_reply(&set, &mut blobs).expect_err("oversized KV blob must fail");
+        assert_eq!(error.status, 413);
+        assert!(blobs.is_empty(), "rejected data must not enter live memory");
+    }
+
+    #[test]
     fn request_context_reply_closes_the_exec_stream() {
         let exec = ExecServerMessage {
             id: 99,
@@ -10913,6 +13110,108 @@ mod tests {
         );
         assert_eq!(state.awaiting().len(), 2);
         assert!(!state.can_expose());
+    }
+
+    #[test]
+    fn pending_tool_ttl_starts_when_the_batch_is_exposed_downstream() {
+        let mut state = PendingExecState::default();
+        assert!(state.queue(pending_exec(1, "tool-1"), Duration::ZERO));
+        state.collecting_since = Some(Instant::now() - Duration::from_secs(10));
+
+        state.expose();
+        assert!(
+            state.tool_wait_since().is_none(),
+            "moving a batch internally is not downstream publication"
+        );
+        state.mark_exposed_at(Instant::now());
+
+        assert!(
+            !pending_tool_wait_timed_out(
+                state.tool_wait_since(),
+                Duration::from_secs(5),
+                &ResumeAdmission::default(),
+            ),
+            "upstream collection time must not consume Claude's tool execution budget"
+        );
+    }
+
+    #[test]
+    fn in_flight_tool_result_wins_the_ttl_boundary() {
+        let expired_since = Instant::now() - Duration::from_secs(10);
+        let admission = ResumeAdmission::with_state(RESUME_ADMISSION_IN_FLIGHT);
+
+        assert!(
+            !pending_tool_wait_timed_out(Some(expired_since), Duration::from_secs(5), &admission,),
+            "a tool-result POST already admitted by the handle must reach the driver before expiry"
+        );
+    }
+
+    #[test]
+    fn tool_ttl_expiry_atomically_blocks_late_result_admission() {
+        let expired_since = Instant::now() - Duration::from_secs(10);
+        let admission = ResumeAdmission::default();
+
+        assert!(pending_tool_wait_timed_out(
+            Some(expired_since),
+            Duration::from_secs(5),
+            &admission,
+        ));
+        assert_eq!(admission.state(), RESUME_ADMISSION_EXPIRED);
+        assert!(
+            admission.try_admit(Instant::now()) == Err(ResumeAdmissionError::Expired),
+            "a request arriving after the expiry claim must never enter the driver"
+        );
+    }
+
+    #[test]
+    fn result_arriving_after_the_tool_deadline_cannot_pause_expiry() {
+        let admission = ResumeAdmission::default();
+        admission.set_deadline(Instant::now() - Duration::from_millis(1));
+
+        assert_eq!(
+            admission.try_admit(Instant::now()),
+            Err(ResumeAdmissionError::Expired)
+        );
+        assert_eq!(admission.state(), RESUME_ADMISSION_EXPIRED);
+    }
+
+    #[tokio::test]
+    async fn tool_ttl_starts_only_after_downstream_channel_capacity_is_reserved() {
+        let mut state = PendingExecState::default();
+        assert!(state.queue(pending_exec(1, "tool-1"), Duration::ZERO));
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let shared_for_task = Arc::clone(&pending_shared);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "occupy capacity".into(),
+        })))
+        .await
+        .unwrap();
+
+        let publish = tokio::spawn(async move {
+            let mut sink = Some(tx);
+            let published =
+                expose_collected_native_tools(&mut state, &shared_for_task, &mut sink).await;
+            (published, state)
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            pending_shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "a blocked downstream channel must not start the tool-result clock"
+        );
+
+        let _ = rx.recv().await;
+        let event = rx.recv().await.expect("published native tool batch");
+        assert!(matches!(event, Ok(LiveRunEvent::NativeToolBatch(_))));
+        let (published, state) = publish.await.unwrap();
+        assert!(published);
+        assert!(
+            state.tool_wait_since().is_some(),
+            "successful enqueue must atomically start the downstream tool wait"
+        );
     }
 
     #[test]
@@ -11107,7 +13406,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -11115,6 +13414,14 @@ mod tests {
     fn lock_live_registry_for_test() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn live_request_fingerprint_is_stable_for_durable_replay() {
+        assert_eq!(
+            live_request_fingerprint(b"operation"),
+            0x9bf5_a24e_4aa7_7998
+        );
     }
 
     #[test]
@@ -11216,6 +13523,108 @@ mod tests {
             LiveRunRegistry::is_ambiguous_run(&session, None),
             "once an upstream open can have been accepted, cancellation must seal the slot"
         );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn ambiguous_reservation_is_durable_after_registry_reset() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CCP_CURSOR_OPERATION_DIR");
+        unsafe {
+            std::env::set_var("CCP_CURSOR_OPERATION_DIR", dir.path());
+        }
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("CCP_CURSOR_OPERATION_DIR", value),
+                        None => std::env::remove_var("CCP_CURSOR_OPERATION_DIR"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        let session = format!("durable-ambiguous-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+
+        let mut reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.set_operation_fingerprint(99);
+        assert_eq!(
+            reservation.begin_durable_operation(),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        reservation.seal_ambiguous(Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL);
+        LiveRunRegistry::clear();
+
+        // The durable marker is keyed by the registry run key, not the raw
+        // Claude session id.
+        assert!(matches!(
+            super::super::operation_ledger::admit(&live_run_key(&session, None), 99),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn stale_reservation_release_cannot_clear_new_owner_durable_marker() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CCP_CURSOR_OPERATION_DIR");
+        unsafe {
+            std::env::set_var("CCP_CURSOR_OPERATION_DIR", dir.path());
+        }
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("CCP_CURSOR_OPERATION_DIR", value),
+                        None => std::env::remove_var("CCP_CURSOR_OPERATION_DIR"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        let session = format!("stale-release-{}", uuid::Uuid::new_v4());
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::clear();
+
+        let mut stale = LiveRunRegistry::reserve(&session).expect("first reserve");
+        stale.set_operation_fingerprint(77);
+        assert_eq!(
+            stale.begin_durable_operation(),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|error| error.into_inner());
+            runs.remove_key(&key);
+        }
+        let mut replacement = LiveRunRegistry::reserve(&session).expect("replacement reserve");
+        replacement.set_operation_fingerprint(77);
+        assert!(
+            super::super::operation_ledger::transfer_owner_if(
+                &key,
+                77,
+                &stale.reservation_id,
+                &replacement.reservation_id,
+            )
+            .unwrap()
+        );
+
+        stale.release();
+
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, 77),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+        replacement.release();
         LiveRunRegistry::clear();
     }
 
@@ -11396,11 +13805,13 @@ mod tests {
         reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
         let (cancel, _) = watch::channel(false);
         let stale = LiveRunReservation {
-            session_id: session.clone(),
+            // Real reservations always carry the registry run key.
+            session_id: live_run_key(&session, None),
             reservation_id: "stale".into(),
             committed: false,
             seal_on_drop: Arc::new(AtomicBool::new(false)),
             cancel,
+            operation_fingerprint: 0,
         };
         assert!(
             stale.insert(dummy_handle("must-not-overwrite")).is_err(),
@@ -11849,7 +14260,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::clone(&completed),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
@@ -12496,7 +14907,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
@@ -12640,7 +15051,7 @@ mod tests {
         );
         assert_eq!(
             live_run_key(&session, Some("agent-nested")),
-            format!("{session}::agent::agent-nested")
+            format!("a:{}:{session}12:agent-nested", session.len())
         );
         assert!(
             !live_run_key(&session, Some("agent-nested")).contains("::nested::"),
@@ -12668,13 +15079,22 @@ mod tests {
             agent_id: Some("agent%2Fchild"),
             parent_agent_id: Some("agent%2Fparent"),
         };
-        assert_eq!(live_run_key_for(parent), session);
+        assert_eq!(
+            live_run_key_for(parent),
+            format!("p:{}:{session}", session.len())
+        );
         assert_eq!(
             live_run_key_for(nested),
-            format!("{session}::agent::agent%2Fchild")
+            format!("a:{}:{session}13:agent%2Fchild", session.len())
         );
         assert!(nested.is_nested());
         assert!(!parent.is_nested());
+
+        assert_ne!(
+            live_run_key("s::agent::a", None),
+            live_run_key("s", Some("a")),
+            "arbitrary parent session text must not collide with a nested tuple"
+        );
 
         let parent_res =
             LiveRunRegistry::reserve_run(session, parent.agent_id).expect("parent reserve");
@@ -15960,9 +18380,24 @@ mod tests {
     async fn run_post_tool_checkpoint_scenario(
         prefetch_before_resume: bool,
         new_checkpoint_after_submit: bool,
+        checkpoint_while_submit_is_blocked: bool,
     ) -> String {
+        let session_id = "session-causal-checkpoint";
+        let conversation = super::super::conversation::get_or_create(session_id);
+        let _lease = super::super::conversation::pin(session_id, &conversation.conversation_id)
+            .expect("pin test conversation");
         let (upstream_tx, upstream_rx) = mpsc::channel(8);
-        let (request_tx, mut request_rx) = mpsc::channel(16);
+        let (request_tx, mut request_rx) = mpsc::channel(if checkpoint_while_submit_is_blocked {
+            1
+        } else {
+            16
+        });
+        if checkpoint_while_submit_is_blocked {
+            request_tx
+                .send(Ok(Bytes::new()))
+                .await
+                .expect("prime blocked outbound send");
+        }
         let (command_tx, command_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
@@ -15971,6 +18406,7 @@ mod tests {
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let mut reconnect = test_reconnect_context();
         reconnect.opening_checkpoint = Some(vec![1_u8, 2, 3]);
+        reconnect.conversation_id = Some(conversation.conversation_id);
 
         let driver = tokio::spawn(drive_live_run(
             upstream_rx,
@@ -15984,7 +18420,7 @@ mod tests {
             Arc::clone(&completed),
             cancel_requested,
             Some(BTreeSet::from(["Read".into()])),
-            "session-causal-checkpoint".into(),
+            session_id.into(),
             "run-causal-checkpoint".into(),
             HashMap::new(),
             "read the file".into(),
@@ -16050,7 +18486,7 @@ mod tests {
                 sink: resume_sink,
                 ack: ack_tx,
                 permit: LiveResumePermit {
-                    in_flight: Arc::new(AtomicBool::new(true)),
+                    in_flight: Arc::new(ResumeAdmission::with_state(RESUME_ADMISSION_IN_FLIGHT)),
                 },
                 generation_permit: test_generation_permit(),
                 dispatch_state: Arc::new(AtomicU8::new(RESUME_DISPATCH_WAITING)),
@@ -16062,6 +18498,26 @@ mod tests {
             .await
             .expect("resume acknowledgement")
             .expect("resume accepted");
+        if checkpoint_while_submit_is_blocked {
+            let mut checkpoint_payload = Vec::new();
+            proto::AgentServerMessage {
+                conversation_checkpoint_update: Some(vec![4_u8, 5, 6]),
+                ..Default::default()
+            }
+            .encode(&mut checkpoint_payload)
+            .expect("encode checkpoint during submit");
+            upstream_tx
+                .send(Ok(Some(encode_connect_frame(checkpoint_payload, 0))))
+                .await
+                .expect("queue checkpoint while submit is blocked");
+            tokio::task::yield_now().await;
+            let primed = request_rx
+                .recv()
+                .await
+                .expect("primed request stream")
+                .expect("primed request");
+            assert!(primed.is_empty());
+        }
         tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
             .await
             .expect("tool result was not submitted")
@@ -16102,7 +18558,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_checkpoint_before_tool_result_submit_is_absorbed_into_baseline() {
-        let message = run_post_tool_checkpoint_scenario(true, false).await;
+        let message = run_post_tool_checkpoint_scenario(true, false, false).await;
         assert!(
             terminal_error_is_ambiguous_accept(&message),
             "a pre-submit checkpoint must not later look like post-tool proof: {message}"
@@ -16111,12 +18567,21 @@ mod tests {
 
     #[tokio::test]
     async fn newer_checkpoint_after_tool_result_submit_allows_checkpoint_retry() {
-        let message = run_post_tool_checkpoint_scenario(false, true).await;
+        let message = run_post_tool_checkpoint_scenario(false, true, false).await;
         assert!(
             message.contains(EMPTY_TURN_CHECKPOINT_RETRY_NOTE),
             "{message}"
         );
         assert!(!terminal_error_is_ambiguous_accept(&message), "{message}");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_queued_while_tool_result_send_is_blocked_is_not_commit_proof() {
+        let message = run_post_tool_checkpoint_scenario(false, false, true).await;
+        assert!(
+            terminal_error_is_ambiguous_accept(&message),
+            "a checkpoint that predates the send boundary must not make the batch retryable: {message}"
+        );
     }
 
     #[test]
@@ -16588,7 +19053,7 @@ mod tests {
             }))),
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
@@ -16741,7 +19206,7 @@ mod tests {
             }))),
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve("terminal-session").expect("reserve");
@@ -16772,7 +19237,7 @@ mod tests {
             }))),
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         LiveRunRegistry::reserve(&session)
@@ -16943,7 +19408,7 @@ mod tests {
             terminal_error,
             completed,
             cancel_requested,
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -17164,7 +19629,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::clone(&completed),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
         let driver = tokio::spawn(async move {
@@ -17202,7 +19667,7 @@ mod tests {
             }))),
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -17227,7 +19692,7 @@ mod tests {
             }))),
             completed: Arc::new(AtomicBool::new(true)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -17328,7 +19793,7 @@ mod tests {
             terminal_error,
             completed,
             cancel_requested,
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -17349,7 +19814,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let resume_handle = Arc::clone(&handle);
@@ -17369,12 +19834,12 @@ mod tests {
         resume.abort();
         let _ = resume.await;
         assert!(
-            handle.resume_in_flight.load(Ordering::Acquire),
+            handle.resume_in_flight.state() == RESUME_ADMISSION_IN_FLIGHT,
             "a delivered command still owns the exact-once resume guard"
         );
         drop(queued);
         assert!(
-            !handle.resume_in_flight.load(Ordering::Acquire),
+            handle.resume_in_flight.state() == RESUME_ADMISSION_IDLE,
             "dropping the unprocessed command must release the guard"
         );
     }
@@ -17389,7 +19854,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -17425,7 +19890,7 @@ mod tests {
         );
         drop(queued);
         assert!(
-            !handle.resume_in_flight.load(Ordering::Acquire),
+            handle.resume_in_flight.state() == RESUME_ADMISSION_IDLE,
             "discarding the cancelled command releases the resume generation"
         );
     }
@@ -17481,7 +19946,7 @@ mod tests {
             terminal_error,
             completed: Arc::clone(&completed),
             cancel_requested,
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         };
 
@@ -17541,7 +20006,7 @@ mod tests {
             terminal_error,
             completed: Arc::clone(&completed),
             cancel_requested,
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
 
@@ -17617,7 +20082,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
@@ -17651,7 +20116,7 @@ mod tests {
             terminal_error: Arc::new(Mutex::new(None)),
             completed: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            resume_in_flight: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
@@ -17738,6 +20203,7 @@ mod tests {
         drop(initial_events);
         let completed = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
+        let terminal_error_for_driver = Arc::clone(&terminal_error);
         let upstream_pump = tokio::spawn(std::future::pending::<()>());
         let driver = tokio::spawn(drive_live_run(
             upstream_rx,
@@ -17747,7 +20213,7 @@ mod tests {
             command_rx,
             initial_sink,
             Arc::new(Mutex::new(Vec::new())),
-            terminal_error,
+            terminal_error_for_driver,
             Arc::clone(&completed),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -17786,5 +20252,74 @@ mod tests {
             .expect("driver remained registered after downstream disconnect")
             .unwrap();
         assert!(completed.load(Ordering::Acquire));
+        let terminal = terminal_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("downstream disconnect must leave an explicit terminal outcome");
+        assert!(
+            terminal_error_is_ambiguous_accept(&terminal),
+            "an accepted Run without authoritative completion must not be sealed as success: {terminal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_error_waits_behind_buffered_events_without_being_dropped() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(LiveRunEvent::Cursor(
+            CursorStreamEvent::OutputTokenDelta { tokens: 1 },
+        )))
+        .await
+        .unwrap();
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut sink = Some(tx);
+
+        report_terminal_error(
+            &mut sink,
+            &terminal_error,
+            "Cursor completion is ambiguous".into(),
+        )
+        .await;
+
+        assert!(rx.recv().await.is_some(), "buffered event");
+        let terminal = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal event remained blocked")
+            .expect("terminal event was dropped");
+        assert!(
+            matches!(terminal, Err(message) if message.contains("ambiguous")),
+            "the original terminal cause must reach the SSE encoder"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_live_events_are_bounded_between_segments() {
+        let mut sink = None;
+        let mut deferred = VecDeque::new();
+        for index in 0..MAX_DEFERRED_LIVE_EVENTS {
+            assert!(
+                emit_or_defer(
+                    &mut sink,
+                    &mut deferred,
+                    Ok(LiveRunEvent::Cursor(CursorStreamEvent::OutputTokenDelta {
+                        tokens: index as u64,
+                    })),
+                )
+                .await
+            );
+        }
+        assert!(
+            !emit_or_defer(
+                &mut sink,
+                &mut deferred,
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::OutputTokenDelta {
+                    tokens: u64::MAX,
+                })),
+            )
+            .await,
+            "the driver must fail closed instead of growing an unbounded deferred queue"
+        );
+        assert_eq!(deferred.len(), MAX_DEFERRED_LIVE_EVENTS);
     }
 }

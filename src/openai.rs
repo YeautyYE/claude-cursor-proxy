@@ -1347,6 +1347,26 @@ data: {"type":"error","error":{"type":"api_error","message":"Cursor error 504: C
     }
 
     #[test]
+    fn anthropic_to_responses_ambiguous_live_completion_is_http_409() {
+        let mut translator =
+            AnthropicToResponses::new("resp_stall".into(), "cursor-grok-4.6-xhigh-fast".into());
+        translator.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"model":"cursor-grok-4.6-xhigh-fast"}}
+
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"Cursor stream produced no useful progress; upstream transport remained live, so completion is ambiguous"}}
+
+"#,
+        );
+        assert_eq!(
+            translator.http_error_status(),
+            Some(409),
+            "pre-output ambiguous completion must be JSON 409 on its first response"
+        );
+    }
+
+    #[test]
     fn anthropic_to_responses_finish_fails_when_started_with_no_output() {
         let mut translator =
             AnthropicToResponses::new("resp_empty".into(), "cursor-grok-4.5-high-fast".into());

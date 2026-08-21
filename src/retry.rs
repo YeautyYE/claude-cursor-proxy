@@ -94,6 +94,12 @@ fn embedded_connect_http_status(message: &str) -> Option<u16> {
 }
 
 pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
+    // Once Cursor may have accepted any part of an operation, replay safety
+    // dominates a nested child status such as 429/503. Mapping the child first
+    // would invite the caller to start a second Run.
+    if is_ambiguous_live_accept(message) {
+        return 409;
+    }
     if is_upstream_rate_limit(message) || status == 429 {
         return 429;
     }
@@ -120,9 +126,6 @@ pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
     {
         return 400;
     }
-    if is_ambiguous_live_accept(message) {
-        return 409;
-    }
     if let Some(embedded) = embedded_connect_http_status(message)
         && (400..500).contains(&embedded)
     {
@@ -135,6 +138,11 @@ pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
 /// grok-build retries 5xx; 409 fail-closes without duplicating the turn.
 pub fn is_ambiguous_live_accept(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    if lower.contains("tool-result batch partially sent")
+        || lower.contains("tool result batch partially sent")
+    {
+        return true;
+    }
     if lower.contains("connect failed") {
         return false;
     }
@@ -147,7 +155,10 @@ pub fn is_ambiguous_live_accept(message: &str) -> bool {
     lower.contains("live open timed out")
         || lower.contains("response-less resumeaction")
         || lower.contains("acceptance is ambiguous")
+        || lower.contains("completion is ambiguous")
         || lower.contains("resume produced no progress")
+        || lower.contains("stream produced no useful progress")
+        || lower.contains("tool result wait expired")
 }
 
 pub fn anthropic_error_kind_for_status(status: u16, message: &str) -> &'static str {
@@ -417,6 +428,47 @@ mod tests {
             502,
             "an explicit cancel is not a hollow-resume accept ambiguity"
         );
+    }
+
+    #[test]
+    fn heartbeat_live_ambiguous_completion_is_classified_as_409_immediately() {
+        let message = "Cursor stream produced no useful progress; upstream transport remained live, so completion is ambiguous";
+
+        assert_eq!(
+            classify_proxy_error_status(502, message),
+            409,
+            "the first response must agree with the ambiguous live-run tombstone"
+        );
+        assert!(
+            !should_retry_upstream(502, message),
+            "a still-live upstream Run must not be replayed by the HTTP client"
+        );
+        assert_eq!(
+            anthropic_error_kind_for_status(502, message),
+            "invalid_request_error"
+        );
+    }
+
+    #[test]
+    fn unresolved_live_failures_never_become_retryable_from_nested_statuses() {
+        let messages = [
+            "Cursor stream produced no useful progress",
+            "Cursor tool result wait expired",
+            "Cursor error 429: Cursor tool-result batch partially sent (1/2); acceptance is ambiguous: ERROR_RESOURCE_EXHAUSTED",
+            "Cursor error 503: Cursor tool-result batch partially sent (1/2); acceptance is ambiguous: upstream unavailable",
+        ];
+
+        for message in messages {
+            assert_eq!(
+                classify_proxy_error_status(502, message),
+                409,
+                "unknown or partial acceptance must dominate nested HTTP status: {message}"
+            );
+            assert!(
+                !should_retry_upstream(502, message),
+                "grok-build must not replay an unresolved operation: {message}"
+            );
+        }
     }
 
     #[test]

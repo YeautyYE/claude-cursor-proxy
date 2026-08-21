@@ -235,9 +235,13 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | 开 | 设 `0` / `false` 可关闭 Keychain 回退 |
 | `CCP_CURSOR_EMBED_SYSTEM` | 关 | 把 Anthropic `system` 塞进 Cursor（可能触发 Fable 注入防御） |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | 关 | 强制倾倒全部 tools schema；BiDi 已默认保留 `Workflow`/`Skill` 等 |
-| `CCP_CURSOR_LIVE_CONCURRENCY` | `32` | 活跃 Cursor generation 的公平并发上限（1–128） |
+| `CCP_CURSOR_LIVE_CONCURRENCY` | `32` | 批量类（`cursor-grok-*`）generation start 的公平并发上限（1–128） |
+| `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `8` | 为非 Grok 模型（Gemini/Claude 等子代理）保留的受保护 start 容量；交互类可借用空闲批量槽，批量类永不可占用保留槽（0–32） |
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | 本地准入最多等待多久后返回可重试 HTTP 503（1–300 秒） |
 | `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | 为暂停后需要提交工具结果的 Run 额外保留的容量（0–16） |
+| `CCP_CURSOR_LIVE_TIMEOUT_SECS` | `1800` | 每段活跃模型生成的预算（最多 3600 秒；下游工具执行期间暂停） |
+| `CCP_CURSOR_TOOL_TTL_SECS` | 与 live timeout 相同 | 工具批次送达下游后的最长等待时间；已准入的结果允许完成派发 |
+| `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | 只有心跳而没有模型进展时的最长思考时间 |
 | `CCP_CURSOR_H2_SHARDS` | `4` | 隔离并发 conversation 的稳定 H2 客户端池数量（1–16） |
 | `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `4` | 进程内同时打开 ResumeAction 替代连接的上限（1–16） |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `15` | 下游 keep-alive 间隔（秒） |
@@ -289,10 +293,11 @@ claude-cursor-proxy cursor auth status
 | Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。 |
 | grok-build 报 `Conflict (409) - error sending request` / `live open timed out after 20s`，或 Claude Code 报 `Agent type 'gemini-3.6-flash-high' not found` | 升级到 ≥0.1.57 并重启 serve。只有可证明尚未连接的失败才会切换传输；没有响应的 send 不再重放。Agent/Task 的模型 slug 会改写成 `general-purpose`。 |
 | grok-build 把 `<tool_use>` / `<parameter>` XML 打到正文，或报 `Cursor auth failed: /usr/bin/security: Too many open files` | 升级到 ≥0.1.51 并重启 serve。带 named parameter 的 XML 会收成工具；XML `spawn_subagent` 等到 turn 结束再一批发出；serve 会抬高 macOS 256 文件上限。 |
-| grok-build 以 `Cursor finished this turn without text or tool calls` 莫名结束，或提示 `workflow` 被桥接拦截/改名 | 升级到 ≥0.1.52 并重启 serve。Cursor 空回合会重试，不再伪装成成功文本；畸形控制 XML 会被隔离；workflow/skill 保留客户端声明的精确大小写。 |
+| grok-build 以 `Cursor finished this turn without text or tool calls` 莫名结束，或提示 `workflow` 被桥接拦截/改名 | 升级到 ≥0.1.61 并重启 serve。有心跳的有效思考不再在 240s 后被掐死；只有心跳、没有任何模型进展的 Run 最多等待 10 分钟。真正的空回合仍会重试，不再伪装成成功文本；畸形控制 XML 会被隔离；workflow/skill 保留客户端声明的精确大小写。 |
 | grok-build/Grok 4.6 扇出时大量子代理失败、重复执行已完成工具、卡住不返回 token，或报 `rate_limit_error: Cursor live generation concurrency saturated` | 升级到 ≥0.1.60 并重启 serve。正常 32 路扇出直接准入，另为工具结果恢复保留 4 个槽位；溢出公平排队后返回可重试 503；conversation 分布到四个 H2 池，替代连接打开也有界。升级后请新开 Grok session。 |
-| grok-build 先报 `Conflict (409) - Cursor live open timed out after 20s`，随后大量 `A Cursor live run is already active` | 升级到 ≥0.1.60 并重启 serve。H2 首次打开等待 90 秒；能够确定只是 Starting/Running 的本地占用会返回 HTTP 503 + `Retry-After`。若无响应的 open 是否已被上游接受无法判断，仍会 fail-closed 为 409，避免重复创建 Run。升级后请新开 Grok session。 |
+| grok-build 先报 `Conflict (409) - Cursor live open timed out after 20s`，随后大量 `A Cursor live run is already active`，或请求长期停在 streaming 0 B/s | 升级到 ≥0.1.61 并重启 serve。H2 首次打开等待 90 秒；一次超时后仅临时切 HTTP/1 30 秒，再用单个只读模型目录请求半开探测 H2，不再永久钉死 HTTP/1。能够确定只是 Starting/Running 的本地占用会返回 HTTP 503 + `Retry-After`；真正无法判断是否已接受的 open 仍保留 409，避免重复 Run。升级后请新开 Grok session。 |
 | grok-build 在工具结果后报 `Conflict (409) - Cursor resume produced no progress before the recovery deadline` | 升级到 ≥0.1.60 并重启 serve。只有 Cursor 在收到这些工具结果后发出了更新的 checkpoint，且没有新文本/工具暴露给客户端，代理才会在不重放工具的前提下重试；没有这项证明时保留 409，因为自动重放可能重复执行。 |
+| grok-build 报 `Cursor tool result wait expired`，或心跳卡顿先报 502、重试后才报 409 | 升级到 ≥0.1.62 并重启 serve。工具计时从 Grok 收到批次时开始，不再消耗下一段模型生成预算；已准入的工具结果会越过 TTL 边界完成派发。无法确认结束状态的心跳 Run 会立即返回 409，因为重放可能造成重复执行。 |
 | Claude Code 的 Bash 标题是整段 `python3 -c` 脚本 | 升级到 ≥0.1.48 并重启 serve。Cursor Shell 没有 description，代理会补一行短标题。 |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 后台工具结果恢复前出现 `Stream idle timeout - no chunks received` | 升级到 ≥0.1.45 并重启 serve。live 工具结果在 HTTP 响应前的分类等待由 30 秒缩短到最多 5 秒；HTTP SSE 建立后仍会每 15 秒发送 Anthropic ping，保护长时间静默思考。 |

@@ -1214,7 +1214,16 @@ async fn record_failed_response(
         "message": message,
         "response": response_body,
     });
-    let error_file = write_error_capture(ctx.req_id, &redact_error_value(document));
+    let error_file = if should_capture_failed_response(status, &message) {
+        let req_id = ctx.req_id.to_string();
+        let document = redact_error_value(document);
+        tokio::task::spawn_blocking(move || write_error_capture(&req_id, &document))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
 
     let mut fields = serde_json::Map::from_iter([
         ("reqId".to_string(), json!(ctx.req_id)),
@@ -1237,6 +1246,16 @@ async fn record_failed_response(
         Response::from_parts(parts, Body::from(bytes)),
         Some(FailedResponseDetails { message }),
     )
+}
+
+fn should_capture_failed_response(status: StatusCode, message: &str) -> bool {
+    if status != StatusCode::SERVICE_UNAVAILABLE {
+        return true;
+    }
+    let lower = message.to_ascii_lowercase();
+    !lower.contains("cursor live generation concurrency saturated")
+        && !lower.contains("cursor live open concurrency saturated")
+        && !lower.contains("cursor live generation admission queue timed out")
 }
 
 fn response_body_value(bytes: &[u8]) -> Value {
@@ -1264,6 +1283,13 @@ fn error_message_from_response(response_body: &Value) -> Option<String> {
 
 fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
+    let max_files = std::env::var("CCP_ERROR_CAPTURE_MAX_FILES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(1_000);
+    if max_files == 0 {
+        return None;
+    }
     fs::create_dir_all(&dir).ok()?;
     set_mode(&dir, 0o700);
     let path = dir.join(format!(
@@ -1276,7 +1302,27 @@ fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     let payload = serde_json::to_vec_pretty(document).ok()?;
     file.write_all(&payload).ok()?;
     file.write_all(b"\n").ok()?;
+    prune_error_captures(&dir, max_files);
     Some(path)
+}
+
+fn prune_error_captures(dir: &Path, max_files: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    if paths.len() <= max_files {
+        return;
+    }
+    paths.sort_unstable();
+    let remove_count = paths.len().saturating_sub(max_files);
+    for path in paths.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn sanitize_path_part(raw: &str) -> String {
@@ -1698,8 +1744,11 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
     use serde_json::json;
-    use std::time::Duration;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
+
+    static ERROR_CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn body_from(value: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(value).unwrap()
@@ -1712,6 +1761,81 @@ mod tests {
             "metadata": {"user_id": user_id},
             "system": format!("# Environment\n - Primary working directory: {cwd}\n - Is a git repository: true")
         }))
+    }
+
+    #[test]
+    fn local_admission_overload_does_not_create_error_capture_files() {
+        let _guard = ERROR_CAPTURE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_state = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+        }
+
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"api_error","message":"Cursor live generation admission queue timed out"}}"#,
+            ))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(super::record_failed_response(
+            &crate::logging::create_logger("test"),
+            super::FailedResponseLogContext {
+                req_id: "local-overload",
+                provider: Some("cursor"),
+                model: Some("fable"),
+                count_tokens: false,
+                started_at: Instant::now(),
+            },
+            response,
+        ));
+
+        let error_dir = dir.path().join(crate::paths::APP_DIR).join("errors");
+        assert!(
+            !error_dir.exists() || std::fs::read_dir(&error_dir).unwrap().next().is_none(),
+            "expected local overload to be logged without permanent per-request files"
+        );
+        unsafe {
+            match previous_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn error_capture_retention_is_bounded() {
+        let _guard = ERROR_CAPTURE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_state = std::env::var_os("XDG_STATE_HOME");
+        let previous_max = std::env::var_os("CCP_ERROR_CAPTURE_MAX_FILES");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("CCP_ERROR_CAPTURE_MAX_FILES", "2");
+        }
+
+        for req_id in ["capture-a", "capture-b", "capture-c"] {
+            super::write_error_capture(req_id, &json!({"error": req_id}))
+                .expect("write error capture");
+        }
+        let error_dir = dir.path().join(crate::paths::APP_DIR).join("errors");
+        let retained = std::fs::read_dir(error_dir).unwrap().count();
+        assert!(retained <= 2, "retained {retained} capture files");
+
+        unsafe {
+            match previous_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match previous_max {
+                Some(value) => std::env::set_var("CCP_ERROR_CAPTURE_MAX_FILES", value),
+                None => std::env::remove_var("CCP_ERROR_CAPTURE_MAX_FILES"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -2272,6 +2396,53 @@ mod tests {
                 .unwrap_or("")
                 .contains("timed out after 20s"),
             "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_anthropic_late_ambiguous_completion_is_non_retryable_after_http_200() {
+        let first = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"cursor-grok-4.6-xhigh-fast\"}}\n\n",
+            "event: ping\n",
+            "data: {\"type\":\"ping\"}\n\n",
+        );
+        let second = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Cursor stream produced no useful progress; upstream transport remained live, so completion is ambiguous\"}}\n\n",
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
+        tokio::spawn(async move {
+            let _ = tx.send(bytes::Bytes::from(first)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = tx.send(bytes::Bytes::from(second)).await;
+        });
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap();
+
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.6-xhigh-fast").await;
+        assert_eq!(
+            wrapped.status(),
+            StatusCode::OK,
+            "HTTP status is immutable once keepalive streaming has begun"
+        );
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"response.failed\""), "{text}");
+        assert!(text.contains("\"code\":\"invalid_request\""), "{text}");
+        assert!(
+            !text.contains("\"code\":\"server_error\""),
+            "late ambiguity must not enter grok-build's retryable HTTP-500 path: {text}"
         );
     }
 }

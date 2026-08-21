@@ -3,6 +3,21 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.62 (2026-08-21)
+
+- Reserve protected admission capacity for interactive models: a 32-wide `cursor-grok-*` fan-out can no longer starve Gemini/Claude subagent starts into `admission queue timed out`. Starts are classed as bulk (`cursor-grok-*`, capped by `CCP_CURSOR_LIVE_CONCURRENCY`) or interactive (everything else, which may borrow idle bulk slots and falls back to `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE`, default 8); resumes keep their own reserve that no start class can consume.
+- Admit against local capacity before claiming the per-session live slot. A start waiting in the local admission queue no longer makes overlapping retries fail with `A Cursor live run is already active for this session`, and an admission timeout leaves the session slot free. Admission timeouts and slow admissions now log their class, limits, and queue time.
+- Persist a durable operation ledger (SHA-256 request fingerprints, owner-fenced CAS transitions, crash-safe atomic writes, cross-process `flock`): ambiguous or completed live operations survive proxy restarts, duplicate replays are refused with 409, and a stale owner can never clear a newer owner's marker.
+- Restore vacant-slot adoption in live-run publication: a Run accepted by Cursor while its reservation was cancelled is adopted instead of dropped, so a retry cannot open a second Run for the same turn; ambiguous tombstones remain non-overwritable.
+- Roll back in-memory conversation state when a conditional checkpoint/blob/clear write fails to reach disk. Memory can no longer run ahead of durable state, so a later turn cannot silently continue from a checkpoint that never survived a restart.
+- Treat downstream tool execution as a paused live-run phase: start its TTL only when the batch reaches Grok, default that TTL to the configured live-generation timeout, pause the active generation budget while tools run, and grant each accepted tool-result continuation a fresh generation budget. A tool-result POST already in flight wins the expiry boundary.
+- Classify a heartbeat-live Run whose completion remains unresolved as HTTP 409 on its first response. The registry and HTTP adapters now agree that retrying could duplicate execution, eliminating the misleading 502 → automatic retry → 409 cascade while preserving retryable pre-connect 502s.
+- Add deterministic 100-way admission turnover coverage proving bounded starts, reserved resume progress, eventual completion, and full semaphore recovery.
+
+## v0.1.61 (2026-08-21)
+
+- Keep legitimate heartbeat-backed Fable/Grok thinking past the old 240-second cutoff, but bound heartbeat-only runs to 10 minutes without model progress instead of the 30-minute hard timeout. Recover the process-wide H2 circuit after a 30-second cooldown through one side-effect-free `GetUsableModels` probe, avoiding both permanent HTTP/1 stalls and ambiguous user-Run probes.
+
 ## v0.1.60 (2026-08-21)
 
 - Bound Grok fan-out without reviving the old 429 failure mode: admit 32 new generations fairly, reserve four additional slots for paused tool-result resumes, release capacity between tool segments, and return HTTP 503 with jittered `Retry-After` after a 15-second overflow queue.

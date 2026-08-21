@@ -1,6 +1,6 @@
 [package]
 name = "claude-cursor-proxy"
-version = "0.1.60"
+version = "0.1.62"
 description = "Local proxy so Claude Code and grok-build can use Cursor (Fable 5) and other providers"
 edition = "2024"
 rust-version = "1.85"
@@ -51,6 +51,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3.14"

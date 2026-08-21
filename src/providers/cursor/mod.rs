@@ -9,6 +9,7 @@ pub(crate) mod identity;
 pub mod live;
 pub mod model;
 pub mod native_tools;
+pub(crate) mod operation_ledger;
 pub mod proto;
 pub mod request;
 pub mod response;
@@ -407,26 +408,72 @@ async fn start_live_events_with_retries(
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
     let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
     let original_request_id = uuid::Uuid::new_v4().to_string();
+    let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
     loop {
-        let reservation = if let Some(reservation) = initial_reservation.take() {
+        // Local admission strictly precedes the session-slot claim. A start
+        // that is only queued for local capacity must stay invisible to
+        // concurrent duplicates; otherwise a 15s admission queue turns into
+        // "already active for this session" for every overlapping retry.
+        let admission = live::admit_live_start(model).await?;
+        let mut reservation = if let Some(reservation) = initial_reservation.take() {
             reservation
         } else {
-            match LiveRunRegistry::try_claim_run(identity.session_id, identity.agent_id) {
-                LiveSlotClaim::Reserved(reservation) => reservation,
-                LiveSlotClaim::Starting => {
-                    if Instant::now() >= conflict_deadline {
-                        break;
+            let claimed = loop {
+                match LiveRunRegistry::try_claim_run(identity.session_id, identity.agent_id) {
+                    LiveSlotClaim::Reserved(reservation) => break Some(reservation),
+                    LiveSlotClaim::Starting => {
+                        if Instant::now() >= conflict_deadline {
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
+                    LiveSlotClaim::Ambiguous => {
+                        return Err(live_ambiguous_accept_error());
+                    }
+                    LiveSlotClaim::Running => return Err(live_run_busy_error()),
                 }
-                LiveSlotClaim::Ambiguous => {
-                    return Err(live_ambiguous_accept_error());
-                }
-                LiveSlotClaim::Running => return Err(live_run_busy_error()),
+            };
+            match claimed {
+                Some(reservation) => reservation,
+                None => break,
             }
         };
+        reservation.set_operation_fingerprint(operation_fingerprint);
+        match reservation.begin_durable_operation() {
+            operation_ledger::OperationAdmission::Allowed => {}
+            operation_ledger::OperationAdmission::DuplicateCompleted => {
+                reservation.release();
+                return Err(CursorError::new(
+                    409,
+                    "Cursor operation already completed; refusing duplicate replay",
+                    None,
+                ));
+            }
+            operation_ledger::OperationAdmission::Ambiguous(message) => {
+                reservation.release();
+                return Err(CursorError::new(
+                    409,
+                    format!("Cursor operation is unresolved; completion is ambiguous: {message}"),
+                    None,
+                ));
+            }
+            operation_ledger::OperationAdmission::Unavailable(error) => {
+                create_logger("cursor").error(
+                    "operation_ledger_begin_failed",
+                    Some(serde_json::Map::from_iter([(
+                        "error".into(),
+                        serde_json::json!(error),
+                    )])),
+                );
+                reservation.release();
+                return Err(CursorError::new(
+                    503,
+                    "Cursor operation ledger is unavailable; request was not dispatched",
+                    None,
+                ));
+            }
+        }
 
         let upstream_open_guard = reservation.upstream_open_guard();
         let start = match client
@@ -443,6 +490,7 @@ async fn start_live_events_with_retries(
                 Some(&original_request_id),
                 Some(reservation.cancelled()),
                 Some(Arc::clone(&upstream_open_guard)),
+                Some(admission),
             )
             .await
         {
@@ -464,6 +512,7 @@ async fn start_live_events_with_retries(
                             Some(&original_request_id),
                             Some(reservation.cancelled()),
                             Some(upstream_open_guard),
+                            None,
                         )
                         .await
                 }
@@ -474,9 +523,7 @@ async fn start_live_events_with_retries(
 
         match start {
             Ok(start) => {
-                start
-                    .handle
-                    .set_request_fingerprint(live_request_fingerprint(&fingerprint));
+                start.handle.set_request_fingerprint(operation_fingerprint);
                 if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
                     let _ = orphaned.cancel_and_wait().await;
                     break;
@@ -3256,6 +3303,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn heartbeat_live_ambiguous_completion_is_http_409_not_502() {
+        let response = json_error_from_cursor_message(
+            "Cursor stream produced no useful progress; upstream transport remained live, so completion is ambiguous",
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "the first terminal response must agree with the ambiguous live-run tombstone"
+        );
+    }
+
     #[tokio::test]
     async fn bidiappend_connect_failure_is_http_502_not_409() {
         let err = client::CursorError::new(
@@ -3499,8 +3558,11 @@ mod tests {
     #[test]
     fn nested_agent_prompt_continuation_ignores_parent_checkpoint() {
         let session = format!("parent-session-{}", uuid::Uuid::new_v4());
+        // Conversations are keyed by the live run key, exactly as the live
+        // driver persists checkpoints for the parent slot.
+        let parent_key = crate::providers::cursor::live::live_run_key(&session, None);
         crate::providers::cursor::conversation::save_checkpoint(
-            &session,
+            &parent_key,
             vec![0x0a, 0x02, 0x01, 0x02],
         );
         let nested = RequestContext {

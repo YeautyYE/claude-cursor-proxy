@@ -4,8 +4,10 @@
 //! addressed blob store between Run streams. Without this, each Claude turn is a
 //! fresh Cursor run that re-uploads the entire Anthropic history + tools schema.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +16,10 @@ use sha2::{Digest, Sha256};
 
 const IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_CONVERSATIONS: usize = 10_000;
+const PERSISTED_SWEEP_INTERVAL_MS: u64 = 60_000;
+static LAST_PERSISTED_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static PERSISTED_SWEEP_RUNS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default)]
 pub struct CursorConversation {
@@ -26,10 +32,18 @@ pub struct CursorConversation {
     pub last_seen: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConditionalPersist {
+    Saved,
+    StaleBinding,
+    Failed(String),
+}
+
 #[derive(Default)]
 struct Store {
     map: HashMap<String, CursorConversation>,
     order: VecDeque<String>,
+    pins: HashMap<String, usize>,
 }
 
 static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| Mutex::new(Store::default()));
@@ -85,16 +99,16 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
-fn persist_conversation(session_id: &str, conv: &CursorConversation) {
+fn persist_conversation(session_id: &str, conv: &CursorConversation) -> io::Result<()> {
     let Some(path) = persist_path(session_id) else {
-        return;
+        return Ok(());
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
     let dto = PersistedConversation {
@@ -108,29 +122,56 @@ fn persist_conversation(session_id: &str, conv: &CursorConversation) {
             .collect(),
         last_seen: conv.last_seen,
     };
-    let Ok(json) = serde_json::to_vec(&dto) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).is_ok() {
+    let json = serde_json::to_vec(&dto).map_err(io::Error::other)?;
+    let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = (|| -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
-        if std::fs::rename(&tmp, &path).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        file.write_all(&json)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
             }
         }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    write_result
+}
+
+fn log_persist_failure(session_id: &str, error: &io::Error) {
+    crate::logging::create_logger("cursor").warn(
+        "conversation_persist_failed",
+        Some(serde_json::Map::from_iter([
+            ("sessionId".into(), serde_json::json!(session_id)),
+            ("error".into(), serde_json::json!(error.to_string())),
+        ])),
+    );
 }
 
 fn expire_abandoned_persisted(now: u64) {
+    #[cfg(test)]
+    PERSISTED_SWEEP_RUNS.fetch_add(1, Ordering::Relaxed);
     let Some(dir) = persist_dir() else {
         return;
+    };
+    let pinned: HashSet<String> = {
+        let store = store_lock();
+        store.pins.keys().cloned().collect()
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -146,10 +187,29 @@ fn expire_abandoned_persisted(now: u64) {
         let Ok(dto) = serde_json::from_slice::<PersistedConversation>(&bytes) else {
             continue;
         };
-        if now.saturating_sub(dto.last_seen) > IDLE_TTL_MS {
+        if !pinned.contains(&dto.session_id) && now.saturating_sub(dto.last_seen) > IDLE_TTL_MS {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+fn maybe_expire_abandoned_persisted(now: u64) {
+    let mut observed = LAST_PERSISTED_SWEEP_MS.load(Ordering::Acquire);
+    loop {
+        if observed != 0 && now.saturating_sub(observed) < PERSISTED_SWEEP_INTERVAL_MS {
+            return;
+        }
+        match LAST_PERSISTED_SWEEP_MS.compare_exchange_weak(
+            observed,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => observed = actual,
+        }
+    }
+    expire_abandoned_persisted(now);
 }
 
 fn load_persisted(session_id: &str) -> Option<CursorConversation> {
@@ -178,10 +238,16 @@ fn touch_and_evict(store: &mut Store, session_id: &str, now: u64) {
     if let Some(entry) = store.map.get_mut(session_id) {
         entry.last_seen = now;
     }
-    while store.order.len() > MAX_CONVERSATIONS {
+    let mut remaining = store.order.len();
+    while store.map.len() > MAX_CONVERSATIONS && remaining > 0 {
+        remaining -= 1;
         if let Some(evict) = store.order.pop_front() {
-            store.map.remove(&evict);
-            delete_persisted(&evict);
+            if store.pins.contains_key(&evict) {
+                store.order.push_back(evict);
+            } else {
+                store.map.remove(&evict);
+                delete_persisted(&evict);
+            }
         } else {
             break;
         }
@@ -190,7 +256,9 @@ fn touch_and_evict(store: &mut Store, session_id: &str, now: u64) {
     let stale: Vec<String> = store
         .map
         .iter()
-        .filter(|(_, v)| now.saturating_sub(v.last_seen) > IDLE_TTL_MS)
+        .filter(|(key, v)| {
+            !store.pins.contains_key(*key) && now.saturating_sub(v.last_seen) > IDLE_TTL_MS
+        })
         .map(|(k, _)| k.clone())
         .collect();
     for key in stale {
@@ -206,10 +274,12 @@ fn touch_and_evict(store: &mut Store, session_id: &str, now: u64) {
 /// Get or create the Cursor conversation binding for a Claude session id.
 pub fn get_or_create(session_id: &str) -> CursorConversation {
     let now = now_millis();
-    expire_abandoned_persisted(now);
+    maybe_expire_abandoned_persisted(now);
     let mut store = store_lock();
     if let Some(existing) = store.map.get(session_id).cloned() {
-        if now.saturating_sub(existing.last_seen) <= IDLE_TTL_MS {
+        if store.pins.contains_key(session_id)
+            || now.saturating_sub(existing.last_seen) <= IDLE_TTL_MS
+        {
             touch_and_evict(&mut store, session_id, now);
             return existing;
         }
@@ -235,7 +305,9 @@ pub fn get_or_create(session_id: &str) -> CursorConversation {
     store.order.push_back(session_id.to_string());
     store.map.insert(session_id.to_string(), created.clone());
     touch_and_evict(&mut store, session_id, now);
-    persist_conversation(session_id, &created);
+    if let Err(error) = persist_conversation(session_id, &created) {
+        log_persist_failure(session_id, &error);
+    }
     created
 }
 
@@ -243,7 +315,9 @@ pub fn get(session_id: &str) -> Option<CursorConversation> {
     let now = now_millis();
     let mut store = store_lock();
     if let Some(existing) = store.map.get(session_id).cloned() {
-        if now.saturating_sub(existing.last_seen) > IDLE_TTL_MS {
+        if !store.pins.contains_key(session_id)
+            && now.saturating_sub(existing.last_seen) > IDLE_TTL_MS
+        {
             store.map.remove(session_id);
             store.order.retain(|item| item != session_id);
             delete_persisted(session_id);
@@ -261,6 +335,42 @@ pub fn get(session_id: &str) -> Option<CursorConversation> {
     store.map.insert(session_id.to_string(), disk.clone());
     touch_and_evict(&mut store, session_id, now);
     Some(disk)
+}
+
+/// Keep one live Cursor conversation binding resident until its driver exits.
+///
+/// The expected id prevents a stale starter from pinning a replacement binding
+/// created after a reset.
+pub(crate) fn pin(session_id: &str, expected_conversation_id: &str) -> Option<ConversationLease> {
+    let now = now_millis();
+    let mut store = store_lock();
+    let entry = store.map.get_mut(session_id)?;
+    if entry.conversation_id != expected_conversation_id {
+        return None;
+    }
+    entry.last_seen = now;
+    *store.pins.entry(session_id.to_string()).or_default() += 1;
+    Some(ConversationLease {
+        session_id: session_id.to_string(),
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct ConversationLease {
+    session_id: String,
+}
+
+impl Drop for ConversationLease {
+    fn drop(&mut self) {
+        let mut store = store_lock();
+        let Some(count) = store.pins.get_mut(&self.session_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            store.pins.remove(&self.session_id);
+        }
+    }
 }
 
 fn ensure_entry<'a>(
@@ -298,7 +408,66 @@ pub fn save_checkpoint(session_id: &str, checkpoint: Vec<u8>) {
         touch_and_evict(&mut store, session_id, now);
         snapshot
     };
-    persist_conversation(session_id, &snapshot);
+    if let Err(error) = persist_conversation(session_id, &snapshot) {
+        log_persist_failure(session_id, &error);
+    }
+}
+
+/// Persist only if the live driver's original conversation binding is current.
+pub(crate) fn save_checkpoint_if_current(
+    session_id: &str,
+    expected_conversation_id: &str,
+    checkpoint: Vec<u8>,
+) -> ConditionalPersist {
+    if checkpoint.is_empty() {
+        return ConditionalPersist::Failed("checkpoint was empty".into());
+    }
+    let now = now_millis();
+    let (snapshot, previous) = {
+        let mut store = store_lock();
+        let Some(entry) = store.map.get_mut(session_id) else {
+            return ConditionalPersist::StaleBinding;
+        };
+        if entry.conversation_id != expected_conversation_id {
+            return ConditionalPersist::StaleBinding;
+        }
+        let previous = entry.checkpoint.replace(checkpoint);
+        entry.last_seen = now;
+        let snapshot = entry.clone();
+        touch_and_evict(&mut store, session_id, now);
+        (snapshot, previous)
+    };
+    match persist_conversation(session_id, &snapshot) {
+        Ok(()) => ConditionalPersist::Saved,
+        Err(error) => {
+            roll_back_checkpoint(
+                session_id,
+                expected_conversation_id,
+                &snapshot.checkpoint,
+                previous,
+            );
+            log_persist_failure(session_id, &error);
+            ConditionalPersist::Failed(error.to_string())
+        }
+    }
+}
+
+/// A failed durable write must not leave memory ahead of disk: a later
+/// continuation would silently serve state that never survived a restart.
+/// Restores the pre-write value only while our own write is still in place.
+fn roll_back_checkpoint(
+    session_id: &str,
+    expected_conversation_id: &str,
+    written: &Option<Vec<u8>>,
+    previous: Option<Vec<u8>>,
+) {
+    let mut store = store_lock();
+    let Some(entry) = store.map.get_mut(session_id) else {
+        return;
+    };
+    if entry.conversation_id == expected_conversation_id && entry.checkpoint == *written {
+        entry.checkpoint = previous;
+    }
 }
 
 /// Drop a stored checkpoint while keeping `conversation_id` and KV blobs.
@@ -318,7 +487,38 @@ pub fn clear_checkpoint(session_id: &str) {
         touch_and_evict(&mut store, session_id, now);
         snapshot
     };
-    persist_conversation(session_id, &snapshot);
+    if let Err(error) = persist_conversation(session_id, &snapshot) {
+        log_persist_failure(session_id, &error);
+    }
+}
+
+pub(crate) fn clear_checkpoint_if_current(
+    session_id: &str,
+    expected_conversation_id: &str,
+) -> ConditionalPersist {
+    let now = now_millis();
+    let (snapshot, previous) = {
+        let mut store = store_lock();
+        let Some(entry) = store.map.get_mut(session_id) else {
+            return ConditionalPersist::StaleBinding;
+        };
+        if entry.conversation_id != expected_conversation_id {
+            return ConditionalPersist::StaleBinding;
+        }
+        let previous = entry.checkpoint.take();
+        entry.last_seen = now;
+        let snapshot = entry.clone();
+        touch_and_evict(&mut store, session_id, now);
+        (snapshot, previous)
+    };
+    match persist_conversation(session_id, &snapshot) {
+        Ok(()) => ConditionalPersist::Saved,
+        Err(error) => {
+            roll_back_checkpoint(session_id, expected_conversation_id, &None, previous);
+            log_persist_failure(session_id, &error);
+            ConditionalPersist::Failed(error.to_string())
+        }
+    }
 }
 
 /// Forget an unrecoverable Cursor conversation binding.
@@ -340,7 +540,9 @@ pub fn reset(session_id: &str) {
         }
         store.map.insert(session_id.to_string(), fresh.clone());
     }
-    persist_conversation(session_id, &fresh);
+    if let Err(error) = persist_conversation(session_id, &fresh) {
+        log_persist_failure(session_id, &error);
+    }
 }
 
 /// Merge KV blobs into the conversation store (set_blob wins).
@@ -360,7 +562,80 @@ pub fn merge_blobs(session_id: &str, blobs: &HashMap<Vec<u8>, Vec<u8>>) {
         touch_and_evict(&mut store, session_id, now);
         snapshot
     };
-    persist_conversation(session_id, &snapshot);
+    if let Err(error) = persist_conversation(session_id, &snapshot) {
+        log_persist_failure(session_id, &error);
+    }
+}
+
+/// Merge blobs only while the live driver's original binding is current.
+pub(crate) fn merge_blobs_if_current(
+    session_id: &str,
+    expected_conversation_id: &str,
+    blobs: &HashMap<Vec<u8>, Vec<u8>>,
+) -> ConditionalPersist {
+    if blobs.is_empty() {
+        return ConditionalPersist::Saved;
+    }
+    let now = now_millis();
+    let (snapshot, replaced) = {
+        let mut store = store_lock();
+        let Some(entry) = store.map.get_mut(session_id) else {
+            return ConditionalPersist::StaleBinding;
+        };
+        if entry.conversation_id != expected_conversation_id {
+            return ConditionalPersist::StaleBinding;
+        }
+        let mut replaced = Vec::with_capacity(blobs.len());
+        for (id, data) in blobs {
+            let previous = entry.blobs.insert(id.clone(), data.clone());
+            replaced.push((id.clone(), previous));
+        }
+        entry.last_seen = now;
+        let snapshot = entry.clone();
+        touch_and_evict(&mut store, session_id, now);
+        (snapshot, replaced)
+    };
+    match persist_conversation(session_id, &snapshot) {
+        Ok(()) => ConditionalPersist::Saved,
+        Err(error) => {
+            roll_back_blobs(session_id, expected_conversation_id, blobs, replaced);
+            log_persist_failure(session_id, &error);
+            ConditionalPersist::Failed(error.to_string())
+        }
+    }
+}
+
+/// See [`roll_back_checkpoint`]: per touched key, restore the previous value
+/// only while our own write is still the visible one.
+fn roll_back_blobs(
+    session_id: &str,
+    expected_conversation_id: &str,
+    written: &HashMap<Vec<u8>, Vec<u8>>,
+    replaced: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+) {
+    let mut store = store_lock();
+    let Some(entry) = store.map.get_mut(session_id) else {
+        return;
+    };
+    if entry.conversation_id != expected_conversation_id {
+        return;
+    }
+    for (id, previous) in replaced {
+        let still_ours = written
+            .get(&id)
+            .is_some_and(|data| entry.blobs.get(&id) == Some(data));
+        if !still_ours {
+            continue;
+        }
+        match previous {
+            Some(previous) => {
+                entry.blobs.insert(id, previous);
+            }
+            None => {
+                entry.blobs.remove(&id);
+            }
+        }
+    }
 }
 
 /// Snapshot used when opening a new Cursor Run.
@@ -393,6 +668,9 @@ pub fn reset_for_test() {
     let mut store = store_lock();
     store.map.clear();
     store.order.clear();
+    store.pins.clear();
+    LAST_PERSISTED_SWEEP_MS.store(0, Ordering::Relaxed);
+    PERSISTED_SWEEP_RUNS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -610,6 +888,172 @@ mod tests {
         assert!(
             !path.exists(),
             "TTL must delete abandoned files from previous processes"
+        );
+    }
+
+    #[test]
+    fn persisted_conversation_sweep_is_not_run_for_every_request() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let _ = get_or_create("sweep-a");
+        let _ = get_or_create("sweep-b");
+
+        assert_eq!(
+            PERSISTED_SWEEP_RUNS.load(Ordering::Relaxed),
+            1,
+            "directory-wide cleanup must be rate-limited off the request hot path"
+        );
+    }
+
+    #[test]
+    fn pinned_live_conversation_survives_idle_eviction() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let original = get_or_create("sess-pinned");
+        let lease =
+            pin("sess-pinned", &original.conversation_id).expect("current binding must pin");
+        {
+            let mut store = store_lock();
+            store
+                .map
+                .get_mut("sess-pinned")
+                .expect("pinned entry")
+                .last_seen = 1;
+        }
+
+        let _ = get_or_create("sess-other");
+
+        assert_eq!(
+            get("sess-pinned")
+                .expect("active live binding must not expire")
+                .conversation_id,
+            original.conversation_id
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn checkpoint_save_rejects_a_rebound_conversation() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let original = get_or_create("sess-rebound");
+        reset("sess-rebound");
+
+        assert_eq!(
+            save_checkpoint_if_current("sess-rebound", &original.conversation_id, vec![0x08, 0x01],),
+            ConditionalPersist::StaleBinding,
+            "an old driver must not attach its checkpoint to a replacement conversation"
+        );
+        assert!(
+            !continuation_for(Some("sess-rebound")).has_checkpoint,
+            "the replacement binding must remain clean"
+        );
+    }
+
+    #[test]
+    fn conditional_checkpoint_save_reports_disk_failure() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"block persistence directory").unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", &blocked);
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+        let created = get_or_create("sess-disk-failure");
+
+        assert!(
+            matches!(
+                save_checkpoint_if_current(
+                    "sess-disk-failure",
+                    &created.conversation_id,
+                    vec![0x08, 0x01],
+                ),
+                ConditionalPersist::Failed(_)
+            ),
+            "a failed atomic write must not be reported as durable success"
+        );
+        assert!(
+            !continuation_for(Some("sess-disk-failure")).has_checkpoint,
+            "a failed checkpoint write must roll back memory so later turns cannot \
+             continue from state that never reached disk"
+        );
+
+        assert!(matches!(
+            merge_blobs_if_current(
+                "sess-disk-failure",
+                &created.conversation_id,
+                &HashMap::from([(vec![0x01], vec![0x02])]),
+            ),
+            ConditionalPersist::Failed(_)
+        ));
+        assert!(
+            continuation_for(Some("sess-disk-failure"))
+                .pre_fetched_blobs
+                .is_empty(),
+            "failed blob writes must roll back memory"
+        );
+    }
+
+    #[test]
+    fn conditional_clear_rolls_back_memory_when_disk_write_fails() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+        save_checkpoint("sess-clear-failure", vec![0x0a, 0x01]);
+        let binding = continuation_for(Some("sess-clear-failure"))
+            .conversation_id
+            .expect("binding");
+
+        // Break the persistence directory only after the checkpoint exists.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"block persistence directory").unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", &blocked);
+        }
+
+        assert!(matches!(
+            clear_checkpoint_if_current("sess-clear-failure", &binding),
+            ConditionalPersist::Failed(_)
+        ));
+        assert!(
+            continuation_for(Some("sess-clear-failure")).has_checkpoint,
+            "a failed clear must keep the durable checkpoint visible in memory"
         );
     }
 }
