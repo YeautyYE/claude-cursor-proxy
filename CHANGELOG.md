@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.63 (2026-08-22)
+
+- Stop sealing a 90-second Ambiguous tombstone when a live run stalls with heartbeats flowing but zero delivered output. A hollow run (no client-visible text, no pending tools) now rotates onto a fresh Cursor conversation and is retried in place — the same rule the resume-probation path already applied — instead of terminating as `produced no useful progress; … completion is ambiguous`. That tombstone made every overlapping grok-build retry fail instantly with `Cursor live run acceptance is ambiguous; retrying could duplicate execution` (409) until the CLI aborted the whole agent, which is exactly the 2026-08-21 incident where upstream TLS connections were killed and the reconnected streams went heartbeat-only. Runs that already delivered text keep the fail-closed 409.
+
 ## v0.1.62 (2026-08-21)
 
 - Reserve protected admission capacity for interactive models: a 32-wide `cursor-grok-*` fan-out can no longer starve Gemini/Claude subagent starts into `admission queue timed out`. Starts are classed as bulk (`cursor-grok-*`, capped by `CCP_CURSOR_LIVE_CONCURRENCY`) or interactive (everything else, which may borrow idle bulk slots and falls back to `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE`, default 8); resumes keep their own reserve that no start class can consume.

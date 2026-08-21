@@ -4369,6 +4369,34 @@ fn hollow_resume_terminal_message(
     fallback.into()
 }
 
+/// A stall while the upstream transport is still delivering heartbeats cannot
+/// reconnect its way out. A hollow run (no client-visible text, no pending
+/// tools) is still safe to rotate onto a fresh conversation — the 90s
+/// Ambiguous tombstone this used to seal turned every grok-build retry into
+/// an instant 409 until the CLI aborted the whole agent.
+#[allow(clippy::too_many_arguments)]
+fn stalled_transport_terminal_message(
+    session_id: &str,
+    stall: &str,
+    saw_text: bool,
+    pending_empty: bool,
+    retain_completed_tool_checkpoint: bool,
+    post_tool_checkpoint_confirmed: bool,
+    latest_checkpoint: &mut Option<Vec<u8>>,
+    kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+) -> String {
+    hollow_resume_terminal_message(
+        session_id,
+        saw_text,
+        pending_empty,
+        retain_completed_tool_checkpoint,
+        post_tool_checkpoint_confirmed,
+        latest_checkpoint,
+        kv_blobs,
+        format!("{stall}; upstream transport remained live, so completion is ambiguous"),
+    )
+}
+
 /// After a ResumeAction HTTP 200, another ResumeAction is only safe once this
 /// stream has produced a body chunk. Delayed hollow EOF must fail closed.
 fn live_should_resume_after_drop(on_probation: bool, got_chunk_since_reconnect: bool) -> bool {
@@ -6183,14 +6211,17 @@ async fn drive_live_run(
                 setup_idle,
                 stream_idle,
             ) {
-                report_terminal_error(
-                    &mut sink,
-                    &terminal_error,
-                    format!(
-                        "{message}; upstream transport remained live, so completion is ambiguous"
-                    ),
-                )
-                .await;
+                let message = stalled_transport_terminal_message(
+                    &session_id,
+                    message,
+                    saw_text,
+                    pending.is_empty(),
+                    user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                    post_tool_checkpoint.confirmed,
+                    &mut latest_checkpoint,
+                    &mut kv_blobs,
+                );
+                report_terminal_error(&mut sink, &terminal_error, message).await;
                 break 'driver;
             }
             let can_resume = live_reconnect_resume_state(
@@ -6253,7 +6284,17 @@ async fn drive_live_run(
                 );
                 report_terminal_error(&mut sink, &terminal_error, message).await;
             } else {
-                report_terminal_error(&mut sink, &terminal_error, message.into()).await;
+                let message = hollow_resume_terminal_message(
+                    &session_id,
+                    saw_text,
+                    pending.is_empty(),
+                    user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                    post_tool_checkpoint.confirmed,
+                    &mut latest_checkpoint,
+                    &mut kv_blobs,
+                    message,
+                );
+                report_terminal_error(&mut sink, &terminal_error, message).await;
             }
             break 'driver;
         }
@@ -10311,6 +10352,86 @@ mod tests {
             "thinking-only hollow resume must be retryable for grok-build"
         );
         assert_ne!(
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id,
+            original
+        );
+    }
+
+    /// Regression: 2026-08-21 incident. Upstream killed TLS connections, the
+    /// reconnected streams delivered heartbeats but no progress, and every
+    /// hollow run terminated as "produced no useful progress; ... completion
+    /// is ambiguous". That sealed 90s Ambiguous tombstones, so every
+    /// grok-build retry got an instant 409 until the CLI aborted the agent.
+    #[test]
+    fn heartbeat_alive_hollow_stall_rotates_instead_of_sealing_ambiguous() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-heartbeat-hollow-stall";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+        let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+
+        let message = stalled_transport_terminal_message(
+            session_id,
+            "Cursor stream produced no useful progress",
+            false,
+            true,
+            false,
+            false,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+        );
+
+        assert!(message.contains(CONVERSATION_RESET_RETRY_NOTE), "{message}");
+        assert!(
+            !terminal_error_is_ambiguous_accept(&message),
+            "a hollow heartbeat-only stall must not seal an Ambiguous tombstone: {message}"
+        );
+        assert!(
+            live_error_is_same_request_retryable(&message),
+            "the proxy must retry a hollow stall in place instead of 409ing grok-build"
+        );
+        assert_ne!(
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id,
+            original
+        );
+    }
+
+    #[test]
+    fn heartbeat_alive_stall_with_delivered_text_stays_ambiguous() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-heartbeat-partial-stall";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+        let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+
+        let message = stalled_transport_terminal_message(
+            session_id,
+            "Cursor stream stalled after partial progress",
+            true,
+            true,
+            false,
+            false,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+        );
+
+        assert_eq!(
+            message,
+            "Cursor stream stalled after partial progress; upstream transport remained live, \
+             so completion is ambiguous"
+        );
+        assert!(terminal_error_is_ambiguous_accept(&message));
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            409
+        );
+        assert_eq!(latest_checkpoint, Some(vec![0x08, 0x01]));
+        assert_eq!(
             super::super::conversation::continuation_for(Some(session_id)).conversation_id,
             original
         );
