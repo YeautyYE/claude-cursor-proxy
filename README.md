@@ -237,6 +237,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `8` | Protected start capacity for non-Grok models (Gemini/Claude/… subagents); interactive starts may also borrow idle bulk slots, but bulk never borrows the reserve (0–32) |
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | Maximum local admission wait before retryable HTTP 503 (1–300s) |
 | `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | Additional capacity reserved for paused Runs that need to submit tool results (0–16) |
+| `CCP_CURSOR_OPERATION_LEDGER` | off | Opt-in durable operation ledger (crash-safe replay refusal). Stays off by default until completion is gated on downstream delivery, so dropped responses cannot permanently refuse client retries |
 | `CCP_CURSOR_LIVE_TIMEOUT_SECS` | `1800` | Active model-generation budget for each live segment (max 3600s; paused while downstream tools run) |
 | `CCP_CURSOR_TOOL_TTL_SECS` | same as live timeout | Maximum wait after a tool batch reaches the downstream client; an admitted result is allowed to finish dispatch |
 | `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | Maximum heartbeat-only thinking period without model progress |

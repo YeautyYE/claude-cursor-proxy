@@ -239,6 +239,7 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 | `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `8` | 为非 Grok 模型（Gemini/Claude 等子代理）保留的受保护 start 容量；交互类可借用空闲批量槽，批量类永不可占用保留槽（0–32） |
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | 本地准入最多等待多久后返回可重试 HTTP 503（1–300 秒） |
 | `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | 为暂停后需要提交工具结果的 Run 额外保留的容量（0–16） |
+| `CCP_CURSOR_OPERATION_LEDGER` | 关 | 可选的持久化操作账本（跨重启拒绝重放）。在“完成标记以下游送达为准”落地前默认关闭，避免响应丢失后客户端重试被永久拒绝 |
 | `CCP_CURSOR_LIVE_TIMEOUT_SECS` | `1800` | 每段活跃模型生成的预算（最多 3600 秒；下游工具执行期间暂停） |
 | `CCP_CURSOR_TOOL_TTL_SECS` | 与 live timeout 相同 | 工具批次送达下游后的最长等待时间；已准入的结果允许完成派发 |
 | `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | 只有心跳而没有模型进展时的最长思考时间 |

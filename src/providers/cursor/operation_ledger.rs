@@ -93,6 +93,21 @@ fn operation_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
+    // Opt-in until durable completion is gated on downstream delivery.
+    // Sealing "completed" before the client observed the terminal output
+    // turns a dropped response into a permanent duplicate-replay refusal,
+    // which stalls legitimate client retries (2026-08-22 incident).
+    let enabled = std::env::var("CCP_CURSOR_OPERATION_LEDGER")
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
     Some(crate::paths::state_dir().join("cursor").join("operations"))
 }
 
@@ -508,9 +523,11 @@ fn normalize(payload: &mut RecordPayload, now_ms: u64) -> bool {
             // Once its process is gone, replay is definitively safe.
             payload.active = None;
         } else if active.expires_at_ms <= now_ms {
-            // A dispatched/ambiguous owner may no longer be running after this
-            // bound, but its exact stage remains a replay tombstone.
-            add_completed(payload, active.fingerprint, now_ms);
+            // The owner is certainly no longer running after this bound. The
+            // outcome stays unknown, but converting it into a permanent
+            // completed tombstone would refuse every later client retry of a
+            // turn that may never have executed; expire to retryable instead,
+            // matching the bounded in-memory ambiguity window.
             payload.active = None;
         }
     }
@@ -976,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_dispatched_stage_becomes_an_exact_replay_tombstone() {
+    fn expired_dispatched_stage_expires_to_retryable_instead_of_tombstoning() {
         let _guard = OPERATION_LEDGER_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -989,10 +1006,10 @@ mod tests {
         payload.active.as_mut().unwrap().expires_at_ms = 0;
         write_record(&dir, &payload).unwrap();
 
-        assert_eq!(
-            admit("session-e", 81),
-            OperationAdmission::DuplicateCompleted
-        );
+        // Before expiry the dispatched stage blocks replays as ambiguous; the
+        // expiry bound must release the client instead of refusing the same
+        // turn forever as a synthetic "completed" tombstone.
+        assert_eq!(admit("session-e", 81), OperationAdmission::Allowed);
         assert_eq!(admit("session-e", 82), OperationAdmission::Allowed);
     }
 

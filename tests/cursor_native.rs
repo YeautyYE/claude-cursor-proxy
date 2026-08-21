@@ -2932,6 +2932,7 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             "CCP_CURSOR_LIVE_CONCURRENCY",
             "CCP_CURSOR_LIVE_QUEUE_SECS",
             "CCP_CURSOR_LIVE_RESUME_RESERVE",
+            "CCP_CURSOR_LIVE_INTERACTIVE_RESERVE",
             "CCP_CURSOR_H2_SHARDS",
         ]
         .into_iter()
@@ -3010,6 +3011,7 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
         std::env::set_var("CCP_CURSOR_LIVE_CONCURRENCY", "32");
         std::env::set_var("CCP_CURSOR_LIVE_QUEUE_SECS", "1");
         std::env::set_var("CCP_CURSOR_LIVE_RESUME_RESERVE", "4");
+        std::env::set_var("CCP_CURSOR_LIVE_INTERACTIVE_RESERVE", "8");
         std::env::set_var("CCP_CURSOR_H2_SHARDS", "4");
     }
 
@@ -3040,7 +3042,9 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
                     format!("cursor-live-concurrency-{index}"),
                 )
                 .json(&serde_json::json!({
-                    "model": "cursor:gpt-5.5",
+                    // Bulk admission class: only cursor-grok-* competes for the
+                    // ordinary start pool; other models keep a protected reserve.
+                    "model": "cursor:cursor-grok-4.6-xhigh-fast",
                     "max_tokens": 32,
                     "stream": true,
                     "messages": [{"role": "user", "content": "Reply OK"}]
@@ -3090,7 +3094,7 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             .header("anthropic-version", "2023-06-01")
             .header("x-claude-code-session-id", overflow_session)
             .json(&serde_json::json!({
-                "model": "cursor:gpt-5.5",
+                "model": "cursor:cursor-grok-4.6-xhigh-fast",
                 "max_tokens": 32,
                 "stream": false,
                 "messages": [{"role": "user", "content": "Reply OK"}]
@@ -3113,6 +3117,30 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
         "the queued request must not reach Cursor before admission"
     );
 
+    // 2026-08-21 incident regression: while the whole bulk pool is held by a
+    // Grok fan-out, an interactive (non-Grok) subagent start must still be
+    // admitted through its protected reserve instead of timing out.
+    let interactive_client = client.clone();
+    let interactive = tokio::spawn(async move {
+        interactive_client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("authorization", "Bearer ignored")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-claude-code-session-id", "cursor-live-interactive-probe")
+            .json(&serde_json::json!({
+                "model": "cursor:gemini-3.1-pro",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{"role": "user", "content": "Reply OK"}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    wait_for_accepted(&held, REQUESTS + 1).await.expect(
+        "an interactive start must use protected reserve capacity while Grok holds every bulk slot",
+    );
+
     let releases = std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner()));
     for release in releases {
         let _ = release.send(());
@@ -3129,6 +3157,15 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             .unwrap();
         assert!(body.contains("OK"), "unexpected live response: {body}");
     }
+    let interactive_response = tokio::time::timeout(std::time::Duration::from_secs(5), interactive)
+        .await
+        .expect("interactive probe did not finish")
+        .unwrap();
+    assert_eq!(interactive_response.status(), reqwest::StatusCode::OK);
+    assert!(
+        interactive_response.text().await.unwrap().contains("OK"),
+        "the interactive probe must complete from reserve capacity"
+    );
 
     let retry_client = client.clone();
     let retry = tokio::spawn(async move {
@@ -3138,7 +3175,7 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             .header("anthropic-version", "2023-06-01")
             .header("x-claude-code-session-id", overflow_session)
             .json(&serde_json::json!({
-                "model": "cursor:gpt-5.5",
+                "model": "cursor:cursor-grok-4.6-xhigh-fast",
                 "max_tokens": 32,
                 "stream": false,
                 "messages": [{"role": "user", "content": "Reply OK"}]
@@ -3147,7 +3184,7 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             .await
             .unwrap()
     });
-    wait_for_accepted(&held, REQUESTS + 1)
+    wait_for_accepted(&held, REQUESTS + 2)
         .await
         .expect("retried overflow request reached Cursor");
     for release in std::mem::take(&mut *held.releases.lock().unwrap_or_else(|e| e.into_inner())) {
