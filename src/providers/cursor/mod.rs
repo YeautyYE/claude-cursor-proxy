@@ -372,6 +372,28 @@ fn live_run_busy_error() -> CursorError {
     error
 }
 
+/// Serve the retained final segment of an already-completed identical
+/// operation: exactly-once delivery for a client that never received the
+/// original response (crash, timeout, dropped connection).
+fn replay_completed_turn_channel(
+    session_id: &str,
+    events: &[LiveRunEvent],
+) -> mpsc::Receiver<LiveEventResult> {
+    let (tx, rx) = mpsc::channel(events.len().max(1));
+    for event in events {
+        // Capacity covers every event; we still hold the receiver.
+        let _ = tx.try_send(Ok(event.clone()));
+    }
+    create_logger("cursor").info(
+        "live_replay_completed_turn",
+        Some(serde_json::Map::from_iter([
+            ("sessionId".into(), serde_json::json!(session_id)),
+            ("replayedEvents".into(), serde_json::json!(events.len())),
+        ])),
+    );
+    rx
+}
+
 fn live_ambiguous_accept_error() -> CursorError {
     CursorError::new(
         409,
@@ -420,7 +442,11 @@ async fn start_live_events_with_retries(
             reservation
         } else {
             let claimed = loop {
-                match LiveRunRegistry::try_claim_run(identity.session_id, identity.agent_id) {
+                match LiveRunRegistry::try_claim_run_for_operation(
+                    identity.session_id,
+                    identity.agent_id,
+                    operation_fingerprint,
+                ) {
                     LiveSlotClaim::Reserved(reservation) => break Some(reservation),
                     LiveSlotClaim::Starting => {
                         if Instant::now() >= conflict_deadline {
@@ -430,6 +456,9 @@ async fn start_live_events_with_retries(
                     }
                     LiveSlotClaim::Ambiguous => {
                         return Err(live_ambiguous_accept_error());
+                    }
+                    LiveSlotClaim::CompletedReplay(events) => {
+                        return Ok(replay_completed_turn_channel(identity.session_id, &events));
                     }
                     LiveSlotClaim::Running => {
                         if let Some(run) =
@@ -1215,6 +1244,12 @@ fn resume_when_slot_has_no_runnable_handle(
     if LiveRunRegistry::is_ambiguous_run(session_id, agent_id) {
         return Some(LiveResumeOutcome::ResumeError(live_ambiguous_accept_error()));
     }
+    // Identical retry of a completed turn: deliver the retained response.
+    if let Some(events) = LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint) {
+        return Some(LiveResumeOutcome::Resumed(replay_completed_turn_channel(
+            session_id, &events,
+        )));
+    }
     LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
     if !LiveRunRegistry::is_occupied_run(session_id, agent_id) {
         if let Some(run_id) = observed_run_id {
@@ -1696,114 +1731,128 @@ impl Provider for CursorProvider {
             let fingerprint_payload =
                 live_operation_fingerprint_payload(&body, ctx.client_request_id.as_deref());
             let fingerprint = live_request_fingerprint(&fingerprint_payload);
-            LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
-            match LiveRunRegistry::probe_run(session_id, agent_id) {
-                LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
-                    return json_error_from_cursor_message(error);
-                }
-                LiveRunProbe::TerminalError(_) => {
-                    // Retryable terminal failures are removed by probe_run.
-                }
-                LiveRunProbe::Free => {
-                    if reject_orphaned_native_results_when_live_slot_is_free(&body) {
-                        return json_error(
-                            StatusCode::CONFLICT,
-                            "invalid_request_error",
-                            "Stale Cursor tool_result cannot start a new live run",
-                        );
-                    }
-                }
-                LiveRunProbe::Occupied => {
-                    let estimated_input = estimate_request_input_tokens(&body);
-                    let monitor = ctx
-                        .monitor
-                        .clone()
-                        .map(|handle| (handle, ctx.req_id.clone()));
-                    match await_live_run_resume_for_operation(
-                        session_id,
-                        agent_id,
-                        &body,
-                        message_id.clone(),
-                        wire_model.clone(),
-                        estimated_input,
-                        monitor,
-                        want_stream,
-                        ctx.client_request_id.as_deref(),
-                    )
-                    .await
+            // Identical retry of a turn that already completed: deliver the
+            // retained response instead of stalling on the Succeeded tombstone
+            // (client crashed / timed out / dropped before it saw message_end).
+            if let Some(events) =
+                LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint)
+            {
+                resumed_live_events = Some(replay_completed_turn_channel(session_id, &events));
+            }
+            if resumed_live_events.is_none() {
+                LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
+            }
+            if resumed_live_events.is_none() {
+                match LiveRunRegistry::probe_run(session_id, agent_id) {
+                    LiveRunProbe::TerminalError(error)
+                        if live_probe_error_blocks_new_run(&error) =>
                     {
-                        LiveResumeOutcome::Resumed(events) => {
-                            resumed_live_events = Some(events);
-                        }
-                        LiveResumeOutcome::TerminalError(error)
-                            if live_probe_error_blocks_new_run(&error) =>
-                        {
-                            return json_error_from_cursor_message(error);
-                        }
-                        LiveResumeOutcome::TerminalError(_) => {}
-                        LiveResumeOutcome::MissingTools(missing) => {
-                            return json_error(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_request_error",
-                                format!(
-                                    "Missing tool_result blocks for pending tools: {}",
-                                    missing.join(", ")
-                                ),
-                            );
-                        }
-                        LiveResumeOutcome::SupersedeRunning(run_id) => {
-                            match LiveRunRegistry::claim_replacement_for_run(
-                                session_id, agent_id, &run_id,
-                            ) {
-                                LiveReplacementClaim::Conflict => {
-                                    let error = live_replacement_conflict_error(
-                                        request_has_current_tool_result(&body),
-                                    );
-                                    return map_cursor_error_to_response(&error);
-                                }
-                                LiveReplacementClaim::Reserved {
-                                    reservation,
-                                    superseded,
-                                } => {
-                                    if let Some(handle) = superseded {
-                                        reservation.protect_on_drop();
-                                        let cancel_result = handle.cancel_and_wait().await;
-                                        match finish_replacement_after_cancel(
-                                            reservation,
-                                            handle,
-                                            request_has_current_tool_result(&body),
-                                            cancel_result,
-                                        ) {
-                                            Ok(kept) => {
-                                                preclaimed_live_reservation = Some(kept);
-                                            }
-                                            Err(error) => {
-                                                return map_cursor_error_to_response(&error);
-                                            }
-                                        }
-                                    } else {
-                                        preclaimed_live_reservation = Some(reservation);
-                                    }
-                                }
-                            }
-                        }
-                        LiveResumeOutcome::Conflict => {
+                        return json_error_from_cursor_message(error);
+                    }
+                    LiveRunProbe::TerminalError(_) => {
+                        // Retryable terminal failures are removed by probe_run.
+                    }
+                    LiveRunProbe::Free => {
+                        if reject_orphaned_native_results_when_live_slot_is_free(&body) {
                             return json_error(
                                 StatusCode::CONFLICT,
                                 "invalid_request_error",
-                                "A Cursor live run is already active for this session",
+                                "Stale Cursor tool_result cannot start a new live run",
                             );
                         }
-                        LiveResumeOutcome::ResumeError(error) => {
-                            return map_cursor_error_to_response(&error);
-                        }
-                        LiveResumeOutcome::Free => {
-                            if reject_orphaned_native_results_when_live_slot_is_free(&body) {
+                    }
+                    LiveRunProbe::Occupied => {
+                        let estimated_input = estimate_request_input_tokens(&body);
+                        let monitor = ctx
+                            .monitor
+                            .clone()
+                            .map(|handle| (handle, ctx.req_id.clone()));
+                        match await_live_run_resume_for_operation(
+                            session_id,
+                            agent_id,
+                            &body,
+                            message_id.clone(),
+                            wire_model.clone(),
+                            estimated_input,
+                            monitor,
+                            want_stream,
+                            ctx.client_request_id.as_deref(),
+                        )
+                        .await
+                        {
+                            LiveResumeOutcome::Resumed(events) => {
+                                resumed_live_events = Some(events);
+                            }
+                            LiveResumeOutcome::TerminalError(error)
+                                if live_probe_error_blocks_new_run(&error) =>
+                            {
+                                return json_error_from_cursor_message(error);
+                            }
+                            LiveResumeOutcome::TerminalError(_) => {}
+                            LiveResumeOutcome::MissingTools(missing) => {
+                                return json_error(
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid_request_error",
+                                    format!(
+                                        "Missing tool_result blocks for pending tools: {}",
+                                        missing.join(", ")
+                                    ),
+                                );
+                            }
+                            LiveResumeOutcome::SupersedeRunning(run_id) => {
+                                match LiveRunRegistry::claim_replacement_for_run(
+                                    session_id, agent_id, &run_id,
+                                ) {
+                                    LiveReplacementClaim::Conflict => {
+                                        let error = live_replacement_conflict_error(
+                                            request_has_current_tool_result(&body),
+                                        );
+                                        return map_cursor_error_to_response(&error);
+                                    }
+                                    LiveReplacementClaim::Reserved {
+                                        reservation,
+                                        superseded,
+                                    } => {
+                                        if let Some(handle) = superseded {
+                                            reservation.protect_on_drop();
+                                            let cancel_result = handle.cancel_and_wait().await;
+                                            match finish_replacement_after_cancel(
+                                                reservation,
+                                                handle,
+                                                request_has_current_tool_result(&body),
+                                                cancel_result,
+                                            ) {
+                                                Ok(kept) => {
+                                                    preclaimed_live_reservation = Some(kept);
+                                                }
+                                                Err(error) => {
+                                                    return map_cursor_error_to_response(&error);
+                                                }
+                                            }
+                                        } else {
+                                            preclaimed_live_reservation = Some(reservation);
+                                        }
+                                    }
+                                }
+                            }
+                            LiveResumeOutcome::Conflict => {
                                 return json_error(
                                     StatusCode::CONFLICT,
                                     "invalid_request_error",
-                                    "Stale Cursor tool_result cannot start a new live run",
+                                    "A Cursor live run is already active for this session",
                                 );
+                            }
+                            LiveResumeOutcome::ResumeError(error) => {
+                                return map_cursor_error_to_response(&error);
+                            }
+                            LiveResumeOutcome::Free => {
+                                if reject_orphaned_native_results_when_live_slot_is_free(&body) {
+                                    return json_error(
+                                        StatusCode::CONFLICT,
+                                        "invalid_request_error",
+                                        "Stale Cursor tool_result cannot start a new live run",
+                                    );
+                                }
                             }
                         }
                     }

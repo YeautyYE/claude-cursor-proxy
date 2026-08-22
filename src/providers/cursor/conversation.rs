@@ -666,11 +666,24 @@ pub fn continuation_for(session_id: Option<&str>) -> RunContinuation {
 #[cfg(test)]
 pub fn reset_for_test() {
     let mut store = store_lock();
-    store.map.clear();
-    store.order.clear();
-    store.pins.clear();
+    // Preserve pinned sessions: a concurrent driver test holds a lease, and a
+    // global wipe would sever its conversation binding mid-run (the
+    // "binding changed while a live Run was active" test flake).
+    let pinned: std::collections::HashSet<String> = store.pins.keys().cloned().collect();
+    store.map.retain(|key, _| pinned.contains(key));
+    store.order.retain(|key| pinned.contains(key));
     LAST_PERSISTED_SWEEP_MS.store(0, Ordering::Relaxed);
     PERSISTED_SWEEP_RUNS.store(0, Ordering::Relaxed);
+}
+
+/// Test-only restart simulation: drop in-memory state so the next lookup must
+/// reload from disk — without severing concurrently pinned sessions.
+#[cfg(test)]
+fn drop_unpinned_in_memory_for_test() {
+    let mut store = store_lock();
+    let pinned: std::collections::HashSet<String> = store.pins.keys().cloned().collect();
+    store.map.retain(|key, _| pinned.contains(key));
+    store.order.retain(|key| pinned.contains(key));
 }
 
 #[cfg(test)]
@@ -780,11 +793,7 @@ mod tests {
         let _clear = ClearEnv;
         reset_for_test();
         save_checkpoint("sess-persist", vec![0x0a, 0x03]);
-        {
-            let mut store = store_lock();
-            store.map.clear();
-            store.order.clear();
-        }
+        drop_unpinned_in_memory_for_test();
         let cont = continuation_for(Some("sess-persist"));
         assert!(cont.has_checkpoint, "checkpoint must reload from disk");
         assert_eq!(cont.conversation_state, vec![0x0a, 0x03]);
@@ -811,11 +820,7 @@ mod tests {
         merge_blobs("sess-reset", &HashMap::from([(vec![0x01], vec![0x02])]));
         let original = continuation_for(Some("sess-reset")).conversation_id.clone();
         reset("sess-reset");
-        {
-            let mut store = store_lock();
-            store.map.clear();
-            store.order.clear();
-        }
+        drop_unpinned_in_memory_for_test();
         let recovered = continuation_for(Some("sess-reset"));
         assert_ne!(recovered.conversation_id, original);
         assert!(!recovered.has_checkpoint);
@@ -879,11 +884,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         dto.last_seen = 1;
         std::fs::write(&path, serde_json::to_vec(&dto).unwrap()).unwrap();
-        {
-            let mut store = store_lock();
-            store.map.clear();
-            store.order.clear();
-        }
+        drop_unpinned_in_memory_for_test();
         expire_abandoned_persisted(now_millis());
         assert!(
             !path.exists(),

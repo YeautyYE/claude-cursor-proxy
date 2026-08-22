@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.65 (2026-08-22)
+
+- Retain the final downstream segment on the `Succeeded` tombstone and replay it to an identical retry (same operation fingerprint): a client that never received the response (timeout, dropped connection, crash) now gets the original events back instead of stalling on 503/409 for 90 seconds and then re-executing the whole turn. Served on all three entry paths (new-request start, `/v1/messages` entry, resume wait).
+- A turn that completes after its consumer disconnected now seals `Succeeded` with the replay instead of a 90-second Ambiguous tombstone. Observed `turn_ended` + a fully recorded segment is not ambiguous completion — only delivery failed, and the retry can be served. grok-build no longer eats a fatal 409 for this case.
+- Deflake the test suite: scope the operation-ledger directory override to the owning test thread, give the post-tool checkpoint scenarios unique sessions, and make test-only conversation-store wipes preserve pinned sessions. These process-global mutations made unrelated driver tests fail with "durable operation owner changed" / "conversation binding changed".
+
 ## v0.1.64 (2026-08-22)
 
 - Attach an identical retry (same operation fingerprint) to the in-flight Cursor live run instead of returning `503 A Cursor live run is already active for this session` until that run dies. The driver keeps a bounded per-segment replay log, replays it to the new consumer, and continues the live stream when the original HTTP client has disconnected. A still-connected original consumer is still busy; a 30-second orphan grace then fail-closes so heartbeats cannot pin the slot forever. This is the grok-build wedge that produced 0-output sessions with 30 consecutive 503s.

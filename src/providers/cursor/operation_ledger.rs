@@ -83,15 +83,47 @@ struct StoredRecord {
     checksum: String,
 }
 
+// Test-only, thread-scoped ledger directory. The old process-global
+// `CCP_CURSOR_OPERATION_DIR` env override enabled the ledger for EVERY
+// concurrently running test while one ledger test held it, making unrelated
+// registry/driver tests fail with "durable operation owner changed".
+#[cfg(test)]
+thread_local! {
+    static TEST_OPERATION_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scope the ledger to the current test thread; restores on drop.
+#[cfg(test)]
+pub(crate) struct TestOperationDirGuard(Option<PathBuf>);
+
+#[cfg(test)]
+pub(crate) fn test_operation_dir_guard(path: &std::path::Path) -> TestOperationDirGuard {
+    TestOperationDirGuard(TEST_OPERATION_DIR.with(|dir| dir.replace(Some(path.to_path_buf()))))
+}
+
+#[cfg(test)]
+impl Drop for TestOperationDirGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        TEST_OPERATION_DIR.with(|dir| {
+            *dir.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+fn operation_dir() -> Option<PathBuf> {
+    TEST_OPERATION_DIR.with(|dir| dir.borrow().clone())
+}
+
+#[cfg(not(test))]
 fn operation_dir() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("CCP_CURSOR_OPERATION_DIR") {
         let path = PathBuf::from(raw);
         if !path.as_os_str().is_empty() {
             return Some(path);
         }
-    }
-    if cfg!(test) {
-        return None;
     }
     // Opt-in until durable completion is gated on downstream delivery.
     // Sealing "completed" before the client observed the terminal output
@@ -847,24 +879,22 @@ mod tests {
     use super::*;
 
     struct LedgerEnv {
-        previous_dir: Option<std::ffi::OsString>,
+        _dir: TestOperationDirGuard,
         previous_retention: Option<std::ffi::OsString>,
     }
 
     impl LedgerEnv {
         fn new(path: &Path) -> Self {
-            let previous_dir = std::env::var_os("CCP_CURSOR_OPERATION_DIR");
             let previous_retention =
                 std::env::var_os("CCP_CURSOR_OPERATION_COMPLETED_RETENTION_SECS");
             unsafe {
-                std::env::set_var("CCP_CURSOR_OPERATION_DIR", path);
                 std::env::set_var(
                     "CCP_CURSOR_OPERATION_COMPLETED_RETENTION_SECS",
                     MIN_UNRESOLVED_RETENTION_SECS.to_string(),
                 );
             }
             Self {
-                previous_dir,
+                _dir: test_operation_dir_guard(path),
                 previous_retention,
             }
         }
@@ -873,10 +903,6 @@ mod tests {
     impl Drop for LedgerEnv {
         fn drop(&mut self) {
             unsafe {
-                match self.previous_dir.take() {
-                    Some(value) => std::env::set_var("CCP_CURSOR_OPERATION_DIR", value),
-                    None => std::env::remove_var("CCP_CURSOR_OPERATION_DIR"),
-                }
                 match self.previous_retention.take() {
                     Some(value) => {
                         std::env::set_var("CCP_CURSOR_OPERATION_COMPLETED_RETENTION_SECS", value)

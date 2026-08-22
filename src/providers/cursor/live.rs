@@ -481,6 +481,24 @@ impl SegmentReplayLog {
         self.bytes = 0;
         self.overflowed = false;
     }
+
+    /// The recorded segment reached the Anthropic terminal `End`, i.e. it is a
+    /// complete, deliverable response on its own.
+    fn ends_with_turn_end(&self) -> bool {
+        matches!(
+            self.events.last(),
+            Some(LiveRunEvent::Cursor(CursorStreamEvent::End))
+        )
+    }
+
+    /// Hand the recorded segment to the Succeeded tombstone. `None` when
+    /// fidelity was lost (overflow) or nothing was recorded.
+    fn take_snapshot(&mut self) -> Option<Arc<Vec<LiveRunEvent>>> {
+        if self.overflowed || self.events.is_empty() {
+            return None;
+        }
+        Some(Arc::new(std::mem::take(&mut self.events)))
+    }
 }
 
 fn segment_replay_event_cost(event: &LiveRunEvent) -> usize {
@@ -1335,10 +1353,14 @@ enum LiveRunEntry {
     },
     /// The previous Run completed successfully. Identical request retries must
     /// not start a second Run before the client could have observed `message_end`.
+    /// `replay` retains the final downstream segment so an identical retry whose
+    /// client never received the response gets the original events replayed
+    /// (exactly-once delivery) instead of a busy/ambiguous stall until `until`.
     Succeeded {
         run_id: String,
         fingerprint: u64,
         until: Instant,
+        replay: Option<Arc<Vec<LiveRunEvent>>>,
     },
 }
 
@@ -1610,7 +1632,7 @@ impl LiveRunReservation {
         // transition after insertion so success is durably sealed exactly as it
         // is for a later driver completion.
         if handle.is_completed() && !handle.has_terminal_error() {
-            LiveRunRegistry::seal_success_if(&self.session_id, handle.run_id());
+            LiveRunRegistry::seal_success_if(&self.session_id, handle.run_id(), None);
         }
         Ok(())
     }
@@ -1667,6 +1689,9 @@ pub enum LiveSlotClaim {
     Starting,
     Ambiguous,
     Running,
+    /// The identical operation already completed and its final segment is
+    /// retained: serve the recorded events instead of starting a second Run.
+    CompletedReplay(Arc<Vec<LiveRunEvent>>),
 }
 
 pub enum LiveConflictAction {
@@ -1712,6 +1737,17 @@ impl LiveRunRegistry {
     /// supersedes an occupied slot; replacement requires an observed run id via
     /// `claim_replacement_for_run`.
     pub fn try_claim_run(session_id: &str, agent_id: Option<&str>) -> LiveSlotClaim {
+        Self::try_claim_run_for_operation(session_id, agent_id, 0)
+    }
+
+    /// Like [`Self::try_claim_run`], but an identical retry (same operation
+    /// fingerprint) of a Succeeded turn whose final segment was retained gets
+    /// [`LiveSlotClaim::CompletedReplay`] instead of an ambiguous stall.
+    pub fn try_claim_run_for_operation(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) -> LiveSlotClaim {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
@@ -1720,14 +1756,45 @@ impl LiveRunRegistry {
             Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => {
                 LiveSlotClaim::Ambiguous
             }
-            Some(LiveRunEntry::Succeeded { until, .. }) if Instant::now() < *until => {
-                LiveSlotClaim::Ambiguous
-            }
+            Some(LiveRunEntry::Succeeded {
+                until,
+                fingerprint: stored,
+                replay,
+                ..
+            }) if Instant::now() < *until => match replay {
+                Some(replay) if fingerprint != 0 && *stored == fingerprint => {
+                    LiveSlotClaim::CompletedReplay(Arc::clone(replay))
+                }
+                _ => LiveSlotClaim::Ambiguous,
+            },
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => LiveSlotClaim::Running,
             _ => match Self::reserve_key(&mut runs, key) {
                 Some(reservation) => LiveSlotClaim::Reserved(reservation),
                 None => LiveSlotClaim::Running,
             },
+        }
+    }
+
+    /// Retained final segment of an identical completed operation, if any.
+    pub(crate) fn completed_replay_for(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) -> Option<Arc<Vec<LiveRunEvent>>> {
+        if fingerprint == 0 {
+            return None;
+        }
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Succeeded {
+                until,
+                fingerprint: stored,
+                replay: Some(replay),
+                ..
+            }) if Instant::now() < *until && *stored == fingerprint => Some(Arc::clone(replay)),
+            _ => None,
         }
     }
 
@@ -2182,7 +2249,7 @@ impl LiveRunRegistry {
         }
     }
 
-    fn seal_success_if(session_id: &str, run_id: &str) {
+    fn seal_success_if(session_id: &str, run_id: &str, replay: Option<Arc<Vec<LiveRunEvent>>>) {
         let candidate = {
             let runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
             let keys = runs.keys_for(claude_session_of(session_id));
@@ -2235,6 +2302,7 @@ impl LiveRunRegistry {
                     run_id: run_id.to_string(),
                     fingerprint,
                     until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                    replay,
                 },
             );
         }
@@ -6126,7 +6194,15 @@ async fn drive_live_run(
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .is_none();
+                    // A recorded segment that reached `End` IS the complete
+                    // response: completion is observed, only delivery to a
+                    // vanished consumer failed. Seal Succeeded with the replay
+                    // (via cleanup) so an identical retry receives the turn,
+                    // instead of tombstoning the session 90s as ambiguous.
+                    let completed_with_replay =
+                        frame_may_complete && segment_replay.ends_with_turn_end();
                     if missing_terminal
+                        && !completed_with_replay
                         && (!frame_may_complete
                             || sink.as_ref().is_some_and(mpsc::Sender::is_closed))
                     {
@@ -7476,8 +7552,10 @@ async fn drive_live_run(
         .is_none()
     {
         // Seal before `completed` so prune_finished cannot drop a successful
-        // Running handle in the gap and lose the retry fingerprint.
-        LiveRunRegistry::seal_success_if(&session_id, &run_id);
+        // Running handle in the gap and lose the retry fingerprint. The final
+        // segment snapshot rides along so an identical retry that never saw
+        // this response gets it replayed instead of a busy/ambiguous stall.
+        LiveRunRegistry::seal_success_if(&session_id, &run_id, segment_replay.take_snapshot());
     }
     completed.store(true, Ordering::Release);
     if let Some(ack) = cancel_ack {
@@ -13939,22 +14017,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let _registry = lock_live_registry_for_test();
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("CCP_CURSOR_OPERATION_DIR");
-        unsafe {
-            std::env::set_var("CCP_CURSOR_OPERATION_DIR", dir.path());
-        }
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.0.take() {
-                        Some(value) => std::env::set_var("CCP_CURSOR_OPERATION_DIR", value),
-                        None => std::env::remove_var("CCP_CURSOR_OPERATION_DIR"),
-                    }
-                }
-            }
-        }
-        let _restore = Restore(previous);
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
         let session = format!("durable-ambiguous-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
 
@@ -13982,22 +14045,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let _registry = lock_live_registry_for_test();
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("CCP_CURSOR_OPERATION_DIR");
-        unsafe {
-            std::env::set_var("CCP_CURSOR_OPERATION_DIR", dir.path());
-        }
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.0.take() {
-                        Some(value) => std::env::set_var("CCP_CURSOR_OPERATION_DIR", value),
-                        None => std::env::remove_var("CCP_CURSOR_OPERATION_DIR"),
-                    }
-                }
-            }
-        }
-        let _restore = Restore(previous);
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
         let session = format!("stale-release-{}", uuid::Uuid::new_v4());
         let key = live_run_key(&session, None);
         LiveRunRegistry::clear();
@@ -14045,7 +14093,7 @@ mod tests {
             .expect("reserve")
             .insert(handle)
             .expect("insert");
-        LiveRunRegistry::seal_success_if(&session, "ok-run");
+        LiveRunRegistry::seal_success_if(&session, "ok-run", None);
         assert!(LiveRunRegistry::is_occupied(&session));
         LiveRunRegistry::release_success_if_new_request(&session, None, 42);
         assert!(
@@ -14964,7 +15012,7 @@ mod tests {
         let sealer = async {
             tokio::time::sleep(Duration::from_millis(80)).await;
             handle.completed.store(true, Ordering::Release);
-            LiveRunRegistry::seal_success_if(&session, "compact-seal-generation");
+            LiveRunRegistry::seal_success_if(&session, "compact-seal-generation", None);
         };
         let wait = super::super::await_live_run_resume(
             &session,
@@ -15013,7 +15061,7 @@ mod tests {
             .expect("reserve")
             .insert(handle)
             .expect("insert");
-        LiveRunRegistry::seal_success_if(&session, "same-fp-generation");
+        LiveRunRegistry::seal_success_if(&session, "same-fp-generation", None);
         assert!(
             LiveRunRegistry::is_occupied(&session),
             "same-fingerprint Succeeded must still block reserve at entry"
@@ -15126,7 +15174,7 @@ mod tests {
             .expect("reserve")
             .insert(handle)
             .expect("insert");
-        LiveRunRegistry::seal_success_if(&session, "finished-generation");
+        LiveRunRegistry::seal_success_if(&session, "finished-generation", None);
         assert!(LiveRunRegistry::is_occupied(&session));
         assert!(matches!(
             LiveRunRegistry::claim_replacement_for_run(&session, None, "stale-generation"),
@@ -18842,7 +18890,11 @@ mod tests {
         new_checkpoint_after_submit: bool,
         checkpoint_while_submit_is_blocked: bool,
     ) -> String {
-        let session_id = "session-causal-checkpoint";
+        // Unique per invocation: the three scenario variants run in parallel
+        // and a shared session id lets one driver's conversation rotation
+        // invalidate another driver's binding mid-run.
+        let session_id = format!("session-causal-checkpoint-{}", uuid::Uuid::new_v4());
+        let session_id = session_id.as_str();
         let conversation = super::super::conversation::get_or_create(session_id);
         let _lease = super::super::conversation::pin(session_id, &conversation.conversation_id)
             .expect("pin test conversation");
@@ -18953,7 +19005,17 @@ mod tests {
                 accepted_fingerprint: None,
             })
             .await
-            .expect("dispatch resume");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "dispatch resume failed: {error:?}; terminal={:?} completed={}",
+                    terminal_error
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .as_ref()
+                        .map(|outcome| outcome.message.clone()),
+                    completed.load(Ordering::Acquire),
+                )
+            });
         ack_rx
             .await
             .expect("resume acknowledgement")
@@ -21022,6 +21084,180 @@ mod tests {
             !harness.completed.load(Ordering::Acquire),
             "the run must stay resumable for tool results after an attach"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn completed_turn_with_gone_consumer_seals_replayable_success() {
+        // The other half of the 503/409 wedge: the consumer disconnects and
+        // the model then finishes the turn. This must seal Succeeded with the
+        // recorded segment — not a 90s Ambiguous tombstone — so the identical
+        // retry receives the original response.
+        let _registry = lock_live_registry_for_test();
+        let session = "completed-orphan-replay";
+        LiveRunRegistry::clear();
+        let registry_handle = dummy_handle(&format!("{session}-run"));
+        registry_handle.set_request_fingerprint(7);
+        LiveRunRegistry::reserve(session)
+            .expect("reserve")
+            .insert(Arc::clone(&registry_handle))
+            .expect("insert running");
+
+        let mut harness = spawn_attach_replay_driver(session);
+        send_text_delta(&harness.upstream_tx, "the answer").await;
+        let first = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("text delta flushed")
+            .expect("stream open")
+            .expect("no error");
+        assert!(matches!(
+            &first,
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) if text == "the answer"
+        ));
+        drop(harness.event_rx);
+
+        let mut turn_payload = Vec::new();
+        proto::AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                turn_ended: Some(TurnEnded {
+                    output_tokens: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut turn_payload)
+        .expect("encode turn_ended");
+        harness
+            .upstream_tx
+            .send(Ok(Some(encode_connect_frame(turn_payload, 0))))
+            .await
+            .expect("send turn_ended");
+        // turn_ended is held until Connect END makes it authoritative.
+        harness
+            .upstream_tx
+            .send(Ok(Some(encode_connect_frame(
+                Vec::new(),
+                super::super::connect::FLAG_END,
+            ))))
+            .await
+            .expect("send END");
+
+        // Driver must terminate as a sealed success, not linger or tombstone.
+        for _ in 0..100 {
+            if harness.completed.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            harness.completed.load(Ordering::Acquire),
+            "completed turn with a gone consumer must still finish the driver"
+        );
+        assert!(
+            !LiveRunRegistry::is_ambiguous_run(session, None),
+            "observed completion must not be sealed as ambiguous"
+        );
+
+        let LiveSlotClaim::CompletedReplay(events) =
+            LiveRunRegistry::try_claim_run_for_operation(session, None, 7)
+        else {
+            panic!("identical retry must receive the retained response");
+        };
+        assert!(
+            matches!(
+                events.first(),
+                Some(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) if text == "the answer"
+            ),
+            "replay must start with the delivered text: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(LiveRunEvent::Cursor(CursorStreamEvent::End))
+            ),
+            "replay must end with the Anthropic terminal End: {events:?}"
+        );
+
+        // A different operation must not receive this response.
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run_for_operation(session, None, 8),
+            LiveSlotClaim::Ambiguous
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn identical_retry_resumes_from_succeeded_replay_tombstone() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("succeeded-replay-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "cursor-grok-4.6-xhigh-fast",
+                "stream": true,
+                "messages": [{"role": "user", "content": "what is 2+2?"}]
+            }))
+            .unwrap();
+        let fingerprint = live_request_fingerprint(
+            &super::super::live_operation_fingerprint_payload(&body, None),
+        );
+        let handle = dummy_handle("replayable-generation");
+        handle.set_request_fingerprint(fingerprint);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert");
+        LiveRunRegistry::seal_success_if(
+            &session,
+            "replayable-generation",
+            Some(Arc::new(vec![
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text: "4".into() }),
+                LiveRunEvent::Cursor(CursorStreamEvent::End),
+            ])),
+        );
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_replay".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        let super::super::LiveResumeOutcome::Resumed(mut events) = outcome else {
+            panic!("identical retry must resume from the retained response");
+        };
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }))) if text == "4"
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+        ));
+        assert!(
+            events.recv().await.is_none(),
+            "replayed response must terminate cleanly"
+        );
+
+        // The tombstone stays for further duplicates within the TTL, and a
+        // NEW request (different fingerprint) releases it as before.
+        assert!(
+            LiveRunRegistry::completed_replay_for(&session, None, fingerprint).is_some(),
+            "replay tombstone must survive one duplicate delivery"
+        );
+        LiveRunRegistry::release_success_if_new_request(&session, None, fingerprint ^ 1);
+        assert!(
+            !LiveRunRegistry::is_occupied_run(&session, None),
+            "a new operation must release the tombstone"
+        );
+        LiveRunRegistry::clear();
     }
 
     #[tokio::test]
