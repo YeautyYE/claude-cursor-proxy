@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use prost::Message;
@@ -1305,11 +1306,16 @@ pub(crate) fn build_run_request_with_continuation(
 ) -> RunRequest {
     let selected_images: Vec<proto::SelectedImage> = images
         .iter()
-        .map(|img| proto::SelectedImage {
-            data: img.data.clone(),
-            uuid: img.uuid.clone(),
-            path: img.path.clone(),
-            mime_type: img.mime_type.clone(),
+        .filter_map(|img| {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(img.data.trim())
+                .ok()?;
+            Some(proto::SelectedImage {
+                data,
+                uuid: img.uuid.clone(),
+                path: img.path.clone(),
+                mime_type: img.mime_type.clone(),
+            })
         })
         .collect();
 
@@ -1630,6 +1636,39 @@ mod tests {
         assert!(text.contains("Cursor error 403"), "{text}");
         assert!(text.contains("Cursor upstream HTTP 403"), "{text}");
         assert!(text.contains("country or region"), "{text}");
+    }
+
+    #[test]
+    fn selected_image_uses_official_inline_data_field() {
+        let resolved = crate::providers::cursor::model::resolve_cursor_model("claude-opus-5")
+            .expect("resolve model");
+        let image = CursorSelectedImage {
+            data: "AAAA".into(),
+            uuid: "image-uuid".into(),
+            path: "image.png".into(),
+            mime_type: "image/png".into(),
+        };
+        let req = build_run_request("describe", &resolved, &[image], "req-image", None);
+        let selected = &req
+            .action
+            .as_ref()
+            .and_then(|action| action.user_message_action.as_ref())
+            .and_then(|action| action.user_message.as_ref())
+            .and_then(|message| message.selected_context.as_ref())
+            .expect("selected context")
+            .selected_images[0];
+        assert_eq!(selected.data, vec![0, 0, 0]);
+
+        let mut encoded = Vec::new();
+        selected
+            .encode(&mut encoded)
+            .expect("encode selected image");
+        assert!(
+            encoded
+                .windows(5)
+                .any(|window| window == [0x42, 0x03, 0, 0, 0]),
+            "inline image bytes must be encoded as length-delimited protobuf field 8: {encoded:?}"
+        );
     }
 
     #[test]

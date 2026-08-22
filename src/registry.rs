@@ -17,6 +17,8 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-sonnet-4-6",
     "claude-sonnet-5",
     "opus",
+    "claude-opus-5",
+    "claude-opus-5-thinking-high",
     "claude-opus-4-7",
     "claude-opus-4-8",
     "fable",
@@ -357,7 +359,14 @@ mod tests {
     #[test]
     fn claude_aliases_route_to_cursor_when_configured() {
         let registry = Registry::new(AliasProvider::Cursor);
-        for model in ["claude-sonnet-5", "fable", "claude-fable-5", "haiku"] {
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-opus-5-thinking-high",
+            "fable",
+            "claude-fable-5",
+            "haiku",
+        ] {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "cursor");

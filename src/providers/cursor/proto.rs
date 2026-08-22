@@ -212,13 +212,17 @@ pub struct ModelParameter {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SelectedImage {
-    #[prost(string, tag = "1")]
-    pub data: String,
+    // Cursor CLI 2026.08 uses a `data_or_blob_id` oneof. Field 1 is now
+    // `blob_id` (bytes); inline image bytes belong in field 8. Encoding base64
+    // text in field 1 makes Cursor treat it as an asset id and return
+    // `Image not found [internal]`.
+    #[prost(bytes = "vec", tag = "8")]
+    pub data: Vec<u8>,
     #[prost(string, tag = "2")]
     pub uuid: String,
     #[prost(string, tag = "3")]
     pub path: String,
-    #[prost(string, tag = "4")]
+    #[prost(string, tag = "7")]
     pub mime_type: String,
 }
 

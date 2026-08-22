@@ -228,8 +228,10 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | --- | --- | --- |
 | `PORT` | `18765` | Listen port |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Bind address |
+| `CCP_ADVERTISED_MODELS` | unset | Optional comma-separated allowlist for `GET /v1/models` (useful for managed desktop model pickers) |
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
+| `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Cursor catalog id used for Anthropic `haiku` aliases and desktop small-model probes |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | on | Disable with `0` / `false` |
 | `CCP_CURSOR_EMBED_SYSTEM` | off | Forward Anthropic `system` into Cursor user text (can trigger Fable injection loops) |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | off | Dump **all** tool schemas (large); BiDi already keeps Claude-local tools (`Workflow`/`Skill`/…) |
@@ -292,6 +294,7 @@ claude-cursor-proxy cursor auth status
 | Duplicated tools | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
+| Image attachment immediately fails with 502 `Image not found [internal]` | Update to a build that encodes inline `SelectedImage.data` as protobuf field 8 bytes. Field 1 is a Cursor blob id in current CLI builds. |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
 | grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.57 and restart serve. Response-less live opens fail closed as HTTP 409; local open-slot saturation is jittered HTTP 503. |
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |
