@@ -431,7 +431,17 @@ async fn start_live_events_with_retries(
                     LiveSlotClaim::Ambiguous => {
                         return Err(live_ambiguous_accept_error());
                     }
-                    LiveSlotClaim::Running => return Err(live_run_busy_error()),
+                    LiveSlotClaim::Running => {
+                        if let Some(run) =
+                            LiveRunRegistry::get_run(identity.session_id, identity.agent_id)
+                            && run.request_fingerprint() == operation_fingerprint
+                            && let Ok(events) =
+                                run.attach_for_operation(operation_fingerprint).await
+                        {
+                            return Ok(events);
+                        }
+                        return Err(live_run_busy_error());
+                    }
                 }
             };
             match claimed {
@@ -1305,7 +1315,26 @@ async fn await_live_run_resume_for_operation(
             continue;
         };
         if run.request_fingerprint() == fingerprint {
-            return LiveResumeOutcome::ResumeError(live_run_busy_error());
+            // The active segment IS this operation. When its original consumer
+            // is gone (client retry after disconnect/timeout), attach to the
+            // in-flight run and replay the segment instead of 503-bouncing the
+            // retry until the run dies — the wedge that killed grok-build
+            // sessions with "already active" storms. A still-connected original
+            // consumer rejects attach; keep waiting until the deadline in case
+            // that consumer is mid-drop.
+            match run.attach_for_operation(fingerprint).await {
+                Ok(events) => return LiveResumeOutcome::Resumed(events),
+                Err(error)
+                    if tokio::time::Instant::now() < deadline
+                        && error.message.contains(LIVE_RUN_BUSY_MESSAGE) =>
+                {
+                    // Original consumer is still connected. It may be mid-drop;
+                    // keep polling until the deadline instead of 503-storming.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                Err(_) => return LiveResumeOutcome::ResumeError(live_run_busy_error()),
+            }
         }
         if observed_non_running_slot {
             // A Starting slot became Running. Tool-result waiters must not
@@ -1382,7 +1411,10 @@ async fn await_live_run_resume_for_operation(
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     };
     if run.request_fingerprint() == fingerprint {
-        return LiveResumeOutcome::ResumeError(live_run_busy_error());
+        match run.attach_for_operation(fingerprint).await {
+            Ok(events) => return LiveResumeOutcome::Resumed(events),
+            Err(_) => return LiveResumeOutcome::ResumeError(live_run_busy_error()),
+        }
     }
     if observed_non_running_slot {
         if has_tool_results {

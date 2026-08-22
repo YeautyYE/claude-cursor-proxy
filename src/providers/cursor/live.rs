@@ -426,9 +426,99 @@ enum RunCommand {
         dispatch_state: Arc<AtomicU8>,
         accepted_fingerprint: Option<(Arc<AtomicU64>, u64)>,
     },
+    /// An identical retry (same operation fingerprint) whose original consumer
+    /// disconnected takes over the current downstream segment: the driver
+    /// replays every event already emitted for this segment into a fresh
+    /// channel and, if the segment is still generating, adopts it as the new
+    /// sink. This turns "503 busy until the run dies" into exactly-once
+    /// delivery for one upstream generation.
+    AttachReplay {
+        ack: oneshot::Sender<Result<mpsc::Receiver<LiveEventResult>, CursorError>>,
+        expected_fingerprint: u64,
+        fingerprint_source: Arc<AtomicU64>,
+    },
     Cancel {
         ack: Option<oneshot::Sender<()>>,
     },
+}
+
+/// Everything already delivered (or attempted) on the current downstream
+/// segment, retained so a duplicate retry can attach mid-run without losing
+/// the prefix. Reset whenever a new segment begins (initial start or an
+/// accepted tool-result resume).
+#[derive(Debug, Default)]
+struct SegmentReplayLog {
+    events: Vec<LiveRunEvent>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+/// Cap on retained segment bytes. Beyond this the log is dropped and attach
+/// falls back to the busy error (bounded memory beats unbounded fidelity).
+const SEGMENT_REPLAY_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// After the downstream consumer vanishes with no pending tools, keep the
+/// generation alive this long so an identical retry can attach-and-replay
+/// instead of 503-storming. Idle/generation budgets still bound the run;
+/// this only stops a heartbeat flood from pinning the slot forever.
+const LIVE_ATTACH_ORPHAN_GRACE: Duration = Duration::from_secs(30);
+
+impl SegmentReplayLog {
+    fn record(&mut self, event: &LiveRunEvent) {
+        if self.overflowed {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(segment_replay_event_cost(event));
+        if self.bytes > SEGMENT_REPLAY_MAX_BYTES {
+            self.events = Vec::new();
+            self.overflowed = true;
+            return;
+        }
+        self.events.push(event.clone());
+    }
+
+    fn reset(&mut self) {
+        self.events.clear();
+        self.bytes = 0;
+        self.overflowed = false;
+    }
+}
+
+fn segment_replay_event_cost(event: &LiveRunEvent) -> usize {
+    const EVENT_OVERHEAD: usize = 64;
+    match event {
+        LiveRunEvent::Cursor(
+            CursorStreamEvent::TextDelta { text } | CursorStreamEvent::ThinkingDelta { text },
+        ) => EVENT_OVERHEAD + text.len(),
+        LiveRunEvent::NativeToolBatch(tools) => tools
+            .iter()
+            .map(|tool| {
+                EVENT_OVERHEAD
+                    + tool.tool_use_id.len()
+                    + tool.name.len()
+                    + serde_json::to_string(&tool.input)
+                        .map(|input| input.len())
+                        .unwrap_or(256)
+            })
+            .sum::<usize>()
+            .max(EVENT_OVERHEAD),
+        LiveRunEvent::Cursor(_) => EVENT_OVERHEAD,
+    }
+}
+
+fn live_attach_unavailable_error() -> CursorError {
+    CursorError::new(
+        503,
+        "Cursor live run cannot be attached right now; retry after it advances",
+        None,
+    )
+}
+
+fn live_attach_consumer_alive_error() -> CursorError {
+    CursorError::new(
+        503,
+        "A Cursor live run is already active for this session; retry after it advances",
+        None,
+    )
 }
 
 #[derive(Debug)]
@@ -536,6 +626,36 @@ impl CursorLiveRunHandle {
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
         self.resume_batch_within(tool_results, resume_dispatch_timeout())
             .await
+    }
+
+    /// Attach an identical retry (same operation fingerprint) to the current
+    /// downstream segment. The driver replays everything the segment already
+    /// produced and, when the segment is still generating, streams the rest to
+    /// the returned receiver. Fails when the original consumer is still
+    /// connected (a true concurrent duplicate) or the run cannot serve replay.
+    pub(crate) async fn attach_for_operation(
+        &self,
+        fingerprint: u64,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        if self.is_completed() || self.is_cancel_requested() || self.has_terminal_error() {
+            return Err(live_attach_unavailable_error());
+        }
+        if self.request_fingerprint() != fingerprint {
+            return Err(live_attach_unavailable_error());
+        }
+        let (ack, ready) = oneshot::channel();
+        self.command_tx
+            .send(RunCommand::AttachReplay {
+                ack,
+                expected_fingerprint: fingerprint,
+                fingerprint_source: Arc::clone(&self.request_fingerprint),
+            })
+            .await
+            .map_err(|_| live_attach_unavailable_error())?;
+        match tokio::time::timeout(resume_dispatch_timeout(), ready).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(live_attach_unavailable_error()),
+        }
     }
 
     pub(crate) async fn resume_batch_for_operation(
@@ -4574,6 +4694,7 @@ fn is_local_live_overload(err: &CursorError) -> bool {
     message.contains("cursor live generation concurrency saturated")
         || message.contains("cursor live open concurrency saturated")
         || message.contains("cursor live generation admission queue timed out")
+        || message.contains("cursor live run admission queue timed out")
 }
 
 fn live_open_should_retry_http1(err: &CursorError) -> bool {
@@ -5703,10 +5824,11 @@ impl LiveDeltaCoalescer {
 async fn flush_coalescer(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     coalescer: &mut LiveDeltaCoalescer,
 ) -> bool {
     match coalescer.flush() {
-        Some(event) => emit_or_defer(sink, deferred, event).await,
+        Some(event) => emit_or_defer(sink, deferred, replay, event).await,
         None => true,
     }
 }
@@ -5714,10 +5836,11 @@ async fn flush_coalescer(
 async fn flush_turn_coalescer(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     turn_ctx: Option<&mut LiveTurnCtx<'_>>,
 ) -> bool {
     match turn_ctx {
-        Some(ctx) => flush_coalescer(sink, deferred, ctx.coalescer).await,
+        Some(ctx) => flush_coalescer(sink, deferred, replay, ctx.coalescer).await,
         None => true,
     }
 }
@@ -5725,21 +5848,22 @@ async fn flush_turn_coalescer(
 async fn emit_live_delta(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     event: CursorStreamEvent,
     turn_ctx: Option<&mut LiveTurnCtx<'_>>,
 ) -> bool {
     let Some(ctx) = turn_ctx else {
-        return emit_cursor_or_defer(sink, deferred, event).await;
+        return emit_cursor_or_defer(sink, deferred, replay, event).await;
     };
     if sink.is_none() {
-        return emit_cursor_or_defer(sink, deferred, event).await;
+        return emit_cursor_or_defer(sink, deferred, replay, event).await;
     }
     let remaining = sink.as_ref().map(|tx| tx.capacity()).unwrap_or(0);
     for item in ctx
         .coalescer
         .ingest(Ok(LiveRunEvent::Cursor(event)), remaining)
     {
-        if !emit_or_defer(sink, deferred, item).await {
+        if !emit_or_defer(sink, deferred, replay, item).await {
             return false;
         }
     }
@@ -5869,6 +5993,7 @@ async fn drive_live_run(
     let mut sink = Some(initial_sink);
     let mut pending = PendingExecState::for_run(&run_id);
     let mut deferred = VecDeque::<LiveEventResult>::new();
+    let mut segment_replay = SegmentReplayLog::default();
     let mut decoder = ConnectFrameDecoder::new();
     let mut kv_blobs = seeded_blobs;
     let mut latest_checkpoint = reconnect.opening_checkpoint.clone();
@@ -5885,6 +6010,7 @@ async fn drive_live_run(
     let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
     let mut coalescer = LiveDeltaCoalescer::default();
     let mut decode_failures: u32 = 0;
+    let mut sink_closed_since: Option<Instant> = None;
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
     // 0 is allowed (expose on next select tick). This does NOT gate thinking/
@@ -5979,6 +6105,7 @@ async fn drive_live_run(
                     &outbound,
                     &mut sink,
                     &mut deferred,
+                    &mut segment_replay,
                     &mut pending,
                     &pending_shared,
                     &mut kv_blobs,
@@ -6015,7 +6142,7 @@ async fn drive_live_run(
                 }
             }
             if keep_running && pending.can_expose() && pending.collecting_has_lifecycle() {
-                if !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await {
+                if !expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay).await {
                     keep_running = false;
                 }
             }
@@ -6092,22 +6219,32 @@ async fn drive_live_run(
         }
         // Check before select: Cursor InteractionUpdate.heartbeat / client
         // heartbeats keep the biased upstream/heartbeat arms ready and would
-        // otherwise starve the 250ms closed-sink poll for minutes — leaving a
-        // zombie "already generating" run after Claude Code disconnects.
+        // otherwise starve the closed-sink poll for minutes. When native tools
+        // are outstanding, drop the sink and wait for results. When the
+        // segment is still generating, keep the run for LIVE_ATTACH_ORPHAN_GRACE
+        // so an identical grok-build retry can attach instead of 503-storming.
         if sink.as_ref().is_some_and(mpsc::Sender::is_closed) {
-            // Keep BiDi only when Claude still owes us native tool_results.
             // logical_tools_waiting alone must not pin the session: those are
             // UI hints, not Anthropic-exposed pending tools.
             if pending.is_empty() {
-                report_terminal_error(
-                    &mut sink,
-                    &terminal_error,
-                    "Cursor downstream disconnected before the accepted Run reached a safely observable terminal state; completion is ambiguous".into(),
-                )
-                .await;
-                break 'driver;
+                let since = *sink_closed_since.get_or_insert_with(Instant::now);
+                // Resume probation is fail-closed: the tool results may already
+                // have been accepted. Do not keep the run for attach-replay.
+                if reconnect.recovery.on_probation || since.elapsed() >= LIVE_ATTACH_ORPHAN_GRACE {
+                    report_terminal_error(
+                        &mut sink,
+                        &terminal_error,
+                        "Cursor downstream disconnected before the accepted Run reached a safely observable terminal state; completion is ambiguous".into(),
+                    )
+                    .await;
+                    break 'driver;
+                }
+            } else {
+                sink = None;
+                sink_closed_since = None;
             }
-            sink = None;
+        } else {
+            sink_closed_since = None;
         }
         // Cursor is between downstream Anthropic segments. Keep the resumable
         // BiDi worker alive, but return scarce generation capacity until the
@@ -6192,7 +6329,13 @@ async fn drive_live_run(
                 logical_tools_waiting.clear();
             }
         } else if !wait_for_turn_ended && saw_text && last_progress.elapsed() >= complete_idle {
-            emit_cursor_or_defer(&mut sink, &mut deferred, CursorStreamEvent::End).await;
+            emit_cursor_or_defer(
+                &mut sink,
+                &mut deferred,
+                &mut segment_replay,
+                CursorStreamEvent::End,
+            )
+            .await;
             break 'driver;
         } else if let Some(message) = live_idle_stall_message(
             useful,
@@ -6344,6 +6487,58 @@ async fn drive_live_run(
                         )
                         .await;
                         break 'driver;
+                    }
+                    Some(RunCommand::AttachReplay {
+                        ack,
+                        expected_fingerprint,
+                        fingerprint_source,
+                    }) => {
+                        // Serve an identical retry whose original consumer is
+                        // gone. Reject when the segment moved to a different
+                        // operation, replay fidelity was lost, or the original
+                        // consumer is still reading (true concurrent duplicate).
+                        if fingerprint_source.load(Ordering::Acquire) != expected_fingerprint
+                            || segment_replay.overflowed
+                        {
+                            let _ = ack.send(Err(live_attach_unavailable_error()));
+                            continue;
+                        }
+                        if sink.as_ref().is_some_and(|tx| !tx.is_closed()) {
+                            let _ = ack.send(Err(live_attach_consumer_alive_error()));
+                            continue;
+                        }
+                        let (new_tx, new_rx) = mpsc::channel(
+                            segment_replay.events.len() + LIVE_EVENT_CHANNEL_CAP,
+                        );
+                        for event in &segment_replay.events {
+                            // Capacity covers every replayed event; failure is
+                            // impossible while we hold the receiver in new_rx.
+                            let _ = new_tx.try_send(Ok(event.clone()));
+                        }
+                        // Adopt the new consumer only while this segment is
+                        // still open. A segment that already closed (tool batch
+                        // exposed / turn delivered) is fully reproduced by the
+                        // replay alone; dropping new_tx ends the retry's
+                        // response exactly where the original ended.
+                        if sink.is_some() {
+                            sink = Some(new_tx);
+                        }
+                        crate::logging::create_logger("cursor").info(
+                            "live_attach_replay",
+                            Some(serde_json::Map::from_iter([
+                                (
+                                    "sessionId".into(),
+                                    serde_json::json!(session_id.as_str()),
+                                ),
+                                (
+                                    "replayedEvents".into(),
+                                    serde_json::json!(segment_replay.events.len()),
+                                ),
+                                ("segmentOpen".into(), serde_json::json!(sink.is_some())),
+                            ])),
+                        );
+                        let _ = ack.send(Ok(new_rx));
+                        continue;
                     }
                     Some(RunCommand::ResumeBatch {
                         tool_results,
@@ -6512,6 +6707,7 @@ async fn drive_live_run(
                             continue;
                         }
                         sink = Some(next_sink);
+                        segment_replay.reset();
                         generation_budget.begin_next_segment(hard);
                         segment_count += 1;
                         reconnect.recovery.rebase_probation(Instant::now());
@@ -6732,6 +6928,9 @@ async fn drive_live_run(
                                 &mut useful,
                                 &mut last_progress,
                             );
+                            if let Ok(replayable) = &event {
+                                segment_replay.record(replayable);
+                            }
                             if !send_live_event(&mut sink, event).await {
                                 report_terminal_error(
                                     &mut sink,
@@ -6879,13 +7078,14 @@ async fn drive_live_run(
                             .native_collect_deadline()
                             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                         {
-                            if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                            if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                                 break 'driver;
                             }
                             if !expose_collected_native_tools(
                                 &mut pending,
                                 &pending_shared,
                                 &mut sink,
+                                &mut segment_replay,
                             )
                             .await
                             {
@@ -6896,10 +7096,10 @@ async fn drive_live_run(
                                 .client_only_collect_deadline()
                                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                         {
-                            if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                            if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                                 break 'driver;
                             }
-                            if !expose_collected_tools(&mut pending, &pending_shared, &mut sink)
+                            if !expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay)
                                 .await
                             {
                                 break 'driver;
@@ -6987,6 +7187,7 @@ async fn drive_live_run(
                             &pending_shared,
                             &mut sink,
                             &mut deferred,
+                            &mut segment_replay,
                             allowed_tool_names.as_ref(),
                             &mut saw_text,
                             &mut useful,
@@ -7019,10 +7220,10 @@ async fn drive_live_run(
                                 }
                             }
                             if pending.all_client_only() {
-                                let _ = flush_coalescer(&mut sink, &mut deferred, &mut coalescer)
+                                let _ = flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer)
                                     .await;
                                 let _ =
-                                    expose_collected_tools(&mut pending, &pending_shared, &mut sink)
+                                    expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay)
                                         .await;
                             } else {
                                 report_terminal_error(
@@ -7037,7 +7238,7 @@ async fn drive_live_run(
                             }
                             break 'driver;
                         }
-                        if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                        if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                             break 'driver;
                         }
                         if abrupt_eof_should_error(useful || saw_text) {
@@ -7162,15 +7363,16 @@ async fn drive_live_run(
                     tokio::time::sleep_until(deadline).await;
                 }
             }, if batch_deadline.is_some() => {
-                if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                     break 'driver;
                 }
                 let exposed = if pending.collecting_has_lifecycle()
                     && pending.native_collect_deadline().is_none()
                 {
-                    expose_collected_tools(&mut pending, &pending_shared, &mut sink).await
+                    expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay).await
                 } else {
-                    expose_collected_native_tools(&mut pending, &pending_shared, &mut sink).await
+                    expose_collected_native_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay)
+                        .await
                 };
                 if !exposed {
                     break 'driver;
@@ -7181,7 +7383,7 @@ async fn drive_live_run(
                     tokio::time::sleep_until(deadline).await;
                 }
             }, if coalesce_deadline.is_some() => {
-                if !flush_coalescer(&mut sink, &mut deferred, &mut coalescer).await {
+                if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                     break 'driver;
                 }
             }
@@ -7289,6 +7491,7 @@ async fn process_live_frame(
     outbound: &ClientOutbound,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -7324,6 +7527,7 @@ async fn process_live_frame(
             pending_shared,
             sink,
             deferred,
+            replay,
             allowed_tool_names,
             saw_text,
             useful,
@@ -7333,7 +7537,7 @@ async fn process_live_frame(
         {
             return false;
         }
-        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+        if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
             return false;
         }
         if !pending.is_empty() {
@@ -7352,7 +7556,7 @@ async fn process_live_frame(
                 }
             }
             if pending.all_client_only() {
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                return expose_collected_tools(pending, pending_shared, sink, replay).await;
             }
             report_terminal_error(
                 sink,
@@ -7368,6 +7572,7 @@ async fn process_live_frame(
             saw_text,
             useful,
             sink,
+            replay,
             pending,
             pending_shared,
             terminal_error,
@@ -7385,7 +7590,7 @@ async fn process_live_frame(
         {
             return false;
         }
-        if !emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await {
+        if !emit_cursor_or_defer(sink, deferred, replay, CursorStreamEvent::End).await {
             report_terminal_error(
                 sink,
                 terminal_error,
@@ -7488,7 +7693,7 @@ async fn process_live_frame(
         if let Some(ask) = query.ask_question_interaction_query.as_ref()
             && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
         {
-            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+            if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                 return false;
             }
             pending.queue(
@@ -7505,10 +7710,10 @@ async fn process_live_frame(
             if turn_ctx.is_some() {
                 return true;
             }
-            return expose_collected_tools(pending, pending_shared, sink).await;
+            return expose_collected_tools(pending, pending_shared, sink, replay).await;
         }
         if let Some(exec) = hosted_query_client_only_exec(&query, allowed_tool_names) {
-            if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+            if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                 return false;
             }
             if !pending_has_client_only(pending, &exec) {
@@ -7518,7 +7723,7 @@ async fn process_live_frame(
             *useful = true;
             // Do not auto-approve Cursor hosted search/fetch/plan. Expose
             // immediately: Cursor blocks on InteractionResponse.
-            return expose_collected_tools(pending, pending_shared, sink).await;
+            return expose_collected_tools(pending, pending_shared, sink, replay).await;
         }
         match encode_interaction_auto_response(&query) {
             Ok(Some(reply)) => {
@@ -7642,6 +7847,7 @@ async fn process_live_frame(
             outbound,
             sink,
             deferred,
+            replay,
             pending,
             pending_shared,
             kv_blobs,
@@ -7667,6 +7873,7 @@ async fn process_interaction_update(
     outbound: &ClientOutbound,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -7709,6 +7916,7 @@ async fn process_interaction_update(
                 outbound,
                 sink,
                 deferred,
+                replay,
                 pending,
                 pending_shared,
                 kv_blobs,
@@ -7750,7 +7958,7 @@ async fn process_interaction_update(
                         emit_name, mapped.name
                     );
                 }
-                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
@@ -7760,7 +7968,7 @@ async fn process_interaction_update(
                 *useful = true;
                 *last_progress = Instant::now();
                 if !defer_client_only_exposure {
-                    return expose_collected_tools(pending, pending_shared, sink).await;
+                    return expose_collected_tools(pending, pending_shared, sink, replay).await;
                 }
                 if is_grok_build_subagent_lifecycle_tool(&emit_name) {
                     return true;
@@ -7773,7 +7981,7 @@ async fn process_interaction_update(
                 // Cursor native Task (tag 19) may start a server-side child
                 // before we observe this frame. Expose immediately and drop
                 // the BiDi segment; do not wait for turn_ended.
-                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
@@ -7786,12 +7994,12 @@ async fn process_interaction_update(
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                return expose_collected_tools(pending, pending_shared, sink, replay).await;
             }
             if mapped.name == "AskUserQuestion"
                 && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
             {
-                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
@@ -7801,7 +8009,7 @@ async fn process_interaction_update(
                 *useful = true;
                 *last_progress = Instant::now();
                 if !defer_client_only_exposure {
-                    return expose_collected_tools(pending, pending_shared, sink).await;
+                    return expose_collected_tools(pending, pending_shared, sink, replay).await;
                 }
             }
             if mapped.name == "Glob"
@@ -7813,7 +8021,7 @@ async fn process_interaction_update(
             {
                 // Official ExecServerMessage has no glob_args (0xlane agent_v1).
                 // tool_call_started is the only signal — expose as ClientOnly.
-                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
@@ -7823,14 +8031,14 @@ async fn process_interaction_update(
                 *useful = true;
                 *last_progress = Instant::now();
                 if !defer_client_only_exposure {
-                    return expose_collected_tools(pending, pending_shared, sink).await;
+                    return expose_collected_tools(pending, pending_shared, sink, replay).await;
                 }
             }
             if matches!(mapped.name.as_str(), "TodoWrite" | "TodoRead")
                 && let Some(emit_name) =
                     advertised_hosted_client_name(&mapped.name, allowed_tool_names)
             {
-                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
@@ -7840,7 +8048,7 @@ async fn process_interaction_update(
                 *useful = true;
                 *last_progress = Instant::now();
                 if !defer_client_only_exposure {
-                    return expose_collected_tools(pending, pending_shared, sink).await;
+                    return expose_collected_tools(pending, pending_shared, sink, replay).await;
                 }
             }
             if matches!(
@@ -7855,7 +8063,7 @@ async fn process_interaction_update(
                 // CreatePlan. Expose immediately like Task: Cursor then
                 // sends InteractionQuery and would otherwise block until we
                 // auto-approve the hosted path.
-                if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
@@ -7864,7 +8072,7 @@ async fn process_interaction_update(
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                return expose_collected_tools(pending, pending_shared, sink, replay).await;
             }
         }
         // Native UI transcript only. Execution is driven by ExecServerMessage,
@@ -7885,6 +8093,7 @@ async fn process_interaction_update(
         if !emit_live_delta(
             sink,
             deferred,
+            replay,
             CursorStreamEvent::ThinkingDelta {
                 text: thinking.text,
             },
@@ -7912,6 +8121,7 @@ async fn process_interaction_update(
                     if !emit_live_delta(
                         sink,
                         deferred,
+                        replay,
                         CursorStreamEvent::TextDelta { text: t },
                         turn_ctx.as_deref_mut(),
                     )
@@ -7935,11 +8145,13 @@ async fn process_interaction_update(
                         // driver defers until turn_ended/END/EOF so a trailing
                         // END error cannot be bypassed by closing the sink.
                         pending.queue(exec, Duration::ZERO);
-                        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+                        if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut())
+                            .await
+                        {
                             return false;
                         }
                         if !defer_client_only_exposure
-                            && !expose_collected_tools(pending, pending_shared, sink).await
+                            && !expose_collected_tools(pending, pending_shared, sink, replay).await
                         {
                             return false;
                         }
@@ -7951,12 +8163,13 @@ async fn process_interaction_update(
     if let Some(tokens) = update.token_delta
         && tokens.tokens > 0
     {
-        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+        if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
             return false;
         }
         if !emit_cursor_or_defer(
             sink,
             deferred,
+            replay,
             CursorStreamEvent::OutputTokenDelta {
                 tokens: tokens.tokens as u64,
             },
@@ -7980,6 +8193,7 @@ async fn process_interaction_update(
             pending_shared,
             sink,
             deferred,
+            replay,
             allowed_tool_names,
             saw_text,
             useful,
@@ -7989,7 +8203,7 @@ async fn process_interaction_update(
         {
             return false;
         }
-        if !flush_turn_coalescer(sink, deferred, turn_ctx.as_deref_mut()).await {
+        if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
             return false;
         }
         if !pending.is_empty() {
@@ -8010,7 +8224,7 @@ async fn process_interaction_update(
             if pending.all_client_only() {
                 // Workflow/Skill: expose Anthropic tool_use and end BiDi
                 // unless native execs are still collecting (mixed keep-alive).
-                return expose_collected_tools(pending, pending_shared, sink).await;
+                return expose_collected_tools(pending, pending_shared, sink, replay).await;
             }
             report_terminal_error(
                 sink,
@@ -8027,6 +8241,7 @@ async fn process_interaction_update(
             saw_text,
             useful,
             sink,
+            replay,
             pending,
             pending_shared,
             terminal_error,
@@ -8047,6 +8262,7 @@ async fn process_interaction_update(
         if !emit_cursor_or_defer(
             sink,
             deferred,
+            replay,
             CursorStreamEvent::Usage {
                 input_tokens: turn.input_tokens.unwrap_or(0),
                 // Fable thinking often lands in reasoning_tokens while
@@ -8064,7 +8280,7 @@ async fn process_interaction_update(
         {
             return false;
         }
-        if !emit_cursor_or_defer(sink, deferred, CursorStreamEvent::End).await {
+        if !emit_cursor_or_defer(sink, deferred, replay, CursorStreamEvent::End).await {
             report_terminal_error(
                 sink,
                 terminal_error,
@@ -8089,6 +8305,7 @@ async fn recover_empty_turn_if_needed(
     saw_text: &mut bool,
     useful: &mut bool,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    replay: &mut SegmentReplayLog,
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
@@ -8134,7 +8351,7 @@ async fn recover_empty_turn_if_needed(
         fields.insert("reason".into(), serde_json::json!(reason));
         fields.insert("workflow_name".into(), serde_json::json!(name));
         crate::logging::create_logger("cursor").info("empty_turn_workflow", Some(fields));
-        return expose_collected_tools(pending, pending_shared, sink).await;
+        return expose_collected_tools(pending, pending_shared, sink, replay).await;
     }
     // Never turn a transport/upstream anomaly into assistant-authored text:
     // clients treat any TextDelta + End as success and will not retry.
@@ -8251,18 +8468,20 @@ async fn expose_collected_tools(
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    replay: &mut SegmentReplayLog,
 ) -> bool {
     let exposed = pending.expose();
-    publish_exposed_tools(pending, exposed, pending_shared, sink).await
+    publish_exposed_tools(pending, exposed, pending_shared, sink, replay).await
 }
 
 async fn expose_collected_native_tools(
     pending: &mut PendingExecState,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    replay: &mut SegmentReplayLog,
 ) -> bool {
     let exposed = pending.expose_native();
-    publish_exposed_tools(pending, exposed, pending_shared, sink).await
+    publish_exposed_tools(pending, exposed, pending_shared, sink, replay).await
 }
 
 async fn publish_exposed_tools(
@@ -8270,6 +8489,7 @@ async fn publish_exposed_tools(
     exposed: Vec<PendingCursorExec>,
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    replay: &mut SegmentReplayLog,
 ) -> bool {
     if exposed.is_empty() {
         return true;
@@ -8286,7 +8506,7 @@ async fn publish_exposed_tools(
         })
         .collect();
 
-    let Some(tx) = sink.as_ref() else {
+    let Some(tx) = sink.clone() else {
         return false;
     };
     let permit = match tokio::time::timeout(
@@ -8295,14 +8515,21 @@ async fn publish_exposed_tools(
     )
     .await
     {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) | Err(_) => return false,
+        Ok(Ok(permit)) => Some(permit),
+        // Closed consumer: still expose and record so an identical retry can
+        // attach to the tool-result wait instead of 503-storming.
+        Ok(Err(_)) => None,
+        Err(_) => return false,
     };
     // No await may occur between publishing the matching ids/clock and making
     // the event receivable. This is the result-admission boundary.
     pending.mark_exposed_at(Instant::now());
     *pending_shared.lock().unwrap_or_else(|e| e.into_inner()) = exposed;
-    permit.send(Ok(LiveRunEvent::NativeToolBatch(tools)));
+    let event = LiveRunEvent::NativeToolBatch(tools);
+    replay.record(&event);
+    if let Some(permit) = permit {
+        permit.send(Ok(event));
+    }
     // Closing this sender ends exactly one downstream Anthropic HTTP segment.
     *sink = None;
     // Client-only tools (Workflow/Skill/AskUserQuestion) are fulfilled by Claude
@@ -8324,6 +8551,7 @@ async fn flush_xml_tool_uses(
     pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     allowed_tool_names: Option<&BTreeSet<String>>,
     saw_text: &mut bool,
     useful: &mut bool,
@@ -8336,8 +8564,13 @@ async fn flush_xml_tool_uses(
                 *saw_text = true;
                 *useful = true;
                 *last_progress = Instant::now();
-                if !emit_cursor_or_defer(sink, deferred, CursorStreamEvent::TextDelta { text: t })
-                    .await
+                if !emit_cursor_or_defer(
+                    sink,
+                    deferred,
+                    replay,
+                    CursorStreamEvent::TextDelta { text: t },
+                )
+                .await
                 {
                     return false;
                 }
@@ -8357,7 +8590,7 @@ async fn flush_xml_tool_uses(
         }
     }
     if exposed_client_only {
-        return expose_collected_tools(pending, pending_shared, sink).await;
+        return expose_collected_tools(pending, pending_shared, sink, replay).await;
     }
     true
 }
@@ -8874,9 +9107,10 @@ fn record_segment_progress(
 async fn emit_cursor_or_defer(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     event: CursorStreamEvent,
 ) -> bool {
-    emit_or_defer(sink, deferred, Ok(LiveRunEvent::Cursor(event))).await
+    emit_or_defer(sink, deferred, replay, Ok(LiveRunEvent::Cursor(event))).await
 }
 
 const MAX_DEFERRED_LIVE_EVENTS: usize = 1_024;
@@ -8885,9 +9119,16 @@ const MAX_LIVE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
 async fn emit_or_defer(
     sink: &mut Option<mpsc::Sender<LiveEventResult>>,
     deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
     event: LiveEventResult,
 ) -> bool {
     if sink.is_some() {
+        // Segment content is retained even when the send fails: a closed sink
+        // means the consumer vanished, and an attaching duplicate must still
+        // receive the full segment.
+        if let Ok(event) = &event {
+            replay.record(event);
+        }
         send_live_event(sink, event).await
     } else {
         if deferred.len() >= MAX_DEFERRED_LIVE_EVENTS {
@@ -8924,10 +9165,10 @@ async fn send_live_event(
                     Err(mpsc::error::TrySendError::Full(event)) => {
                         send_live_event_bounded(tx, event).await
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(mpsc::error::TrySendError::Closed(_)) => true,
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => true,
         }
     } else {
         send_live_event_bounded(tx, event).await
@@ -8938,14 +9179,20 @@ async fn send_live_event_bounded(
     tx: &mpsc::Sender<LiveEventResult>,
     event: LiveEventResult,
 ) -> bool {
-    matches!(
-        tokio::time::timeout(
-            Duration::from_secs(env_u64("CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_SECS", 5)),
-            tx.send(event),
-        )
-        .await,
-        Ok(Ok(()))
+    match tokio::time::timeout(
+        Duration::from_secs(env_u64("CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_SECS", 5)),
+        tx.send(event),
     )
+    .await
+    {
+        Ok(Ok(())) => true,
+        // Closed: the consumer vanished. emit_or_defer already recorded the
+        // event for attach-replay; returning false would tear the driver down
+        // before an identical retry can take over. Orphan grace is the loop's
+        // job. A send timeout against a live consumer is still fatal.
+        Ok(Err(_)) => true,
+        Err(_) => false,
+    }
 }
 
 fn apply_live_run_event(encoder: &mut CursorSseEncoder, event: LiveRunEvent) {
@@ -11731,6 +11978,29 @@ mod tests {
         );
     }
 
+    /// Regression: `is_local_live_overload` listed only the *generation*
+    /// admission-queue message, so the *run-gate* queue timeout — a purely
+    /// local wait where nothing was dispatched upstream — matched the broad
+    /// "timed out" ambiguous classifier instead. The client saw a 503 with
+    /// Retry-After, retried as told, and hit a 90s Ambiguous tombstone: the
+    /// same instant-409 storm that hard-stops grok-build.
+    #[test]
+    fn local_run_queue_timeout_is_overload_without_tombstone() {
+        let mut error = CursorError::new(503, "Cursor live run admission queue timed out", None);
+        error.retry_after = Some(local_overload_retry_after());
+
+        assert!(is_local_live_overload(&error));
+        assert!(
+            !live_start_error_seals_tombstone(&error),
+            "a local run-gate queue timeout never crossed Cursor's acceptance boundary, \
+             so it must not seal an ambiguous tombstone"
+        );
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&error),
+            "bounded local queueing must return control to the HTTP client"
+        );
+    }
+
     #[tokio::test]
     async fn resume_admission_uses_capacity_reserved_from_new_starts() {
         let gate = LiveGenerationGate::new(2, 1);
@@ -12258,6 +12528,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let client_only = PendingCursorExec {
             id: 7,
@@ -12318,6 +12589,7 @@ mod tests {
                 &outbound,
                 &mut sink,
                 &mut deferred,
+                &mut segment_replay,
                 &mut pending,
                 &pending_shared,
                 &mut kv_blobs,
@@ -13311,8 +13583,14 @@ mod tests {
 
         let publish = tokio::spawn(async move {
             let mut sink = Some(tx);
-            let published =
-                expose_collected_native_tools(&mut state, &shared_for_task, &mut sink).await;
+            let mut segment_replay = SegmentReplayLog::default();
+            let published = expose_collected_native_tools(
+                &mut state,
+                &shared_for_task,
+                &mut sink,
+                &mut segment_replay,
+            )
+            .await;
             (published, state)
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -13576,7 +13854,14 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
-        let keep_bidi = expose_collected_tools(&mut pending, &pending_shared, &mut sink).await;
+        let mut segment_replay = SegmentReplayLog::default();
+        let keep_bidi = expose_collected_tools(
+            &mut pending,
+            &pending_shared,
+            &mut sink,
+            &mut segment_replay,
+        )
+        .await;
         assert!(
             !keep_bidi,
             "mixed ClientOnly+native must end BiDi so the next POST includes Workflow/Skill results"
@@ -15320,6 +15605,7 @@ mod tests {
         let outbound = ClientOutbound::Bidi(request_tx);
         let mut sink = None;
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -15335,6 +15621,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -15572,6 +15859,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -15589,6 +15877,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -15738,6 +16027,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -15755,6 +16045,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -15843,6 +16134,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -15860,6 +16152,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -15953,6 +16246,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -15970,6 +16264,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -16126,6 +16421,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -16141,6 +16437,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -16602,6 +16899,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -16617,6 +16915,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -16651,7 +16950,13 @@ mod tests {
             }
         }
         assert!(
-            !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await,
+            !expose_collected_tools(
+                &mut pending,
+                &pending_shared,
+                &mut sink,
+                &mut segment_replay
+            )
+            .await,
             "wrapped siblings must tear down as one ClientOnly batch"
         );
         match event_rx.recv().await.expect("NativeToolBatch") {
@@ -16855,6 +17160,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -16870,6 +17176,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -17181,6 +17488,7 @@ mod tests {
             allowed: &BTreeSet<String>,
         ) -> bool {
             let mut deferred = VecDeque::new();
+            let mut segment_replay = SegmentReplayLog::default();
             let mut kv_blobs = HashMap::new();
             let mut latest_checkpoint = None;
             let terminal_error = Arc::new(Mutex::new(None));
@@ -17193,6 +17501,7 @@ mod tests {
                 outbound,
                 sink,
                 &mut deferred,
+                &mut segment_replay,
                 pending,
                 pending_shared,
                 &mut kv_blobs,
@@ -17339,6 +17648,7 @@ mod tests {
         allowed: &BTreeSet<String>,
     ) -> bool {
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut kv_blobs = HashMap::new();
         let mut latest_checkpoint = None;
         let terminal_error = Arc::new(Mutex::new(None));
@@ -17351,6 +17661,7 @@ mod tests {
             outbound,
             sink,
             &mut deferred,
+            &mut segment_replay,
             pending,
             pending_shared,
             &mut kv_blobs,
@@ -17650,6 +17961,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -17667,6 +17979,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -17816,6 +18129,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -17833,6 +18147,7 @@ mod tests {
                 &outbound,
                 &mut sink,
                 &mut deferred,
+                &mut segment_replay,
                 &mut pending,
                 &pending_shared,
                 &mut kv_blobs,
@@ -17854,7 +18169,13 @@ mod tests {
             );
         }
         assert!(
-            !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await,
+            !expose_collected_tools(
+                &mut pending,
+                &pending_shared,
+                &mut sink,
+                &mut segment_replay
+            )
+            .await,
             "lifecycle batch must tear down BiDi after both siblings"
         );
         match event_rx.recv().await.expect("NativeToolBatch") {
@@ -17914,6 +18235,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -17931,6 +18253,7 @@ mod tests {
                 &outbound,
                 &mut sink,
                 &mut deferred,
+                &mut segment_replay,
                 &mut pending,
                 &pending_shared,
                 &mut kv_blobs,
@@ -17960,7 +18283,13 @@ mod tests {
             "XML spawns must not emit a batch until turn_ended"
         );
         assert!(
-            !expose_collected_tools(&mut pending, &pending_shared, &mut sink).await,
+            !expose_collected_tools(
+                &mut pending,
+                &pending_shared,
+                &mut sink,
+                &mut segment_replay
+            )
+            .await,
             "turn_ended flush must tear down BiDi after both XML spawns"
         );
         match event_rx.recv().await.expect("NativeToolBatch") {
@@ -18160,6 +18489,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -18177,6 +18507,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -18231,6 +18562,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -18261,6 +18593,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -18318,6 +18651,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = stale_blobs;
@@ -18347,6 +18681,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -18412,12 +18747,14 @@ mod tests {
         let mut useful = false;
         let mut latest_checkpoint = Some(checkpoint.clone());
         let mut kv_blobs = blobs.clone();
+        let mut segment_replay = SegmentReplayLog::default();
 
         assert!(
             !recover_empty_turn_if_needed(
                 &mut saw_text,
                 &mut useful,
                 &mut sink,
+                &mut segment_replay,
                 &mut pending,
                 &pending_shared,
                 &terminal_error,
@@ -18468,12 +18805,14 @@ mod tests {
         let checkpoint = vec![0x08, 0x01];
         let mut latest_checkpoint = Some(checkpoint.clone());
         let mut kv_blobs = HashMap::new();
+        let mut segment_replay = SegmentReplayLog::default();
 
         assert!(
             !recover_empty_turn_if_needed(
                 &mut saw_text,
                 &mut useful,
                 &mut sink,
+                &mut segment_replay,
                 &mut pending,
                 &pending_shared,
                 &terminal_error,
@@ -18727,6 +19066,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -18744,6 +19084,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -18892,6 +19233,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -18909,6 +19251,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -19004,6 +19347,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -19021,6 +19365,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -19060,6 +19405,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let mut sink = Some(event_tx);
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         let mut pending = PendingExecState::default();
         let pending_shared = Arc::new(Mutex::new(Vec::new()));
         let mut kv_blobs = HashMap::new();
@@ -19092,6 +19438,7 @@ mod tests {
             &outbound,
             &mut sink,
             &mut deferred,
+            &mut segment_replay,
             &mut pending,
             &pending_shared,
             &mut kv_blobs,
@@ -20253,13 +20600,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_driver_terminates_on_disconnect_even_with_heartbeat_flood() {
-        // Regression: Cursor InteractionUpdate.heartbeat used to keep the biased
-        // upstream arm ready forever, starving the closed-sink poll so retries
-        // hit 409 "already generating".
+    async fn live_driver_stays_attachable_on_disconnect_even_with_heartbeat_flood() {
+        // Heartbeats used to starve the closed-sink poll so the driver never
+        // noticed the consumer was gone. They must not prevent AttachReplay,
+        // and they must not pin the slot past orphan grace.
         let (upstream_tx, upstream_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(8);
         let (request_tx, _request_rx) = mpsc::channel(4);
-        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (command_tx, command_rx) = mpsc::channel(4);
         let (initial_sink, initial_events) = mpsc::channel(1);
         drop(initial_events);
         let completed = Arc::new(AtomicBool::new(false));
@@ -20308,23 +20655,34 @@ mod tests {
                 .unwrap();
         }
 
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !completed.load(Ordering::Acquire),
+            "orphan grace must keep the generation attachable through a heartbeat flood"
+        );
+        attach_replay(&command_tx, 7)
+            .await
+            .expect("identical retry attaches during heartbeat flood after SSE drop");
+
+        command_tx
+            .send(RunCommand::Cancel { ack: None })
+            .await
+            .expect("cancel driver");
         tokio::time::timeout(Duration::from_secs(2), driver)
             .await
-            .expect("driver must exit despite heartbeat flood after SSE drop")
+            .expect("cancelled driver")
             .unwrap();
-        assert!(completed.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn live_driver_terminates_when_downstream_segment_is_dropped() {
+    async fn live_driver_keeps_post_drop_deltas_for_attach_replay() {
         let (upstream_tx, upstream_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(2);
         let (request_tx, _request_rx) = mpsc::channel(4);
-        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (command_tx, command_rx) = mpsc::channel(4);
         let (initial_sink, initial_events) = mpsc::channel(1);
         drop(initial_events);
         let completed = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
-        let terminal_error_for_driver = Arc::clone(&terminal_error);
         let upstream_pump = tokio::spawn(std::future::pending::<()>());
         let driver = tokio::spawn(drive_live_run(
             upstream_rx,
@@ -20334,7 +20692,7 @@ mod tests {
             command_rx,
             initial_sink,
             Arc::new(Mutex::new(Vec::new())),
-            terminal_error_for_driver,
+            terminal_error,
             Arc::clone(&completed),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -20347,42 +20705,36 @@ mod tests {
             test_generation_permit(),
         ));
 
-        let mut payload = Vec::new();
-        proto::AgentServerMessage {
-            conversation_checkpoint_update: None,
-            interaction_update: Some(InteractionUpdate {
-                heartbeat: None,
-                text_delta: Some(TextDelta {
-                    text: "this send observes the dropped receiver".into(),
-                }),
-                ..Default::default()
-            }),
-            kv_server_message: None,
-            interaction_query: None,
-            exec_server_message: None,
-        }
-        .encode(&mut payload)
-        .unwrap();
-        upstream_tx
-            .send(Ok(Some(encode_connect_frame(payload, 0))))
-            .await
-            .unwrap();
+        send_text_delta(&upstream_tx, "this send observes the dropped receiver").await;
 
-        tokio::time::timeout(Duration::from_secs(1), driver)
+        let mut attached =
+            tokio::time::timeout(Duration::from_secs(2), attach_replay(&command_tx, 7))
+                .await
+                .expect("driver answered attach")
+                .expect("post-drop delta must remain attachable instead of tearing the run down");
+        let replayed = tokio::time::timeout(Duration::from_secs(2), attached.recv())
             .await
-            .expect("driver remained registered after downstream disconnect")
-            .unwrap();
-        assert!(completed.load(Ordering::Acquire));
-        let terminal = terminal_error
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|outcome| outcome.message.clone())
-            .expect("downstream disconnect must leave an explicit terminal outcome");
+            .expect("replayed delta")
+            .expect("attached stream open")
+            .expect("no error");
         assert!(
-            terminal_error_is_ambiguous_accept(&terminal),
-            "an accepted Run without authoritative completion must not be sealed as success: {terminal}"
+            matches!(
+                &replayed,
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })
+                    if text == "this send observes the dropped receiver"
+            ),
+            "the retry must receive the delta that landed after the original consumer dropped: {replayed:?}"
         );
+        assert!(!completed.load(Ordering::Acquire));
+
+        command_tx
+            .send(RunCommand::Cancel { ack: None })
+            .await
+            .expect("cancel driver");
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("cancelled driver")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -20418,11 +20770,13 @@ mod tests {
     async fn deferred_live_events_are_bounded_between_segments() {
         let mut sink = None;
         let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
         for index in 0..MAX_DEFERRED_LIVE_EVENTS {
             assert!(
                 emit_or_defer(
                     &mut sink,
                     &mut deferred,
+                    &mut segment_replay,
                     Ok(LiveRunEvent::Cursor(CursorStreamEvent::OutputTokenDelta {
                         tokens: index as u64,
                     })),
@@ -20434,6 +20788,7 @@ mod tests {
             !emit_or_defer(
                 &mut sink,
                 &mut deferred,
+                &mut segment_replay,
                 Ok(LiveRunEvent::Cursor(CursorStreamEvent::OutputTokenDelta {
                     tokens: u64::MAX,
                 })),
@@ -20442,5 +20797,259 @@ mod tests {
             "the driver must fail closed instead of growing an unbounded deferred queue"
         );
         assert_eq!(deferred.len(), MAX_DEFERRED_LIVE_EVENTS);
+    }
+
+    /// Harness for the attach-with-replay regression tests: a live driver fed
+    /// through a fake BiDi upstream, returning the handles needed to emit
+    /// frames, receive downstream events, and issue driver commands.
+    struct AttachReplayHarness {
+        upstream_tx: mpsc::Sender<Result<Option<Bytes>, String>>,
+        command_tx: mpsc::Sender<RunCommand>,
+        event_rx: mpsc::Receiver<LiveEventResult>,
+        completed: Arc<AtomicBool>,
+    }
+
+    fn spawn_attach_replay_driver(session: &str) -> AttachReplayHarness {
+        let (upstream_tx, upstream_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(16);
+        let (request_tx, _request_rx) = mpsc::channel(8);
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let completed = Arc::new(AtomicBool::new(false));
+        tokio::spawn(drive_live_run(
+            upstream_rx,
+            upstream_tx.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+            ClientOutbound::Bidi(request_tx),
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&completed),
+            Arc::new(AtomicBool::new(false)),
+            Some(BTreeSet::from(["Read".to_string()])),
+            session.into(),
+            format!("{session}-run"),
+            HashMap::new(),
+            "attach replay prompt".into(),
+            RequestContext::default(),
+            test_reconnect_context(),
+            test_generation_permit(),
+        ));
+        AttachReplayHarness {
+            upstream_tx,
+            command_tx,
+            event_rx,
+            completed,
+        }
+    }
+
+    async fn send_text_delta(
+        upstream_tx: &mpsc::Sender<Result<Option<Bytes>, String>>,
+        text: &str,
+    ) {
+        let mut payload = Vec::new();
+        proto::AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: None,
+                text_delta: Some(TextDelta { text: text.into() }),
+                ..Default::default()
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: None,
+        }
+        .encode(&mut payload)
+        .unwrap();
+        upstream_tx
+            .send(Ok(Some(encode_connect_frame(payload, 0))))
+            .await
+            .unwrap();
+    }
+
+    async fn attach_replay(
+        command_tx: &mpsc::Sender<RunCommand>,
+        fingerprint: u64,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        let (ack, ready) = oneshot::channel();
+        command_tx
+            .send(RunCommand::AttachReplay {
+                ack,
+                expected_fingerprint: fingerprint,
+                fingerprint_source: Arc::new(AtomicU64::new(fingerprint)),
+            })
+            .await
+            .expect("driver accepts commands");
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("driver answers attach")
+            .expect("attach ack not dropped")
+    }
+
+    #[tokio::test]
+    async fn attach_replay_recovers_segment_after_consumer_drop() {
+        // The 503 "already active" wedge: the original consumer vanished
+        // mid-generation and an identical retry must take over the segment
+        // with a full replay instead of bouncing until the run dies.
+        let mut harness = spawn_attach_replay_driver("attach-after-drop");
+        send_text_delta(&harness.upstream_tx, "first chunk").await;
+        let first = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("text delta flushed")
+            .expect("stream open")
+            .expect("no error");
+        assert!(matches!(
+            &first,
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) if text == "first chunk"
+        ));
+        drop(harness.event_rx);
+
+        let mut attached = attach_replay(&harness.command_tx, 7)
+            .await
+            .expect("identical retry attaches once the original consumer is gone");
+        let replayed = tokio::time::timeout(Duration::from_secs(2), attached.recv())
+            .await
+            .expect("replayed prefix arrives")
+            .expect("attached stream open")
+            .expect("no error");
+        assert!(
+            matches!(
+                &replayed,
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) if text == "first chunk"
+            ),
+            "the attached retry must receive the already-delivered prefix: {replayed:?}"
+        );
+
+        // The attached channel is adopted as the live sink: later upstream
+        // deltas continue on it.
+        send_text_delta(&harness.upstream_tx, "second chunk").await;
+        let live = tokio::time::timeout(Duration::from_secs(2), attached.recv())
+            .await
+            .expect("live continuation arrives")
+            .expect("attached stream still open")
+            .expect("no error");
+        assert!(
+            matches!(
+                &live,
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) if text == "second chunk"
+            ),
+            "the attached retry must keep streaming the rest of the segment: {live:?}"
+        );
+        assert!(!harness.completed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn attach_replay_rejects_while_original_consumer_is_alive() {
+        // A true concurrent duplicate (same fingerprint, original consumer
+        // still reading) must stay a busy error, not steal the stream.
+        let mut harness = spawn_attach_replay_driver("attach-while-alive");
+        send_text_delta(&harness.upstream_tx, "held by the original consumer").await;
+        let _first = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("text delta flushed")
+            .expect("stream open")
+            .expect("no error");
+
+        let error = attach_replay(&harness.command_tx, 7)
+            .await
+            .expect_err("a live original consumer must reject the duplicate");
+        assert_eq!(error.status, 503);
+    }
+
+    #[tokio::test]
+    async fn attach_replay_reproduces_exposed_native_tool_batch() {
+        // Segment already closed by a NativeToolBatch handoff (the exact state
+        // from the grok-build 503 storms: run Running, waiting on tool
+        // results, retry same fingerprint). Replay must reproduce the batch
+        // and end the attached stream exactly where the original ended.
+        let mut harness = spawn_attach_replay_driver("attach-tool-batch");
+        let mut payload = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_message: Some(ExecServerMessage {
+                id: 1,
+                exec_id: Some("read-exec".into()),
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/input.txt".into(),
+                    tool_call_id: "read-call".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .unwrap();
+        harness
+            .upstream_tx
+            .send(Ok(Some(encode_connect_frame(payload, 0))))
+            .await
+            .unwrap();
+        let original = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("native tool exposed")
+            .expect("stream open")
+            .expect("no error");
+        let LiveRunEvent::NativeToolBatch(original_tools) = original else {
+            panic!("expected native tool batch, got {original:?}");
+        };
+        assert!(!harness.completed.load(Ordering::Acquire));
+
+        let mut attached = attach_replay(&harness.command_tx, 7)
+            .await
+            .expect("retry attaches to the tool-result wait state");
+        let replayed = tokio::time::timeout(Duration::from_secs(2), attached.recv())
+            .await
+            .expect("replayed batch arrives")
+            .expect("attached stream open")
+            .expect("no error");
+        let LiveRunEvent::NativeToolBatch(replayed_tools) = replayed else {
+            panic!("expected replayed native tool batch, got {replayed:?}");
+        };
+        assert_eq!(replayed_tools.len(), original_tools.len());
+        assert_eq!(replayed_tools[0].tool_use_id, original_tools[0].tool_use_id);
+        assert_eq!(replayed_tools[0].name, original_tools[0].name);
+        // The segment closed at the batch; the attached stream must end there
+        // too so the retry's HTTP response terminates like the original.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), attached.recv())
+                .await
+                .expect("attached stream must close after replaying a closed segment")
+                .is_none(),
+            "no events may follow the replayed segment boundary"
+        );
+        assert!(
+            !harness.completed.load(Ordering::Acquire),
+            "the run must stay resumable for tool results after an attach"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_replay_rejects_fingerprint_mismatch() {
+        let mut harness = spawn_attach_replay_driver("attach-wrong-op");
+        send_text_delta(&harness.upstream_tx, "belongs to another operation").await;
+        let _first = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("text delta flushed")
+            .expect("stream open")
+            .expect("no error");
+        drop(harness.event_rx);
+
+        let (ack, ready) = oneshot::channel();
+        harness
+            .command_tx
+            .send(RunCommand::AttachReplay {
+                ack,
+                expected_fingerprint: 7,
+                fingerprint_source: Arc::new(AtomicU64::new(8)),
+            })
+            .await
+            .expect("driver accepts commands");
+        let error = tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("driver answers attach")
+            .expect("attach ack not dropped")
+            .expect_err("a different operation must not receive this segment");
+        assert_eq!(error.status, 503);
     }
 }

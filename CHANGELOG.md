@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.64 (2026-08-22)
+
+- Attach an identical retry (same operation fingerprint) to the in-flight Cursor live run instead of returning `503 A Cursor live run is already active for this session` until that run dies. The driver keeps a bounded per-segment replay log, replays it to the new consumer, and continues the live stream when the original HTTP client has disconnected. A still-connected original consumer is still busy; a 30-second orphan grace then fail-closes so heartbeats cannot pin the slot forever. This is the grok-build wedge that produced 0-output sessions with 30 consecutive 503s.
+
 ## v0.1.63 (2026-08-22)
 
 - Stop sealing a 90-second Ambiguous tombstone when a live run stalls with heartbeats flowing but zero delivered output. A hollow run (no client-visible text, no pending tools) now rotates onto a fresh Cursor conversation and is retried in place — the same rule the resume-probation path already applied — instead of terminating as `produced no useful progress; … completion is ambiguous`. That tombstone made every overlapping grok-build retry fail instantly with `Cursor live run acceptance is ambiguous; retrying could duplicate execution` (409) until the CLI aborted the whole agent, which is exactly the 2026-08-21 incident where upstream TLS connections were killed and the reconnected streams went heartbeat-only. Runs that already delivered text keep the fail-closed 409.
