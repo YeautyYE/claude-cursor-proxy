@@ -191,10 +191,59 @@ async fn healthz() -> Json<serde_json::Value> {
 ///
 /// Cursor fable-family ids are rewritten through [`anthropic_list_model_id`] so
 /// Claude Code sees a `[1m]` marker (1M context) on this surface.
+fn parse_advertised_models(raw: &str) -> Option<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let models: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .filter_map(|model| {
+            let model = model.to_string();
+            seen.insert(model.clone()).then_some(model)
+        })
+        .collect();
+    (!models.is_empty()).then_some(models)
+}
+
+fn configured_advertised_models() -> Option<Vec<String>> {
+    std::env::var("CCP_ADVERTISED_MODELS")
+        .ok()
+        .and_then(|raw| parse_advertised_models(&raw))
+}
+
+fn advertised_surface_model(id: &str, provider: &str) -> String {
+    if provider == "cursor" {
+        crate::providers::cursor::model::anthropic_list_model_id(id)
+    } else {
+        id.to_string()
+    }
+}
+
 async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     use crate::providers::cursor::model::{
         anthropic_list_model_id, cursor_anthropic_surface_models,
     };
+
+    // A Claude-only deployment can expose a small, verified picker surface
+    // while retaining the proxy's full internal routing catalog.
+    if let Some(models) = configured_advertised_models() {
+        let data: Vec<Value> = models
+            .into_iter()
+            .map(|id| {
+                let provider = state
+                    .registry
+                    .provider_for_model(&id, None)
+                    .map(|provider| provider.name().to_string())
+                    .unwrap_or_else(|| "configured".to_string());
+                let surface = advertised_surface_model(&id, &provider);
+                crate::openai::catalog_model(&surface, &provider)
+            })
+            .collect();
+        return Json(json!({
+            "object": "list",
+            "data": data,
+        }));
+    }
 
     let mut seen = std::collections::BTreeSet::new();
     let mut data: Vec<Value> = Vec::new();
@@ -1521,6 +1570,16 @@ fn derive_fallback_session_id_from_responses(
 }
 
 fn hash_fallback_session(user_id: &str, cwd: &str, first_user: &str) -> String {
+    // Claude Desktop gateway health probes omit the session header, metadata,
+    // working directory, and user content. A deterministic hash for that fully
+    // empty identity makes every probe share one Cursor live slot; a cancelled
+    // probe can then poison later checks with "live run is already active".
+    // Preserve stable hashing for real headerless conversations, but isolate
+    // context-free probes per request.
+    let is_desktop_probe = first_user.is_empty() || first_user == ".";
+    if user_id.is_empty() && cwd.is_empty() && is_desktop_probe {
+        return format!("ccp-probe-{}", Uuid::new_v4().simple());
+    }
     let mut hasher = Sha256::new();
     hasher.update(user_id.as_bytes());
     hasher.update([0]);
@@ -1735,9 +1794,9 @@ fn set_mode(path: &Path, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_code_headers_from, derive_fallback_session_id, enable_accepted_tcp_nodelay,
-        resolve_responses_session_id, resolve_session_id, session_id_from_headers,
-        wrap_anthropic_as_responses,
+        advertised_surface_model, claude_code_headers_from, derive_fallback_session_id,
+        enable_accepted_tcp_nodelay, parse_advertised_models, resolve_responses_session_id,
+        resolve_session_id, session_id_from_headers, wrap_anthropic_as_responses,
     };
     use crate::anthropic::error::json_error;
     use crate::anthropic::schema::MessagesRequest;
@@ -2004,6 +2063,49 @@ mod tests {
         let resolved = resolve_session_id(None, &empty);
         assert!(resolved.fallback);
         assert!(!resolved.session_id.is_empty());
+        assert!(resolved.session_id.starts_with("ccp-probe-"));
+
+        let next = resolve_session_id(None, &empty);
+        assert_ne!(
+            resolved.session_id, next.session_id,
+            "context-free desktop probes must not share a Cursor live slot"
+        );
+
+        let desktop_probe = body_from(json!({
+            "model": "haiku",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "."}]
+        }));
+        let first_probe = resolve_session_id(None, &desktop_probe);
+        let second_probe = resolve_session_id(None, &desktop_probe);
+        assert!(first_probe.session_id.starts_with("ccp-probe-"));
+        assert_ne!(
+            first_probe.session_id, second_probe.session_id,
+            "Claude Desktop's literal dot health probes must be isolated"
+        );
+    }
+
+    #[test]
+    fn configured_advertised_models_are_trimmed_and_deduplicated() {
+        assert_eq!(
+            parse_advertised_models(
+                " claude-opus-4-7,claude-opus-4-8,claude-opus-4-7, claude-opus-5 ",
+            ),
+            Some(vec![
+                "claude-opus-4-7".to_string(),
+                "claude-opus-4-8".to_string(),
+                "claude-opus-5".to_string(),
+            ])
+        );
+        assert_eq!(parse_advertised_models(" , , "), None);
+        assert_eq!(
+            advertised_surface_model("fable", "cursor"),
+            "claude-fable-5[1m]"
+        );
+        assert_eq!(
+            advertised_surface_model("gpt-5.6-sol", "codex"),
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]

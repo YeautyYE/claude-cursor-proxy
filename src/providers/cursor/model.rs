@@ -9,6 +9,11 @@
 //! - `cursor-agent:` is also supported for agent mode routing.
 
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-opus-5-thinking-high",
+    "claude-sonnet-5",
     "cursor",
     "cursor-agent",
     "cursor-composer",
@@ -44,6 +49,14 @@ impl CursorAgentMode {
             CursorAgentMode::Plan => 3,  // AGENT_MODE_PLAN
         }
     }
+}
+
+fn cursor_haiku_model_id(configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("claude-haiku-4-5")
+        .to_string()
 }
 
 /// Apply grok-build / Anthropic `output_config.effort` onto a Cursor model id.
@@ -149,15 +162,35 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             model_id: "claude-fable-5-thinking-max".to_string(),
             mode: CursorAgentMode::Agent,
         }),
-        "haiku" => Ok(CursorModelResolution {
-            model_id: "claude-haiku-4-5".to_string(),
+        // Claude Desktop probes the Haiku alias even when another model is
+        // selected. Some Cursor pools do not expose Haiku, so deployments may
+        // route the probe to another usable catalog id without changing the
+        // public Anthropic alias.
+        "haiku" | "claude-haiku-4-5" | "claude-haiku-4-5-20251001" => Ok(CursorModelResolution {
+            model_id: cursor_haiku_model_id(
+                std::env::var("CCP_CURSOR_HAIKU_MODEL").ok().as_deref(),
+            ),
             mode: CursorAgentMode::Agent,
         }),
         "sonnet" | "claude-sonnet-5" => Ok(CursorModelResolution {
             model_id: "claude-sonnet-5-high".to_string(),
             mode: CursorAgentMode::Agent,
         }),
-        "opus" => Ok(CursorModelResolution {
+        // Claude Desktop sends the canonical Anthropic id and ignores local
+        // modelOverrides when the desktop host manages the provider. Cursor's
+        // catalog requires an explicit reasoning tier for Opus 5.
+        "claude-opus-5" => Ok(CursorModelResolution {
+            model_id: "claude-opus-5-thinking-high".to_string(),
+            mode: CursorAgentMode::Agent,
+        }),
+        // Cursor advertises canonical family ids for discovery, but live runs
+        // require an explicit effort tier. Keep the public ids concise while
+        // routing them to the verified high-effort catalog entries.
+        "claude-opus-4-7" => Ok(CursorModelResolution {
+            model_id: "claude-opus-4-7-high".to_string(),
+            mode: CursorAgentMode::Agent,
+        }),
+        "opus" | "claude-opus-4-8" => Ok(CursorModelResolution {
             model_id: "claude-opus-4-8-high".to_string(),
             mode: CursorAgentMode::Agent,
         }),
@@ -486,6 +519,12 @@ mod tests {
 
     #[test]
     fn resolve_anthropic_aliases_for_cursor_alias_provider() {
+        assert_eq!(cursor_haiku_model_id(None), "claude-haiku-4-5");
+        assert_eq!(
+            cursor_haiku_model_id(Some(" claude-opus-5-thinking-high ")),
+            "claude-opus-5-thinking-high"
+        );
+
         let r = resolve_cursor_model("fable").unwrap();
         assert_eq!(r.model_id, "claude-fable-5-thinking-max");
         assert_eq!(r.mode, CursorAgentMode::Agent);
@@ -498,6 +537,18 @@ mod tests {
 
         let r = resolve_cursor_model("haiku").unwrap();
         assert_eq!(r.model_id, "claude-haiku-4-5");
+
+        let r = resolve_cursor_model("claude-haiku-4-5").unwrap();
+        assert_eq!(r.model_id, "claude-haiku-4-5");
+
+        let r = resolve_cursor_model("claude-opus-5").unwrap();
+        assert_eq!(r.model_id, "claude-opus-5-thinking-high");
+
+        let r = resolve_cursor_model("claude-opus-4-7").unwrap();
+        assert_eq!(r.model_id, "claude-opus-4-7-high");
+
+        let r = resolve_cursor_model("claude-opus-4-8").unwrap();
+        assert_eq!(r.model_id, "claude-opus-4-8-high");
     }
 
     #[test]
@@ -550,6 +601,8 @@ mod tests {
     #[test]
     fn anthropic_surface_models_advertise_fable_1m() {
         let models = cursor_anthropic_surface_models();
+        assert!(models.iter().any(|m| m == "claude-opus-5"));
+        assert!(models.iter().any(|m| m == "claude-opus-5-thinking-high"));
         assert!(
             models.iter().any(|m| m == "claude-fable-5[1m]"),
             "missing claude-fable-5[1m] in {models:?}"

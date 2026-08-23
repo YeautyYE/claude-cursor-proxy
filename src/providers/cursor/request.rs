@@ -1,4 +1,5 @@
 use crate::anthropic::schema::{Message, MessagesRequest};
+use base64::Engine as _;
 
 /// A selected image extracted from the request content blocks.
 #[derive(Debug, Clone)]
@@ -1217,6 +1218,12 @@ fn collect_image_blocks(
         if data.trim().is_empty() {
             return;
         }
+        if base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .is_err()
+        {
+            return;
+        }
         let media_type = source
             .get("media_type")
             .and_then(|m| m.as_str())
@@ -2322,7 +2329,7 @@ mod tests {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "look"},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "NEWIMG"}}
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "TkVXSU1H"}}
                     ]
                 }
             ]
@@ -2330,7 +2337,7 @@ mod tests {
         .unwrap();
         let images = cursor_selected_images(&req);
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].data, "NEWIMG");
+        assert_eq!(images[0].data, "TkVXSU1H");
     }
 
     #[test]
@@ -2349,6 +2356,21 @@ mod tests {
         let images = cursor_selected_images(&req);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "REAL");
+    }
+
+    #[test]
+    fn selected_images_skip_invalid_base64() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not base64!"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(cursor_selected_images(&req).is_empty());
     }
 
     #[test]
