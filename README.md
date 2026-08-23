@@ -86,6 +86,22 @@ claude-cursor-proxy serve --no-monitor    # logs only
 claude-cursor-proxy serve --port 11435    # custom port
 ```
 
+#### Hot account switch (no restart)
+
+Run `claude-cursor-proxy cursor auth login` in another terminal while `serve`
+is running. Credentials are re-read from the store on every request, so:
+
+- new requests use the new account immediately;
+- in-flight runs keep the token they captured at start and finish on the
+  previous login — nothing is interrupted;
+- existing sessions start a fresh Cursor conversation on their next turn
+  (the client resends its history automatically).
+
+`cursor auth status` shows the active account. Note: if
+`CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN` is set in the `serve` process's
+environment, the env token shadows the store and a login hot swap will not
+take effect until you unset it.
+
 ### Point Claude Code at the proxy (Fable 5)
 
 ```bash

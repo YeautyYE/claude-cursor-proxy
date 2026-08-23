@@ -74,8 +74,11 @@ use crate::providers::cursor::tool_bridge::{
 // Provider
 // ---------------------------------------------------------------------------
 
-const CURSOR_HTTP_SHARDS_DEFAULT: usize = 4;
-const CURSOR_HTTP_SHARDS_MAX: usize = 16;
+// Sized for ~2000 concurrent live runs (4 windows x 512 agents): 16 shards
+// keep per-connection H2 stream depth near typical server limits while
+// bounding TLS handshakes. Tune with CCP_CURSOR_H2_SHARDS.
+const CURSOR_HTTP_SHARDS_DEFAULT: usize = 16;
+const CURSOR_HTTP_SHARDS_MAX: usize = 64;
 
 struct SharedCursorHttpClients {
     base_url: String,
@@ -375,15 +378,16 @@ fn live_run_busy_error() -> CursorError {
 /// Serve the retained final segment of an already-completed identical
 /// operation: exactly-once delivery for a client that never received the
 /// original response (crash, timeout, dropped connection).
+///
+/// Replays lazily through a small bounded channel: cloning the whole segment
+/// upfront multiplied a large replay by every concurrent duplicate (a 113-wide
+/// retry burst of an 8 MiB replay would allocate ~900 MiB).
 fn replay_completed_turn_channel(
     session_id: &str,
-    events: &[LiveRunEvent],
+    events: &Arc<Vec<LiveRunEvent>>,
 ) -> mpsc::Receiver<LiveEventResult> {
-    let (tx, rx) = mpsc::channel(events.len().max(1));
-    for event in events {
-        // Capacity covers every event; we still hold the receiver.
-        let _ = tx.try_send(Ok(event.clone()));
-    }
+    const REPLAY_CHANNEL_CAP: usize = 32;
+    let (tx, rx) = mpsc::channel(REPLAY_CHANNEL_CAP.min(events.len().max(1)));
     create_logger("cursor").info(
         "live_replay_completed_turn",
         Some(serde_json::Map::from_iter([
@@ -391,6 +395,16 @@ fn replay_completed_turn_channel(
             ("replayedEvents".into(), serde_json::json!(events.len())),
         ])),
     );
+    let events = Arc::clone(events);
+    tokio::spawn(async move {
+        for event in events.iter() {
+            if tx.send(Ok(event.clone())).await.is_err() {
+                // Receiver dropped mid-replay; the tombstone still holds the
+                // segment for the next identical retry.
+                return;
+            }
+        }
+    });
     rx
 }
 
@@ -400,6 +414,43 @@ fn live_ambiguous_accept_error() -> CursorError {
         "Cursor live run acceptance is ambiguous; retrying could duplicate execution",
         None,
     )
+}
+
+/// Hot account switch failover budget per request. One swap covers the normal
+/// old-account -> new-account case; a second tolerates a rapid double switch.
+const MAX_ACCOUNT_FAILOVER_SWAPS: u32 = 2;
+
+/// 401-recovery refresh off the async workers: the refresh HTTP call is
+/// blocking (single-flighted in auth.rs), so run it on the blocking pool.
+async fn force_refresh_cursor_auth_async(
+    failed_access_token: String,
+) -> anyhow::Result<Option<crate::providers::cursor::auth::CursorAuth>> {
+    match tokio::task::spawn_blocking(move || force_refresh_cursor_auth(Some(&failed_access_token)))
+        .await
+    {
+        Ok(result) => result,
+        Err(join) => Err(anyhow::anyhow!("Cursor auth refresh task failed: {join}")),
+    }
+}
+
+/// After a hot account switch (`cursor auth login` while serve runs), a
+/// request that started on the previous login and hit an account-bound 429
+/// fails over to the newly stored credentials instead of surfacing the old
+/// account's limit. Returns the replacement token only when the store now
+/// holds a different one.
+fn account_switch_replacement_token(current_token: &str) -> Option<String> {
+    let auth = load_cursor_auth().ok().flatten()?;
+    if auth.access_token == current_token {
+        return None;
+    }
+    create_logger("cursor").info(
+        "live_account_failover",
+        Some(serde_json::Map::from_iter([(
+            "email".into(),
+            serde_json::json!(auth.email.as_deref().unwrap_or("unknown")),
+        )])),
+    );
+    Some(auth.access_token)
 }
 
 fn live_replacement_conflict_error(has_tool_results: bool) -> CursorError {
@@ -432,6 +483,7 @@ async fn start_live_events_with_retries(
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
+    let mut account_swaps = 0_u32;
     loop {
         // Local admission strictly precedes the session-slot claim. A start
         // that is only queued for local capacity must stay invisible to
@@ -460,14 +512,42 @@ async fn start_live_events_with_retries(
                     LiveSlotClaim::CompletedReplay(events) => {
                         return Ok(replay_completed_turn_channel(identity.session_id, &events));
                     }
+                    LiveSlotClaim::CompletedNoReplay => {
+                        // The identical operation already completed but its
+                        // response is no longer replayable. Retryable-busy
+                        // here would invite the client to retry until the
+                        // tombstone expires and then silently re-execute the
+                        // turn. Fail closed instead.
+                        return Err(CursorError::new(
+                            409,
+                            "Cursor operation already completed; response no longer replayable. Refusing duplicate execution",
+                            None,
+                        ));
+                    }
                     LiveSlotClaim::Running => {
                         if let Some(run) =
                             LiveRunRegistry::get_run(identity.session_id, identity.agent_id)
-                            && run.request_fingerprint() == operation_fingerprint
-                            && let Ok(events) =
-                                run.attach_for_operation(operation_fingerprint).await
                         {
-                            return Ok(events);
+                            if run.request_fingerprint() == operation_fingerprint
+                                && let Ok(events) =
+                                    run.attach_for_operation(operation_fingerprint).await
+                            {
+                                return Ok(events);
+                            }
+                            // A different operation while the previous run's
+                            // consumer vanished: the client moved on (ESC +
+                            // new message). Supersede the orphan instead of
+                            // busy-bouncing until it finishes generating.
+                            if run.request_fingerprint() != operation_fingerprint
+                                && run.is_consumer_gone()
+                                && !run.has_pending_execs()
+                                && let Some(reservation) = LiveRunRegistry::supersede_run(
+                                    identity.session_id,
+                                    identity.agent_id,
+                                )
+                            {
+                                break Some(reservation);
+                            }
                         }
                         return Err(live_run_busy_error());
                     }
@@ -534,29 +614,31 @@ async fn start_live_events_with_retries(
             .await
         {
             Ok(start) => Ok(start),
-            Err(error) if error.status == 401 && has_refresh => match force_refresh_cursor_auth() {
-                Ok(Some(refreshed)) => {
-                    token = refreshed.access_token;
-                    client
-                        .start_live_agent_with_identity_guarded(
-                            &token,
-                            user_text,
-                            model,
-                            images,
-                            custom_system,
-                            identity,
-                            allowed.clone(),
-                            mcp_tools.clone(),
-                            request_context.clone(),
-                            Some(&original_request_id),
-                            Some(reservation.cancelled()),
-                            Some(upstream_open_guard),
-                            None,
-                        )
-                        .await
+            Err(error) if error.status == 401 && has_refresh => {
+                match force_refresh_cursor_auth_async(token.clone()).await {
+                    Ok(Some(refreshed)) => {
+                        token = refreshed.access_token;
+                        client
+                            .start_live_agent_with_identity_guarded(
+                                &token,
+                                user_text,
+                                model,
+                                images,
+                                custom_system,
+                                identity,
+                                allowed.clone(),
+                                mcp_tools.clone(),
+                                request_context.clone(),
+                                Some(&original_request_id),
+                                Some(reservation.cancelled()),
+                                Some(upstream_open_guard),
+                                None,
+                            )
+                            .await
+                    }
+                    _ => Err(error),
                 }
-                _ => Err(error),
-            },
+            }
             Err(error) => Err(error),
         };
 
@@ -572,6 +654,21 @@ async fn start_live_events_with_retries(
                     LiveStartPeek::Retryable(error) => {
                         let _ = start.handle.cancel_and_wait().await;
                         let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
+                        if crate::retry::is_policy_rate_limit(&error) {
+                            // Account-bound 429: same-login retries cannot
+                            // succeed. Fail over to newly stored credentials
+                            // after a hot account switch, else pass through.
+                            if account_swaps < MAX_ACCOUNT_FAILOVER_SWAPS
+                                && let Some(replacement) = account_switch_replacement_token(&token)
+                            {
+                                token = replacement;
+                                account_swaps += 1;
+                                transient_retries = 0;
+                                continue;
+                            }
+                            let status = crate::retry::classify_proxy_error_status(502, &error);
+                            return Err(CursorError::new(status, error, None));
+                        }
                         if transient_retries >= crate::retry::MAX_RATE_LIMIT_RETRIES {
                             return Err(CursorError::internal(error));
                         }
@@ -583,6 +680,18 @@ async fn start_live_events_with_retries(
                 }
             }
             Err(error) => {
+                let policy_limited = crate::retry::is_policy_rate_limit(&error.client_message())
+                    || crate::retry::is_policy_rate_limit(&error.message);
+                if policy_limited
+                    && account_swaps < MAX_ACCOUNT_FAILOVER_SWAPS
+                    && let Some(replacement) = account_switch_replacement_token(&token)
+                {
+                    reservation.release();
+                    token = replacement;
+                    account_swaps += 1;
+                    transient_retries = 0;
+                    continue;
+                }
                 let retryable = transient_retries < crate::retry::MAX_RATE_LIMIT_RETRIES
                     && cursor_start_error_is_same_request_retryable(&error);
                 if retryable {
@@ -669,8 +778,12 @@ async fn peek_live_start_for_stale_reset(
 ) -> LiveStartPeek {
     let wait = Duration::from_millis(env_u64_millis("CCP_CURSOR_STALE_CONV_PEEK_MS", 2_000));
     match tokio::time::timeout(wait, events.recv()).await {
+        // Policy 429s are routed as Retryable so the start loop can fail over
+        // to newly stored credentials after a hot account switch; without a
+        // switch the loop passes them through verbatim instead of retrying.
         Ok(Some(Err(error)))
-            if live_error_is_same_request_retryable(&error)
+            if (live_error_is_same_request_retryable(&error)
+                || crate::retry::is_policy_rate_limit(&error))
                 && !live_error_is_empty_turn_retry(&error) =>
         {
             LiveStartPeek::Retryable(error)
@@ -828,7 +941,13 @@ async fn forward_live_events_with_retries<F, Fut>(
         tokio::pin!(pump);
         let outcome = tokio::select! {
             _ = tx.closed() => {
-                LiveRunRegistry::cancel_run(session_id, agent_id);
+                // Downstream disconnected. Do NOT destructively cancel: that
+                // frees the slot before the upstream Run acknowledges and
+                // seals ambiguous tombstones that 409 the client's retry.
+                // Dropping the receiver lets the driver observe the closed
+                // sink and run the orphan path — an identical retry attaches
+                // or gets the completed turn replayed; a different request
+                // supersedes the orphan.
                 return;
             }
             _ = wait_for_optional_deadline(empty_turn_deadline) => {
@@ -847,7 +966,7 @@ async fn forward_live_events_with_retries<F, Fut>(
         };
         match outcome {
             LivePumpOutcome::ClientGone => {
-                LiveRunRegistry::cancel_run(session_id, agent_id);
+                // Same as tx.closed above: leave the run to the orphan path.
                 return;
             }
             LivePumpOutcome::Retry(error) => {
@@ -891,7 +1010,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                         LiveRunProbe::Occupied if Instant::now() < slot_deadline => {
                             tokio::select! {
                                 _ = tx.closed() => {
-                                    LiveRunRegistry::cancel_run(session_id, agent_id);
+                                    // Disconnect: leave the run to the orphan path.
                                     return;
                                 }
                                 _ = wait_for_optional_deadline(empty_turn_deadline) => {
@@ -918,7 +1037,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                 let wait = same_request_retry_wait_ms(retry_index, &error);
                 tokio::select! {
                     _ = tx.closed() => {
-                        LiveRunRegistry::cancel_run(session_id, agent_id);
+                        // Disconnect: leave the run to the orphan path.
                         return;
                     }
                     _ = wait_for_optional_deadline(empty_turn_deadline) => {
@@ -942,7 +1061,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                 tokio::pin!(start);
                 events = match tokio::select! {
                     _ = tx.closed() => {
-                        LiveRunRegistry::cancel_run(session_id, agent_id);
+                        // Disconnect: leave the run to the orphan path.
                         return;
                     }
                     _ = wait_for_optional_deadline(empty_turn_deadline) => {
@@ -987,7 +1106,10 @@ fn spawn_live_events_with_late_retries(
                 tokio::pin!(first);
                 match tokio::select! {
                     _ = tx.closed() => {
-                        LiveRunRegistry::cancel_run(&session_id, agent_id.as_deref());
+                        // Disconnect while starting: dropping the start future
+                        // aborts a pre-accept open via the reservation's cancel
+                        // watch; an already-accepted Run stays owned by its
+                        // driver and the orphan path (attach/replay/supersede).
                         return;
                     }
                     result = &mut first => result,
@@ -1207,7 +1329,10 @@ enum LiveResumeOutcome {
     ResumeError(CursorError),
     SupersedeRunning(String),
     Conflict,
-    Free,
+    /// Slot is free for a fresh start. Carries the reservation when a
+    /// Succeeded tombstone was atomically released+reclaimed, so no other
+    /// request can slip into the gap.
+    Free(Option<LiveRunReservation>),
 }
 
 fn unresolved_live_tools_outcome(
@@ -1250,12 +1375,19 @@ fn resume_when_slot_has_no_runnable_handle(
             session_id, &events,
         )));
     }
-    LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
+    // Atomic release+reserve of a different-operation Succeeded tombstone:
+    // the freed slot is claimed under the same lock, so a concurrent identical
+    // retry of the OLD operation can never start a duplicate Run in between.
+    if let Some(reservation) =
+        LiveRunRegistry::claim_success_release_for_new_operation(session_id, agent_id, fingerprint)
+    {
+        return Some(LiveResumeOutcome::Free(Some(reservation)));
+    }
     if !LiveRunRegistry::is_occupied_run(session_id, agent_id) {
         if let Some(run_id) = observed_run_id {
             return Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()));
         }
-        return Some(LiveResumeOutcome::Free);
+        return Some(LiveResumeOutcome::Free(None));
     }
     match LiveRunRegistry::probe_run(session_id, agent_id) {
         LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
@@ -1265,14 +1397,14 @@ fn resume_when_slot_has_no_runnable_handle(
             if let Some(run_id) = observed_run_id {
                 Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
             } else {
-                Some(LiveResumeOutcome::Free)
+                Some(LiveResumeOutcome::Free(None))
             }
         }
         LiveRunProbe::Free => {
             if let Some(run_id) = observed_run_id {
                 Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
             } else {
-                Some(LiveResumeOutcome::Free)
+                Some(LiveResumeOutcome::Free(None))
             }
         }
         LiveRunProbe::Occupied => None,
@@ -1739,10 +1871,19 @@ impl Provider for CursorProvider {
             {
                 resumed_live_events = Some(replay_completed_turn_channel(session_id, &events));
             }
-            if resumed_live_events.is_none() {
-                LiveRunRegistry::release_success_if_new_request(session_id, agent_id, fingerprint);
+            if resumed_live_events.is_none()
+                && let Some(reservation) = LiveRunRegistry::claim_success_release_for_new_operation(
+                    session_id,
+                    agent_id,
+                    fingerprint,
+                )
+            {
+                // Atomic release+reserve: no window in which a concurrent
+                // identical retry of the completed operation could take the
+                // freed slot and execute a duplicate.
+                preclaimed_live_reservation = Some(reservation);
             }
-            if resumed_live_events.is_none() {
+            if resumed_live_events.is_none() && preclaimed_live_reservation.is_none() {
                 match LiveRunRegistry::probe_run(session_id, agent_id) {
                     LiveRunProbe::TerminalError(error)
                         if live_probe_error_blocks_new_run(&error) =>
@@ -1845,13 +1986,16 @@ impl Provider for CursorProvider {
                             LiveResumeOutcome::ResumeError(error) => {
                                 return map_cursor_error_to_response(&error);
                             }
-                            LiveResumeOutcome::Free => {
+                            LiveResumeOutcome::Free(reservation) => {
                                 if reject_orphaned_native_results_when_live_slot_is_free(&body) {
                                     return json_error(
                                         StatusCode::CONFLICT,
                                         "invalid_request_error",
                                         "Stale Cursor tool_result cannot start a new live run",
                                     );
+                                }
+                                if let Some(reservation) = reservation {
+                                    preclaimed_live_reservation = Some(reservation);
                                 }
                             }
                         }
@@ -1871,6 +2015,10 @@ impl Provider for CursorProvider {
             BridgeRegistry::remove(session_id);
         }
 
+        // INVARIANT: auth is re-read from the store on every request — never
+        // cache it process-wide. `cursor auth login` in another terminal hot
+        // swaps the account for new requests while in-flight runs keep the
+        // token copy they captured at start.
         let mut auth = match load_cursor_auth() {
             Ok(Some(auth)) => auth,
             Ok(None) => {
@@ -1891,7 +2039,7 @@ impl Provider for CursorProvider {
 
         // Near expiry: force-refresh when possible instead of hard-failing re-login.
         if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
-            match force_refresh_cursor_auth() {
+            match force_refresh_cursor_auth_async(auth.access_token.clone()).await {
                 Ok(Some(refreshed)) => auth = refreshed,
                 Ok(None) | Err(_) => {
                     return json_error(
@@ -2132,7 +2280,7 @@ impl Provider for CursorProvider {
             {
                 Ok(r) => break r,
                 Err(e) if e.status == 401 && !refreshed_once && auth.refresh_token.is_some() => {
-                    match force_refresh_cursor_auth() {
+                    match force_refresh_cursor_auth_async(token.clone()).await {
                         Ok(Some(refreshed)) => {
                             token = refreshed.access_token;
                             refreshed_once = true;
@@ -2388,6 +2536,11 @@ pub(crate) struct CursorCli;
 
 impl CliHandlers for CursorCli {
     fn login(&self) -> Result<(), anyhow::Error> {
+        // Capture the account being replaced so a hot swap is explicit.
+        let previous_email = load_cursor_auth()
+            .ok()
+            .flatten()
+            .and_then(|auth| auth.email);
         let auth = run_cursor_login()?.ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
         println!("Cursor auth saved in {}", auth.source);
         if let Some(ref user_id) = auth.user_id {
@@ -2395,6 +2548,33 @@ impl CliHandlers for CursorCli {
         }
         if let Some(ref email) = auth.email {
             println!("Email: {email}");
+        }
+        match (previous_email.as_deref(), auth.email.as_deref()) {
+            (Some(old), Some(new)) if old != new => {
+                println!();
+                println!("Account switched: {old} -> {new}");
+                println!(
+                    "A running `serve` picks this up immediately: new requests use the new \
+                     account, while in-flight runs finish on the previous login. No restart \
+                     needed. Existing sessions start a fresh Cursor conversation on their \
+                     next turn (client-side history is replayed automatically)."
+                );
+            }
+            _ => {
+                println!();
+                println!(
+                    "A running `serve` picks this login up immediately for new requests; \
+                     no restart needed."
+                );
+            }
+        }
+        if crate::providers::cursor::auth::env_cursor_token_present() {
+            println!();
+            println!(
+                "WARNING: CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set in this shell. Any \
+                 process started with that env (including `serve`) keeps using the env token \
+                 and will NOT see this login. Unset the env var to use the stored account."
+            );
         }
         Ok(())
     }
@@ -2431,6 +2611,10 @@ impl CliHandlers for CursorCli {
         clear_cursor_auth()?;
         println!(
             "Cursor persistent auth cleared. Unset CCP_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN if using env auth."
+        );
+        println!(
+            "A running `serve` keeps finishing in-flight runs with the old credentials; new \
+             requests will fail with 401 until the next `cursor auth login`."
         );
         Ok(())
     }
@@ -2988,6 +3172,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_policy_429_is_retryable_for_account_failover() {
+        // Routed as Retryable so the start loop can swap to newly stored
+        // credentials after a hot account switch; without a switch the loop
+        // passes the 429 through verbatim instead of retrying the same login.
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(
+            "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded. [resource_exhausted]"
+                .into(),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(matches!(
+            peek_live_start_for_stale_reset(rx).await,
+            LiveStartPeek::Retryable(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn peek_empty_turn_defers_to_the_dedicated_late_retry_policy() {
         let error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
                      (stale Cursor conversation reset; retry this message to continue)";
@@ -3327,22 +3530,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peek_unpaid_invoice_stays_on_the_same_run() {
+    async fn peek_unpaid_invoice_routes_to_the_policy_failover_arm() {
+        // Billing blocks are policy rate limits: peek hands them to the start
+        // loop, which fails over to newly stored credentials after an account
+        // switch or otherwise returns the verbatim error as a pre-commit 429
+        // (never a hidden same-login retry).
         let (tx, rx) = mpsc::channel(2);
-        tx.send(Err(
-            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]"
-                .into(),
-        ))
-        .await
-        .unwrap();
+        let text = "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]";
+        tx.send(Err(text.into())).await.unwrap();
         drop(tx);
-        let LiveStartPeek::Ready(mut events) = peek_live_start_for_stale_reset(rx).await else {
-            panic!("billing 429 must be forwarded, not retried");
-        };
-        let Err(error) = events.recv().await.unwrap() else {
-            panic!("the billing error must still be delivered");
+        let LiveStartPeek::Retryable(error) = peek_live_start_for_stale_reset(rx).await else {
+            panic!("billing 429 must reach the policy failover arm");
         };
         assert!(error.contains("unpaid invoice"), "{error}");
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &error),
+            429,
+            "pass-through must surface as HTTP 429"
+        );
     }
 
     #[test]

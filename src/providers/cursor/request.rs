@@ -170,8 +170,12 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
 /// `Tool not found`. Filesystem/web grok names with a native remap stay off
 /// MCP so Fable does not teach `mcp_claude-local_run_terminal_command`.
 /// Steal maps remaining `mcp_claude-local_*` back to the exact grok wire name.
-/// Workflow / Skill / `mcp__*` stay for Claude Code. Aliases stay off MCP.
-fn advertise_as_cursor_mcp(name: &str) -> bool {
+/// Workflow / Skill / Task / `mcp__*` stay for Claude Code — Task must be on
+/// MCP too, or function-calling models (gemini) have no callable subagent
+/// tool at all. Task is exact-case and Claude-Code-only: grok-build's real
+/// task tool is `spawn_subagent`, so on grok requests Claude `Task` and the
+/// lowercase `task` / `Agent` aliases all stay off MCP (no dual catalog).
+fn advertise_as_cursor_mcp(name: &str, grok_build_request: bool) -> bool {
     if is_grok_build_subagent_lifecycle_tool(name)
         || normalize_grok_build_lifecycle_name(name).is_some()
     {
@@ -188,6 +192,7 @@ fn advertise_as_cursor_mcp(name: &str) -> bool {
     }
     bare.eq_ignore_ascii_case("Workflow")
         || bare.eq_ignore_ascii_case("Skill")
+        || (!grok_build_request && bare == "Task")
         || bare.starts_with("mcp__")
 }
 
@@ -209,7 +214,7 @@ fn grok_client_tool_uses_native_remap(name: &str) -> bool {
     )
 }
 
-fn is_claude_local_mcp_spelling(name: &str) -> bool {
+pub(crate) fn is_claude_local_mcp_spelling(name: &str) -> bool {
     name.starts_with("mcp_claude-local_")
         || name.starts_with("mcp__claude-local__")
         || name.starts_with("claude-local/")
@@ -342,19 +347,26 @@ pub(crate) const CLAUDE_LOCAL_MCP_PROVIDER: &str = "claude-local";
 /// Struct at tag 3, which Cursor rejected with `invalid end group tag`).
 pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::McpTools> {
     let tools = req.extra.get("tools")?.as_array()?;
+    let grok_build_request = request_has_grok_build_client_tools(req);
     let mapped: Vec<super::proto::McpTool> = tools
         .iter()
         .filter_map(|tool| {
             let name = tool.get("name")?.as_str()?.to_string();
-            if !advertise_as_cursor_mcp(&name) {
+            if !advertise_as_cursor_mcp(&name, grok_build_request) {
                 return None;
             }
+            // Keep descriptions essentially intact: Claude Code's Workflow /
+            // Task / Skill descriptions ENUMERATE the valid workflow, agent,
+            // and skill names. The old 240-char cap cut those lists off, so
+            // function-calling models (gemini) hallucinated names like
+            // "asr-review-workflow". The generous ceiling only guards against
+            // pathological megabyte descriptions.
             let description = tool
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .chars()
-                .take(240)
+                .take(16_384)
                 .collect::<String>();
             Some(super::proto::McpTool {
                 tool_name: name.clone(),
@@ -912,6 +924,7 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
     if tools.is_empty() {
         return None;
     }
+    let grok_build_request = request_has_grok_build_client_tools(req);
     let tool_lines: Vec<String> = tools
         .iter()
         .filter_map(|t| {
@@ -931,9 +944,22 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
             };
             let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
             if compact {
+                // Compact lines only render when mcp_tools is populated. The
+                // model can invoke those tools solely under Cursor's composed
+                // catalog name (`mcp_claude-local_<tool>`); dumping the bare
+                // Anthropic name here taught function-calling models (gemini)
+                // to call `Workflow` / `Task`, which Cursor rejects as
+                // `Tool not found`. grok-build requests keep bare names: their
+                // dump teaches exact grok wire names and steal maps the
+                // MCP-prefixed calls back.
+                let catalog_name = if !grok_build_request && advertise_as_cursor_mcp(name, false) {
+                    format!("mcp_{CLAUDE_LOCAL_MCP_PROVIDER}_{name}")
+                } else {
+                    name.to_string()
+                };
                 Some(
                     serde_json::json!({
-                        "name": name,
+                        "name": catalog_name,
                         "description": description,
                     })
                     .to_string(),
@@ -960,9 +986,12 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
         let body = tool_lines.join("\n");
         let preface = match mode {
             ToolDumpMode::All => "",
-            ToolDumpMode::ClaudeLocalOnly
-            | ToolDumpMode::CompactClaudeLocal
-            | ToolDumpMode::NativeFullMcpCompact => tools_dump_preface(req),
+            // No MCP catalog on the wire: bare names + XML recovery.
+            ToolDumpMode::ClaudeLocalOnly => tools_dump_preface(req, false),
+            // mcp_tools is populated: teach the exact catalog names.
+            ToolDumpMode::CompactClaudeLocal | ToolDumpMode::NativeFullMcpCompact => {
+                tools_dump_preface(req, true)
+            }
         };
         Some(format!("<tools>\n{preface}{body}\n</tools>"))
     }
@@ -979,9 +1008,14 @@ fn request_has_grok_build_client_tools(req: &MessagesRequest) -> bool {
     })
 }
 
-fn tools_dump_preface(req: &MessagesRequest) -> &'static str {
+fn tools_dump_preface(req: &MessagesRequest, mcp_catalog: bool) -> &'static str {
     if request_has_grok_build_client_tools(req) {
         "Call run_terminal_command, read_file, list_dir, grep, write, search_replace, todo_write, web_search, web_fetch, spawn_subagent, and enter_plan_mode by those exact names.\n"
+    } else if mcp_catalog {
+        // The MCP catalog is the only invokable surface for these tools, and
+        // Cursor registers them under the composed provider-prefixed name.
+        // Teaching bare `Workflow` here made gemini call a nonexistent tool.
+        "Prefer these Claude Code client tools when they match the user request (e.g. mcp_claude-local_Workflow for /deep-research or /workflows; mcp_claude-local_Skill for skills; mcp_claude-local_Task for subagents). Call the exact mcp_claude-local_* names listed below — never bare Workflow/Skill/Task, and not Bash.\n"
     } else {
         "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Call the Workflow tool, not Bash.\n"
     }
@@ -1393,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_local_mcp_tools_skips_task_and_ask_user_question() {
+    fn claude_local_mcp_tools_advertises_task_but_skips_ask_user_question() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
             "messages": [{"role": "user", "content": "go"}],
@@ -1406,7 +1440,11 @@ mod tests {
         .unwrap();
         let mcp = claude_local_mcp_tools(&req).expect("mcp tools");
         let names: Vec<&str> = mcp.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["Workflow"]);
+        assert_eq!(
+            names,
+            vec!["Task", "Workflow"],
+            "Claude Code Task must be on MCP (gemini has no other subagent tool); AskUserQuestion has a native remap"
+        );
     }
 
     #[test]
@@ -1548,9 +1586,23 @@ mod tests {
             parts.user_text.contains("<tools>"),
             "claude-local tools must still reach Cursor"
         );
-        assert!(parts.user_text.contains("\"name\":\"Workflow\""));
-        assert!(parts.user_text.contains("\"name\":\"Skill\""));
-        assert!(parts.user_text.contains("mcp__plugin__search"));
+        assert!(
+            parts
+                .user_text
+                .contains("\"name\":\"mcp_claude-local_Workflow\""),
+            "dump must teach the invokable catalog name, not bare Workflow: {}",
+            parts.user_text
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("\"name\":\"mcp_claude-local_Skill\"")
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("\"name\":\"mcp_claude-local_mcp__plugin__search\"")
+        );
         assert!(
             parts
                 .user_text
@@ -1598,15 +1650,23 @@ mod tests {
             "Claude Code /deep-research invoke text must not be stripped; got: {}",
             parts.user_text
         );
-        assert!(parts.user_text.contains("\"name\":\"Workflow\""));
+        assert!(
+            parts
+                .user_text
+                .contains("\"name\":\"mcp_claude-local_Workflow\""),
+            "compact dump must advertise the invokable catalog name: {}",
+            parts.user_text
+        );
         assert!(
             parts
                 .user_text
                 .contains("Prefer these Claude Code client tools")
         );
         assert!(
-            parts.user_text.contains("Call the Workflow tool, not Bash"),
-            "compact dump should tell Fable to call Workflow, not Bash: {}",
+            parts
+                .user_text
+                .contains("Call the exact mcp_claude-local_* names"),
+            "compact dump should teach the mcp_claude-local_* catalog names, not bare Workflow: {}",
             parts.user_text
         );
         assert!(
@@ -1781,8 +1841,10 @@ mod tests {
         assert!(!parts.user_text.contains("first"));
         assert!(!parts.user_text.contains("<assistant>"));
         assert!(
-            parts.user_text.contains("\"name\":\"Workflow\""),
-            "checkpoint delta must still advertise Workflow"
+            parts
+                .user_text
+                .contains("\"name\":\"mcp_claude-local_Workflow\""),
+            "checkpoint delta must still advertise Workflow under its catalog name"
         );
         assert!(!parts.user_text.contains("\"name\":\"Read\""));
     }
@@ -1840,8 +1902,10 @@ mod tests {
             parts.user_text
         );
         assert!(
-            parts.user_text.contains("\"name\":\"Workflow\""),
-            "checkpoint delta must still advertise Workflow"
+            parts
+                .user_text
+                .contains("\"name\":\"mcp_claude-local_Workflow\""),
+            "checkpoint delta must still advertise Workflow under its catalog name"
         );
     }
 

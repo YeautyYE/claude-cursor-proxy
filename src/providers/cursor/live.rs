@@ -52,9 +52,9 @@ use super::proto::{
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
 use super::request::{
-    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_tool_name,
-    is_grok_build_subagent_lifecycle_tool, normalize_grok_build_lifecycle_name,
-    strip_mcp_provider_prefix,
+    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_mcp_spelling,
+    is_claude_local_tool_name, is_grok_build_subagent_lifecycle_tool,
+    normalize_grok_build_lifecycle_name, strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
 use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
@@ -461,6 +461,10 @@ const SEGMENT_REPLAY_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// instead of 503-storming. Idle/generation budgets still bound the run;
 /// this only stops a heartbeat flood from pinning the slot forever.
 const LIVE_ATTACH_ORPHAN_GRACE: Duration = Duration::from_secs(30);
+/// Absolute ceiling on how long an orphaned run may keep its slot and
+/// generation permit, even while still making model progress. Bounds
+/// capacity leakage when clients abandon many long generations.
+const LIVE_ATTACH_ORPHAN_MAX_AGE: Duration = Duration::from_secs(240);
 
 impl SegmentReplayLog {
     fn record(&mut self, event: &LiveRunEvent) {
@@ -549,6 +553,10 @@ pub struct CursorLiveRunHandle {
     cancel_requested: Arc<AtomicBool>,
     resume_in_flight: Arc<ResumeAdmission>,
     request_fingerprint: Arc<AtomicU64>,
+    /// Driver-published: the downstream sink closed with no pending tools
+    /// (orphaned, still-generating run). A different-fingerprint claim may
+    /// supersede it instead of busy-bouncing until natural completion.
+    consumer_gone: Arc<AtomicBool>,
 }
 
 impl CursorLiveRunHandle {
@@ -563,6 +571,16 @@ impl CursorLiveRunHandle {
 
     pub(crate) fn request_fingerprint(&self) -> u64 {
         self.request_fingerprint.load(Ordering::Acquire)
+    }
+
+    /// True while the driver observes a closed downstream sink with no
+    /// pending tools — an orphaned, still-generating run.
+    pub(crate) fn is_consumer_gone(&self) -> bool {
+        self.consumer_gone.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_pending_execs(&self) -> bool {
+        !self.pending_tools().is_empty()
     }
 
     /// Return the first exposed exec for compatibility with the original
@@ -1692,6 +1710,10 @@ pub enum LiveSlotClaim {
     /// The identical operation already completed and its final segment is
     /// retained: serve the recorded events instead of starting a second Run.
     CompletedReplay(Arc<Vec<LiveRunEvent>>),
+    /// The identical operation completed but no replay was retained (log
+    /// overflow, segment without a recorded `End`). The turn is NOT ambiguous
+    /// — starting a duplicate is refused as retryable busy, never a fatal 409.
+    CompletedNoReplay,
 }
 
 pub enum LiveConflictAction {
@@ -1751,27 +1773,64 @@ impl LiveRunRegistry {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        match runs.runs.get(&key) {
-            Some(LiveRunEntry::Starting { .. }) => LiveSlotClaim::Starting,
+        // Pre-classify Succeeded so the immutable borrow ends before a
+        // different-fingerprint claimant releases the tombstone below.
+        enum SucceededClaim {
+            Replay(Arc<Vec<LiveRunEvent>>),
+            NoReplay,
+            NewOperation,
+            Unfingerprinted,
+        }
+        let succeeded = match runs.runs.get(&key) {
+            Some(LiveRunEntry::Starting { .. }) => return LiveSlotClaim::Starting,
             Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => {
-                LiveSlotClaim::Ambiguous
+                return LiveSlotClaim::Ambiguous;
             }
             Some(LiveRunEntry::Succeeded {
                 until,
                 fingerprint: stored,
                 replay,
                 ..
-            }) if Instant::now() < *until => match replay {
-                Some(replay) if fingerprint != 0 && *stored == fingerprint => {
-                    LiveSlotClaim::CompletedReplay(Arc::clone(replay))
+            }) if Instant::now() < *until => {
+                if fingerprint == 0 {
+                    SucceededClaim::Unfingerprinted
+                } else if *stored == fingerprint {
+                    match replay {
+                        Some(replay) => SucceededClaim::Replay(Arc::clone(replay)),
+                        None => SucceededClaim::NoReplay,
+                    }
+                } else {
+                    SucceededClaim::NewOperation
                 }
-                _ => LiveSlotClaim::Ambiguous,
-            },
-            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => LiveSlotClaim::Running,
-            _ => match Self::reserve_key(&mut runs, key) {
-                Some(reservation) => LiveSlotClaim::Reserved(reservation),
-                None => LiveSlotClaim::Running,
-            },
+            }
+            Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => {
+                return LiveSlotClaim::Running;
+            }
+            _ => {
+                return match Self::reserve_key(&mut runs, key) {
+                    Some(reservation) => LiveSlotClaim::Reserved(reservation),
+                    None => LiveSlotClaim::Running,
+                };
+            }
+        };
+        match succeeded {
+            SucceededClaim::Replay(replay) => LiveSlotClaim::CompletedReplay(replay),
+            // A completed turn is never ambiguous: an identical duplicate we
+            // cannot serve stays retryable-busy until the tombstone expires.
+            SucceededClaim::NoReplay => LiveSlotClaim::CompletedNoReplay,
+            // A NEW operation releases the tombstone exactly like
+            // `release_success_if_new_request` (internal retry paths skip the
+            // handle_messages preamble and must not be 409'd here).
+            SucceededClaim::NewOperation => {
+                runs.remove_key(&key);
+                match Self::reserve_key(&mut runs, key) {
+                    Some(reservation) => LiveSlotClaim::Reserved(reservation),
+                    None => LiveSlotClaim::Running,
+                }
+            }
+            // Fingerprint-less callers (tests / legacy) keep the conservative
+            // duplicate-refusal classification.
+            SucceededClaim::Unfingerprinted => LiveSlotClaim::Ambiguous,
         }
     }
 
@@ -1971,6 +2030,26 @@ impl LiveRunRegistry {
 
     /// Cancel only the `(session_id, agent_id)` slot. Nested agents must pass
     /// their agent id so the parent run is left alone.
+    /// Driver-owned orphan signal for the Running occupant matching `run_id`.
+    /// Mirrors `seal_success_if`'s key resolution: the driver holds the
+    /// composed worker key, not the client session/agent pair.
+    pub(crate) fn set_run_consumer_gone(session_id: &str, run_id: &str, gone: bool) {
+        let runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = runs.keys_for(claude_session_of(session_id));
+        let mut extra = Vec::new();
+        if !keys.iter().any(|key| key == session_id) {
+            extra.push(session_id.to_string());
+        }
+        for key in keys.into_iter().chain(extra) {
+            if let Some(LiveRunEntry::Running(handle)) = runs.runs.get(&key)
+                && handle.run_id == run_id
+            {
+                handle.consumer_gone.store(gone, Ordering::Release);
+                return;
+            }
+        }
+    }
+
     pub fn cancel_run(session_id: &str, agent_id: Option<&str>) -> bool {
         let key = live_run_key(session_id, agent_id);
         let entry = {
@@ -2109,6 +2188,9 @@ impl LiveRunRegistry {
             _ => None,
         };
         if let Some(error) = error {
+            // Plain policy 429s are not same-request-retryable and not
+            // ambiguous, so they fall through to the remove-and-deliver arm:
+            // slot freed immediately, verbatim message delivered once.
             if terminal_error_clears_live_slot(&error) {
                 runs.remove_key(&key);
                 return LiveRunProbe::Free;
@@ -2296,15 +2378,53 @@ impl LiveRunRegistry {
                 if current.run_id == run_id && Arc::ptr_eq(current, &handle)
         );
         if still_current {
+            // Both replay-bearing and no-replay tombstones hold the full
+            // duplicate-suppression window: after the shorter 90s window an
+            // identical retry would silently re-execute the completed turn.
+            // No-replay entries are tiny; NEW operations release them
+            // atomically on claim.
+            let ttl = LIVE_SUCCEEDED_REPLAY_TTL;
             runs.insert_key(
                 key,
                 LiveRunEntry::Succeeded {
                     run_id: run_id.to_string(),
                     fingerprint,
-                    until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                    until: Instant::now() + ttl,
                     replay,
                 },
             );
+            Self::enforce_replay_budget(&mut runs);
+        }
+    }
+
+    /// Bound aggregate replay memory process-wide. Each retained replay is
+    /// already capped at SEGMENT_REPLAY_MAX_BYTES; keeping at most
+    /// LIVE_REPLAY_MAX_ENTRIES bounds the total. The oldest replays degrade
+    /// to no-replay tombstones — the fingerprint stays, so identical
+    /// duplicates keep failing closed instead of silently re-executing.
+    fn enforce_replay_budget(runs: &mut LiveRunMap) {
+        const LIVE_REPLAY_MAX_ENTRIES: usize = 8;
+        let mut bearing: Vec<(String, Instant)> = runs
+            .runs
+            .iter()
+            .filter_map(|(key, entry)| match entry {
+                LiveRunEntry::Succeeded {
+                    replay: Some(_),
+                    until,
+                    ..
+                } => Some((key.clone(), *until)),
+                _ => None,
+            })
+            .collect();
+        if bearing.len() <= LIVE_REPLAY_MAX_ENTRIES {
+            return;
+        }
+        bearing.sort_by_key(|(_, until)| *until);
+        let excess = bearing.len() - LIVE_REPLAY_MAX_ENTRIES;
+        for (key, _) in bearing.into_iter().take(excess) {
+            if let Some(LiveRunEntry::Succeeded { replay, .. }) = runs.runs.get_mut(&key) {
+                *replay = None;
+            }
         }
     }
 
@@ -2326,6 +2446,33 @@ impl LiveRunRegistry {
                 runs.remove_key(&key);
             }
             _ => {}
+        }
+    }
+
+    /// Atomically release a Succeeded tombstone that belongs to a DIFFERENT
+    /// operation and reserve the slot for the new one under a single lock.
+    /// The two-step release-then-reserve window used to let a concurrent
+    /// identical retry of the OLD operation reserve the freed slot and
+    /// execute a duplicate.
+    pub fn claim_success_release_for_new_operation(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) -> Option<LiveRunReservation> {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Succeeded {
+                fingerprint: stored,
+                until,
+                ..
+            }) if Instant::now() < *until && *stored == fingerprint => None,
+            Some(LiveRunEntry::Succeeded { .. }) => {
+                runs.remove_key(&key);
+                Self::reserve_key(&mut runs, key)
+            }
+            _ => None,
         }
     }
 
@@ -2494,8 +2641,10 @@ impl CursorHttpClient {
         let mut generation_permit = match pre_admission {
             Some(permit) => permit,
             None => {
-                let run_permit = acquire_live_run_permit(cancel.as_mut()).await?;
-                let mut permit = acquire_live_generation_permit(model, cancel.as_mut()).await?;
+                let deadline = live_admission_deadline();
+                let run_permit = acquire_live_run_permit(cancel.as_mut(), deadline).await?;
+                let mut permit =
+                    acquire_live_generation_permit(model, cancel.as_mut(), deadline).await?;
                 permit._run_permit = Some(run_permit);
                 permit
             }
@@ -2629,6 +2778,7 @@ impl CursorHttpClient {
             cancel_requested: Arc::clone(&cancel_requested),
             resume_in_flight,
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
 
         let seeded_blobs: HashMap<Vec<u8>, Vec<u8>> =
@@ -3164,6 +3314,9 @@ impl LiveRecoveryEpisode {
 struct LiveReconnectContext {
     http: CursorHttpClient,
     recovery_open_gate: Arc<Semaphore>,
+    /// INVARIANT: the token captured at run start. Reconnects must reuse this
+    /// copy — never re-read the auth store mid-run, or a `cursor auth login`
+    /// hot swap would splice a different account into a live conversation.
     token: String,
     identity: LiveIdentityHeaders,
     original_request_id: String,
@@ -3323,21 +3476,33 @@ fn reconnect_prefers_http1(force_http1: bool) -> bool {
 pub(crate) const LIVE_H2_OPEN_ATTEMPT: Duration = Duration::from_secs(90);
 const LIVE_H1_OPEN_ATTEMPT: Duration = Duration::from_secs(90);
 pub(crate) const LIVE_AMBIGUOUS_OPEN_TTL: Duration = Duration::from_secs(90);
+/// Retention for a Succeeded tombstone that carries the final-segment replay.
+/// Longer than the plain ambiguous window: identical retries after a client's
+/// exponential backoff must still find the retained response rather than
+/// silently re-executing the completed turn.
+pub(crate) const LIVE_SUCCEEDED_REPLAY_TTL: Duration = Duration::from_secs(300);
 const LIVE_RECOVERY_DEADLINE: Duration = Duration::from_secs(45);
 const LIVE_RECOVERY_MAX_OPENS: u32 = 4;
 const LIVE_RECONNECT_BACKOFF_CAP_MS: u64 = 8_000;
 const LIVE_RECONNECT_BACKOFF_BASE_MS: u64 = 1_000;
-const LIVE_GENERATION_DEFAULT_MAX: usize = 32;
-const LIVE_GENERATION_MAX: usize = 128;
-const LIVE_RUN_DEFAULT_MAX: usize = 256;
-const LIVE_RUN_MAX: usize = 4_096;
-const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 15;
-const LIVE_GENERATION_DEFAULT_RESUME_RESERVE: usize = 4;
-const LIVE_GENERATION_RESUME_RESERVE_MAX: usize = 16;
-const LIVE_GENERATION_DEFAULT_INTERACTIVE_RESERVE: usize = 8;
-const LIVE_GENERATION_INTERACTIVE_RESERVE_MAX: usize = 32;
-const LIVE_RECOVERY_OPEN_DEFAULT_MAX: usize = 4;
-const LIVE_RECOVERY_OPEN_MAX: usize = 16;
+// Local admission exists to keep the process healthy, NOT to police
+// parallelism. Operator profile (2026-08-23): 4 grok-build windows x 256-512
+// parallel agents (~2000 concurrent live runs). Defaults must never be the
+// binding constraint for that load — Cursor upstream 429/capacity sheds are
+// the real backpressure and are classified and paced correctly downstream.
+// (History: 2026-08-22, a 32-slot bulk pool 503-stormed a 113-wide burst and
+// starved gemini's 8-slot interactive reserve.)
+const LIVE_GENERATION_DEFAULT_MAX: usize = 1_024;
+const LIVE_GENERATION_MAX: usize = 8_192;
+const LIVE_RUN_DEFAULT_MAX: usize = 4_096;
+const LIVE_RUN_MAX: usize = 16_384;
+const LIVE_GENERATION_DEFAULT_QUEUE_SECS: u64 = 30;
+const LIVE_GENERATION_DEFAULT_RESUME_RESERVE: usize = 64;
+const LIVE_GENERATION_RESUME_RESERVE_MAX: usize = 512;
+const LIVE_GENERATION_DEFAULT_INTERACTIVE_RESERVE: usize = 128;
+const LIVE_GENERATION_INTERACTIVE_RESERVE_MAX: usize = 1_024;
+const LIVE_RECOVERY_OPEN_DEFAULT_MAX: usize = 16;
+const LIVE_RECOVERY_OPEN_MAX: usize = 128;
 const TRANSPORT_BREAKER_THRESHOLD: u32 = 3;
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -3822,12 +3987,21 @@ static LIVE_RUN_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     )))
 });
 
+/// One shared deadline for both admission stages (run gate + generation
+/// gate). Stacking two independent full-length waits could hold a pre-open
+/// request for 2x the configured queue budget — past client timeouts.
+fn live_admission_deadline() -> Instant {
+    Instant::now()
+        + Duration::from_secs(live_generation_queue_secs(
+            std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
+        ))
+}
+
 async fn acquire_live_run_permit(
     cancel: Option<&mut watch::Receiver<bool>>,
+    deadline: Instant,
 ) -> Result<OwnedSemaphorePermit, CursorError> {
-    let wait = Duration::from_secs(live_generation_queue_secs(
-        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
-    ));
+    let wait = deadline.saturating_duration_since(Instant::now());
     if cancel.as_deref().is_some_and(|rx| *rx.borrow()) {
         return Err(CursorError::new(
             409,
@@ -3890,8 +4064,9 @@ static LIVE_RECOVERY_OPEN_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
 /// A request waiting in the local queue holds no session slot, so concurrent
 /// duplicates never see "already active" for a start that is merely queued.
 pub(crate) async fn admit_live_start(model: &str) -> Result<LiveGenerationPermit, CursorError> {
-    let run_permit = acquire_live_run_permit(None).await?;
-    let mut permit = acquire_live_generation_permit(model, None).await?;
+    let deadline = live_admission_deadline();
+    let run_permit = acquire_live_run_permit(None, deadline).await?;
+    let mut permit = acquire_live_generation_permit(model, None, deadline).await?;
     permit._run_permit = Some(run_permit);
     Ok(permit)
 }
@@ -3899,10 +4074,9 @@ pub(crate) async fn admit_live_start(model: &str) -> Result<LiveGenerationPermit
 async fn acquire_live_generation_permit(
     model: &str,
     cancel: Option<&mut watch::Receiver<bool>>,
+    deadline: Instant,
 ) -> Result<LiveGenerationPermit, CursorError> {
-    let wait = Duration::from_secs(live_generation_queue_secs(
-        std::env::var("CCP_CURSOR_LIVE_QUEUE_SECS").ok().as_deref(),
-    ));
+    let wait = deadline.saturating_duration_since(Instant::now());
     let interactive = live_start_is_interactive(model);
     let queued_at = Instant::now();
     let admission = if interactive {
@@ -4941,6 +5115,11 @@ pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
 }
 
 pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
+    // NOTE: a policy 429 nested inside stall/reconnect wrapper text does NOT
+    // suppress ambiguity. The wrapper means an accepted Run stalled and the
+    // *reconnect* was rejected — the original Run's state is unknown, so
+    // fail-closed sealing is required to prevent duplicate execution. Plain
+    // policy 429s contain none of these markers and never match.
     let lower = message.to_ascii_lowercase();
     lower.contains("timed out")
         || lower.contains("no progress")
@@ -5004,7 +5183,10 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if terminal_error_is_ambiguous_accept(message) {
         return false;
     }
-    if crate::retry::is_billing_block(message) || crate::retry::is_capacity_shed(message) {
+    if crate::retry::is_billing_block(message)
+        || crate::retry::is_capacity_shed(message)
+        || crate::retry::is_policy_rate_limit(message)
+    {
         return false;
     }
     if live_error_is_empty_turn_retry(message) {
@@ -5039,6 +5221,8 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
         || crate::retry::is_billing_block(&err.message)
         || crate::retry::is_capacity_shed(&text)
         || crate::retry::is_capacity_shed(&err.message)
+        || crate::retry::is_policy_rate_limit(&text)
+        || crate::retry::is_policy_rate_limit(&err.message)
     {
         return false;
     }
@@ -6079,6 +6263,7 @@ async fn drive_live_run(
     let mut coalescer = LiveDeltaCoalescer::default();
     let mut decode_failures: u32 = 0;
     let mut sink_closed_since: Option<Instant> = None;
+    let mut consumer_gone_published = false;
     // Keep the quiet window short: Claude Code cannot start tools until we
     // expose the batch. 100ms felt like extra "tool lag" vs native CLI.
     // 0 is allowed (expose on next select tick). This does NOT gate thinking/
@@ -6304,9 +6489,26 @@ async fn drive_live_run(
             // UI hints, not Anthropic-exposed pending tools.
             if pending.is_empty() {
                 let since = *sink_closed_since.get_or_insert_with(Instant::now);
+                if !consumer_gone_published {
+                    consumer_gone_published = true;
+                    LiveRunRegistry::set_run_consumer_gone(&session_id, &run_id, true);
+                }
                 // Resume probation is fail-closed: the tool results may already
                 // have been accepted. Do not keep the run for attach-replay.
-                if reconnect.recovery.on_probation || since.elapsed() >= LIVE_ATTACH_ORPHAN_GRACE {
+                //
+                // Otherwise an orphaned run is reaped only when it is BOTH past
+                // the attach grace AND no longer making model progress. A
+                // still-generating orphan runs to natural completion and seals
+                // Succeeded-with-replay, so a retry arriving after the client's
+                // exponential backoff (often > 30s) receives the full response
+                // instead of a 90s ambiguous 409. Heartbeat-only zombies still
+                // die at the grace boundary; the absolute age cap bounds
+                // capacity leakage from abandoned long generations.
+                if reconnect.recovery.on_probation
+                    || (since.elapsed() >= LIVE_ATTACH_ORPHAN_GRACE
+                        && last_progress.elapsed() >= LIVE_ATTACH_ORPHAN_GRACE)
+                    || since.elapsed() >= LIVE_ATTACH_ORPHAN_MAX_AGE
+                {
                     report_terminal_error(
                         &mut sink,
                         &terminal_error,
@@ -6321,6 +6523,10 @@ async fn drive_live_run(
             }
         } else {
             sink_closed_since = None;
+            if consumer_gone_published {
+                consumer_gone_published = false;
+                LiveRunRegistry::set_run_consumer_gone(&session_id, &run_id, false);
+            }
         }
         // Cursor is between downstream Anthropic segments. Keep the resumable
         // BiDi worker alive, but return scarce generation capacity until the
@@ -8053,12 +8259,16 @@ async fn process_interaction_update(
                 }
             }
             if mapped.name == "Task"
+                && provider.is_empty()
                 && task_nest_depth == 0
                 && let Some(emit_name) = advertised_client_task_name(allowed_tool_names)
             {
                 // Cursor native Task (tag 19) may start a server-side child
                 // before we observe this frame. Expose immediately and drop
-                // the BiDi segment; do not wait for turn_ended.
+                // the BiDi segment; do not wait for turn_ended. MCP Task
+                // (provider=claude-local) is handled by the ClientOnly path
+                // above; without the provider guard it would queue twice when
+                // client-only exposure is deferred.
                 if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                     return false;
                 }
@@ -8754,11 +8964,21 @@ fn client_only_anthropic_name(
     {
         return lifecycle_client_only_name(mapped_name, provider_identifier, allowed);
     }
-    // Cursor native Task is translated only by advertised_client_task_name.
-    // Claude Task / internal aliases must not become ClientOnly via this path.
+    // Bare Task/task/Agent must not become ClientOnly via this path: Cursor
+    // native Task (which never carries an MCP provider) is translated only by
+    // the dedicated native-Task branch, and internal aliases stay dead. A
+    // claude-local-qualified exact `Task` is different — that is the model
+    // invoking the advertised `mcp_claude-local_Task` (Claude Code
+    // subagents). Map it back to the client's task tool, or advertising Task
+    // hands function-calling models a tool that errors on every call.
     if matches!(mapped_name, "Task" | "task" | "Agent")
         || matches!(stripped, "Task" | "task" | "Agent")
     {
+        let claude_local_qualified = provider_identifier == CLAUDE_LOCAL_MCP_PROVIDER
+            || (provider_identifier.is_empty() && is_claude_local_mcp_spelling(mapped_name));
+        if stripped == "Task" && claude_local_qualified {
+            return advertised_client_task_name(allowed);
+        }
         return None;
     }
     let local = is_claude_local_tool_name(stripped)
@@ -10123,6 +10343,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let driver = tokio::spawn(async move {
             let RunCommand::ResumeBatch {
@@ -10177,6 +10398,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::with_state(RESUME_ADMISSION_IN_FLIGHT)),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         let error = handle
@@ -10207,6 +10429,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(11)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let driver = tokio::spawn(async move {
             let Some(RunCommand::ResumeBatch {
@@ -10264,6 +10487,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(true)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let error = handle
             .resume_batch_within(
@@ -12109,21 +12333,21 @@ mod tests {
             live_generation_concurrency_max(None),
             LIVE_GENERATION_DEFAULT_MAX
         );
-        assert_eq!(live_generation_concurrency_max(Some("0")), 32);
-        assert_eq!(live_generation_concurrency_max(Some("999")), 128);
+        assert_eq!(live_generation_concurrency_max(Some("0")), 1024);
+        assert_eq!(live_generation_concurrency_max(Some("99999")), 8192);
         assert_eq!(
             live_generation_queue_secs(None),
             LIVE_GENERATION_DEFAULT_QUEUE_SECS
         );
         assert_eq!(live_generation_queue_secs(Some("999")), 300);
-        assert_eq!(live_generation_resume_reserve(None), 4);
+        assert_eq!(live_generation_resume_reserve(None), 64);
         assert_eq!(live_generation_resume_reserve(Some("0")), 0);
-        assert_eq!(live_generation_resume_reserve(Some("999")), 16);
-        assert_eq!(live_generation_interactive_reserve(None), 8);
+        assert_eq!(live_generation_resume_reserve(Some("99999")), 512);
+        assert_eq!(live_generation_interactive_reserve(None), 128);
         assert_eq!(live_generation_interactive_reserve(Some("0")), 0);
-        assert_eq!(live_generation_interactive_reserve(Some("999")), 32);
-        assert_eq!(live_recovery_open_max(None), 4);
-        assert_eq!(live_recovery_open_max(Some("999")), 16);
+        assert_eq!(live_generation_interactive_reserve(Some("99999")), 1024);
+        assert_eq!(live_recovery_open_max(None), 16);
+        assert_eq!(live_recovery_open_max(Some("99999")), 128);
     }
 
     #[test]
@@ -12709,6 +12933,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         LiveRunRegistry::reserve(session_id)
             .expect("fresh registry slot")
@@ -12741,6 +12966,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -12752,6 +12978,75 @@ mod tests {
                 LiveRunProbe::Free
             ),
             "the next grok turn must not replay a consumed 429 as 502"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn policy_rate_limit_429_is_terminal_never_seals_and_frees_the_slot() {
+        let free_plan = "Connect error 429: ERROR_RATE_LIMITED_CHANGEABLE: Named models unavailable — Free plans can only use Auto. [resource_exhausted]";
+        assert!(
+            !live_error_is_same_request_retryable(free_plan),
+            "policy 429s must surface verbatim on the first upstream response"
+        );
+        let err = CursorError::new(429, free_plan, None);
+        assert!(!cursor_start_error_is_same_request_retryable(&err));
+        assert!(!live_start_error_seals_tombstone(&err));
+        assert!(!terminal_error_is_ambiguous_accept(free_plan));
+
+        let quota = "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded. [resource_exhausted]";
+        assert!(!live_error_is_same_request_retryable(quota));
+        assert!(!terminal_error_is_ambiguous_accept(quota));
+
+        // A policy 429 folded into stall/reconnect wrapper text means an
+        // ACCEPTED Run stalled and only the reconnect was rejected — the
+        // original Run's state is unknown, so it must stay ambiguous
+        // (fail-closed) to prevent duplicate execution.
+        let wrapped = format!(
+            "Cursor resume produced no progress before the stream stalled (reconnect failed: {free_plan})"
+        );
+        assert!(terminal_error_is_ambiguous_accept(&wrapped));
+    }
+
+    #[test]
+    fn policy_rate_limit_terminal_error_frees_slot_and_keeps_message() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("policy-429-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let text = "Connect error 429: ERROR_RATE_LIMITED_CHANGEABLE: Named models unavailable — Free plans can only use Auto. [resource_exhausted]";
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "policy-429-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: text.into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(true)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert policy 429 failure");
+        match LiveRunRegistry::probe_run(&session, None) {
+            LiveRunProbe::TerminalError(delivered) => assert_eq!(
+                delivered, text,
+                "the verbatim policy 429 must be delivered once"
+            ),
+            LiveRunProbe::Free => panic!("expected TerminalError, got Free"),
+            LiveRunProbe::Occupied => panic!("expected TerminalError, got Occupied"),
+        }
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(&session, None),
+                LiveRunProbe::Free
+            ),
+            "the slot must already be free for the next POST"
         );
         LiveRunRegistry::clear();
     }
@@ -13885,6 +14180,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -14716,6 +15012,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -15363,6 +15660,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -15413,6 +15711,47 @@ mod tests {
             *rx.borrow(),
             "send_replace must persist cancel even if no receiver existed yet"
         );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn orphaned_running_run_can_be_superseded_by_a_different_operation() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("orphan-supersede-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "orphan-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(7)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert running");
+
+        assert!(!handle.is_consumer_gone());
+        // The driver publishes through the composed worker key.
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::set_run_consumer_gone(&key, "orphan-run", true);
+        assert!(handle.is_consumer_gone(), "driver signal must reach claims");
+        // Wrong run id must not flip the flag.
+        LiveRunRegistry::set_run_consumer_gone(&key, "other-run", false);
+        assert!(handle.is_consumer_gone());
+
+        let reservation = LiveRunRegistry::supersede_run(&session, None)
+            .expect("orphaned running slot must be supersedable");
+        assert!(
+            handle.cancel_requested.load(Ordering::Acquire),
+            "supersede must cancel the orphan"
+        );
+        drop(reservation);
         LiveRunRegistry::clear();
     }
 
@@ -15813,6 +16152,50 @@ mod tests {
     }
 
     #[test]
+    fn client_only_anthropic_name_maps_advertised_mcp_task_to_client_task_tool() {
+        // Claude Code advertises Task; the MCP catalog exposes it as
+        // mcp_claude-local_Task. Model calls against that catalog entry must
+        // come back as Claude Code Task tool_use, or the advertised tool
+        // errors as unsupported on every call.
+        let allowed = BTreeSet::from(["Task".to_string(), "Workflow".to_string()]);
+        for (mapped, provider) in [
+            ("mcp_claude-local_Task", "claude-local"),
+            ("mcp__claude-local__Task", "claude-local"),
+            ("Task", "claude-local"),
+            ("mcp_claude-local_Task", ""),
+        ] {
+            assert_eq!(
+                client_only_anthropic_name(mapped, provider, Some(&allowed)).as_deref(),
+                Some("Task"),
+                "{mapped} (provider={provider:?}) must map back to Claude Code Task"
+            );
+        }
+        assert_eq!(
+            client_only_anthropic_name("Task", "", Some(&allowed)),
+            None,
+            "bare Task without an MCP qualifier is Cursor native Task — only the native-Task branch may translate it"
+        );
+        assert_eq!(
+            client_only_anthropic_name("mcp_claude-local_Task", "evil", Some(&allowed)),
+            None,
+            "foreign providers cannot impersonate claude-local Task"
+        );
+        assert_eq!(
+            client_only_anthropic_name("mcp_claude-local_Task", "claude-local", None),
+            None,
+            "allowed=None must not invent Task"
+        );
+        // grok-build never advertises Task on MCP, but if a mixed allowlist
+        // ever produced this call the client's real task tool wins.
+        let grok = BTreeSet::from(["spawn_subagent".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("mcp_claude-local_Task", "claude-local", Some(&grok))
+                .as_deref(),
+            Some("spawn_subagent")
+        );
+    }
+
+    #[test]
     fn client_only_anthropic_name_maps_fable_workflow_to_grok_workflow() {
         let allowed = BTreeSet::from(["workflow".to_string(), "skill".to_string()]);
         for mapped in [
@@ -15958,6 +16341,125 @@ mod tests {
             }
             other => panic!("expected NativeToolBatch, got {other:?}"),
         }
+    }
+
+    fn mcp_task_started_frame(call_id: &str) -> super::super::connect::ConnectFrame {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionUpdate, McpArgs, McpToolCall, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: call_id.into(),
+                    model_call_id: "model-task".into(),
+                    tool_call: Some(ToolCall {
+                        mcp_tool_call: Some(McpToolCall {
+                            args: Some(McpArgs {
+                                name: "Task".into(),
+                                tool_name: "Task".into(),
+                                tool_call_id: call_id.into(),
+                                provider_identifier: "claude-local".into(),
+                                args: {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("description".into(), br#""audit tests""#.to_vec());
+                                    m.insert("prompt".into(), br#""run the audit""#.to_vec());
+                                    m.insert("subagent_type".into(), br#""explore""#.to_vec());
+                                    m
+                                },
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        decoder.push(&framed).unwrap().into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_task_tool_call_started_exposes_claude_task_client_only() {
+        // The MCP catalog advertises `mcp_claude-local_Task` for Claude Code.
+        // A model call against it must come back as a Claude Code `Task`
+        // tool_use, or subagents error as unsupported on every call.
+        let allowed = BTreeSet::from(["Task".to_string(), "Workflow".to_string()]);
+        let (cont, event, pending) =
+            drive_native_task_frame(mcp_task_started_frame("mcp-task-1"), Some(&allowed), None)
+                .await;
+        assert!(!cont, "MCP Task must expose ClientOnly and end the segment");
+        match event.expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1, "MCP Task must queue exactly once");
+                assert_eq!(tools[0].name, "Task");
+                assert_eq!(
+                    tools[0].input.get("prompt").and_then(|v| v.as_str()),
+                    Some("run the audit")
+                );
+                assert!(
+                    tools[0].input.get("provider_identifier").is_none(),
+                    "Task Anthropic input must not include provider_identifier"
+                );
+            }
+            other => panic!("expected Task NativeToolBatch, got {other:?}"),
+        }
+        assert_eq!(
+            pending.awaiting.len(),
+            1,
+            "exposed exec must await the client tool result exactly once"
+        );
+        assert!(pending.collecting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_task_with_turn_ctx_defers_and_queues_exactly_once() {
+        // Live-driver path (turn_ctx present, exposure deferred): the
+        // claude-local MCP Task is handled by the ClientOnly arm; the native
+        // Task branch must skip it via the provider guard or the exec queues
+        // twice and Claude Code sees duplicate tool_use ids.
+        let allowed = BTreeSet::from(["Task".to_string()]);
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-mcp-task",
+            user_prompt: "spawn a subagent",
+            post_tool_checkpoint: &mut post_tool_checkpoint,
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+        };
+        let (cont, event, pending) = drive_native_task_frame(
+            mcp_task_started_frame("mcp-task-2"),
+            Some(&allowed),
+            Some(&mut turn),
+        )
+        .await;
+        assert!(cont, "deferred exposure keeps the segment running");
+        assert!(
+            event.is_none(),
+            "exposure must wait for turn end: {event:?}"
+        );
+        assert_eq!(
+            pending.awaiting.len() + pending.collecting.len(),
+            1,
+            "claude-local Task must not double-queue via the native-Task branch"
+        );
+        let exec = pending
+            .collecting
+            .first()
+            .or_else(|| pending.awaiting.first())
+            .expect("one pending exec");
+        assert_eq!(exec.claude_name, "Task");
     }
 
     #[tokio::test]
@@ -19585,6 +20087,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -19738,6 +20241,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let reservation = LiveRunRegistry::reserve("terminal-session").expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -19769,6 +20273,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -19940,6 +20445,7 @@ mod tests {
             cancel_requested,
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         upstream_tx
@@ -20161,6 +20667,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
         let driver = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -20199,6 +20706,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         let error = handle
@@ -20224,6 +20732,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(
@@ -20325,6 +20834,7 @@ mod tests {
             cancel_requested,
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         handle
@@ -20346,6 +20856,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let resume_handle = Arc::clone(&handle);
         let resume = tokio::spawn(async move {
@@ -20386,6 +20897,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         let error = tokio::time::timeout(
@@ -20478,6 +20990,7 @@ mod tests {
             cancel_requested,
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         };
 
         handle
@@ -20538,6 +21051,7 @@ mod tests {
             cancel_requested,
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
 
         let mut payload = Vec::new();
@@ -20614,6 +21128,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(Arc::clone(&handle)).is_err() {
@@ -20648,6 +21163,7 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
         });
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve");
         if reservation.insert(handle).is_err() {
@@ -21180,11 +21696,14 @@ mod tests {
             "replay must end with the Anthropic terminal End: {events:?}"
         );
 
-        // A different operation must not receive this response.
-        assert!(matches!(
-            LiveRunRegistry::try_claim_run_for_operation(session, None, 8),
-            LiveSlotClaim::Ambiguous
-        ));
+        // A different operation must not receive this response — it releases
+        // the tombstone and claims the slot as a fresh run instead.
+        let LiveSlotClaim::Reserved(reservation) =
+            LiveRunRegistry::try_claim_run_for_operation(session, None, 8)
+        else {
+            panic!("a new operation must release the replay tombstone and reserve");
+        };
+        reservation.release();
         LiveRunRegistry::clear();
     }
 
@@ -21257,6 +21776,43 @@ mod tests {
             !LiveRunRegistry::is_occupied_run(&session, None),
             "a new operation must release the tombstone"
         );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn succeeded_claims_map_by_fingerprint_without_false_ambiguity() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("succeeded-claims-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+
+        // No replay retained (overflow / no recorded End).
+        let handle = dummy_handle("no-replay-generation");
+        handle.set_request_fingerprint(7);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert");
+        LiveRunRegistry::seal_success_if(&session, "no-replay-generation", None);
+
+        // Identical duplicate: completed turns are never ambiguous — busy.
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 7),
+            LiveSlotClaim::CompletedNoReplay
+        ));
+        // Fingerprint-less callers keep the conservative classification.
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run(&session, None),
+            LiveSlotClaim::Ambiguous
+        ));
+        // A NEW operation releases the tombstone and claims the slot even on
+        // paths that skip the handle_messages release preamble.
+        let LiveSlotClaim::Reserved(reservation) =
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 8)
+        else {
+            panic!("a new operation must release the Succeeded tombstone");
+        };
+        reservation.release();
+        assert!(!LiveRunRegistry::is_occupied_run(&session, None));
         LiveRunRegistry::clear();
     }
 

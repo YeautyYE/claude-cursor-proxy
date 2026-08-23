@@ -75,7 +75,7 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
     }
 
     fn refresh_if_needed(&self, auth: CursorAuth) -> anyhow::Result<Option<CursorAuth>> {
-        let Some(refresh_token) = auth.refresh_token.as_deref() else {
+        let Some(refresh_token) = auth.refresh_token.clone() else {
             return Ok(Some(auth));
         };
         let Some(expires) = auth.expires else {
@@ -85,8 +85,28 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
             return Ok(Some(auth));
         }
 
-        match refresh_cursor_auth(refresh_token) {
+        // Single-flight: concurrent near-expiry loads must not race the
+        // rotation (a second refresh can invalidate the first's tokens).
+        let _flight = refresh_single_flight();
+        // Re-check under the lock: another request may have refreshed, or
+        // `cursor auth login` may have hot-swapped the account.
+        match self.store.load()? {
+            Some(current) if current.access_token != auth.access_token => {
+                return Ok(Some(enrich(current, self.auth_path())));
+            }
+            Some(_) => {}
+            None => return Ok(None),
+        }
+
+        match refresh_cursor_auth(&refresh_token) {
             Ok(Some(refreshed)) => {
+                // Account CAS before save: never overwrite a hot-swapped login
+                // with a refresh of the account it replaced.
+                if let Some(current) = self.store.load()?
+                    && current.access_token != auth.access_token
+                {
+                    return Ok(Some(enrich(current, self.auth_path())));
+                }
                 let new_refresh = if refreshed.refresh_token.is_empty() {
                     auth.refresh_token.clone()
                 } else {
@@ -119,13 +139,26 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
         }
     }
 
-    /// Unconditional refresh using the stored refresh token (upstream 401 recovery).
-    pub fn force_refresh(&self) -> anyhow::Result<Option<CursorAuth>> {
+    /// Unconditional refresh using the stored refresh token (upstream 401
+    /// recovery). `failed_access_token` is the bearer that just 401'd: when
+    /// the store already holds a different token (another flight refreshed,
+    /// or a hot account switch happened), that stored auth is returned
+    /// without spending a rotation.
+    pub fn force_refresh(
+        &self,
+        failed_access_token: Option<&str>,
+    ) -> anyhow::Result<Option<CursorAuth>> {
+        let _flight = refresh_single_flight();
         let Some(stored) = self.store.load()? else {
             return Ok(None);
         };
         if stored.access_token.trim().is_empty() {
             return Ok(None);
+        }
+        if let Some(failed) = failed_access_token
+            && stored.access_token != failed
+        {
+            return Ok(Some(enrich(stored, self.auth_path())));
         }
         let auth = enrich(stored.clone(), self.auth_path());
         let Some(refresh_token) = auth.refresh_token.as_deref() else {
@@ -135,6 +168,13 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
         };
         let refreshed = refresh_cursor_auth(refresh_token)?
             .ok_or_else(|| anyhow::anyhow!("Cursor /auth/refresh returned non-success"))?;
+        // Account CAS before save (hot login is a separate process; the
+        // in-process single-flight cannot serialize it).
+        if let Some(current) = self.store.load()?
+            && current.access_token != stored.access_token
+        {
+            return Ok(Some(enrich(current, self.auth_path())));
+        }
         let new_refresh = if refreshed.refresh_token.is_empty() {
             auth.refresh_token.clone()
         } else {
@@ -147,6 +187,14 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
         })
         .map(Some)
     }
+}
+
+/// Process-wide refresh serialization. Held across the blocking refresh HTTP
+/// call; waiters re-check the store and usually return without a second
+/// rotation.
+fn refresh_single_flight() -> std::sync::MutexGuard<'static, ()> {
+    static REFRESH_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    REFRESH_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,13 +388,17 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 }
 
 /// Force a refresh from the file/keychain store (ignores env-only tokens).
-pub fn force_refresh_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
+/// Pass the bearer token that 401'd so an already-rotated or hot-swapped
+/// store is returned as-is instead of burning another rotation.
+pub fn force_refresh_cursor_auth(
+    failed_access_token: Option<&str>,
+) -> anyhow::Result<Option<CursorAuth>> {
     if env_cursor_token().is_some() {
         anyhow::bail!(
             "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-proxy cursor auth login`, or supply a fresh token."
         );
     }
-    file_store().force_refresh()
+    file_store().force_refresh(failed_access_token)
 }
 
 /// Load only the bearer token for call sites that do not need auth metadata.
@@ -520,6 +572,12 @@ fn env_cursor_token() -> Option<String> {
     env_cursor_token_from(|key| std::env::var(key).ok())
 }
 
+/// True when an env token shadows the persistent store. A `cursor auth login`
+/// hot-swap will not take effect for a running `serve` in that case.
+pub fn env_cursor_token_present() -> bool {
+    env_cursor_token().is_some()
+}
+
 fn env_cursor_token_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     get("CCP_CURSOR_AUTH_TOKEN")
         .filter(|token| !token.trim().is_empty())
@@ -605,7 +663,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn format_unix_ms(ms: u64) -> String {
+pub(crate) fn format_unix_ms(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     match time::OffsetDateTime::from_unix_timestamp(secs) {
         Ok(ts) => ts

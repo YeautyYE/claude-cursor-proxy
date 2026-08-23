@@ -86,6 +86,19 @@ claude-cursor-proxy serve --no-monitor    # 只要日志，不要监控界面
 claude-cursor-proxy serve --port 11435    # 换端口
 ```
 
+#### 运行中热切换账号（无需重启）
+
+`serve` 运行时，直接在另一个终端执行 `claude-cursor-proxy cursor auth login`
+即可换号。代理每个请求都会重新读取凭据，所以：
+
+- 新请求立即使用新账号；
+- 正在进行的运行继续用启动时拿到的旧 token 跑完，不会被打断；
+- 已有会话的下一轮会在新账号下重开 Cursor 对话（客户端自动重发完整历史，上下文不丢）。
+
+`cursor auth status` 可查看当前生效的账号。注意：如果 `serve` 进程的环境里设了
+`CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN`，env token 会遮蔽存储的登录态，
+热切换不会生效，需先取消该环境变量。
+
 ### 3. 让 Claude Code 走本机代理（Fable 5）
 
 ```bash

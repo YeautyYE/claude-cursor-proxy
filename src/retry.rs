@@ -34,9 +34,33 @@ pub fn is_capacity_shed(message: &str) -> bool {
             || lower.contains("try again in a few"))
 }
 
+/// Definite policy 429s: plan/entitlement/account-quota rate limits that will
+/// not succeed on a same-account retry (e.g. `ERROR_RATE_LIMITED_CHANGEABLE:
+/// Free plans can only use Auto`, `ERROR_PRO_USER_RATE_LIMIT_EXCEEDED`). These
+/// must pass through verbatim on the first upstream response instead of being
+/// retried internally — and after a hot account switch they trigger an
+/// automatic failover to the newly stored credentials.
+pub fn is_policy_rate_limit(message: &str) -> bool {
+    if is_billing_block(message) {
+        return true;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("error_rate_limited_changeable")
+        // ERROR_PRO_USER_/ERROR_FREE_USER_/ERROR_USER_RATE_LIMIT_EXCEEDED:
+        // the account's own quota window, not pool capacity.
+        || lower.contains("user_rate_limit_exceeded")
+        || (lower.contains("error_rate_limited")
+            && (lower.contains("free plans")
+                || lower.contains("upgrade plans")
+                || lower.contains("increase limits")))
+}
+
 pub fn should_retry_upstream(status: u16, message: &str) -> bool {
     let status = classify_proxy_error_status(status, message);
-    should_retry_status(status) && !is_billing_block(message) && !is_capacity_shed(message)
+    should_retry_status(status)
+        && !is_billing_block(message)
+        && !is_capacity_shed(message)
+        && !is_policy_rate_limit(message)
 }
 
 /// Cursor Connect often records `status: 502` while the message is still
@@ -93,12 +117,27 @@ fn embedded_connect_http_status(message: &str) -> Option<u16> {
     None
 }
 
+/// Local admission backpressure (semaphore queues and the per-session busy
+/// gate). These start as 503 + Retry-After but the late-retry engine folds
+/// them into event strings ("Cursor error 503: ..."), which would otherwise
+/// surface as 502 — grok-build then reports "Server error (our side)"
+/// instead of backing off.
+pub fn is_local_admission_backpressure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("cursor live generation admission queue timed out")
+        || lower.contains("cursor live run admission queue timed out")
+        || lower.contains("already active for this session")
+}
+
 pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
     // Once Cursor may have accepted any part of an operation, replay safety
     // dominates a nested child status such as 429/503. Mapping the child first
     // would invite the caller to start a second Run.
     if is_ambiguous_live_accept(message) {
         return 409;
+    }
+    if is_local_admission_backpressure(message) {
+        return 503;
     }
     if is_upstream_rate_limit(message) || status == 429 {
         return 429;
@@ -272,6 +311,65 @@ mod tests {
         );
         assert!(!should_retry_upstream(400, "bad request"));
         assert!(!should_retry_upstream(401, "unauthorized"));
+    }
+
+    #[test]
+    fn local_admission_backpressure_stays_503_even_when_wrapped() {
+        // The late-retry engine folds local 503s into event strings; the
+        // classifier must map them back to 503 so clients back off instead of
+        // reporting "Server error (our side)" from a 502.
+        for text in [
+            "Cursor error 503: Cursor live generation admission queue timed out",
+            "Cursor live generation admission queue timed out",
+            "Cursor error 503: Cursor live run admission queue timed out",
+            "Cursor error 503: A Cursor live run is already active for this session; retry after it advances",
+        ] {
+            assert!(is_local_admission_backpressure(text), "{text}");
+            assert_eq!(classify_proxy_error_status(502, text), 503, "{text}");
+            assert_eq!(anthropic_error_kind_for_status(502, text), "api_error");
+        }
+        assert!(!is_local_admission_backpressure(
+            "Connect error 503: upstream unavailable"
+        ));
+    }
+
+    #[test]
+    fn policy_rate_limit_is_terminal_and_never_internally_retried() {
+        let free_plan = "Connect error 429: ERROR_RATE_LIMITED_CHANGEABLE: Named models unavailable — Free plans can only use Auto. [resource_exhausted]";
+        assert!(is_policy_rate_limit(free_plan));
+        assert!(
+            !should_retry_upstream(429, free_plan),
+            "a plan-entitlement 429 will never succeed on retry; hidden retries multiply the flood"
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, free_plan),
+            429,
+            "the verbatim policy 429 must reach the client as HTTP 429"
+        );
+
+        let limits = "Connect error 429: ERROR_RATE_LIMITED: Increase limits for faster responses at cursor.com/dashboard [resource_exhausted]";
+        assert!(is_policy_rate_limit(limits));
+        assert!(!should_retry_upstream(429, limits));
+
+        let invoice = "You have an unpaid invoice — pay your invoice to continue";
+        assert!(is_policy_rate_limit(invoice), "billing blocks are a subset");
+
+        // Per-account quota windows (observed 2026-08-23 after an account
+        // switch): must not be hidden-retried on the same login.
+        let pro_quota = "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded. — You have exceeded your usage limit. [resource_exhausted]";
+        assert!(is_policy_rate_limit(pro_quota));
+        assert!(!should_retry_upstream(429, pro_quota));
+        assert_eq!(classify_proxy_error_status(502, pro_quota), 429);
+        assert!(is_policy_rate_limit(
+            "Connect error 429: ERROR_FREE_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded [resource_exhausted]"
+        ));
+
+        let transient = "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]";
+        assert!(
+            !is_policy_rate_limit(transient),
+            "transient provider exhaustion must stay retryable"
+        );
+        assert!(should_retry_upstream(429, transient));
     }
 
     #[test]
