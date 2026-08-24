@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.69 (2026-08-25)
+
+- Give Sand routing a dedicated, TUI-first README guide covering one-process startup, model selection, dynamic Cursor model discovery, manual model ids such as `gemini-3.1-pro`, and account usage details.
+- Keep the English and Chinese configuration references aligned so the Sand policy, usage view, and `serve` workflow are documented in one place.
+
 ## v0.1.68 (2026-08-25)
 
 - Wait briefly for same-operation live attach handoff and for a different operation to observe the current session Run advance, reducing transient `already active` 503 retry storms without reusing a different request or cancelling pending tools.

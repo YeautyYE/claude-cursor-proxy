@@ -21,7 +21,7 @@ grok-build  ──Responses / Messages ──►        │
                                               └── Grok
 ```
 
-[快速开始](#快速开始) · [模型](#模型) · [功能](#功能) · [配置](#配置) · [常见问题](#常见问题) · [限制](#限制)
+[快速开始](#快速开始) · [模型](#模型) · [Sand 模式](#sand-模式) · [功能](#功能) · [配置](#配置) · [常见问题](#常见问题) · [限制](#限制)
 
 ---
 
@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.26 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.69 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -213,6 +213,78 @@ claude-cursor-proxy models --full
 curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 ```
 
+## Sand 模式
+
+Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规则的请求会
+发送 `x-cursor-client-type: sand`；其他 Cursor 请求继续使用普通的 `cli`
+（或你设置的 `CCP_CURSOR_CLIENT_TYPE`）身份。混合路由由同一个
+`claude-cursor-proxy serve` 进程完成，不需要再启动第二个 Sand 二进制。
+这套规则只作用于最终路由到 Cursor 的请求；Codex、Kimi、Grok 路由不受影响。
+
+### 最快配置
+
+```bash
+claude-cursor-proxy cursor auth login
+claude-cursor-proxy serve              # 保持监控 TUI 打开
+```
+
+在监控 TUI 中按 `s` 打开 **Sand Models**。用 `j`/`k` 选择模型，按空格或
+回车切换，按 `a` 输入一个精确的 Cursor catalog ID。列表会标记
+`[sand]` 或 `[cli]`；修改只影响新请求，并以原子方式写入 `config.json`。
+TUI 需要终端；`serve --no-monitor` 仍可运行代理，但不会显示设置面板。
+
+推荐优先使用这套 TUI 流程管理 Sand，不需要手动编辑配置文件，也不需要再
+启动第二个二进制。正在运行的 `serve` 会在下一条请求时使用保存后的规则。
+
+### 使用已选择的模型
+
+在 TUI 中启用模型后，再让 Claude Code 使用这个模型：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
+export ANTHROPIC_AUTH_TOKEN=unused
+export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
+export ANTHROPIC_SMALL_FAST_MODEL="cursor:gemini-3.1-pro"
+claude
+```
+
+如果是临时 shell 或自动化任务，可以用 `CCP_CURSOR_SAND_MODELS` 覆盖 TUI
+策略：
+
+```bash
+export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
+```
+
+`CCP_CURSOR_SAND_MODELS` 是逗号分隔的规则，支持 `*` 和 `?`。匹配不区分
+大小写，并会自动归一化 `[1m]` 以及 `cursor:`/`cursor-agent:`/
+`cursor-plan:`/`cursor-ask:` 前缀。因此，`gemini-3.1-pro` 也会匹配
+`cursor:gemini-3.1-pro[1m]`。环境变量优先于 `config.json` 的
+`cursor.sandModels`；想从 TUI 编辑文件时先取消这个环境变量。需要混合
+路由时请保留 `CCP_CURSOR_CLIENT_TYPE` 默认值 `cli`；把它设为 `sand` 会让
+未命中规则的模型也使用 Sand。
+显式设置为空值 `CCP_CURSOR_SAND_MODELS=` 会关闭全部 Sand 匹配；取消该变量
+后才会重新读取 `config.json`。
+
+### 模型目录从哪里来
+
+代码内置的 Cursor 列表只是启动和离线时的兜底目录。已登录 Cursor 时，
+代理启动会调用 `GetUsableModels`，请求 `GET /v1/models` 时也会刷新；账号
+返回的实时 catalog 会合并到 TUI 和模型列表。你仍可以按 `a` 填写任意精确
+ID，或直接写入环境变量，但当前 Cursor 账号必须在上游目录中提供该模型。
+
+### 账号用量
+
+监控器会轮询 Cursor 只读 Dashboard 接口，显示当前账号、套餐、Auto/API
+百分比、按量余额、Dashboard 费用/事件统计，以及账号提供时的 Sand/Grok
+Bot 周期用量。按 `u` 打开多行用量详情，其中包含 Sand 周期和最近用量事件。
+`cursor auth status` 可查看当前登录账号；macOS 没有代理/Agent 登录态时，
+监控器会只读回退到 Cursor Desktop 的 `state.vscdb`。Dashboard 没提供的字段
+会留空，不会伪造数据。
+
+```bash
+claude-cursor-proxy cursor auth status
+```
+
 ---
 
 ## 功能
@@ -296,35 +368,8 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 }
 ```
 
-`cursor.sandModels` 会在每个请求开始时按模型匹配；`[1m]` 以及
-`cursor:`/`cursor-plan:`/`cursor-ask:` 前缀会自动归一化。监控 TUI 中按
-`s` 打开设置，使用空格或回车切换模型，按 `a` 可以直接输入当前列表中
-没有的 catalog ID，配置会原子写入。环境变量优先于配置文件，并会在面板
-中标记覆盖状态。
-
-代码里的 Cursor 列表只是启动和离线时的兜底目录。已登录时，代理启动后
-会调用 `GetUsableModels`，访问 `GET /v1/models` 时也会刷新；账号返回的
-实时模型会合并到 TUI 和模型列表。你也可以自己填写任意 Cursor catalog ID：
-
-```bash
-export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
-export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
-```
-
-或者直接把它加入 `config.json` 的 `cursor.sandModels`。手工填写的 ID 仍需
-在当前 Cursor 账号的上游目录中可用。
-
-TUI 顶部会轮询 Cursor Dashboard，显示账号、套餐、Auto/API 百分比、按量
-余额、Dashboard 费用/事件统计，以及账号提供时的 Sand/Grok Bot 周期用量。
-优先使用代理/Agent 登录态；在 macOS 上没有这些登录态时，会只读回退到
-Cursor Desktop 的 `state.vscdb`。轮询不会写入 Cursor 状态。TUI 中按 `u`
-可打开多行用量详情，其中包含 Sand 周期和最近用量事件。
-
-检查 Cursor 登录状态：
-
-```bash
-claude-cursor-proxy cursor auth status
-```
+上面就是 TUI 写入的配置形状；手动编辑主要用于自动化场景。完整的路由、
+TUI、模型发现和用量说明见 [Sand 模式](#sand-模式)。
 
 ---
 

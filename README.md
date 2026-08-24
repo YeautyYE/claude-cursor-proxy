@@ -21,7 +21,7 @@ grok-build  ──Responses / Messages ──►        │
                                               └── Grok
 ```
 
-[Quick start](#quick-start) · [Models](#models) · [Features](#features) · [Config](#configuration) · [Limitations](#limitations)
+[Quick start](#quick-start) · [Models](#models) · [Sand mode](#sand-mode) · [Features](#features) · [Config](#configuration) · [Limitations](#limitations)
 
 ---
 
@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.26 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.69 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -215,6 +215,85 @@ claude-cursor-proxy models --full
 curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 ```
 
+## Sand mode
+
+Sand is a separate Cursor request surface selected **per model**. For a model
+that matches the Sand policy, the proxy sends Cursor's
+`x-cursor-client-type: sand`; other Cursor models keep the normal `cli` (or
+your configured `CCP_CURSOR_CLIENT_TYPE`) identity. Mixed routing happens in
+the same `claude-cursor-proxy serve` process; a second Sand binary is not
+needed.
+The policy applies only to requests resolved to the Cursor provider; Codex,
+Kimi, and Grok routes are unchanged.
+
+### Fast setup
+
+```bash
+claude-cursor-proxy cursor auth login
+claude-cursor-proxy serve              # keep the monitor TUI open
+```
+
+In the monitor TUI, press `s` to open **Sand Models**. Use `j`/`k` to select a
+model, `Space` or `Enter` to toggle it, and `a` to enter an exact Cursor
+catalog id. The list is marked `[sand]` or `[cli]`; changes apply to new
+requests and are written atomically to `config.json`. The TUI requires a
+terminal; `serve --no-monitor` keeps the proxy running without it.
+
+This TUI flow is the recommended way to manage Sand routing. You do not need
+to edit a file or launch another binary; the running `serve` process picks up
+the saved policy for the next request.
+
+### Use the selected model
+
+After enabling a model with `s`, point Claude Code at that model:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
+export ANTHROPIC_AUTH_TOKEN=unused
+export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
+export ANTHROPIC_SMALL_FAST_MODEL="cursor:gemini-3.1-pro"
+claude
+```
+
+For a temporary shell/session or automation, `CCP_CURSOR_SAND_MODELS` can
+override the TUI policy:
+
+```bash
+export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
+```
+
+`CCP_CURSOR_SAND_MODELS` is a comma-separated list and supports `*` and `?`.
+Model matching is case-insensitive and normalizes `[1m]` plus
+`cursor:`/`cursor-agent:`/`cursor-plan:`/`cursor-ask:` prefixes, so a rule for
+`gemini-3.1-pro` also covers `cursor:gemini-3.1-pro[1m]`. An environment value
+always overrides `cursor.sandModels` in `config.json`; unset it to edit the
+file from the TUI. Leave `CCP_CURSOR_CLIENT_TYPE` at its default `cli` when you
+want mixed routing; setting it to `sand` makes unmatched models use Sand too.
+An explicitly empty `CCP_CURSOR_SAND_MODELS=` disables all Sand matches until
+the variable is unset.
+
+### Model discovery
+
+The built-in Cursor catalog is only an offline/startup fallback. With a Cursor
+login, the proxy fetches `GetUsableModels` at startup and refreshes it when
+`GET /v1/models` is requested. The returned account catalog is merged into the
+TUI and the model list. You can still add an exact id with `a` or set it in the
+environment, but the signed-in Cursor account must expose that model upstream.
+
+### Account usage
+
+The monitor polls Cursor's read-only dashboard endpoints and shows the signed-in
+account, plan, Auto/API percentages, on-demand dollars, dashboard cost/event
+totals, and the Sand/Grok Bot period meter when the account provides it. Press
+`u` for the multi-line usage view, including the Sand period and recent usage
+events. `cursor auth status` shows the active login. On macOS, the monitor can
+fall back to Cursor Desktop's read-only `state.vscdb`; missing dashboard fields
+are omitted rather than invented.
+
+```bash
+claude-cursor-proxy cursor auth status
+```
+
 ---
 
 ## Features
@@ -297,37 +376,9 @@ These are Claude Code knobs (not proxy config). Useful when `/deep-research` or 
 }
 ```
 
-`cursor.sandModels` is evaluated per request after model normalization, so
-`[1m]` and `cursor:`/`cursor-plan:`/`cursor-ask:` forms match the same model.
-The monitor TUI opens the editor with `s`; `space` or `Enter` toggles a model,
-and `a` lets you type an exact catalog id that is not in the current list.
-Changes are written atomically. An environment value takes precedence over
-the file and is shown as an override in the editor.
-
-The static Cursor list is only a fallback for startup and offline discovery.
-When a Cursor login is available, the proxy calls `GetUsableModels` at startup
-and also when `GET /v1/models` is requested; returned catalog ids are merged
-into the TUI and model list. You may also enter any catalog id yourself:
-
-```bash
-export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
-export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
-```
-
-or add it to `cursor.sandModels` in `config.json`. A manually entered id still
-has to be enabled for the signed-in Cursor account upstream.
-
-The TUI header polls the Cursor dashboard and shows the signed-in account,
-plan, Auto/API percentages, on-demand dollars, dashboard cost/event totals, and
-the Sand/Grok Bot weekly meter when the account exposes it. It first uses the
-proxy/Agent auth store and then falls back to Cursor Desktop's read-only
-`state.vscdb` on macOS. The poller never writes Cursor state. Press `u` in the
-TUI for the multi-line usage view, including the Sand period and recent usage
-events.
-
-```bash
-claude-cursor-proxy cursor auth status
-```
+This is the shape written by the TUI; manual editing is mainly useful for
+automation. See [Sand mode](#sand-mode) for the complete routing, TUI, model
+discovery, and usage guide.
 
 ---
 
