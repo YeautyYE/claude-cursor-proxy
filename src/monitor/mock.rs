@@ -5,7 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, session_summaries,
+    AccountUsageEvent, AccountUsageSnapshot, AccountUsageState, ActiveRequest, CompletedRequest,
+    EndpointKind, MonitorState, RequestStatus, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -356,6 +357,37 @@ fn mock_state_for_tick(
         sessions,
         active,
         recent: recent.into_iter().collect(),
+        account_usage: AccountUsageState::Ready(AccountUsageSnapshot {
+            email: Some("dev@example.com".into()),
+            membership: Some("ultra".into()),
+            auto_percent: Some(12.4),
+            api_percent: Some(48.0),
+            total_percent: Some(30.2),
+            plan_used_usd: Some(42.0),
+            plan_limit_usd: Some(200.0),
+            on_demand_used_usd: Some(1.5),
+            on_demand_limit_usd: Some(10.0),
+            grok_bot_percent: Some(8.25),
+            grok_bot_period_start: Some("2026-08-01T00:00:00.000Z".into()),
+            grok_bot_reset: Some("2026-08-31T00:00:00.000Z".into()),
+            total_cost_usd: Some(12.50),
+            usage_event_count: Some(7),
+            usage_events: vec![
+                AccountUsageEvent {
+                    timestamp: Some("2026-08-25T12:00:00Z".into()),
+                    model: Some("claude-fable-5".into()),
+                    charged_usd: Some(1.25),
+                    kind: Some("INCLUDED".into()),
+                },
+                AccountUsageEvent {
+                    timestamp: Some("2026-08-25T11:42:00Z".into()),
+                    model: Some("gpt-5.5".into()),
+                    charged_usd: Some(0.30),
+                    kind: Some("API".into()),
+                },
+            ],
+            fetched_at: now,
+        }),
     }
 }
 

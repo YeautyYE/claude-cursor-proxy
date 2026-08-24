@@ -535,14 +535,6 @@ fn live_attach_unavailable_error() -> CursorError {
     )
 }
 
-fn live_attach_consumer_alive_error() -> CursorError {
-    CursorError::new(
-        503,
-        "A Cursor live run is already active for this session; retry after it advances",
-        None,
-    )
-}
-
 #[derive(Debug)]
 pub struct CursorLiveRunHandle {
     run_id: String,
@@ -667,8 +659,10 @@ impl CursorLiveRunHandle {
     /// Attach an identical retry (same operation fingerprint) to the current
     /// downstream segment. The driver replays everything the segment already
     /// produced and, when the segment is still generating, streams the rest to
-    /// the returned receiver. Fails when the original consumer is still
-    /// connected (a true concurrent duplicate) or the run cannot serve replay.
+    /// the returned receiver. A still-open original SSE is stolen: grok-build
+    /// retries the same `x-grok-req-id` only after abandoning the previous
+    /// HTTP attempt, and rejecting that retry as busy is the 503 storm. Fails
+    /// when the run cannot serve replay.
     pub(crate) async fn attach_for_operation(
         &self,
         fingerprint: u64,
@@ -1365,9 +1359,13 @@ enum LiveRunEntry {
     },
     Running(Arc<CursorLiveRunHandle>),
     /// Open `.send()` timed out: Cursor may already have the Run. Occupy the
-    /// slot so a concurrent POST cannot start a duplicate.
+    /// slot so a concurrent POST cannot start a duplicate of *this* operation.
+    /// `fingerprint` scopes the 409: a later grok-build stage / next turn
+    /// (different operation) must not inherit a fatal tombstone. `0` is the
+    /// unknown-operation sentinel and fail-closes every claimant.
     Ambiguous {
         until: Instant,
+        fingerprint: u64,
     },
     /// The previous Run completed successfully. Identical request retries must
     /// not start a second Run before the client could have observed `message_end`.
@@ -1540,7 +1538,13 @@ impl LiveRunReservation {
                     if reservation_id == &self.reservation_id
             );
             if owns_reservation {
-                runs.insert_key(self.session_id.clone(), LiveRunEntry::Ambiguous { until });
+                runs.insert_key(
+                    self.session_id.clone(),
+                    LiveRunEntry::Ambiguous {
+                        until,
+                        fingerprint: self.operation_fingerprint,
+                    },
+                );
                 Some(self.session_id.clone())
             } else {
                 None
@@ -1675,6 +1679,7 @@ impl Drop for LiveRunReservation {
                     self.session_id.clone(),
                     LiveRunEntry::Ambiguous {
                         until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                        fingerprint: self.operation_fingerprint,
                     },
                 );
                 (Some(self.session_id.clone()), false)
@@ -1783,8 +1788,21 @@ impl LiveRunRegistry {
         }
         let succeeded = match runs.runs.get(&key) {
             Some(LiveRunEntry::Starting { .. }) => return LiveSlotClaim::Starting,
-            Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => {
-                return LiveSlotClaim::Ambiguous;
+            Some(LiveRunEntry::Ambiguous {
+                until,
+                fingerprint: stored,
+            }) if Instant::now() < *until => {
+                // Same operation (or unknown fingerprint) stays fail-closed.
+                // A later grok-build stage / next turn must not inherit a 409:
+                // grok-build treats 409 as fatal and would abort the agent.
+                if ambiguous_blocks_operation(*stored, fingerprint) {
+                    return LiveSlotClaim::Ambiguous;
+                }
+                runs.remove_key(&key);
+                return match Self::reserve_key(&mut runs, key) {
+                    Some(reservation) => LiveSlotClaim::Reserved(reservation),
+                    None => LiveSlotClaim::Running,
+                };
             }
             Some(LiveRunEntry::Succeeded {
                 until,
@@ -2016,7 +2034,7 @@ impl LiveRunRegistry {
     fn key_occupied(runs: &LiveRunMap, key: &str) -> bool {
         match runs.runs.get(key) {
             Some(LiveRunEntry::Starting { .. }) => true,
-            Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until => true,
+            Some(LiveRunEntry::Ambiguous { until, .. }) if Instant::now() < *until => true,
             Some(LiveRunEntry::Succeeded { until, .. }) if Instant::now() < *until => true,
             Some(LiveRunEntry::Running(handle)) if !handle.is_completed() => true,
             _ => false,
@@ -2181,11 +2199,11 @@ impl LiveRunRegistry {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        let error = match runs.runs.get(&key) {
+        let (error, sealed_fingerprint) = match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(handle)) if handle.is_completed() => {
-                handle.take_terminal_error()
+                (handle.take_terminal_error(), handle.request_fingerprint())
             }
-            _ => None,
+            _ => (None, 0),
         };
         if let Some(error) = error {
             // Plain policy 429s are not same-request-retryable and not
@@ -2200,6 +2218,7 @@ impl LiveRunRegistry {
                     key,
                     LiveRunEntry::Ambiguous {
                         until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                        fingerprint: sealed_fingerprint,
                     },
                 );
             } else {
@@ -2233,8 +2252,28 @@ impl LiveRunRegistry {
         Self::prune_finished(&mut runs);
         matches!(
             runs.runs.get(&key),
-            Some(LiveRunEntry::Ambiguous { until }) if Instant::now() < *until
+            Some(LiveRunEntry::Ambiguous { until, .. }) if Instant::now() < *until
         )
+    }
+
+    /// True only when this slot's Ambiguous tombstone applies to `fingerprint`.
+    /// A later grok-build stage / next turn (different operation) is not
+    /// blocked: grok-build treats 409 as fatal and would abort the agent.
+    pub fn is_ambiguous_for_operation(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) -> bool {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Ambiguous {
+                until,
+                fingerprint: stored,
+            }) if Instant::now() < *until => ambiguous_blocks_operation(*stored, fingerprint),
+            _ => false,
+        }
     }
 
     pub fn take_terminal_error(session_id: &str) -> Option<String> {
@@ -2291,6 +2330,7 @@ impl LiveRunRegistry {
                     key,
                     LiveRunEntry::Ambiguous {
                         until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
+                        fingerprint,
                     },
                 );
             } else {
@@ -2314,7 +2354,7 @@ impl LiveRunRegistry {
             .iter()
             .filter_map(|(key, entry)| match entry {
                 LiveRunEntry::Starting { .. } => None,
-                LiveRunEntry::Ambiguous { until } if Instant::now() < *until => None,
+                LiveRunEntry::Ambiguous { until, .. } if Instant::now() < *until => None,
                 LiveRunEntry::Ambiguous { .. } => Some(key.clone()),
                 LiveRunEntry::Succeeded { until, .. } if Instant::now() < *until => None,
                 LiveRunEntry::Succeeded { .. } => Some(key.clone()),
@@ -2476,6 +2516,32 @@ impl LiveRunRegistry {
         }
     }
 
+    /// Atomically release an Ambiguous tombstone that belongs to a DIFFERENT
+    /// operation and reserve the slot for the new one. Same-operation
+    /// claimants stay fail-closed so a retry cannot start a duplicate Run.
+    pub fn claim_ambiguous_release_for_new_operation(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) -> Option<LiveRunReservation> {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Ambiguous {
+                until,
+                fingerprint: stored,
+            }) if Instant::now() < *until && ambiguous_blocks_operation(*stored, fingerprint) => {
+                None
+            }
+            Some(LiveRunEntry::Ambiguous { .. }) => {
+                runs.remove_key(&key);
+                Self::reserve_key(&mut runs, key)
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn clear() {
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2629,9 +2695,46 @@ impl CursorHttpClient {
         mcp_tools: Option<super::proto::McpTools>,
         request_context: super::proto::RequestContext,
         original_request_id: Option<&str>,
+        cancel: Option<watch::Receiver<bool>>,
+        upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
+        pre_admission: Option<LiveGenerationPermit>,
+    ) -> Result<LiveRunStart, CursorError> {
+        self.start_live_agent_with_identity_guarded_profile(
+            token,
+            prompt,
+            model,
+            images,
+            custom_system_prompt,
+            identity,
+            allowed_tool_names,
+            mcp_tools,
+            request_context,
+            original_request_id,
+            cancel,
+            upstream_open_guard,
+            pre_admission,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_live_agent_with_identity_guarded_profile(
+        &self,
+        token: &str,
+        prompt: &str,
+        model: &str,
+        images: &[CursorSelectedImage],
+        custom_system_prompt: Option<&str>,
+        identity: LiveRunIdentity<'_>,
+        allowed_tool_names: Option<BTreeSet<String>>,
+        mcp_tools: Option<super::proto::McpTools>,
+        request_context: super::proto::RequestContext,
+        original_request_id: Option<&str>,
         mut cancel: Option<watch::Receiver<bool>>,
         upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
         pre_admission: Option<LiveGenerationPermit>,
+        client_type_override: Option<&str>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -2650,7 +2753,8 @@ impl CursorHttpClient {
             }
         };
 
-        let cursor_identity = LiveIdentityHeaders::build(token);
+        let cursor_identity =
+            LiveIdentityHeaders::build_with_client_type(token, client_type_override);
         let mut h2_probe_guard = None;
         let mut process_h2_epoch = process_h2_circuit_epoch();
         let (http, force_http1) = match live_open_circuit_route() {
@@ -3203,9 +3307,13 @@ struct LiveIdentityHeaders {
 }
 
 impl LiveIdentityHeaders {
-    fn build(token: &str) -> Self {
+    fn build_with_client_type(token: &str, client_type_override: Option<&str>) -> Self {
         let client_version = crate::config::cursor_client_version();
-        let client_type = crate::config::cursor_client_type();
+        let client_type = client_type_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(crate::config::cursor_client_type);
         let ghost_mode = crate::config::cursor_ghost_mode().to_string();
         let profile = crate::config::cursor_client_profile();
         let ide_profile = profile.eq_ignore_ascii_case("ide");
@@ -4830,6 +4938,13 @@ fn annotate_live_cursor_error(session_id: &str, err: CursorError) -> CursorError
         format!("{} ({CONVERSATION_RESET_RETRY_NOTE})", err.message),
         err.detail,
     )
+}
+
+/// An Ambiguous tombstone with an unknown fingerprint (`0`) fail-closes every
+/// claimant. A known fingerprint only 409s the same operation: grok-build
+/// treats 409 as fatal, so a later stage / next turn must not inherit it.
+fn ambiguous_blocks_operation(stored: u64, incoming: u64) -> bool {
+    incoming == 0 || stored == 0 || stored == incoming
 }
 
 pub(crate) fn live_request_fingerprint(payload: &[u8]) -> u64 {
@@ -6775,20 +6890,20 @@ async fn drive_live_run(
                         expected_fingerprint,
                         fingerprint_source,
                     }) => {
-                        // Serve an identical retry whose original consumer is
-                        // gone. Reject when the segment moved to a different
-                        // operation, replay fidelity was lost, or the original
-                        // consumer is still reading (true concurrent duplicate).
+                        // Serve an identical retry. grok-build's sampler retries
+                        // the same x-grok-req-id only after it has already
+                        // dropped the previous attempt; a half-open SSE is a
+                        // zombie, not a second legitimate consumer. Steal it.
+                        // Reject only when the segment moved or replay overflowed.
                         if fingerprint_source.load(Ordering::Acquire) != expected_fingerprint
                             || segment_replay.overflowed
                         {
                             let _ = ack.send(Err(live_attach_unavailable_error()));
                             continue;
                         }
-                        if sink.as_ref().is_some_and(|tx| !tx.is_closed()) {
-                            let _ = ack.send(Err(live_attach_consumer_alive_error()));
-                            continue;
-                        }
+                        // A still-open sink is stolen by assigning `new_tx`
+                        // below (the old sender drops). Do not clear it first
+                        // or the segment looks closed and live deltas vanish.
                         let (new_tx, new_rx) = mpsc::channel(
                             segment_replay.events.len() + LIVE_EVENT_CHANNEL_CAP,
                         );
@@ -21517,10 +21632,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_replay_rejects_while_original_consumer_is_alive() {
-        // A true concurrent duplicate (same fingerprint, original consumer
-        // still reading) must stay a busy error, not steal the stream.
-        let mut harness = spawn_attach_replay_driver("attach-while-alive");
+    async fn attach_replay_steals_from_a_still_open_original_consumer() {
+        // grok-build retries 503 sequentially with the same x-grok-req-id after
+        // it has already abandoned the previous HTTP attempt. That attempt's
+        // SSE body can still look "alive" for seconds (proxy buffering, delayed
+        // TCP close). Rejecting attach as busy is what produced the 503 storm:
+        // grok-build treats 503 as transient overload and retries 2s/4s/8s
+        // while the Cursor run keeps the slot for the whole generation.
+        // Same-fingerprint attach must steal the sink; last retry wins.
+        let mut harness = spawn_attach_replay_driver("attach-steal-alive");
         send_text_delta(&harness.upstream_tx, "held by the original consumer").await;
         let _first = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
             .await
@@ -21528,10 +21648,44 @@ mod tests {
             .expect("stream open")
             .expect("no error");
 
-        let error = attach_replay(&harness.command_tx, 7)
+        let mut attached = attach_replay(&harness.command_tx, 7)
             .await
-            .expect_err("a live original consumer must reject the duplicate");
-        assert_eq!(error.status, 503);
+            .expect("same-fingerprint retry must steal, not 503, while the old SSE is half-open");
+        let replayed = tokio::time::timeout(Duration::from_secs(2), attached.recv())
+            .await
+            .expect("stolen consumer gets the prefix")
+            .expect("attached stream open")
+            .expect("no error");
+        assert!(
+            matches!(
+                &replayed,
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })
+                    if text == "held by the original consumer"
+            ),
+            "stolen attach must replay the already-delivered prefix: {replayed:?}"
+        );
+
+        send_text_delta(&harness.upstream_tx, "after steal").await;
+        let live = tokio::time::timeout(Duration::from_secs(2), attached.recv())
+            .await
+            .expect("live continuation after steal")
+            .expect("attached stream still open")
+            .expect("no error");
+        assert!(
+            matches!(
+                &live,
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) if text == "after steal"
+            ),
+            "the stolen retry must keep the live segment: {live:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), harness.event_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "the abandoned original consumer must not keep receiving after steal"
+        );
     }
 
     #[tokio::test]
@@ -21810,6 +21964,38 @@ mod tests {
             LiveRunRegistry::try_claim_run_for_operation(&session, None, 8)
         else {
             panic!("a new operation must release the Succeeded tombstone");
+        };
+        reservation.release();
+        assert!(!LiveRunRegistry::is_occupied_run(&session, None));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn ambiguous_tombstone_only_blocks_the_same_operation() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("ambiguous-fp-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let mut reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.set_operation_fingerprint(11);
+        reservation.seal_ambiguous(Instant::now() + Duration::from_secs(60));
+
+        assert!(
+            LiveRunRegistry::is_ambiguous_for_operation(&session, None, 11),
+            "the sealed operation must stay fail-closed"
+        );
+        assert!(
+            !LiveRunRegistry::is_ambiguous_for_operation(&session, None, 22),
+            "a later grok-build stage / next turn must not inherit that 409"
+        );
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 11),
+            LiveSlotClaim::Ambiguous
+        ));
+
+        let LiveSlotClaim::Reserved(reservation) =
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 22)
+        else {
+            panic!("a new operation must not inherit another turn's ambiguous 409");
         };
         reservation.release();
         assert!(!LiveRunRegistry::is_occupied_run(&session, None));

@@ -238,6 +238,128 @@ pub struct MonitorState {
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
+    pub account_usage: AccountUsageState,
+}
+
+/// One recent usage event returned by Cursor's dashboard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountUsageEvent {
+    pub timestamp: Option<String>,
+    pub model: Option<String>,
+    pub charged_usd: Option<f64>,
+    pub kind: Option<String>,
+}
+
+/// Official Cursor dashboard usage (Auto / API / optional Grok Bot).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountUsageSnapshot {
+    pub email: Option<String>,
+    pub membership: Option<String>,
+    pub auto_percent: Option<f64>,
+    pub api_percent: Option<f64>,
+    pub total_percent: Option<f64>,
+    pub plan_used_usd: Option<f64>,
+    pub plan_limit_usd: Option<f64>,
+    pub on_demand_used_usd: Option<f64>,
+    pub on_demand_limit_usd: Option<f64>,
+    pub grok_bot_percent: Option<f64>,
+    pub grok_bot_period_start: Option<String>,
+    pub grok_bot_reset: Option<String>,
+    pub total_cost_usd: Option<f64>,
+    pub usage_event_count: Option<u64>,
+    pub usage_events: Vec<AccountUsageEvent>,
+    pub fetched_at: SystemTime,
+}
+
+impl AccountUsageSnapshot {
+    pub fn header_line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(email) = self.email.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(truncate_middle(email, 28));
+        }
+        if let Some(plan) = self.membership.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(plan.replace('_', "-"));
+        }
+        if let Some(total) = self.total_percent {
+            parts.push(format!("total {}", format_percent(total)));
+        }
+        if let Some(auto) = self.auto_percent {
+            parts.push(format!("auto {}", format_percent(auto)));
+        }
+        if let Some(api) = self.api_percent {
+            parts.push(format!("api {}", format_percent(api)));
+        }
+        if let (Some(used), Some(limit)) = (self.plan_used_usd, self.plan_limit_usd)
+            && limit > 0.0
+        {
+            parts.push(format!("${used:.0}/${limit:.0}"));
+        }
+        if let (Some(used), Some(limit)) = (self.on_demand_used_usd, self.on_demand_limit_usd)
+            && limit > 0.0
+        {
+            parts.push(format!("on-demand ${used:.2}/${limit:.2}"));
+        }
+        if let Some(bot) = self.grok_bot_percent {
+            parts.push(format!("bot {}/wk", format_percent(bot)));
+        }
+        if let Some(cost) = self.total_cost_usd {
+            parts.push(format!("cost ${cost:.2}"));
+        }
+        if let Some(events) = self.usage_event_count {
+            parts.push(format!("events {events}"));
+        }
+        if parts.is_empty() {
+            "usage: no meters on this account".to_string()
+        } else {
+            format!("usage  {}", parts.join("  "))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum AccountUsageState {
+    Unknown,
+    MissingAuth,
+    Ready(AccountUsageSnapshot),
+    Failed(String),
+}
+
+impl AccountUsageState {
+    pub fn header_line(&self) -> String {
+        match self {
+            Self::Unknown => "usage  fetching official dashboard…".to_string(),
+            Self::MissingAuth => "usage  not logged in".to_string(),
+            Self::Ready(snapshot) => snapshot.header_line(),
+            Self::Failed(err) => format!("usage  {err}"),
+        }
+    }
+}
+
+fn format_percent(value: f64) -> String {
+    let clamped = value.clamp(0.0, 100.0);
+    if clamped < 10.0 {
+        format!("{clamped:.1}%")
+    } else {
+        format!("{:.0}%", clamped.round())
+    }
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return chars.into_iter().take(max_chars).collect();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    let mut out: String = chars.iter().take(head).collect();
+    out.push('…');
+    out.extend(chars.iter().rev().take(tail).rev());
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +405,7 @@ struct MonitorStore {
     recent: VecDeque<CompletedRequest>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
+    account_usage: AccountUsageState,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +428,7 @@ impl MonitorHandle {
                 recent: VecDeque::new(),
                 session_output_buckets: HashMap::new(),
                 recent_limit,
+                account_usage: AccountUsageState::Unknown,
             })),
         }
     }
@@ -338,7 +462,14 @@ impl MonitorHandle {
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
+                account_usage: AccountUsageState::Unknown,
             },
+        }
+    }
+
+    pub fn set_account_usage(&self, usage: AccountUsageState) {
+        if let Ok(mut store) = self.store.lock() {
+            store.account_usage = usage;
         }
     }
 
@@ -882,6 +1013,7 @@ impl MonitorStore {
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
+            account_usage: self.account_usage.clone(),
         }
     }
 }
@@ -1138,6 +1270,45 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_usage_snapshot_is_visible_to_tui() {
+        let monitor = MonitorHandle::new(10);
+        assert!(matches!(
+            monitor.snapshot().account_usage,
+            AccountUsageState::Unknown
+        ));
+        monitor.set_account_usage(AccountUsageState::MissingAuth);
+        assert!(matches!(
+            monitor.snapshot().account_usage,
+            AccountUsageState::MissingAuth
+        ));
+        let snapshot = AccountUsageSnapshot {
+            email: Some("a@b.c".into()),
+            membership: Some("pro".into()),
+            auto_percent: Some(9.2),
+            api_percent: None,
+            total_percent: Some(9.2),
+            plan_used_usd: None,
+            plan_limit_usd: None,
+            on_demand_used_usd: Some(1.25),
+            on_demand_limit_usd: Some(10.0),
+            grok_bot_percent: None,
+            grok_bot_period_start: None,
+            grok_bot_reset: None,
+            total_cost_usd: None,
+            usage_event_count: None,
+            usage_events: Vec::new(),
+            fetched_at: SystemTime::now(),
+        };
+        monitor.set_account_usage(AccountUsageState::Ready(snapshot));
+        let line = monitor.snapshot().account_usage.header_line();
+        assert!(line.contains("a@b.c"), "{line}");
+        assert!(line.contains("pro"), "{line}");
+        assert!(line.contains("9.2%"), "{line}");
+        assert!(line.contains("on-demand $1.25/$10.00"), "{line}");
+        assert!(!line.contains("bot"), "{line}");
+    }
 
     #[test]
     fn started_requests_appear_active() {

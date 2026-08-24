@@ -246,6 +246,9 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 | `CCP_ADVERTISED_MODELS` | 未设置 | `GET /v1/models` 的可选逗号白名单，适合托管桌面端模型选择器 |
 | `CCP_CURSOR_AUTH_TOKEN` | 未设置 | 手动覆盖 Cursor 登录令牌 |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API 地址 |
+| `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头 |
+| `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |
+| `CCP_CURSOR_STATE_DB` | macOS 默认使用 Cursor Desktop 状态路径 | TUI 用量回退读取的 `state.vscdb` 路径 |
 | `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Anthropic `haiku` 别名和桌面端小模型探针实际使用的 Cursor 模型 id |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | 开 | 设 `0` / `false` 可关闭 Keychain 回退 |
 | `CCP_CURSOR_EMBED_SYSTEM` | 关 | 把 Anthropic `system` 塞进 Cursor（可能触发 Fable 注入防御） |
@@ -282,9 +285,36 @@ curl -s http://127.0.0.1:18765/v1/models | jq '.data[].id'
 {
   "bindAddress": "127.0.0.1",
   "port": 18765,
+  "cursor": {
+    "sandModels": ["claude-fable-5", "cursor:gpt-5.5"]
+  },
   "log": { "stderr": false, "verbose": false }
 }
 ```
+
+`cursor.sandModels` 会在每个请求开始时按模型匹配；`[1m]` 以及
+`cursor:`/`cursor-plan:`/`cursor-ask:` 前缀会自动归一化。监控 TUI 中按
+`s` 打开设置，使用空格或回车切换模型，按 `a` 可以直接输入当前列表中
+没有的 catalog ID，配置会原子写入。环境变量优先于配置文件，并会在面板
+中标记覆盖状态。
+
+代码里的 Cursor 列表只是启动和离线时的兜底目录。已登录时，代理启动后
+会调用 `GetUsableModels`，访问 `GET /v1/models` 时也会刷新；账号返回的
+实时模型会合并到 TUI 和模型列表。你也可以自己填写任意 Cursor catalog ID：
+
+```bash
+export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
+export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
+```
+
+或者直接把它加入 `config.json` 的 `cursor.sandModels`。手工填写的 ID 仍需
+在当前 Cursor 账号的上游目录中可用。
+
+TUI 顶部会轮询 Cursor Dashboard，显示账号、套餐、Auto/API 百分比、按量
+余额、Dashboard 费用/事件统计，以及账号提供时的 Sand/Grok Bot 周期用量。
+优先使用代理/Agent 登录态；在 macOS 上没有这些登录态时，会只读回退到
+Cursor Desktop 的 `state.vscdb`。轮询不会写入 Cursor 状态。TUI 中按 `u`
+可打开多行用量详情，其中包含 Sand 周期和最近用量事件。
 
 检查 Cursor 登录状态：
 

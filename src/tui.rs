@@ -30,6 +30,7 @@ use ratatui::{
 };
 use tokio::sync::oneshot;
 
+use crate::config::{self, SandRoutingPolicy};
 use crate::{
     monitor::{
         ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
@@ -102,6 +103,7 @@ fn run_monitor_loop(
         listen_url: config.listen_url,
         setup_text: setup_text_override.unwrap_or_else(|| setup_text(config.port, config.registry)),
         show_setup: false,
+        show_sand_settings: false,
         show_help: false,
         detail: None,
         focus: FocusPane::Sessions,
@@ -111,6 +113,11 @@ fn run_monitor_loop(
         phase: MonitorPhase::Running,
         shutdown: config.shutdown,
         shutdown_complete: config.shutdown_complete,
+        sand_models: sand_model_choices(config.registry),
+        sand_policy: config::cursor_sand_policy(),
+        sand_selected: 0,
+        sand_message: None,
+        sand_input: None,
     };
 
     let run_result = run_monitor_events(&mut terminal, &mut snapshot, &mut app);
@@ -139,6 +146,7 @@ fn run_monitor_events(
         if app.shutdown_is_complete() {
             return Ok(MonitorExit::ShutdownComplete);
         }
+        app.merge_cached_sand_models();
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
@@ -157,9 +165,22 @@ fn run_monitor_events(
                         app.cancel_shutdown_confirmation()
                     }
                     _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
+                    _ if app.show_sand_settings => app.handle_sand_key(key.code),
                     KeyCode::Char('q') => app.request_shutdown_confirmation(),
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
+                    KeyCode::Char('u') => {
+                        app.detail = Some(DetailView::Usage);
+                        app.show_setup = false;
+                        app.show_sand_settings = false;
+                        app.show_help = false;
+                    }
+                    KeyCode::Char('s') => {
+                        app.refresh_sand_models();
+                        app.show_sand_settings = true;
+                        app.show_setup = false;
+                        app.show_help = false;
+                    }
                     KeyCode::Tab => app.focus = app.focus.next(),
                     KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
                     KeyCode::Char('j') => {
@@ -187,6 +208,8 @@ fn run_monitor_events(
                             app.show_help = false;
                         } else if app.show_setup {
                             app.show_setup = false;
+                        } else if app.show_sand_settings {
+                            app.show_sand_settings = false;
                         } else {
                             app.detail = None;
                         }
@@ -219,6 +242,7 @@ impl FocusPane {
 enum DetailView {
     Session,
     Request,
+    Usage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +256,7 @@ struct MonitorApp {
     listen_url: String,
     setup_text: String,
     show_setup: bool,
+    show_sand_settings: bool,
     show_help: bool,
     detail: Option<DetailView>,
     focus: FocusPane,
@@ -241,6 +266,11 @@ struct MonitorApp {
     phase: MonitorPhase,
     shutdown: Option<oneshot::Sender<()>>,
     shutdown_complete: Option<mpsc::Receiver<()>>,
+    sand_models: Vec<String>,
+    sand_policy: SandRoutingPolicy,
+    sand_selected: usize,
+    sand_message: Option<String>,
+    sand_input: Option<String>,
 }
 
 impl MonitorApp {
@@ -293,6 +323,156 @@ impl MonitorApp {
         }
     }
 
+    fn handle_sand_key(&mut self, key: KeyCode) {
+        if self.sand_input.is_some() {
+            self.handle_sand_input_key(key);
+            return;
+        }
+        match key {
+            KeyCode::Esc | KeyCode::Char('s') => {
+                self.show_sand_settings = false;
+                self.sand_message = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sand_selected = self.sand_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.sand_selected = self
+                    .sand_selected
+                    .saturating_add(1)
+                    .min(self.sand_models.len().saturating_sub(1));
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected_sand_model(),
+            KeyCode::Char('a') => {
+                if std::env::var_os("CCP_CURSOR_SAND_MODELS").is_some() {
+                    self.sand_message = Some(
+                        "CCP_CURSOR_SAND_MODELS is active; unset it to add a model".to_string(),
+                    );
+                } else {
+                    self.sand_input = Some(String::new());
+                    self.sand_message = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sand_input_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.sand_input = None,
+            KeyCode::Enter => self.save_custom_sand_model(),
+            KeyCode::Backspace => {
+                if let Some(input) = self.sand_input.as_mut() {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                if let Some(input) = self.sand_input.as_mut()
+                    && input.len() < 160
+                {
+                    input.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn save_custom_sand_model(&mut self) {
+        let raw = self.sand_input.clone().unwrap_or_default();
+        let model = config::normalize_sand_model(&raw);
+        if model.is_empty() {
+            self.sand_message = Some("Model id cannot be empty".to_string());
+            return;
+        }
+        if model.chars().any(char::is_whitespace) || model.contains(['*', '?']) {
+            self.sand_message = Some("Enter one exact Cursor model id".to_string());
+            return;
+        }
+        self.sand_input = None;
+
+        self.sand_models.push(model.clone());
+        self.sand_models.sort_unstable();
+        self.sand_models.dedup();
+        self.sand_selected = self
+            .sand_models
+            .iter()
+            .position(|candidate| candidate == &model)
+            .unwrap_or(0);
+
+        if self.sand_policy.matches(&model) {
+            self.sand_message = Some("Model already uses Sand".to_string());
+            return;
+        }
+        let mut patterns = self.sand_policy.patterns().to_vec();
+        patterns.push(model);
+        let policy = SandRoutingPolicy::new(patterns);
+        match config::persist_cursor_sand_policy(&policy) {
+            Ok(()) => {
+                self.sand_policy = policy;
+                self.sand_message = Some("Added and enabled for Sand".to_string());
+            }
+            Err(error) => self.sand_message = Some(format!("Save failed: {error}")),
+        }
+    }
+
+    fn refresh_sand_models(&mut self) {
+        // Pick up edits made by another terminal before opening the editor.
+        self.sand_policy = config::cursor_sand_policy();
+        self.merge_cached_sand_models();
+    }
+
+    fn merge_cached_sand_models(&mut self) {
+        self.sand_models
+            .extend(crate::providers::cursor::model::cursor_supported_models());
+        self.sand_models.extend(
+            self.sand_policy
+                .patterns()
+                .iter()
+                .filter(|pattern| !pattern.contains(['*', '?']))
+                .cloned(),
+        );
+        self.sand_models.sort_unstable();
+        self.sand_models.dedup();
+        self.sand_selected = self
+            .sand_selected
+            .min(self.sand_models.len().saturating_sub(1));
+    }
+
+    fn toggle_selected_sand_model(&mut self) {
+        if std::env::var_os("CCP_CURSOR_SAND_MODELS").is_some() {
+            self.sand_message =
+                Some("CCP_CURSOR_SAND_MODELS is active; unset it to edit config.json".to_string());
+            return;
+        }
+        let Some(model) = self.sand_models.get(self.sand_selected) else {
+            self.sand_message = Some("No Cursor models are available".to_string());
+            return;
+        };
+        let normalized = config::normalize_sand_model(model);
+        let mut patterns = self.sand_policy.patterns().to_vec();
+        if let Some(index) = patterns.iter().position(|pattern| pattern == &normalized) {
+            patterns.remove(index);
+        } else if self.sand_policy.matches(&normalized) {
+            self.sand_message = Some(
+                "This model is covered by a wildcard Sand pattern; edit config.json to change it"
+                    .to_string(),
+            );
+            return;
+        } else {
+            patterns.push(normalized);
+        }
+        let policy = SandRoutingPolicy::new(patterns);
+        match config::persist_cursor_sand_policy(&policy) {
+            Ok(()) => {
+                self.sand_policy = policy;
+                self.sand_message = Some("Saved; new requests use this policy".to_string());
+            }
+            Err(error) => {
+                self.sand_message = Some(format!("Save failed: {error}"));
+            }
+        }
+    }
+
     fn clamp_selection(&mut self, sessions: usize, recent: usize) {
         self.selected = self.selected.min(sessions.saturating_sub(1));
         self.recent_selected = self.recent_selected.min(recent.saturating_sub(1));
@@ -338,6 +518,14 @@ impl MonitorApp {
     }
 }
 
+fn sand_model_choices(registry: &Registry) -> Vec<String> {
+    let mut models = registry.supported_models_for("cursor");
+    models.extend(crate::providers::cursor::model::cursor_supported_models());
+    models.sort_unstable();
+    models.dedup();
+    models
+}
+
 impl Drop for MonitorApp {
     fn drop(&mut self) {
         self.begin_shutdown();
@@ -369,7 +557,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Percentage(30),
             Constraint::Percentage(20),
             Constraint::Percentage(25),
@@ -379,32 +567,48 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         .split(area);
 
     render_header(frame, root[0], app, state);
-    match app.detail {
-        Some(DetailView::Session) => render_session_detail(frame, root[1], state, app.selected),
-        Some(DetailView::Request) => {
-            render_request_detail(frame, root[1], state, app.recent_selected)
+    if matches!(app.detail, Some(DetailView::Usage)) {
+        // Usage is a full-height detail view so period, cost, and event rows
+        // remain visible on ordinary 24-row terminals.
+        let usage_area = Rect {
+            x: root[1].x,
+            y: root[1].y,
+            width: root[1].width,
+            height: root[4].y + root[4].height - root[1].y,
+        };
+        render_usage_detail(frame, usage_area, state);
+    } else {
+        match app.detail {
+            Some(DetailView::Session) => render_session_detail(frame, root[1], state, app.selected),
+            Some(DetailView::Request) => {
+                render_request_detail(frame, root[1], state, app.recent_selected)
+            }
+            Some(DetailView::Usage) => unreachable!("usage detail handled above"),
+            None => render_sessions(
+                frame,
+                root[1],
+                &state.sessions,
+                app.selected,
+                app.focus == FocusPane::Sessions,
+            ),
         }
-        None => render_sessions(
+        render_active(frame, root[2], &state.active, app.tick);
+        render_recent(
             frame,
-            root[1],
-            &state.sessions,
-            app.selected,
-            app.focus == FocusPane::Sessions,
-        ),
+            root[3],
+            &state.recent,
+            app.recent_selected,
+            app.focus == FocusPane::Recent,
+        );
+        render_events(frame, root[4], &state.recent);
     }
-    render_active(frame, root[2], &state.active, app.tick);
-    render_recent(
-        frame,
-        root[3],
-        &state.recent,
-        app.recent_selected,
-        app.focus == FocusPane::Recent,
-    );
-    render_events(frame, root[4], &state.recent);
     render_footer(frame, root[5], app);
 
     if app.show_setup {
         render_setup_overlay(frame, area, &app.setup_text);
+    }
+    if app.show_sand_settings {
+        render_sand_settings_overlay(frame, area, app);
     }
     if app.show_help {
         render_help_overlay(frame, area);
@@ -426,7 +630,7 @@ fn render_header(
         .started_at
         .elapsed()
         .unwrap_or_else(|_| Duration::from_secs(0));
-    let text = Line::from(vec![
+    let top = Line::from(vec![
         Span::styled(
             " claude-cursor-proxy",
             Style::default()
@@ -461,7 +665,40 @@ fn render_header(
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
-    frame.render_widget(Paragraph::new(text).style(Style::default().bg(TEAL)), area);
+    let usage_line = state.account_usage.header_line();
+    let usage = Line::from(Span::styled(
+        format!(" {usage_line}"),
+        Style::default().fg(usage_header_color(&state.account_usage)),
+    ));
+    frame.render_widget(
+        Paragraph::new(vec![top, usage]).style(Style::default().bg(TEAL)),
+        area,
+    );
+}
+
+fn usage_header_color(usage: &crate::monitor::AccountUsageState) -> Color {
+    match usage {
+        crate::monitor::AccountUsageState::Ready(snapshot) => {
+            let hottest = [
+                snapshot.total_percent,
+                snapshot.auto_percent,
+                snapshot.api_percent,
+            ]
+            .into_iter()
+            .flatten()
+            .fold(0.0_f64, f64::max);
+            if hottest >= 90.0 {
+                RED
+            } else if hottest >= 70.0 {
+                YELLOW
+            } else {
+                BG
+            }
+        }
+        crate::monitor::AccountUsageState::Failed(_) => RED,
+        crate::monitor::AccountUsageState::MissingAuth => YELLOW,
+        crate::monitor::AccountUsageState::Unknown => BG,
+    }
 }
 
 fn panel(title: &'static str, focused: bool) -> Block<'static> {
@@ -1455,6 +1692,130 @@ fn render_request_detail(
     );
 }
 
+fn render_usage_detail(frame: &mut ratatui::Frame<'_>, area: Rect, state: &MonitorState) {
+    let lines = match &state.account_usage {
+        crate::monitor::AccountUsageState::Unknown => vec![detail_line(
+            "status",
+            "fetching official dashboard...",
+            DIM_WHITE,
+        )],
+        crate::monitor::AccountUsageState::MissingAuth => {
+            vec![detail_line("status", "not logged in", YELLOW)]
+        }
+        crate::monitor::AccountUsageState::Failed(error) => {
+            vec![detail_line("status", error.clone(), RED)]
+        }
+        crate::monitor::AccountUsageState::Ready(snapshot) => {
+            let mut lines = vec![
+                detail_line("account", snapshot.email.as_deref().unwrap_or("-"), WHITE),
+                detail_line("plan", snapshot.membership.as_deref().unwrap_or("-"), TEAL),
+            ];
+            push_usage_percent(&mut lines, "total", snapshot.total_percent);
+            push_usage_percent(&mut lines, "auto", snapshot.auto_percent);
+            push_usage_percent(&mut lines, "api", snapshot.api_percent);
+            push_usage_money(
+                &mut lines,
+                "plan spend",
+                snapshot.plan_used_usd,
+                snapshot.plan_limit_usd,
+            );
+            push_usage_money(
+                &mut lines,
+                "on-demand",
+                snapshot.on_demand_used_usd,
+                snapshot.on_demand_limit_usd,
+            );
+            push_usage_percent(&mut lines, "sand / grok bot", snapshot.grok_bot_percent);
+            if let Some(start) = snapshot.grok_bot_period_start.as_deref() {
+                lines.push(detail_line("bot period", start, DIM_WHITE));
+            }
+            if let Some(reset) = snapshot.grok_bot_reset.as_deref() {
+                lines.push(detail_line("bot reset", reset, DIM_WHITE));
+            }
+            if let Some(cost) = snapshot.total_cost_usd {
+                lines.push(detail_line(
+                    "dashboard cost",
+                    format!("${cost:.2}"),
+                    DIM_WHITE,
+                ));
+            }
+            if let Some(events) = snapshot.usage_event_count {
+                lines.push(detail_line(
+                    "dashboard events",
+                    events.to_string(),
+                    DIM_WHITE,
+                ));
+            }
+            if !snapshot.usage_events.is_empty() {
+                lines.push(detail_line("recent events", "", DIM));
+                let available_lines = usize::from(area.height.saturating_sub(2));
+                let event_limit = available_lines.saturating_sub(lines.len() + 2);
+                for event in snapshot.usage_events.iter().take(event_limit) {
+                    lines.push(usage_event_line(event));
+                }
+            }
+            lines.push(detail_line(
+                "updated",
+                format_system_time(snapshot.fetched_at),
+                DIM,
+            ));
+            lines
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .block(panel("Account usage", true)),
+        area,
+    );
+}
+
+fn usage_event_line(event: &crate::monitor::AccountUsageEvent) -> Line<'static> {
+    let time = event.timestamp.as_deref().unwrap_or("-");
+    let model = event.model.as_deref().unwrap_or("-");
+    let cost = event
+        .charged_usd
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "-".to_string());
+    let kind = event.kind.as_deref().unwrap_or("-");
+    let value = format!(
+        "{}  {}  {}  {}",
+        ellipsize(time, 20),
+        ellipsize(model, 22),
+        cost,
+        ellipsize(kind, 18)
+    );
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(value, Style::default().fg(DIM_WHITE)),
+    ])
+}
+
+fn push_usage_percent(lines: &mut Vec<Line<'static>>, label: &'static str, value: Option<f64>) {
+    if let Some(value) = value {
+        lines.push(detail_line(label, format_usage_percent(value), DIM_WHITE));
+    }
+}
+
+fn push_usage_money(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    used: Option<f64>,
+    limit: Option<f64>,
+) {
+    if let (Some(used), Some(limit)) = (used, limit) {
+        lines.push(detail_line(
+            label,
+            format!("${used:.2} / ${limit:.2}"),
+            DIM_WHITE,
+        ));
+    }
+}
+
+fn format_usage_percent(value: f64) -> String {
+    format!("{:.1}%", value.clamp(0.0, 100.0))
+}
+
 fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: Color) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("  {label:<16}"), Style::default().fg(DIM)),
@@ -1471,6 +1832,10 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" setup  ", Style::default().fg(DIM)),
+        Span::styled("u", Style::default().fg(TEAL)),
+        Span::styled(" usage  ", Style::default().fg(DIM)),
+        Span::styled("s", Style::default().fg(TEAL)),
+        Span::styled(" sand models  ", Style::default().fg(DIM)),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
         Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
@@ -1579,6 +1944,8 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("q / Ctrl-C", "quit proxy"),
         ("?", "toggle help"),
         ("b", "toggle setup"),
+        ("u", "show account usage"),
+        ("s", "configure Sand models"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
         ("Tab", "switch pane"),
@@ -1650,6 +2017,117 @@ fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: 
     );
 }
 
+fn render_sand_settings_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp) {
+    let width = 92.min(area.width.saturating_sub(4)).max(40);
+    let visible_rows = area.height.saturating_sub(9).max(3) as usize;
+    let height = (visible_rows as u16 + 6)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" Sand Models ", Style::default().fg(TEAL)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEAL))
+        .style(Style::default().bg(BG));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = Vec::new();
+    let source = if std::env::var_os("CCP_CURSOR_SAND_MODELS").is_some() {
+        "env override active"
+    } else {
+        "config.json"
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("source ", Style::default().fg(DIM)),
+        Span::styled(source, Style::default().fg(YELLOW)),
+        Span::styled("  space/Enter toggle  ", Style::default().fg(DIM)),
+        Span::styled("a", Style::default().fg(TEAL)),
+        Span::styled(" add", Style::default().fg(DIM)),
+    ]));
+    if let Some(input) = app.sand_input.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("  model id: ", Style::default().fg(DIM)),
+            Span::styled(format!("{input}_"), Style::default().fg(WHITE)),
+        ]));
+    }
+
+    let start = app
+        .sand_selected
+        .saturating_sub(visible_rows.saturating_sub(1) / 2);
+    for (index, model) in app
+        .sand_models
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+    {
+        let selected = index == app.sand_selected;
+        let enabled = app.sand_policy.matches(model);
+        let marker = if enabled { "[sand]" } else { "[cli ]" };
+        let style = if selected {
+            Style::default().fg(WHITE).bg(SELECTED_BG)
+        } else if enabled {
+            Style::default().fg(GREEN)
+        } else {
+            Style::default().fg(DIM_WHITE)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "  > " } else { "    " }, style),
+            Span::styled(format!("{marker:<7}"), style),
+            Span::styled(model.clone(), style),
+        ]));
+    }
+    if app.sand_models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No Cursor models are registered",
+            Style::default().fg(DIM_WHITE),
+        )));
+    }
+    lines.push(Line::from(""));
+    if let Some(message) = app.sand_message.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(YELLOW),
+        )));
+    }
+    if app.sand_input.is_some() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(TEAL)),
+            Span::styled(" save  ", Style::default().fg(DIM)),
+            Span::styled("Esc", Style::default().fg(TEAL)),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Esc/s", Style::default().fg(TEAL)),
+            Span::styled(" close  ", Style::default().fg(DIM)),
+            Span::styled("j/k", Style::default().fg(TEAL)),
+            Span::styled(" move  ", Style::default().fg(DIM)),
+            Span::styled("space", Style::default().fg(TEAL)),
+            Span::styled(" toggle  ", Style::default().fg(DIM)),
+            Span::styled("a", Style::default().fg(TEAL)),
+            Span::styled(" add", Style::default().fg(DIM)),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn mock_setup_text(port: u16, registry: &Registry) -> String {
     format!(
         "Mock mode uses deterministic simulated monitor traffic.\nNo proxy server is listening.\nRun `claude-cursor-proxy serve` to start the proxy.\n\n{}",
@@ -1668,10 +2146,17 @@ pub fn setup_text(port: u16, registry: &Registry) -> String {
         })
         .collect::<Vec<_>>()
         .join("  ");
+    let sand_patterns = config::cursor_sand_policy().patterns().join(", ");
+    let sand_summary = if sand_patterns.is_empty() {
+        "none".to_string()
+    } else {
+        sand_patterns
+    };
     let mut lines = vec![
         format!("Logs: {}", paths::log_file().display()),
         format!("Config: {}", paths::config_dir().display()),
         format!("Providers: {model_summary}"),
+        format!("Sand models: {sand_summary}"),
     ];
     lines.push(format!(
         "export ANTHROPIC_BASE_URL=\"http://localhost:{port}\""
@@ -2311,6 +2796,7 @@ mod tests {
             listen_url: "mock://tui-demo".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2320,6 +2806,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: None,
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         let buffer = draw(180, 48, |frame| render(frame, &mut app, &state));
@@ -2327,9 +2818,34 @@ mod tests {
 
         assert!(text.contains("mock://tui-demo"), "{text}");
         assert!(text.contains("claude-cursor-proxy"), "{text}");
+        assert!(text.contains("usage"), "{text}");
+        assert!(text.contains("ultra"), "{text}");
+        assert!(text.contains("bot"), "{text}");
+        assert!(text.contains("cost"), "{text}");
+        assert!(text.contains("events 7"), "{text}");
         assert!(text.contains("streaming"), "{text}");
         assert!(text.contains("gpt-5.6-terra"), "{text}");
         assert!(text.contains("upstream connection closed"), "{text}");
+
+        app.detail = Some(DetailView::Usage);
+        let usage = draw(80, 24, |frame| render(frame, &mut app, &state));
+        let usage_text = buffer_text(&usage);
+        assert!(usage_text.contains("bot period"), "{usage_text}");
+        assert!(usage_text.contains("dashboard cost"), "{usage_text}");
+        assert!(usage_text.contains("claude-fable-5"), "{usage_text}");
+    }
+
+    #[test]
+    fn usage_detail_renders_dashboard_period_and_events() {
+        let state = mock_state();
+        let detail = draw(140, 24, |frame| {
+            render_usage_detail(frame, frame.area(), &state)
+        });
+        let text = buffer_text(&detail);
+        assert!(text.contains("2026-08-01T00:00:00"), "{text}");
+        assert!(text.contains("dashboard cost"), "{text}");
+        assert!(text.contains("claude-fable-5"), "{text}");
+        assert!(text.contains("INCLUDED"), "{text}");
     }
 
     #[test]
@@ -2448,6 +2964,7 @@ mod tests {
             listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2457,6 +2974,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: Some(shutdown_tx),
             shutdown_complete: Some(mpsc::channel().1),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         app.request_shutdown_confirmation();
@@ -2494,6 +3016,7 @@ mod tests {
             listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2503,6 +3026,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: Some(shutdown_tx),
             shutdown_complete: Some(shutdown_complete_rx),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         assert!(!app.handle_ctrl_c());
@@ -2524,6 +3052,7 @@ mod tests {
             listen_url: String::new(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2533,6 +3062,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(complete_rx),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         assert!(!app.shutdown_is_complete());
@@ -2552,6 +3086,7 @@ mod tests {
             listen_url: "http://[::]:18765".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2561,14 +3096,20 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
         let state = MonitorHandle::default().snapshot();
 
-        let header = draw(100, 1, |frame| {
+        let header = draw(100, 2, |frame| {
             render_header(frame, frame.area(), &app, &state)
         });
-
-        assert!(buffer_text(&header).contains("http://[::]:18765"));
+        let text = buffer_text(&header);
+        assert!(text.contains("http://[::]:18765"), "{text}");
+        assert!(text.contains("usage"), "{text}");
     }
 
     #[test]
@@ -2577,6 +3118,7 @@ mod tests {
             listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2586,6 +3128,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         app.clamp_selection(3, 4);
@@ -2603,6 +3150,7 @@ mod tests {
             listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2612,6 +3160,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         app.move_down(2, 3, true);
@@ -2629,6 +3182,7 @@ mod tests {
             listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
+            show_sand_settings: false,
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
@@ -2638,6 +3192,11 @@ mod tests {
             phase: MonitorPhase::Running,
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
         };
 
         app.move_down(2, 3, false);

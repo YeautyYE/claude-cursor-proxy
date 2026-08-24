@@ -247,6 +247,9 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_ADVERTISED_MODELS` | unset | Optional comma-separated allowlist for `GET /v1/models` (useful for managed desktop model pickers) |
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
+| `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value |
+| `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
+| `CCP_CURSOR_STATE_DB` | Cursor Desktop state path on macOS | Optional read-only state.vscdb path used by the TUI usage fallback |
 | `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Cursor catalog id used for Anthropic `haiku` aliases and desktop small-model probes |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | on | Disable with `0` / `false` |
 | `CCP_CURSOR_EMBED_SYSTEM` | off | Forward Anthropic `system` into Cursor user text (can trigger Fable injection loops) |
@@ -283,9 +286,40 @@ These are Claude Code knobs (not proxy config). Useful when `/deep-research` or 
 {
   "bindAddress": "127.0.0.1",
   "port": 18765,
+  "cursor": {
+    "sandModels": ["claude-fable-5", "cursor:gpt-5.5"]
+  },
   "log": { "stderr": false, "verbose": false }
 }
 ```
+
+`cursor.sandModels` is evaluated per request after model normalization, so
+`[1m]` and `cursor:`/`cursor-plan:`/`cursor-ask:` forms match the same model.
+The monitor TUI opens the editor with `s`; `space` or `Enter` toggles a model,
+and `a` lets you type an exact catalog id that is not in the current list.
+Changes are written atomically. An environment value takes precedence over
+the file and is shown as an override in the editor.
+
+The static Cursor list is only a fallback for startup and offline discovery.
+When a Cursor login is available, the proxy calls `GetUsableModels` at startup
+and also when `GET /v1/models` is requested; returned catalog ids are merged
+into the TUI and model list. You may also enter any catalog id yourself:
+
+```bash
+export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
+export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
+```
+
+or add it to `cursor.sandModels` in `config.json`. A manually entered id still
+has to be enabled for the signed-in Cursor account upstream.
+
+The TUI header polls the Cursor dashboard and shows the signed-in account,
+plan, Auto/API percentages, on-demand dollars, dashboard cost/event totals, and
+the Sand/Grok Bot weekly meter when the account exposes it. It first uses the
+proxy/Agent auth store and then falls back to Cursor Desktop's read-only
+`state.vscdb` on macOS. The poller never writes Cursor state. Press `u` in the
+TUI for the multi-line usage view, including the Sand period and recent usage
+events.
 
 ```bash
 claude-cursor-proxy cursor auth status

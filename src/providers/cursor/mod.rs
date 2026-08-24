@@ -18,6 +18,7 @@ pub mod sse;
 pub(crate) mod test_frames;
 pub mod tool_bridge;
 pub mod tool_use_xml;
+pub mod usage;
 
 use async_trait::async_trait;
 use axum::Json;
@@ -37,7 +38,7 @@ use crate::providers::cursor::auth::{
     clear_cursor_auth, expired_auth_message, force_refresh_cursor_auth, load_cursor_auth,
     missing_auth_message, run_cursor_login,
 };
-use crate::providers::cursor::client::{CursorError, CursorHttpClient};
+use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::exec_results::PendingCursorExec;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
@@ -301,6 +302,9 @@ struct LiveRetryStart {
     request_context: crate::providers::cursor::proto::RequestContext,
     fingerprint: Vec<u8>,
     has_refresh: bool,
+    /// Captured when the logical request starts; retries must keep the same
+    /// client identity even if the live routing config is edited meanwhile.
+    client_type: String,
 }
 
 fn live_retry_user_text<'a>(original: &'a str, error: &str) -> &'a str {
@@ -337,7 +341,7 @@ impl LiveRetryStart {
         user_text: &str,
         reservation: Option<LiveRunReservation>,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
-        start_live_events_with_retries(
+        start_live_events_with_retries_with_client_type(
             self.client.clone(),
             self.token.clone(),
             user_text,
@@ -355,6 +359,7 @@ impl LiveRetryStart {
             self.fingerprint.clone(),
             reservation,
             self.has_refresh,
+            &self.client_type,
         )
         .await
     }
@@ -464,7 +469,44 @@ fn live_replacement_conflict_error(has_tool_results: bool) -> CursorError {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn start_live_events_with_retries(
+    client: CursorHttpClient,
+    token: String,
+    user_text: &str,
+    model: &str,
+    images: &[CursorSelectedImage],
+    custom_system: Option<&str>,
+    identity: LiveRunIdentity<'_>,
+    allowed: Option<BTreeSet<String>>,
+    mcp_tools: Option<crate::providers::cursor::proto::McpTools>,
+    request_context: crate::providers::cursor::proto::RequestContext,
+    fingerprint: Vec<u8>,
+    initial_reservation: Option<LiveRunReservation>,
+    has_refresh: bool,
+) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+    let client_type = crate::config::cursor_client_type_for_model(model);
+    start_live_events_with_retries_with_client_type(
+        client,
+        token,
+        user_text,
+        model,
+        images,
+        custom_system,
+        identity,
+        allowed,
+        mcp_tools,
+        request_context,
+        fingerprint,
+        initial_reservation,
+        has_refresh,
+        &client_type,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_live_events_with_retries_with_client_type(
     client: CursorHttpClient,
     mut token: String,
     user_text: &str,
@@ -478,6 +520,7 @@ async fn start_live_events_with_retries(
     fingerprint: Vec<u8>,
     mut initial_reservation: Option<LiveRunReservation>,
     has_refresh: bool,
+    client_type: &str,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
     let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
     let original_request_id = uuid::Uuid::new_v4().to_string();
@@ -596,7 +639,7 @@ async fn start_live_events_with_retries(
 
         let upstream_open_guard = reservation.upstream_open_guard();
         let start = match client
-            .start_live_agent_with_identity_guarded(
+            .start_live_agent_with_identity_guarded_profile(
                 &token,
                 user_text,
                 model,
@@ -610,6 +653,7 @@ async fn start_live_events_with_retries(
                 Some(reservation.cancelled()),
                 Some(Arc::clone(&upstream_open_guard)),
                 Some(admission),
+                Some(client_type),
             )
             .await
         {
@@ -619,7 +663,7 @@ async fn start_live_events_with_retries(
                     Ok(Some(refreshed)) => {
                         token = refreshed.access_token;
                         client
-                            .start_live_agent_with_identity_guarded(
+                            .start_live_agent_with_identity_guarded_profile(
                                 &token,
                                 user_text,
                                 model,
@@ -633,6 +677,7 @@ async fn start_live_events_with_retries(
                                 Some(reservation.cancelled()),
                                 Some(upstream_open_guard),
                                 None,
+                                Some(client_type),
                             )
                             .await
                     }
@@ -734,6 +779,7 @@ fn spawn_streaming_live_sse(
     fingerprint: Vec<u8>,
     initial_reservation: Option<LiveRunReservation>,
     has_refresh: bool,
+    client_type: String,
     message_id: String,
     wire_model: String,
     estimated_input: u64,
@@ -756,6 +802,7 @@ fn spawn_streaming_live_sse(
             request_context,
             fingerprint,
             has_refresh,
+            client_type,
         },
         initial_reservation,
         None,
@@ -1366,8 +1413,15 @@ fn resume_when_slot_has_no_runnable_handle(
         // must be superseded, not 409'd.
         return Some(LiveResumeOutcome::SupersedeRunning(run_id));
     }
-    if LiveRunRegistry::is_ambiguous_run(session_id, agent_id) {
+    if LiveRunRegistry::is_ambiguous_for_operation(session_id, agent_id, fingerprint) {
         return Some(LiveResumeOutcome::ResumeError(live_ambiguous_accept_error()));
+    }
+    if let Some(reservation) = LiveRunRegistry::claim_ambiguous_release_for_new_operation(
+        session_id,
+        agent_id,
+        fingerprint,
+    ) {
+        return Some(LiveResumeOutcome::Free(Some(reservation)));
     }
     // Identical retry of a completed turn: deliver the retained response.
     if let Some(events) = LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint) {
@@ -1482,24 +1536,12 @@ async fn await_live_run_resume_for_operation(
             continue;
         };
         if run.request_fingerprint() == fingerprint {
-            // The active segment IS this operation. When its original consumer
-            // is gone (client retry after disconnect/timeout), attach to the
-            // in-flight run and replay the segment instead of 503-bouncing the
-            // retry until the run dies — the wedge that killed grok-build
-            // sessions with "already active" storms. A still-connected original
-            // consumer rejects attach; keep waiting until the deadline in case
-            // that consumer is mid-drop.
+            // The active segment IS this operation. Attach (and steal a
+            // half-open original SSE) instead of 503-bouncing until the run
+            // dies — grok-build retries 503 as transient overload and that
+            // is the "already active" storm.
             match run.attach_for_operation(fingerprint).await {
                 Ok(events) => return LiveResumeOutcome::Resumed(events),
-                Err(error)
-                    if tokio::time::Instant::now() < deadline
-                        && error.message.contains(LIVE_RUN_BUSY_MESSAGE) =>
-                {
-                    // Original consumer is still connected. It may be mid-drop;
-                    // keep polling until the deadline instead of 503-storming.
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    continue;
-                }
                 Err(_) => return LiveResumeOutcome::ResumeError(live_run_busy_error()),
             }
         }
@@ -1842,6 +1884,14 @@ impl Provider for CursorProvider {
         let routed_model =
             crate::providers::cursor::model::apply_effort_to_cursor_model(requested_model, effort);
         let model = routed_model.as_str();
+        let client_type = {
+            let policy = crate::config::cursor_sand_policy();
+            if policy.matches(requested_model) || policy.matches(model) {
+                "sand".to_string()
+            } else {
+                crate::config::cursor_client_type()
+            }
+        };
 
         let resolved = resolve_cursor_model(model);
         if let Err(e) = resolved {
@@ -1883,12 +1933,33 @@ impl Provider for CursorProvider {
                 // freed slot and execute a duplicate.
                 preclaimed_live_reservation = Some(reservation);
             }
+            if resumed_live_events.is_none()
+                && preclaimed_live_reservation.is_none()
+                && let Some(reservation) =
+                    LiveRunRegistry::claim_ambiguous_release_for_new_operation(
+                        session_id,
+                        agent_id,
+                        fingerprint,
+                    )
+            {
+                preclaimed_live_reservation = Some(reservation);
+            }
             if resumed_live_events.is_none() && preclaimed_live_reservation.is_none() {
                 match LiveRunRegistry::probe_run(session_id, agent_id) {
                     LiveRunProbe::TerminalError(error)
                         if live_probe_error_blocks_new_run(&error) =>
                     {
-                        return json_error_from_cursor_message(error);
+                        if let Some(reservation) =
+                            LiveRunRegistry::claim_ambiguous_release_for_new_operation(
+                                session_id,
+                                agent_id,
+                                fingerprint,
+                            )
+                        {
+                            preclaimed_live_reservation = Some(reservation);
+                        } else {
+                            return json_error_from_cursor_message(error);
+                        }
                     }
                     LiveRunProbe::TerminalError(_) => {
                         // Retryable terminal failures are removed by probe_run.
@@ -1927,7 +1998,17 @@ impl Provider for CursorProvider {
                             LiveResumeOutcome::TerminalError(error)
                                 if live_probe_error_blocks_new_run(&error) =>
                             {
-                                return json_error_from_cursor_message(error);
+                                if let Some(reservation) =
+                                    LiveRunRegistry::claim_ambiguous_release_for_new_operation(
+                                        session_id,
+                                        agent_id,
+                                        fingerprint,
+                                    )
+                                {
+                                    preclaimed_live_reservation = Some(reservation);
+                                } else {
+                                    return json_error_from_cursor_message(error);
+                                }
                             }
                             LiveResumeOutcome::TerminalError(_) => {}
                             LiveResumeOutcome::MissingTools(missing) => {
@@ -2144,6 +2225,7 @@ impl Provider for CursorProvider {
                     ctx.client_request_id.as_deref(),
                 ),
                 has_refresh: auth.refresh_token.is_some(),
+                client_type: client_type.clone(),
             };
             let events = spawn_live_events_with_late_retries(retry_start, None, Some(events));
             return live_downstream_response(
@@ -2223,6 +2305,7 @@ impl Provider for CursorProvider {
                     fingerprint,
                     initial_reservation,
                     has_refresh,
+                    client_type.clone(),
                     message_id,
                     wire_model,
                     estimated_input,
@@ -2244,6 +2327,7 @@ impl Provider for CursorProvider {
                 request_context,
                 fingerprint,
                 has_refresh,
+                client_type: client_type.clone(),
             };
             match retry_start.start(initial_reservation).await {
                 Ok(events) => {
@@ -2268,13 +2352,16 @@ impl Provider for CursorProvider {
         let mut refreshed_once = false;
         let upstream = loop {
             match client
-                .run_agent_with_session(
+                .run_agent_with_session_profile(
                     &token,
                     user_text,
                     model,
                     &images,
                     custom_system,
-                    continuation_key.as_deref(),
+                    CursorRunOptions {
+                        session_id: continuation_key.as_deref(),
+                        client_type: Some(&client_type),
+                    },
                 )
                 .await
             {

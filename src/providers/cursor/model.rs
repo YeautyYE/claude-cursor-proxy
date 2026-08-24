@@ -684,4 +684,11 @@ mod tests {
             assert!(models.contains(&m.to_string()), "missing {m}");
         }
     }
+
+    #[test]
+    fn resolve_gemini_31_pro_as_cursor_catalog_model() {
+        let resolved = resolve_cursor_model("gemini-3.1-pro").unwrap();
+        assert_eq!(resolved.model_id, "gemini-3.1-pro");
+        assert_eq!(resolved.mode, CursorAgentMode::Agent);
+    }
 }

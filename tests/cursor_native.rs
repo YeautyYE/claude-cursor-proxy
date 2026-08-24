@@ -367,6 +367,8 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     unsafe {
         std::env::set_var("CCP_CURSOR_BASE_URL", &mock_url);
         std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "test-client-version");
+        std::env::set_var("CCP_CURSOR_CLIENT_TYPE", "cli");
+        std::env::remove_var("CCP_CURSOR_SAND_MODELS");
     }
 
     let _handle = tokio::spawn(async move {
@@ -393,56 +395,56 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         .expect("mock upstream request should succeed");
     assert!(upstream.is_success());
 
-    let observed = observed.lock().unwrap().clone().expect("request captured");
+    let cli_observed = observed.lock().unwrap().clone().expect("request captured");
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
         Some("Bearer wire-token")
     );
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()),
         Some("application/connect+proto")
     );
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get("connect-protocol-version")
             .and_then(|v| v.to_str().ok()),
         Some("1")
     );
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get("x-cursor-client-type")
             .and_then(|v| v.to_str().ok()),
         Some("cli")
     );
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get("x-cursor-client-version")
             .and_then(|v| v.to_str().ok()),
         Some("test-client-version")
     );
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get("x-cursor-streaming")
             .and_then(|v| v.to_str().ok()),
         Some("true")
     );
-    let request_id = observed
+    let request_id = cli_observed
         .headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .expect("x-request-id");
     assert_eq!(
-        observed
+        cli_observed
             .headers
             .get("x-original-request-id")
             .and_then(|v| v.to_str().ok()),
@@ -450,7 +452,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     );
 
     let mut decoder = ConnectFrameDecoder::new();
-    let frames = decoder.push(&observed.body).unwrap();
+    let frames = decoder.push(&cli_observed.body).unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].flags, 0);
     let msg = AgentClientMessage::decode(&frames[0].payload[..]).unwrap();
@@ -489,8 +491,30 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     assert_eq!(image.mime_type, "image/png");
 
     unsafe {
+        std::env::set_var("CCP_CURSOR_SAND_MODELS", "cursor:gpt-5.5");
+    }
+    client
+        .run_agent("wire-token", "sand prompt", "cursor:gpt-5.5", &[], None)
+        .await
+        .expect("sand mock upstream request should succeed");
+    let sand_observed = observed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("sand request captured");
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-cursor-client-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("sand")
+    );
+
+    unsafe {
         std::env::remove_var("CCP_CURSOR_BASE_URL");
         std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
+        std::env::remove_var("CCP_CURSOR_CLIENT_TYPE");
+        std::env::remove_var("CCP_CURSOR_SAND_MODELS");
     }
 }
 

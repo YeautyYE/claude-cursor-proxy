@@ -3,7 +3,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use claude_cursor_proxy::{
     config, logging,
     monitor::MonitorHandle,
-    paths,
+    paths, providers,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
@@ -101,6 +101,7 @@ fn main() -> Result<()> {
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
+                    spawn_cursor_catalog_warmup(&runtime);
                     runtime
                         .block_on(server::serve(ServerConfig {
                             bind_address,
@@ -120,6 +121,11 @@ fn main() -> Result<()> {
                     let monitor_listen_url =
                         listen_url(&local_addr.ip().to_string(), local_addr.port());
                     let server_monitor = monitor.clone();
+                    let usage_monitor = monitor.clone();
+                    runtime.spawn(async move {
+                        providers::cursor::usage::poll_cursor_account_usage(usage_monitor).await;
+                    });
+                    spawn_cursor_catalog_warmup(&runtime);
                     let server_task = runtime.spawn(async move {
                         let result =
                             server::serve_listener(listener, Some(server_monitor), async move {
@@ -163,6 +169,30 @@ fn main() -> Result<()> {
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
     }
+}
+
+/// Populate the process-wide Cursor model cache before the TUI opens its
+/// selector. `/v1/models` also refreshes this cache on demand; this warm-up
+/// keeps the first `s` press useful even when the client has not queried that
+/// endpoint yet.
+fn spawn_cursor_catalog_warmup(runtime: &tokio::runtime::Runtime) {
+    runtime.spawn(async {
+        let auth =
+            tokio::task::spawn_blocking(|| match providers::cursor::auth::load_cursor_auth() {
+                Ok(Some(auth)) => Some(auth),
+                Ok(None) | Err(_) => providers::cursor::auth::load_cursor_desktop_auth()
+                    .ok()
+                    .flatten(),
+            })
+            .await
+            .ok()
+            .flatten();
+        let Some(auth) = auth else {
+            return;
+        };
+        let client = providers::cursor::client::CursorHttpClient::new();
+        let _ = client.fetch_usable_models(&auth.access_token).await;
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

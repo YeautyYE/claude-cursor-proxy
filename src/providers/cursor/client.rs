@@ -32,6 +32,15 @@ pub struct CursorUpstreamResponse {
     pub error_detail: Option<String>,
 }
 
+/// Request-scoped values that must remain stable across a Cursor run and any
+/// transport retry. Keeping these together also makes it harder for a new
+/// call site to accidentally omit the identity override.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CursorRunOptions<'a> {
+    pub session_id: Option<&'a str>,
+    pub client_type: Option<&'a str>,
+}
+
 impl CursorUpstreamResponse {
     pub fn is_success(&self) -> bool {
         self.status >= 200 && self.status < 300
@@ -293,11 +302,38 @@ impl CursorHttpClient {
         custom_system_prompt: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<CursorUpstreamResponse, CursorError> {
+        let client_type = config::cursor_client_type_for_model(model);
+        self.run_agent_with_session_profile(
+            token,
+            prompt,
+            model,
+            images,
+            custom_system_prompt,
+            CursorRunOptions {
+                session_id,
+                client_type: Some(&client_type),
+            },
+        )
+        .await
+    }
+
+    /// Run an agent with an optional request-scoped client type override. The
+    /// override is captured before opening the stream and is reused by HTTP/1
+    /// retries, keeping a Sand run on one identity for its full lifetime.
+    pub(crate) async fn run_agent_with_session_profile(
+        &self,
+        token: &str,
+        prompt: &str,
+        model: &str,
+        images: &[CursorSelectedImage],
+        custom_system_prompt: Option<&str>,
+        options: CursorRunOptions<'_>,
+    ) -> Result<CursorUpstreamResponse, CursorError> {
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
 
         let request_id = uuid::Uuid::new_v4().to_string();
-        let continuation = super::conversation::continuation_for(session_id);
+        let continuation = super::conversation::continuation_for(options.session_id);
         let run_request = build_run_request_with_continuation(
             prompt,
             &resolved,
@@ -328,7 +364,12 @@ impl CursorHttpClient {
         );
 
         let client_version = config::cursor_client_version();
-        let client_type = config::cursor_client_type();
+        let client_type = options
+            .client_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(config::cursor_client_type);
         let ghost_mode = if config::cursor_ghost_mode() {
             "true"
         } else {
@@ -813,13 +854,13 @@ impl CursorHttpClient {
                     fields.insert("elapsedMs".into(), json!(elapsed_ms as u64));
                     create_logger("cursor").warn("run_agent_retry_http1", Some(fields));
                     return Box::pin(
-                        CursorHttpClient::with_prefer_http1(true).run_agent_with_session(
+                        CursorHttpClient::with_prefer_http1(true).run_agent_with_session_profile(
                             token,
                             prompt,
                             model,
                             images,
                             custom_system_prompt,
-                            session_id,
+                            options,
                         ),
                     )
                     .await;

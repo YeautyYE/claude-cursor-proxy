@@ -1,7 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::paths;
 
@@ -81,6 +83,27 @@ struct CursorConfig {
     pub ghost_mode: Option<bool>,
     #[serde(rename = "agentBundle")]
     pub agent_bundle: Option<String>,
+    #[serde(rename = "sandModels")]
+    pub sand_models: Option<SandModelsConfig>,
+}
+
+/// The persisted form accepts either a JSON array or a comma/newline-separated
+/// string. The latter is convenient for hand-edited configs and mirrors the env
+/// override without making the rest of the config parser more permissive.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SandModelsConfig {
+    List(Vec<String>),
+    Text(String),
+}
+
+impl SandModelsConfig {
+    fn into_patterns(self) -> Vec<String> {
+        match self {
+            Self::List(values) => values,
+            Self::Text(value) => split_sand_models(&value),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -114,6 +137,241 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
         "cursor" => Some(AliasProvider::Cursor),
         _ => None,
     }
+}
+
+/// Model-selection policy for Cursor requests that should use the `sand`
+/// client surface. Patterns are case-insensitive and support `*` (any number
+/// of characters) and `?` (one character).
+///
+/// Model ids are normalized before matching, so a rule for `claude-fable-5`
+/// also matches the `[1m]` listing suffix and the `cursor:`/`cursor-agent:`/
+/// `cursor-plan:`/`cursor-ask:` aliases used by the proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct SandRoutingPolicy {
+    patterns: Vec<String>,
+}
+
+impl SandRoutingPolicy {
+    pub fn new<I, S>(patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized = Vec::new();
+        for raw in patterns {
+            let pattern = normalize_sand_model(raw.as_ref());
+            if pattern.is_empty() || normalized.iter().any(|item| item == &pattern) {
+                continue;
+            }
+            normalized.push(pattern);
+        }
+        Self {
+            patterns: normalized,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+
+    pub fn into_patterns(self) -> Vec<String> {
+        self.patterns
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn matches(&self, model: &str) -> bool {
+        let model = normalize_sand_model(model);
+        !model.is_empty()
+            && self
+                .patterns
+                .iter()
+                .any(|pattern| glob_matches(pattern, &model))
+    }
+
+    pub fn matches_model(&self, model: &str) -> bool {
+        self.matches(model)
+    }
+}
+
+/// Normalize a model id for Sand policy matching.
+pub fn normalize_sand_model(model: &str) -> String {
+    let mut normalized = model.trim().to_ascii_lowercase();
+    if normalized.ends_with("[1m]") {
+        normalized.truncate(normalized.len().saturating_sub(4));
+    }
+    for prefix in ["cursor-plan:", "cursor-ask:", "cursor-agent:", "cursor:"] {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            normalized = rest.to_string();
+            break;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn split_sand_models(raw: &str) -> Vec<String> {
+    raw.split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse the env representation. A JSON array is accepted in addition to the
+/// documented comma-separated form, which makes shell quoting less fragile.
+fn parse_sand_models_env(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[')
+        && let Ok(values) = serde_json::from_str::<Vec<String>>(trimmed)
+    {
+        return values;
+    }
+    split_sand_models(raw)
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    // Iterative wildcard matching with backtracking to the most recent `*`.
+    // Model ids are short, so this stays both simple and allocation-free.
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star = None;
+    let mut star_text = 0usize;
+
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star = Some(pi);
+            star_text = ti;
+            pi += 1;
+        } else if let Some(star_index) = star {
+            pi = star_index + 1;
+            star_text += 1;
+            ti = star_text;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+/// Resolve the current model policy. The env var is an explicit override,
+/// including an empty value (which disables all Sand matches).
+pub fn cursor_sand_policy() -> SandRoutingPolicy {
+    if let Some(raw) = std::env::var_os("CCP_CURSOR_SAND_MODELS") {
+        return SandRoutingPolicy::new(parse_sand_models_env(&raw.to_string_lossy()));
+    }
+
+    let configured = read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.sand_models)
+        .map(SandModelsConfig::into_patterns)
+        .unwrap_or_default();
+    SandRoutingPolicy::new(configured)
+}
+
+/// Alias retained for call sites that prefer the field's name.
+pub fn cursor_sand_models() -> SandRoutingPolicy {
+    cursor_sand_policy()
+}
+
+pub fn cursor_model_uses_sand(model: &str) -> bool {
+    cursor_sand_policy().matches(model)
+}
+
+/// Persist only `cursor.sandModels`, preserving all unrelated config keys.
+/// The write uses a same-directory temporary file and rename, so a TUI update
+/// cannot leave a partially written JSON document after a process interruption.
+pub fn persist_cursor_sand_policy(policy: &SandRoutingPolicy) -> io::Result<()> {
+    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("config write lock poisoned"))?;
+
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut root = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid config JSON: {err}"),
+            )
+        })?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(err) => return Err(err),
+    };
+    if !root.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config root must be a JSON object",
+        ));
+    }
+    let cursor = root
+        .as_object_mut()
+        .expect("checked object above")
+        .entry("cursor")
+        .or_insert_with(|| serde_json::json!({}));
+    if !cursor.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config cursor must be a JSON object",
+        ));
+    }
+    cursor
+        .as_object_mut()
+        .expect("checked object above")
+        .insert(
+            "sandModels".to_string(),
+            serde_json::to_value(policy.patterns()).map_err(io::Error::other)?,
+        );
+
+    let encoded = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+/// Convenience wrapper for TUI callers that own the editable pattern list.
+pub fn save_cursor_sand_models<I, S>(patterns: I) -> io::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    persist_cursor_sand_policy(&SandRoutingPolicy::new(patterns))
 }
 
 fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
@@ -249,6 +507,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CURSOR_GHOST_MODE") {
         out.push("cursor.ghostMode (env)".to_string());
     }
+    if env.contains_key("CCP_CURSOR_SAND_MODELS") {
+        out.push("cursor.sandModels (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_USER_AGENT") {
         out.push("kimi.userAgent (env)".to_string());
     }
@@ -287,6 +548,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             && !summary.is_empty()
         {
             out.push("codex.reasoningSummary (config)".to_string());
+        }
+        if let Some(cursor) = file_cfg.cursor
+            && let Some(models) = cursor.sand_models
+            && !models.into_patterns().is_empty()
+        {
+            out.push("cursor.sandModels (config)".to_string());
         }
     }
     out
@@ -624,6 +891,17 @@ pub fn cursor_client_type() -> String {
     "cli".to_string()
 }
 
+/// Select the Cursor identity for one request. Sand routing is deliberately
+/// resolved without mutating process-wide configuration, so concurrent model
+/// requests cannot leak their client type into one another.
+pub fn cursor_client_type_for_model(model: &str) -> String {
+    if cursor_sand_policy().matches(model) {
+        "sand".to_string()
+    } else {
+        cursor_client_type()
+    }
+}
+
 /// Detect installed Cursor Agent CLI version directory name
 /// (e.g. `2026.07.16-899851b` under `~/.local/share/cursor-agent/versions/`).
 pub fn detect_installed_cursor_cli_version() -> Option<String> {
@@ -806,6 +1084,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_CURSOR_SAND_MODELS");
         }
     }
 
@@ -995,5 +1274,73 @@ mod tests {
             let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "");
             assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
         }
+    }
+
+    #[test]
+    fn sand_policy_normalizes_aliases_and_supports_globs() {
+        let policy = SandRoutingPolicy::new([
+            "claude-fable-5",
+            "gpt-5.?",
+            "cursor:duplicate",
+            "cursor:duplicate[1m]",
+        ]);
+        assert_eq!(
+            policy.patterns(),
+            &["claude-fable-5", "gpt-5.?", "duplicate"]
+        );
+        assert!(policy.matches("claude-fable-5[1m]"));
+        assert!(policy.matches("cursor-plan:claude-fable-5"));
+        assert!(policy.matches("cursor-agent:claude-fable-5"));
+        assert!(policy.matches("gpt-5.4"));
+        assert!(!policy.matches("gpt-5.42"));
+    }
+
+    #[test]
+    fn sand_policy_reads_config_and_env_overrides_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["claude-fable-*","gpt-5.4"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let from_file = cursor_sand_policy();
+        assert!(from_file.matches("claude-fable-5"));
+        assert!(from_file.matches("gpt-5.4"));
+        assert!(!from_file.matches("gpt-5.5"));
+
+        let _sand_env = EnvGuard::set("CCP_CURSOR_SAND_MODELS", "grok-*, [1m-invalid]");
+        let from_env = cursor_sand_policy();
+        assert!(from_env.matches("grok-4.5"));
+        assert!(!from_env.matches("claude-fable-5"));
+    }
+
+    #[test]
+    fn persist_sand_policy_preserves_unknown_config_fields() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"port":1234,"future":{"keep":true},"cursor":{"clientType":"cli"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        persist_cursor_sand_policy(&SandRoutingPolicy::new(["claude-fable-*", "gpt-5.4"])).unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["port"], 1234);
+        assert_eq!(value["future"]["keep"], true);
+        assert_eq!(value["cursor"]["clientType"], "cli");
+        assert_eq!(
+            value["cursor"]["sandModels"],
+            serde_json::json!(["claude-fable-*", "gpt-5.4"])
+        );
     }
 }

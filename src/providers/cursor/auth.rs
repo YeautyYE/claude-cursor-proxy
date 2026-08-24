@@ -3,7 +3,9 @@ use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
 use crate::{config, paths};
@@ -14,6 +16,7 @@ pub const KEYCHAIN_ACCOUNT: &str = "auth";
 /// Refresh when access JWT is within this window of expiry (align with Codex 5min).
 const REFRESH_EXPIRY_SKEW_MS: u64 = 5 * 60_000;
 const CURSOR_WEBSITE_URL: &str = "https://cursor.com";
+const DESKTOP_STATE_DB_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +257,152 @@ pub fn load_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
     Ok(None)
 }
 
+/// Load the login state written by the Cursor desktop app on macOS.
+///
+/// This is intentionally a read-only, best-effort fallback for dashboard
+/// consumers. The proxy's own auth store and the official Agent credentials
+/// remain higher priority, so merely having Cursor Desktop open never changes
+/// the credentials used by an existing proxy session.
+pub fn load_cursor_desktop_auth() -> anyhow::Result<Option<CursorAuth>> {
+    let Some(path) = cursor_desktop_state_db_path() else {
+        return Ok(None);
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let sqlite = if std::path::Path::new("/usr/bin/sqlite3").is_file() {
+        "/usr/bin/sqlite3"
+    } else if std::path::Path::new("/opt/homebrew/bin/sqlite3").is_file() {
+        "/opt/homebrew/bin/sqlite3"
+    } else if std::path::Path::new("/usr/local/bin/sqlite3").is_file() {
+        "/usr/local/bin/sqlite3"
+    } else {
+        "sqlite3"
+    };
+    let output = run_desktop_state_query(
+        sqlite,
+        &path,
+        "SELECT hex(key), hex(value) FROM ItemTable WHERE key LIKE 'cursorAuth/%';",
+    );
+    let Some(output) = output else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let mut values = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((encoded_key, encoded_value)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(key) = decode_hex_text(encoded_key) else {
+            continue;
+        };
+        let Some(value) = decode_hex_text(encoded_value) else {
+            continue;
+        };
+        let Some(key) = key.strip_prefix("cursorAuth/") else {
+            continue;
+        };
+        values.insert(key.to_string(), value);
+    }
+    let access_token = values
+        .get("accessToken")
+        .map(String::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(str::to_string);
+    let Some(access_token) = access_token else {
+        return Ok(None);
+    };
+    let refresh_token = values
+        .get("refreshToken")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+
+    let mut auth = enrich(
+        StoredCursorAuth {
+            access_token,
+            refresh_token,
+            api_key: None,
+        },
+        format!("cursor-desktop:{}", path.display()),
+    );
+    if let Some(email) = values
+        .get("cachedEmail")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    {
+        auth.email = Some(email.to_string());
+    }
+    Ok(Some(auth))
+}
+
+fn run_desktop_state_query(
+    sqlite: &str,
+    path: &std::path::Path,
+    query: &str,
+) -> Option<std::process::Output> {
+    let mut child = Command::new(sqlite)
+        .args(["-readonly", "-batch", "-noheader", "-separator", "\t"])
+        .arg(path)
+        .arg(query)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + DESKTOP_STATE_DB_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn decode_hex_text(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for index in (0..raw.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&raw[index..index + 2], 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn cursor_desktop_state_db_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("CCP_CURSOR_STATE_DB") {
+        let path = std::path::PathBuf::from(path);
+        return (!path.as_os_str().is_empty()).then_some(path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        dirs_home().map(|home| {
+            home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 fn cli_keychain_fallback_enabled() -> bool {
     match std::env::var("CCP_CURSOR_CLI_KEYCHAIN_FALLBACK") {
         Ok(raw) => matches!(
@@ -426,6 +575,7 @@ pub fn missing_auth_message() -> String {
         "Cursor authentication was not found.",
         "Run `claude-cursor-proxy cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
         "On macOS the proxy also falls back to Cursor Agent Keychain (cursor-access-token) when CCP_CURSOR_CLI_KEYCHAIN_FALLBACK is on (default).",
+        "The TUI usage view can also read Cursor Desktop state.vscdb on macOS when the proxy and Agent stores are empty.",
         "On Linux/Windows it also reads ~/.config/cursor/auth.json when that fallback is enabled.",
     ]
     .join(" ")
@@ -746,6 +896,17 @@ mod tests {
         assert!(login.login_url.contains("&uuid="));
         assert!(login.login_url.contains("&mode=login&redirectTarget=cli"));
         assert!(!login.verifier.contains('='));
+    }
+
+    #[test]
+    fn desktop_state_hex_decoder_handles_text_and_invalid_rows() {
+        assert_eq!(
+            decode_hex_text("636163686564456d61696c"),
+            Some("cachedEmail".into())
+        );
+        assert_eq!(decode_hex_text("746f6b3a656e"), Some("tok:en".into()));
+        assert!(decode_hex_text("0").is_none());
+        assert!(decode_hex_text("zz").is_none());
     }
 
     fn test_jwt(exp: u64, sub: Option<&str>, email: Option<&str>) -> String {
