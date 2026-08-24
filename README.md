@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.69 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.70 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -250,8 +250,8 @@ After enabling a model with `s`, point Claude Code at that model:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
 export ANTHROPIC_AUTH_TOKEN=unused
-export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
-export ANTHROPIC_SMALL_FAST_MODEL="cursor:gemini-3.1-pro"
+export ANTHROPIC_MODEL="cursor:claude-fable-5[1m]"
+export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5[1m]"
 claude
 ```
 
@@ -259,13 +259,16 @@ For a temporary shell/session or automation, `CCP_CURSOR_SAND_MODELS` can
 override the TUI policy:
 
 ```bash
-export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
+export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 ```
+
+For another account-enabled Cursor catalog id, press `a` in the TUI and enter
+it directly; for example, `gemini-3.1-pro`.
 
 `CCP_CURSOR_SAND_MODELS` is a comma-separated list and supports `*` and `?`.
 Model matching is case-insensitive and normalizes `[1m]` plus
 `cursor:`/`cursor-agent:`/`cursor-plan:`/`cursor-ask:` prefixes, so a rule for
-`gemini-3.1-pro` also covers `cursor:gemini-3.1-pro[1m]`. An environment value
+`claude-fable-5` also covers `cursor:claude-fable-5[1m]`. An environment value
 always overrides `cursor.sandModels` in `config.json`; unset it to edit the
 file from the TUI. Leave `CCP_CURSOR_CLIENT_TYPE` at its default `cli` when you
 want mixed routing; setting it to `sand` makes unmatched models use Sand too.

@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.69 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.70 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -243,8 +243,8 @@ TUI 需要终端；`serve --no-monitor` 仍可运行代理，但不会显示设�
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
 export ANTHROPIC_AUTH_TOKEN=unused
-export ANTHROPIC_MODEL="cursor:gemini-3.1-pro"
-export ANTHROPIC_SMALL_FAST_MODEL="cursor:gemini-3.1-pro"
+export ANTHROPIC_MODEL="cursor:claude-fable-5[1m]"
+export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5[1m]"
 claude
 ```
 
@@ -252,13 +252,16 @@ claude
 策略：
 
 ```bash
-export CCP_CURSOR_SAND_MODELS="gemini-3.1-pro"
+export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 ```
+
+如果要使用账号提供的其他 Cursor catalog ID，可在 TUI 中按 `a` 直接填写，
+例如 `gemini-3.1-pro`。
 
 `CCP_CURSOR_SAND_MODELS` 是逗号分隔的规则，支持 `*` 和 `?`。匹配不区分
 大小写，并会自动归一化 `[1m]` 以及 `cursor:`/`cursor-agent:`/
-`cursor-plan:`/`cursor-ask:` 前缀。因此，`gemini-3.1-pro` 也会匹配
-`cursor:gemini-3.1-pro[1m]`。环境变量优先于 `config.json` 的
+`cursor-plan:`/`cursor-ask:` 前缀。因此，`claude-fable-5` 也会匹配
+`cursor:claude-fable-5[1m]`。环境变量优先于 `config.json` 的
 `cursor.sandModels`；想从 TUI 编辑文件时先取消这个环境变量。需要混合
 路由时请保留 `CCP_CURSOR_CLIENT_TYPE` 默认值 `cli`；把它设为 `sand` 会让
 未命中规则的模型也使用 Sand。

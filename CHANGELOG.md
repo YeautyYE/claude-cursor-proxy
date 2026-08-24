@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.70 (2026-08-25)
+
+- Use `claude-fable-5[1m]` as the primary Sand walkthrough and keep `gemini-3.1-pro` as the manual catalog-id example.
+
 ## v0.1.69 (2026-08-25)
 
 - Give Sand routing a dedicated, TUI-first README guide covering one-process startup, model selection, dynamic Cursor model discovery, manual model ids such as `gemini-3.1-pro`, and account usage details.
