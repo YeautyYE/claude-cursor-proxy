@@ -142,6 +142,8 @@ const MAX_SESSION_USAGE: usize = 10_000;
 const LIVE_USAGE_TAP_CAP: usize = 512;
 const LIVE_EMPTY_TURN_MAX_RETRIES: u32 = 1;
 const LIVE_EMPTY_TURN_EPISODE_MS: u64 = 300_000;
+const CURSOR_RESOURCE_RETRIES_DEFAULT: u32 = 6;
+const CURSOR_RESOURCE_RETRIES_MAX: u32 = 12;
 
 #[derive(Debug, Clone, Copy)]
 struct LiveLateRetryPolicy {
@@ -714,7 +716,7 @@ async fn start_live_events_with_retries_with_client_type(
                             let status = crate::retry::classify_proxy_error_status(502, &error);
                             return Err(CursorError::new(status, error, None));
                         }
-                        if transient_retries >= crate::retry::MAX_RATE_LIMIT_RETRIES {
+                        if transient_retries >= cursor_transient_retry_limit(&error) {
                             return Err(CursorError::internal(error));
                         }
                         crate::retry::sleep(same_request_retry_wait_ms(transient_retries, &error))
@@ -737,7 +739,8 @@ async fn start_live_events_with_retries_with_client_type(
                     transient_retries = 0;
                     continue;
                 }
-                let retryable = transient_retries < crate::retry::MAX_RATE_LIMIT_RETRIES
+                let retryable = transient_retries
+                    < cursor_transient_retry_limit(&error.client_message())
                     && cursor_start_error_is_same_request_retryable(&error);
                 if retryable {
                     reservation.release();
@@ -962,6 +965,8 @@ async fn forward_empty_turn_deadline(
 fn live_late_retry_limit(error: &str, policy: LiveLateRetryPolicy) -> u32 {
     if live_error_is_empty_turn_retry(error) {
         policy.empty_turn_max_retries
+    } else if is_transient_resource_exhausted(error) {
+        cursor_transient_retry_limit(error)
     } else {
         policy.transient_max_retries
     }
@@ -1700,6 +1705,31 @@ fn env_u64_millis(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Distinguish a short-lived provider-pool failure from account or capacity
+/// policy errors. The former can recover while the request is still open;
+/// retrying the latter only delays a useful error and may amplify a shed.
+fn is_transient_resource_exhausted(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("error_resource_exhausted")
+        || (lower.contains("unable to reach the model provider")
+            && lower.contains("resource_exhausted")))
+        && !crate::retry::is_billing_block(message)
+        && !crate::retry::is_capacity_shed(message)
+        && !crate::retry::is_policy_rate_limit(message)
+}
+
+fn cursor_transient_retry_limit(message: &str) -> u32 {
+    if !is_transient_resource_exhausted(message) {
+        return crate::retry::MAX_RATE_LIMIT_RETRIES;
+    }
+
+    env_u64_millis(
+        "CCP_CURSOR_RESOURCE_RETRIES",
+        CURSOR_RESOURCE_RETRIES_DEFAULT as u64,
+    )
+    .clamp(1, CURSOR_RESOURCE_RETRIES_MAX as u64) as u32
+}
+
 fn strip_cursor_run_generation(id: &str) -> &str {
     id.split("__cursor_run_").next().unwrap_or(id)
 }
@@ -2377,7 +2407,7 @@ impl Provider for CursorProvider {
                     }
                 }
                 Err(e)
-                    if transport_retries < crate::retry::MAX_RATE_LIMIT_RETRIES
+                    if transport_retries < cursor_transient_retry_limit(&e.client_message())
                         && cursor_start_error_is_same_request_retryable(&e) =>
                 {
                     crate::retry::sleep(same_request_retry_wait_ms(
@@ -3307,6 +3337,49 @@ mod tests {
             ),
             crate::retry::MAX_RATE_LIMIT_RETRIES
         );
+    }
+
+    #[test]
+    fn transient_resource_exhaustion_gets_extended_retry_budget() {
+        let transient = "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]";
+        assert!(is_transient_resource_exhausted(transient));
+        assert_eq!(cursor_transient_retry_limit(transient), 6);
+        assert_eq!(
+            live_late_retry_limit(transient, LiveLateRetryPolicy::default()),
+            6
+        );
+
+        let ordinary =
+            "Connect error 502: ERROR_OPENAI: Unable to reach the model provider [unavailable]";
+        assert!(!is_transient_resource_exhausted(ordinary));
+        assert_eq!(
+            cursor_transient_retry_limit(ordinary),
+            crate::retry::MAX_RATE_LIMIT_RETRIES
+        );
+        assert_eq!(
+            live_late_retry_limit(ordinary, LiveLateRetryPolicy::default()),
+            crate::retry::MAX_RATE_LIMIT_RETRIES
+        );
+    }
+
+    #[test]
+    fn policy_resource_exhaustion_never_uses_extended_retry_budget() {
+        for message in [
+            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice [resource_exhausted]",
+            "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded [resource_exhausted]",
+            "Connect error 429: ERROR_RESOURCE_EXHAUSTED: High Load — please switch to another model [resource_exhausted]",
+        ] {
+            assert!(!is_transient_resource_exhausted(message), "{message}");
+            assert_eq!(
+                cursor_transient_retry_limit(message),
+                crate::retry::MAX_RATE_LIMIT_RETRIES,
+                "policy errors retain the normal retry budget"
+            );
+            assert_eq!(
+                live_late_retry_limit(message, LiveLateRetryPolicy::default()),
+                crate::retry::MAX_RATE_LIMIT_RETRIES
+            );
+        }
     }
 
     #[tokio::test]
