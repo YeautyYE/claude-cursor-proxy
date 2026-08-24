@@ -575,6 +575,10 @@ impl CursorLiveRunHandle {
         !self.pending_tools().is_empty()
     }
 
+    pub(crate) fn is_command_closed(&self) -> bool {
+        self.command_tx.is_closed()
+    }
+
     /// Return the first exposed exec for compatibility with the original
     /// single-tool bridge API.
     pub fn pending(&self) -> Option<PendingCursorExec> {
@@ -5318,6 +5322,13 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     }
     if cursor_connect_error_is_missing_image(message) {
         return false;
+    }
+    // Cursor may report exhaustion of its internal step loop as a 502/[internal]
+    // even though the Run has not emitted client-visible output yet. Keep this
+    // exact transient failure on the same-request retry path; the live pump
+    // still forwards it once output has committed.
+    if super::is_transient_step_failure(message) {
+        return true;
     }
     let lower = message.to_ascii_lowercase();
     if lower.contains("outdated_client") || lower.contains("outdated client") {

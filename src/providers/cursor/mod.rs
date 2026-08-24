@@ -45,9 +45,9 @@ use crate::providers::cursor::hosted_web_search::{
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
 use crate::providers::cursor::live::{
-    EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT,
-    LiveEventResult, LiveReplacementClaim, LiveRunEvent, LiveRunIdentity, LiveRunProbe,
-    LiveRunRegistry, LiveRunReservation, LiveSlotClaim,
+    CursorLiveRunHandle, EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, LIVE_AMBIGUOUS_OPEN_TTL,
+    LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim, LiveRunEvent, LiveRunIdentity,
+    LiveRunProbe, LiveRunRegistry, LiveRunReservation, LiveSlotClaim,
     cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
     finish_replacement_after_cancel, live_error_is_empty_turn_retry,
     live_error_is_same_request_retryable, live_error_needs_checkpoint_continue,
@@ -144,6 +144,8 @@ const LIVE_EMPTY_TURN_MAX_RETRIES: u32 = 1;
 const LIVE_EMPTY_TURN_EPISODE_MS: u64 = 300_000;
 const CURSOR_RESOURCE_RETRIES_DEFAULT: u32 = 6;
 const CURSOR_RESOURCE_RETRIES_MAX: u32 = 12;
+const CURSOR_STEP_FAILURE_RETRIES_DEFAULT: u32 = 4;
+const CURSOR_STEP_FAILURE_RETRIES_MAX: u32 = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct LiveLateRetryPolicy {
@@ -375,11 +377,51 @@ fn commit_streaming_live_sse_before_start_live(want_stream: bool, hold_http: boo
 
 const LIVE_RUN_BUSY_MESSAGE: &str =
     "A Cursor live run is already active for this session; retry after it advances";
+const LIVE_ATTACH_WAIT_DEFAULT_MS: u64 = 2_500;
+const LIVE_ATTACH_WAIT_MAX_MS: u64 = 10_000;
+const LIVE_CONFLICT_WAIT_DEFAULT_MS: u64 = 2_500;
+const LIVE_CONFLICT_WAIT_MAX_MS: u64 = 10_000;
 
 fn live_run_busy_error() -> CursorError {
     let mut error = CursorError::new(503, LIVE_RUN_BUSY_MESSAGE, None);
     error.retry_after = Some(local_overload_retry_after());
     error
+}
+
+/// A retry of the same logical operation can race the driver while it is
+/// handing the downstream channel from the original request to the retry.
+/// Wait briefly for that handoff instead of immediately returning local 503.
+/// The fingerprint check and the existing attach protocol preserve exactly-once
+/// execution; a different operation never enters this path.
+async fn attach_live_run_with_bounded_wait(
+    run: Arc<CursorLiveRunHandle>,
+    fingerprint: u64,
+) -> Option<mpsc::Receiver<LiveEventResult>> {
+    let wait_ms = env_u64_millis(
+        "CCP_CURSOR_LIVE_ATTACH_WAIT_MS",
+        LIVE_ATTACH_WAIT_DEFAULT_MS,
+    )
+    .clamp(250, LIVE_ATTACH_WAIT_MAX_MS);
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        if run.request_fingerprint() != fingerprint || run.is_completed() || run.is_command_closed()
+        {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let attempt = remaining.min(Duration::from_millis(500));
+        if let Ok(Ok(events)) =
+            tokio::time::timeout(attempt, run.attach_for_operation(fingerprint)).await
+        {
+            return Some(events);
+        }
+        if !remaining.is_zero() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// Serve the retained final segment of an already-completed identical
@@ -525,6 +567,14 @@ async fn start_live_events_with_retries_with_client_type(
     client_type: &str,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
     let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
+    let operation_conflict_deadline = Instant::now()
+        + Duration::from_millis(
+            env_u64_millis(
+                "CCP_CURSOR_LIVE_CONFLICT_WAIT_MS",
+                LIVE_CONFLICT_WAIT_DEFAULT_MS,
+            )
+            .clamp(250, LIVE_CONFLICT_WAIT_MAX_MS),
+        );
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
@@ -574,8 +624,11 @@ async fn start_live_events_with_retries_with_client_type(
                             LiveRunRegistry::get_run(identity.session_id, identity.agent_id)
                         {
                             if run.request_fingerprint() == operation_fingerprint
-                                && let Ok(events) =
-                                    run.attach_for_operation(operation_fingerprint).await
+                                && let Some(events) = attach_live_run_with_bounded_wait(
+                                    Arc::clone(&run),
+                                    operation_fingerprint,
+                                )
+                                .await
                             {
                                 return Ok(events);
                             }
@@ -592,6 +645,16 @@ async fn start_live_events_with_retries_with_client_type(
                                 )
                             {
                                 break Some(reservation);
+                            }
+                            // A different operation must never attach to or
+                            // cancel a live generation. Give the old request
+                            // a short chance to finish before surfacing local
+                            // backpressure to a client retry.
+                            if !run.is_command_closed()
+                                && Instant::now() < operation_conflict_deadline
+                            {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
                             }
                         }
                         return Err(live_run_busy_error());
@@ -965,6 +1028,8 @@ async fn forward_empty_turn_deadline(
 fn live_late_retry_limit(error: &str, policy: LiveLateRetryPolicy) -> u32 {
     if live_error_is_empty_turn_retry(error) {
         policy.empty_turn_max_retries
+    } else if is_transient_step_failure(error) {
+        cursor_step_failure_retry_limit(error)
     } else if is_transient_resource_exhausted(error) {
         cursor_transient_retry_limit(error)
     } else {
@@ -1545,10 +1610,12 @@ async fn await_live_run_resume_for_operation(
             // half-open original SSE) instead of 503-bouncing until the run
             // dies — grok-build retries 503 as transient overload and that
             // is the "already active" storm.
-            match run.attach_for_operation(fingerprint).await {
-                Ok(events) => return LiveResumeOutcome::Resumed(events),
-                Err(_) => return LiveResumeOutcome::ResumeError(live_run_busy_error()),
+            if let Some(events) =
+                attach_live_run_with_bounded_wait(Arc::clone(&run), fingerprint).await
+            {
+                return LiveResumeOutcome::Resumed(events);
             }
+            return LiveResumeOutcome::ResumeError(live_run_busy_error());
         }
         if observed_non_running_slot {
             // A Starting slot became Running. Tool-result waiters must not
@@ -1625,10 +1692,11 @@ async fn await_live_run_resume_for_operation(
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     };
     if run.request_fingerprint() == fingerprint {
-        match run.attach_for_operation(fingerprint).await {
-            Ok(events) => return LiveResumeOutcome::Resumed(events),
-            Err(_) => return LiveResumeOutcome::ResumeError(live_run_busy_error()),
+        if let Some(events) = attach_live_run_with_bounded_wait(Arc::clone(&run), fingerprint).await
+        {
+            return LiveResumeOutcome::Resumed(events);
         }
+        return LiveResumeOutcome::ResumeError(live_run_busy_error());
     }
     if observed_non_running_slot {
         if has_tool_results {
@@ -1718,7 +1786,39 @@ fn is_transient_resource_exhausted(message: &str) -> bool {
         && !crate::retry::is_policy_rate_limit(message)
 }
 
+/// Cursor sometimes exhausts its own internal step loop while the upstream
+/// Run is still safe to replay. Treat this exact provider failure as transient
+/// while the downstream response is still pre-output; policy errors remain
+/// terminal through the guards below.
+fn is_transient_step_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("failed to run step")
+        && lower.contains("exceeded max retries")
+        && (lower.contains("[internal]")
+            || lower.contains("connect error 502")
+            || lower.contains("cursor error 502"))
+        && !crate::retry::is_billing_block(message)
+        && !crate::retry::is_capacity_shed(message)
+        && !crate::retry::is_policy_rate_limit(message)
+}
+
+fn cursor_step_failure_retry_limit(message: &str) -> u32 {
+    if !is_transient_step_failure(message) {
+        return crate::retry::MAX_RATE_LIMIT_RETRIES;
+    }
+
+    std::env::var("CCP_CURSOR_STEP_FAILURE_RETRIES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CURSOR_STEP_FAILURE_RETRIES_DEFAULT as u64)
+        .clamp(1, CURSOR_STEP_FAILURE_RETRIES_MAX as u64) as u32
+}
+
 fn cursor_transient_retry_limit(message: &str) -> u32 {
+    if is_transient_step_failure(message) {
+        return cursor_step_failure_retry_limit(message);
+    }
     if !is_transient_resource_exhausted(message) {
         return crate::retry::MAX_RATE_LIMIT_RETRIES;
     }
@@ -3382,6 +3482,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cursor_step_failure_gets_a_bounded_pre_output_retry_budget() {
+        let transient = "Cursor error 502: Failed to run step, exceeded max retries [internal]";
+        assert!(is_transient_step_failure(transient));
+        assert_eq!(cursor_step_failure_retry_limit(transient), 4);
+        assert_eq!(
+            live_late_retry_limit(transient, LiveLateRetryPolicy::default()),
+            4,
+            "step exhaustion gets its own short retry budget"
+        );
+        assert!(!is_transient_step_failure(
+            "Cursor error 502: Failed to run step, exceeded max retries; unpaid invoice"
+        ));
+        assert_eq!(
+            cursor_step_failure_retry_limit("Cursor error 502: upstream unavailable"),
+            crate::retry::MAX_RATE_LIMIT_RETRIES
+        );
+    }
+
     #[tokio::test]
     async fn pre_output_openai_502_is_retried_not_forwarded() {
         let provider_502 = "Connect error 502: ERROR_OPENAI: Unable to reach the model provider — We're having trouble connecting to the model provider. This might be temporary - please try again in a moment. [unavailable]";
@@ -3636,6 +3755,7 @@ mod tests {
         let billing = "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]";
         let empty_turn =
             "Cursor upstream finished this turn without text or tool calls; retry this turn";
+        let step_failure = "Cursor error 502: Failed to run step, exceeded max retries [internal]";
         assert_eq!(
             classify_live_pump_item(false, &Err(billing.into())),
             LivePumpAction::Forward
@@ -3654,6 +3774,16 @@ mod tests {
             classify_live_pump_item(true, &Err(empty_turn.into())),
             LivePumpAction::Retry,
             "thinking-only output must not expose a failed empty turn"
+        );
+        assert_eq!(
+            classify_live_pump_item(false, &Err(step_failure.into())),
+            LivePumpAction::Retry,
+            "step exhaustion must retry before client-visible output"
+        );
+        assert_eq!(
+            classify_live_pump_item(true, &Err(step_failure.into())),
+            LivePumpAction::Forward,
+            "step exhaustion must not replay after output commits"
         );
 
         let (src_tx, src_rx) = mpsc::channel(8);

@@ -1443,7 +1443,10 @@ impl RequestMonitorGuard {
 impl Drop for RequestMonitorGuard {
     fn drop(&mut self) {
         if let Some(monitor) = self.monitor.as_ref() {
-            monitor.request_abandoned(&self.req_id, "Request future ended before completion");
+            monitor.request_abandoned(
+                &self.req_id,
+                "Client response stream disconnected before completion",
+            );
         }
     }
 }

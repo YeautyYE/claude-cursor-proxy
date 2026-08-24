@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.68 (2026-08-25)
+
+- Wait briefly for same-operation live attach handoff and for a different operation to observe the current session Run advance, reducing transient `already active` 503 retry storms without reusing a different request or cancelling pending tools.
+- Retry Cursor `Failed to run step, exceeded max retries` failures before client-visible output with a bounded four-attempt budget (`CCP_CURSOR_STEP_FAILURE_RETRIES`, 1–8); once text or tool output is committed, the error remains terminal to prevent duplicate side effects.
+- Clarify monitor records for downstream response disconnects and document the new live attach/conflict and step-failure retry controls.
+
 ## v0.1.66 (2026-08-23)
 
 - Client disconnect no longer cancels an accepted live run. All six disconnect paths hand the run to the driver's orphan logic: an identical retry attaches (or gets the completed replay), a different new operation supersedes the orphan once its consumer is gone and no tool results are outstanding, and an absolute 240-second orphan age cap reaps abandoned generations. This removes the ambiguous-tombstone / replacement-conflict cascade behind the grok-4.6 and gemini 409 storms.
