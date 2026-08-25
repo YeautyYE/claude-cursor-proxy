@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.72 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.73 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -421,7 +421,8 @@ discovery, and usage guide.
 | grok-build reports `Cursor tool result wait expired`, or a heartbeat stall first appears as 502 and then 409 | Update to ≥0.1.62 and restart serve. Tool time starts when Grok receives the batch and no longer consumes the next model segment's budget; an already-admitted tool result wins the TTL boundary. Unresolved heartbeat completion is reported as 409 immediately because replay could duplicate the Run. |
 | Claude Code Bash widget titles a giant `python3 -c` script | Update to ≥0.1.48 and restart serve. Cursor Shell has no description; the proxy now fills a short one-line title. |
 | 45s 502 `idle timeout` / `0 response bytes` | Update to ≥0.1.39 and restart serve. Still set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`. Clash/Surge TUN: DIRECT `*.cursor.sh`. Optional: `CCP_CURSOR_HTTP1=1` |
-| `Stream idle timeout - no chunks received` before a background tool result resumes | Update to ≥0.1.45 and restart serve. The pre-response live-result classification wait is capped at 5s instead of 30s; once an SSE response exists, 15s Anthropic pings still protect quiet model thinking. |
+| `Stream idle timeout - no chunks received`, especially on the first turn or before a background tool result resumes | Update to ≥0.1.73 and restart serve. `/v1/messages` now commits the Anthropic SSE lifecycle before Cursor live open, so the client receives bytes immediately and 15s `ping` keep-alives cover quiet thinking. Pre-output Cursor open/step failures stay inside the bounded retry loop; `/v1/responses` intentionally keeps held-HTTP mapping for `response.failed`. |
+| Claude Code shows `Cursor live run cancelled` and the turn stops | Update to ≥0.1.73 and restart serve. A resolved cancellation before the first text/tool event is retried inside the same SSE request; cancellation reports that include unresolved/ambiguous acceptance are kept fail-closed to prevent duplicate tool execution. |
 | 502 `Image not found [internal]` on a text-only turn | Update to ≥0.1.40 and restart serve, then retry the same message once (the poisoned conversation checkpoint is cleared on that error). A new Claude Code session also works. |
 | 502 `Conversation data missing` / `missing blobs` and the session cannot recover | Update to ≥0.1.45 and restart serve, then retry the same message. The failed turn now resets the unrecoverable Cursor conversation binding; the first retry replays full history in a fresh Cursor conversation without requiring a new Claude Code chat. |
 | 400 `Missing tool_result blocks for pending tools` after an interrupted turn / with background shells | Update to ≥0.1.45 and restart serve. A new request without current-turn tool results now supersedes the abandoned live turn; partial tool-result batches are still rejected. |

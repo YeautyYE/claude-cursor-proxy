@@ -601,6 +601,19 @@ impl CursorLiveRunHandle {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
+    /// A fresh operation may replace this generation only after the driver
+    /// has published a terminal/orphan signal (or exposed a client-only batch
+    /// that is about to tear the driver down). Keep this predicate next to
+    /// the atomics so the registry can re-check it at claim time instead of
+    /// trusting a waiter snapshot that may already be stale.
+    pub(crate) fn is_replaceable_for_fresh_request(&self) -> bool {
+        !self.is_completed()
+            && (self.is_consumer_gone()
+                || self.is_cancel_requested()
+                || self.is_command_closed()
+                || live_pending_must_supersede(&self.pending_tools()))
+    }
+
     fn take_terminal_error(&self) -> Option<String> {
         self.terminal_error
             .lock()
@@ -1904,11 +1917,36 @@ impl LiveRunRegistry {
         agent_id: Option<&str>,
         expected_run_id: &str,
     ) -> LiveReplacementClaim {
+        Self::claim_replacement_for_run_inner(session_id, agent_id, expected_run_id, false)
+    }
+
+    /// Claim a replacement for a fresh request only while the exact
+    /// generation is still marked replaceable.  The check occurs under the
+    /// registry lock, closing the window where a waiter observes an orphaned
+    /// consumer and the driver reattaches before the claim is committed.
+    pub fn claim_replacement_for_fresh_request(
+        session_id: &str,
+        agent_id: Option<&str>,
+        expected_run_id: &str,
+    ) -> LiveReplacementClaim {
+        Self::claim_replacement_for_run_inner(session_id, agent_id, expected_run_id, true)
+    }
+
+    fn claim_replacement_for_run_inner(
+        session_id: &str,
+        agent_id: Option<&str>,
+        expected_run_id: &str,
+        require_fresh_replaceable: bool,
+    ) -> LiveReplacementClaim {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
         match runs.runs.get(&key) {
-            Some(LiveRunEntry::Running(handle)) if handle.run_id() == expected_run_id => {
+            Some(LiveRunEntry::Running(handle))
+                if handle.run_id() == expected_run_id
+                    && (!require_fresh_replaceable
+                        || handle.is_replaceable_for_fresh_request()) =>
+            {
                 let handle = Arc::clone(handle);
                 runs.remove_key(&key);
                 match Self::reserve_key(&mut runs, key.clone()) {
@@ -2241,23 +2279,14 @@ impl LiveRunRegistry {
         agent_id: Option<&str>,
     ) -> Option<String> {
         let key = live_run_key(session_id, agent_id);
-        let handle = {
-            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-            Self::prune_finished(&mut runs);
-            match runs.runs.get(&key) {
-                Some(LiveRunEntry::Running(handle)) => Some(Arc::clone(handle)),
-                _ => None,
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(handle)) if handle.is_replaceable_for_fresh_request() => {
+                Some(handle.run_id().to_string())
             }
-        }?;
-        if handle.is_completed()
-            || !(handle.is_consumer_gone()
-                || handle.is_cancel_requested()
-                || handle.is_command_closed()
-                || live_pending_must_supersede(&handle.pending_tools()))
-        {
-            return None;
+            _ => None,
         }
-        Some(handle.run_id().to_string())
     }
 
     /// True while a reservation or live handle owns this Claude session slot
@@ -5384,6 +5413,16 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
         return false;
     }
     if live_error_is_empty_turn_retry(message) {
+        return true;
+    }
+    // A generation can be cancelled by a stale overlap/replacement signal
+    // before Cursor accepts any user-visible output. The driver uses this
+    // exact wording only for a resolved cancellation; unresolved cancellation
+    // paths include the ambiguity marker above and remain fail-closed.
+    if message
+        .trim()
+        .eq_ignore_ascii_case("Cursor live run cancelled")
+    {
         return true;
     }
     if cursor_connect_error_is_missing_conversation_data(message)
@@ -9547,8 +9586,7 @@ fn strip_serialized_tool_results(prompt: &str) -> String {
             break;
         };
         let tag_end = after_name + tag_end_rel;
-        if prompt[after_name..tag_end]
-            .as_bytes()
+        if prompt.as_bytes()[after_name..tag_end]
             .first()
             .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
         {
@@ -9614,12 +9652,8 @@ fn find_ignore_ascii_case_at(haystack: &str, needle: &str) -> Option<usize> {
     if needle_bytes.is_empty() || hay.len() < needle_bytes.len() {
         return None;
     }
-    for i in 0..=hay.len() - needle_bytes.len() {
-        if hay[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes) {
-            return Some(i);
-        }
-    }
-    None
+    (0..=hay.len() - needle_bytes.len())
+        .find(|&i| hay[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes))
 }
 
 fn jsonish_quoted_field(source: &str, key: &str) -> Option<String> {
@@ -11395,6 +11429,12 @@ mod tests {
 
     #[test]
     fn cancel_without_client_visible_output_stays_retryable() {
+        assert!(live_error_is_same_request_retryable(
+            "Cursor live run cancelled"
+        ));
+        assert!(!live_error_is_same_request_retryable(
+            "Cursor live cancellation interrupted an accepted ResumeAction; acceptance is ambiguous"
+        ));
         assert!(
             !live_cancel_is_ambiguous(true, false, true, false),
             "unconfirmed ResumeAction with no text/tools must 502 so grok retries"
@@ -15468,6 +15508,50 @@ mod tests {
         assert!(
             command_rx.try_recv().is_err(),
             "busy classification must not send cancellation to the active driver"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn fresh_replacement_claim_rechecks_consumer_state_at_commit() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("fresh-claim-fence-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        // Keep the command channel open while the claim is tested. A closed
+        // receiver is itself a replaceable-generation signal and would mask
+        // the consumer reattachment fence this regression covers.
+        let _command_rx_guard = command_rx;
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "reattached-generation".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(1)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        handle.consumer_gone.store(true, Ordering::Release);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert run");
+
+        let observed = LiveRunRegistry::replaceable_running_generation(&session, None)
+            .expect("orphan generation should be observed");
+        assert_eq!(observed, "reattached-generation");
+        // The original consumer reattached after the waiter snapshot. The
+        // claim must refuse to cancel this now-healthy generation.
+        handle.consumer_gone.store(false, Ordering::Release);
+        assert!(matches!(
+            LiveRunRegistry::claim_replacement_for_fresh_request(&session, None, &observed),
+            LiveReplacementClaim::Conflict
+        ));
+        assert_eq!(
+            LiveRunRegistry::running_generation(&session, None).as_deref(),
+            Some("reattached-generation")
         );
         LiveRunRegistry::clear();
     }

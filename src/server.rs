@@ -1105,7 +1105,12 @@ async fn dispatch_request(
         traffic,
         monitor: state.monitor.clone(),
         claude_code,
-        hold_http_until_live_open: client_request_id.is_some(),
+        // Anthropic `/v1/messages` can commit its SSE lifecycle before the
+        // Cursor live open finishes.  Holding this response for an upstream
+        // retry wave leaves Claude Code with no bytes and triggers its stream
+        // idle watchdog.  The OpenAI Responses adapter above is the endpoint
+        // that requires a held HTTP status for `response.failed` mapping.
+        hold_http_until_live_open: false,
     };
 
     let response = if count_tokens {

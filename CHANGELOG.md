@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.73 (2026-08-25)
+
+- Commit Anthropic `/v1/messages` SSE lifecycle bytes before waiting for Cursor live open, so Claude Code's stream-idle watchdog is protected by immediate output and 15-second `ping` keep-alives.
+- Keep transient Cursor open/step failures inside the existing bounded retry loop before client-visible output, and fence fresh-request replacement claims against a generation that reattaches during the handoff race.
+- Retry a resolved `Cursor live run cancelled` before the first text/tool event; cancellation paths that report ambiguous upstream acceptance remain fail-closed to avoid duplicate execution.
+
 ## v0.1.72 (2026-08-25)
 
 - Route Sand policy checks through resolved Cursor aliases and Fable thinking tiers, so `claude-fable-5[1m]`, `cursor:` forms, and high/low effort variants keep the selected Sand surface.

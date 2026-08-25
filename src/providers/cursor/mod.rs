@@ -2215,13 +2215,20 @@ impl Provider for CursorProvider {
                                 );
                             }
                             LiveResumeOutcome::SupersedeRunning(run_id) => {
-                                match LiveRunRegistry::claim_replacement_for_run(
-                                    session_id, agent_id, &run_id,
-                                ) {
+                                let has_tool_results = request_has_current_tool_result(&body);
+                                let replacement = if has_tool_results {
+                                    LiveRunRegistry::claim_replacement_for_run(
+                                        session_id, agent_id, &run_id,
+                                    )
+                                } else {
+                                    LiveRunRegistry::claim_replacement_for_fresh_request(
+                                        session_id, agent_id, &run_id,
+                                    )
+                                };
+                                match replacement {
                                     LiveReplacementClaim::Conflict => {
-                                        let error = live_replacement_conflict_error(
-                                            request_has_current_tool_result(&body),
-                                        );
+                                        let error =
+                                            live_replacement_conflict_error(has_tool_results);
                                         return map_cursor_error_to_response(&error);
                                     }
                                     LiveReplacementClaim::Reserved {
@@ -2234,7 +2241,7 @@ impl Provider for CursorProvider {
                                             match finish_replacement_after_cancel(
                                                 reservation,
                                                 handle,
-                                                request_has_current_tool_result(&body),
+                                                has_tool_results,
                                                 cancel_result,
                                             ) {
                                                 Ok(kept) => {
@@ -3567,6 +3574,11 @@ mod tests {
     #[tokio::test]
     async fn pre_output_openai_502_is_retried_not_forwarded() {
         let provider_502 = "Connect error 502: ERROR_OPENAI: Unable to reach the model provider — We're having trouble connecting to the model provider. This might be temporary - please try again in a moment. [unavailable]";
+        assert_eq!(
+            classify_live_pump_item(false, &Err("Cursor live run cancelled".into())),
+            LivePumpAction::Retry,
+            "a resolved pre-output cancellation must restart the same SSE request"
+        );
         assert_eq!(
             classify_live_pump_item(false, &Err(provider_502.into())),
             LivePumpAction::Retry
