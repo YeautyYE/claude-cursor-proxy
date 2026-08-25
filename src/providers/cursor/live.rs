@@ -2189,6 +2189,11 @@ impl LiveRunRegistry {
         };
         match entry {
             Some(LiveRunEntry::Running(handle)) => {
+                mark_cancelled_operation(
+                    &key,
+                    &handle,
+                    "Cursor live run cancellation requested; completion is ambiguous",
+                );
                 handle.cancel();
                 true
             }
@@ -2231,6 +2236,11 @@ impl LiveRunRegistry {
         };
         match entry {
             Some(LiveRunEntry::Running(handle)) if handle.run_id() == expected_run_id => {
+                mark_cancelled_operation(
+                    &key,
+                    &handle,
+                    "Cursor live run cancellation requested for a stale generation; completion is ambiguous",
+                );
                 handle.cancel();
                 true
             }
@@ -2263,6 +2273,11 @@ impl LiveRunRegistry {
             }
         };
         if let Some(handle) = handle {
+            mark_cancelled_operation(
+                &key,
+                &handle,
+                "Cursor live run cancellation requested; completion is ambiguous",
+            );
             handle.cancel();
             true
         } else {
@@ -2295,8 +2310,26 @@ impl LiveRunRegistry {
         let Some(LiveRunEntry::Running(handle)) = runs.remove_key(&key) else {
             return Self::reserve_key(&mut runs, key);
         };
-        let reservation = Self::reserve_key(&mut runs, key);
+        let mut reservation = Self::reserve_key(&mut runs, key.clone());
         drop(runs);
+        if let Some(reservation) = reservation.as_mut() {
+            let fingerprint = handle.request_fingerprint();
+            if fingerprint != 0 {
+                // Keep the old durable owner through replacement startup. The
+                // caller will claim the fresh fingerprint under this owner,
+                // then `insert` transfers ownership to the new Run id. This
+                // prevents a late cancellation/terminal callback from
+                // clearing the replacement marker.
+                reservation.set_operation_fingerprint(fingerprint);
+                reservation.set_durable_owner_token(handle.run_id());
+                reservation.protect_on_drop();
+                mark_cancelled_operation(
+                    &key,
+                    &handle,
+                    "Cursor live run superseded; completion is ambiguous",
+                );
+            }
+        }
         handle.cancel();
         reservation
     }
@@ -5166,6 +5199,22 @@ fn persist_ambiguous_operation(
             ])),
         );
     }
+}
+
+/// Reconcile a Running entry that is removed before its driver can publish a
+/// terminal outcome. A cancellation request is not proof that Cursor did not
+/// accept the operation, so clearing the durable marker here would permit a
+/// duplicate dispatch after a process restart. Scope the tombstone to the
+/// exact operation and owner; stale callbacks from an older generation then
+/// fail the ledger compare-and-set instead of touching a replacement marker.
+fn mark_cancelled_operation(operation_key: &str, handle: &CursorLiveRunHandle, message: &str) {
+    let fingerprint = handle.request_fingerprint();
+    if fingerprint == 0 {
+        // Zero is the unpublished sentinel used by synthetic handles and by
+        // reservations before the upstream operation fingerprint is bound.
+        return;
+    }
+    persist_ambiguous_operation(operation_key, fingerprint, handle.run_id(), message);
 }
 
 fn clear_durable_operation(operation_key: &str, fingerprint: u64, owner_token: &str) {
@@ -14632,6 +14681,32 @@ mod tests {
         })
     }
 
+    fn durable_running_handle(
+        session: &str,
+        run_id: &str,
+        fingerprint: u64,
+    ) -> Arc<CursorLiveRunHandle> {
+        let key = live_run_key(session, None);
+        let mut reservation = LiveRunRegistry::reserve(session).expect("reserve");
+        reservation.set_operation_fingerprint(fingerprint);
+        assert_eq!(
+            reservation.begin_durable_operation(),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        assert!(
+            super::super::operation_ledger::mark_dispatched_if_owner(
+                &key,
+                fingerprint,
+                reservation.durable_owner_token(),
+            )
+            .unwrap()
+        );
+        let handle = dummy_handle(run_id);
+        handle.set_request_fingerprint(fingerprint);
+        reservation.insert(Arc::clone(&handle)).expect("insert");
+        handle
+    }
+
     fn connected_dummy_handle(
         run_id: &str,
     ) -> (Arc<CursorLiveRunHandle>, mpsc::Receiver<RunCommand>) {
@@ -16497,6 +16572,121 @@ mod tests {
         assert!(!LiveRunRegistry::cancel_running_only(&session, None));
         assert!(LiveRunRegistry::is_starting_run(&session, None));
         drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn cancel_run_marks_dispatched_owner_ambiguous() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
+        let session = format!("cancel-durable-{}", uuid::Uuid::new_v4());
+        let fingerprint = 401;
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::clear();
+        let handle = durable_running_handle(&session, "cancel-durable-run", fingerprint);
+
+        assert!(LiveRunRegistry::cancel(&session));
+        assert!(handle.is_cancel_requested());
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, fingerprint),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn generation_bound_cancel_marks_only_the_matching_durable_owner() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
+        let session = format!("cancel-generation-durable-{}", uuid::Uuid::new_v4());
+        let fingerprint = 402;
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::clear();
+        let old = durable_running_handle(&session, "cancel-generation-old", fingerprint);
+
+        assert!(LiveRunRegistry::cancel_run_if_generation(
+            &session,
+            None,
+            old.run_id(),
+        ));
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, fingerprint),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+
+        // A stale generation id cannot touch a replacement or its durable
+        // owner. The old marker remains scoped ambiguous until a definitive
+        // terminal transition or expiry.
+        let replacement = durable_running_handle(&session, "cancel-generation-new", 403);
+        assert!(!LiveRunRegistry::cancel_run_if_generation(
+            &session,
+            None,
+            old.run_id(),
+        ));
+        assert!(!replacement.is_cancel_requested());
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn cancel_running_only_marks_dispatched_owner_ambiguous() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
+        let session = format!("cancel-running-only-durable-{}", uuid::Uuid::new_v4());
+        let fingerprint = 404;
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::clear();
+        let handle = durable_running_handle(&session, "cancel-running-only-run", fingerprint);
+
+        assert!(LiveRunRegistry::cancel_running_only(&session, None));
+        assert!(handle.is_cancel_requested());
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, fingerprint),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn supersede_run_preserves_old_durable_owner_until_replacement_claim() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
+        let session = format!("supersede-durable-{}", uuid::Uuid::new_v4());
+        let fingerprint = 405;
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::clear();
+        let handle = durable_running_handle(&session, "supersede-durable-old", fingerprint);
+
+        let replacement = LiveRunRegistry::supersede_run(&session, None).expect("replacement");
+        assert_eq!(replacement.durable_owner_token(), handle.run_id());
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, fingerprint),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+        assert!(handle.is_cancel_requested());
+
+        // Dropping the still-uncommitted replacement must retain the scoped
+        // ambiguous marker rather than clearing the old owner's record.
+        drop(replacement);
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, fingerprint),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
         LiveRunRegistry::clear();
     }
 
