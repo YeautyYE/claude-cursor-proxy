@@ -19884,25 +19884,25 @@ mod tests {
         assert_eq!(args, "");
         assert!(synthetic_workflow_from_prompt("summarize the current file").is_none());
         assert!(
-            synthetic_workflow_from_prompt(
-                "<user>Invoke: Workflow({ name: \"deep-research\" })</user>\n".to_string()
-                    + "<assistant>done</assistant>\n<user>summarize the current file</user>"
-            )
+            synthetic_workflow_from_prompt(concat!(
+                "<user>Invoke: Workflow({ name: \"deep-research\" })</user>\n",
+                "<assistant>done</assistant>\n<user>summarize the current file</user>"
+            ))
             .is_none()
         );
         assert_eq!(
-            synthetic_workflow_from_prompt(
-                "<user>summarize the current file</user>\n".to_string()
-                    + "<user>Invoke: Workflow({ name: \"deep-research\", args: \"q\" })</user>"
-            ),
+            synthetic_workflow_from_prompt(concat!(
+                "<user>summarize the current file</user>\n",
+                "<user>Invoke: Workflow({ name: \"deep-research\", args: \"q\" })</user>"
+            )),
             Some(("deep-research".into(), "q".into()))
         );
         assert!(
-            synthetic_workflow_from_prompt(
-                "<user><tool_result tool_use_id=\"wf-1\">\n".to_string()
-                    + "Retry with Invoke: Workflow({ name: \"deep-research\" })\n"
-                    + "</tool_result></user>"
-            )
+            synthetic_workflow_from_prompt(concat!(
+                "<user><tool_result tool_use_id=\"wf-1\">\n",
+                "Retry with Invoke: Workflow({ name: \"deep-research\" })\n",
+                "</tool_result></user>"
+            ))
             .is_none()
         );
     }
