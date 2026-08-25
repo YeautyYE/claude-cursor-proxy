@@ -229,7 +229,15 @@ pub(crate) fn is_model_visible_tool_definition(tool: &serde_json::Value) -> bool
                 .next()
                 .is_some_and(|ch| !ch.is_ascii_alphanumeric())
     });
+    let deprecated_marker = lower.strip_prefix("deprecated").is_some_and(|rest| {
+        rest.is_empty()
+            || rest
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_ascii_alphanumeric())
+    });
     !(internal_marker
+        || deprecated_marker
         || (lower.contains("do not call") && lower.contains("model output"))
         || lower.contains("not for model output"))
 }
@@ -1736,6 +1744,8 @@ mod tests {
         for description in [
             "INTERNAL",
             "INTERNAL hook",
+            "DEPRECATED",
+            "DEPRECATED hook",
             "Do not call from model output",
             "This is not for model output",
         ] {
