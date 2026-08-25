@@ -377,10 +377,22 @@ fn commit_streaming_live_sse_before_start_live(want_stream: bool, hold_http: boo
 
 const LIVE_RUN_BUSY_MESSAGE: &str =
     "A Cursor live run is already active for this session; retry after it advances";
-const LIVE_ATTACH_WAIT_DEFAULT_MS: u64 = 2_500;
-const LIVE_ATTACH_WAIT_MAX_MS: u64 = 10_000;
-const LIVE_CONFLICT_WAIT_DEFAULT_MS: u64 = 2_500;
-const LIVE_CONFLICT_WAIT_MAX_MS: u64 = 10_000;
+// A Claude Code retry can arrive while the previous HTTP segment is being
+// detached, replayed, or finishing its last Cursor turn.  Short waits turn
+// that normal handoff into a repeated client-visible 503 storm.  Keep the
+// waits bounded, but long enough to cover the common Cursor step/reconnect
+// window; SSE callers continue receiving heartbeats while this task waits.
+const LIVE_ATTACH_WAIT_DEFAULT_MS: u64 = 15_000;
+const LIVE_ATTACH_WAIT_MAX_MS: u64 = 60_000;
+const LIVE_CONFLICT_WAIT_DEFAULT_MS: u64 = 30_000;
+const LIVE_CONFLICT_WAIT_MAX_MS: u64 = 120_000;
+// This wait runs before the Anthropic response has been committed, so it must
+// stay below Claude Code's stream watchdog.  The longer conflict wait above is
+// used only after the streaming response has been handed to the client.
+const LIVE_RESUME_WAIT_DEFAULT_MS: u64 = 5_000;
+const LIVE_RESUME_WAIT_MAX_MS: u64 = 15_000;
+const LIVE_NESTED_WAIT_DEFAULT_MS: u64 = 1_500;
+const LIVE_NESTED_WAIT_MAX_MS: u64 = 15_000;
 
 fn live_run_busy_error() -> CursorError {
     let mut error = CursorError::new(503, LIVE_RUN_BUSY_MESSAGE, None);
@@ -401,7 +413,7 @@ async fn attach_live_run_with_bounded_wait(
         "CCP_CURSOR_LIVE_ATTACH_WAIT_MS",
         LIVE_ATTACH_WAIT_DEFAULT_MS,
     )
-    .clamp(250, LIVE_ATTACH_WAIT_MAX_MS);
+    .clamp(500, LIVE_ATTACH_WAIT_MAX_MS);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     loop {
         if run.request_fingerprint() != fingerprint || run.is_completed() || run.is_command_closed()
@@ -573,7 +585,7 @@ async fn start_live_events_with_retries_with_client_type(
                 "CCP_CURSOR_LIVE_CONFLICT_WAIT_MS",
                 LIVE_CONFLICT_WAIT_DEFAULT_MS,
             )
-            .clamp(250, LIVE_CONFLICT_WAIT_MAX_MS),
+            .clamp(500, LIVE_CONFLICT_WAIT_MAX_MS),
         );
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
@@ -1426,6 +1438,15 @@ fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRu
     }
 }
 
+/// Tool-bridge state must use the same composite identity as live runs and
+/// conversation checkpoints. Claude Code nested agents reuse the parent
+/// `X-Claude-Code-Session-Id`, so the raw session id alone is not an isolation
+/// boundary.
+fn bridge_registry_key(ctx: &RequestContext) -> Option<String> {
+    let session_id = ctx.session_id.as_deref().filter(|id| !id.is_empty())?;
+    Some(live_run_key_for(live_run_identity(session_id, ctx)))
+}
+
 fn live_operation_fingerprint_payload(
     body: &MessagesRequest,
     client_request_id: Option<&str>,
@@ -1633,9 +1654,17 @@ async fn await_live_run_resume_for_operation(
     // Keep this below downstream stream-idle: no Anthropic response exists yet,
     // so SSE pings cannot protect this pre-response window.
     let wait_ms = if has_tool_results {
-        env_u64_millis("CCP_CURSOR_LIVE_RESUME_WAIT_MS", 5_000)
+        env_u64_millis(
+            "CCP_CURSOR_LIVE_RESUME_WAIT_MS",
+            LIVE_RESUME_WAIT_DEFAULT_MS,
+        )
+        .clamp(500, LIVE_RESUME_WAIT_MAX_MS)
     } else {
-        env_u64_millis("CCP_CURSOR_LIVE_NESTED_WAIT_MS", 1_500)
+        env_u64_millis(
+            "CCP_CURSOR_LIVE_NESTED_WAIT_MS",
+            LIVE_NESTED_WAIT_DEFAULT_MS,
+        )
+        .clamp(500, LIVE_NESTED_WAIT_MAX_MS)
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
     let mut observed_run_id: Option<String> = None;
@@ -2289,11 +2318,11 @@ impl Provider for CursorProvider {
         // tool_result in `messages` and expects a *new* model turn (full history),
         // not an empty resume of leftover Cursor frames. Clear bridge pending and
         // fall through to run_agent with the complete Anthropic conversation.
-        if let Some(ref session_id) = ctx.session_id
-            && let Some(pending) = BridgeRegistry::pending_tool(session_id)
+        if let Some(bridge_key) = bridge_registry_key(&ctx)
+            && let Some(pending) = BridgeRegistry::pending_tool(&bridge_key)
             && find_tool_result(&body, pending.tool_use_id()).is_some()
         {
-            BridgeRegistry::remove(session_id);
+            BridgeRegistry::remove(&bridge_key);
         }
 
         // INVARIANT: auth is re-read from the store on every request — never
@@ -2359,6 +2388,7 @@ impl Provider for CursorProvider {
 
         let session_id = ctx.session_id.as_deref();
         let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
+        let bridge_key = bridge_registry_key(&ctx);
         let continuation_key = session_id
             .filter(|s| !s.is_empty())
             .map(|sid| live_run_key_for(live_run_identity(sid, &ctx)));
@@ -2611,7 +2641,9 @@ impl Provider for CursorProvider {
                 let (sse_bytes, _paused) = start_cursor_tool_bridge(
                     &message_id,
                     &wire_model,
-                    session_id.unwrap(),
+                    bridge_key.as_deref().unwrap_or_else(|| {
+                        session_id.expect("bridge eligibility requires a session id")
+                    }),
                     &events,
                     allowed,
                     Box::new(|| uuid::Uuid::new_v4().to_string().replace('-', "")),
@@ -4204,6 +4236,51 @@ mod tests {
         assert_eq!(identity.agent_id, Some("agent%2Fchild"));
         assert_eq!(identity.parent_agent_id, Some("agent%2Fparent"));
         assert!(identity.is_nested());
+    }
+
+    #[test]
+    fn bridge_registry_key_isolated_for_nested_agent() {
+        let parent = RequestContext {
+            req_id: "req-parent".into(),
+            client_request_id: None,
+            session_id: Some("shared-session".into()),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders::default(),
+            hold_http_until_live_open: false,
+        };
+        let child = RequestContext {
+            req_id: "req-child".into(),
+            client_request_id: None,
+            session_id: Some("shared-session".into()),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders {
+                agent_id: Some("agent%2Fchild".into()),
+                parent_agent_id: Some("agent%2Fparent".into()),
+                app: Some("cli-bg".into()),
+            },
+            hold_http_until_live_open: false,
+        };
+
+        let parent_key = bridge_registry_key(&parent).expect("parent session key");
+        let child_key = bridge_registry_key(&child).expect("nested session key");
+        assert_eq!(
+            parent_key,
+            live_run_key_for(live_run_identity("shared-session", &parent))
+        );
+        assert_eq!(
+            child_key,
+            live_run_key_for(live_run_identity("shared-session", &child))
+        );
+        assert_ne!(
+            parent_key, child_key,
+            "nested agents sharing Claude's session header need separate bridge state"
+        );
     }
 
     #[test]

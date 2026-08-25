@@ -3,6 +3,14 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.74 (2026-08-25)
+
+- Keep the Claude Code tool contract aligned with the actual Cursor MCP catalog: remove synthetic provider-prefixed names, restore 64-character MCP aliases, deduplicate registrations, and filter internal/deprecated hook tools from the model-facing surface.
+- Isolate paused tool bridges by parent/nested agent identity so a retry cannot resume another agent's pending tool.
+- Accept both varint and length-delimited Cursor encodings for Task background flags, preventing an entire interaction update from being dropped.
+- Send a watchdog-safe `message_delta` plus `ping` heartbeat every 5 seconds, and extend live handoff waits to reduce first-turn idle timeouts and repeated `already active` 503 responses.
+- Keep usage header colors on the warning palette rather than red for normal quota consumption.
+
 ## v0.1.73 (2026-08-25)
 
 - Commit Anthropic `/v1/messages` SSE lifecycle bytes before waiting for Cursor live open, so Claude Code's stream-idle watchdog is protected by immediate output and 15-second `ping` keep-alives.

@@ -693,13 +693,10 @@ fn usage_header_color(usage: &crate::monitor::AccountUsageState) -> Color {
             .flatten()
             .filter(|value| value.is_finite())
             .fold(0.0_f64, f64::max);
-            if hottest >= 90.0 {
-                RED
-            } else if hottest >= 70.0 {
-                YELLOW
-            } else {
-                DIM_WHITE
-            }
+            // Usage is a quota indicator, not an error state. Keep the header
+            // on the warning palette even when a meter is fully consumed;
+            // reserve red for an actual failed usage fetch below.
+            if hottest >= 70.0 { YELLOW } else { DIM_WHITE }
         }
         crate::monitor::AccountUsageState::Failed(_) => RED,
         crate::monitor::AccountUsageState::MissingAuth => YELLOW,
@@ -3309,6 +3306,12 @@ mod tests {
         );
         assert_eq!(
             usage_header_color(&usage_state_with_sand_percent(90.0)),
+            YELLOW
+        );
+        assert_eq!(
+            usage_header_color(&crate::monitor::AccountUsageState::Failed(
+                "dashboard unavailable".to_string(),
+            )),
             RED
         );
     }

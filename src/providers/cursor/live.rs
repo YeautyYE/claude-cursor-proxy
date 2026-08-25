@@ -52,12 +52,14 @@ use super::proto::{
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
 use super::request::{
-    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, is_claude_local_mcp_spelling,
-    is_claude_local_tool_name, is_grok_build_subagent_lifecycle_tool,
+    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, cursor_mcp_wire_name,
+    is_claude_local_mcp_spelling, is_claude_local_tool_name, is_grok_build_subagent_lifecycle_tool,
     normalize_grok_build_lifecycle_name, strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
-use super::sse::{CursorSseEncoder, EVENT_ERROR, EVENT_PING, format_sse_event_bytes};
+use super::sse::{
+    CursorSseEncoder, EVENT_ERROR, EVENT_MESSAGE_DELTA, EVENT_PING, format_sse_event_bytes,
+};
 use super::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
 
 /// Outbound client messages: BiDi request body stream, or HTTP/1 BidiAppend.
@@ -9235,6 +9237,12 @@ fn client_only_anthropic_name(
     // Missing/empty tool lists must not invent Workflow/web_search/etc.
     // XML recovery and MCP both go through here.
     let set = allowed.filter(|set| !set.is_empty())?;
+    if let Some(original) = set
+        .iter()
+        .find(|candidate| cursor_mcp_wire_name(candidate) == stripped)
+    {
+        return Some(original.clone());
+    }
     // Prefix stripping is enough to match `claude-local/Workflow` to
     // advertised `Workflow`. Case folding is required for grok-cli
     // `workflow` vs Fable `Workflow`. Emit the exact advertised spelling
@@ -9850,6 +9858,12 @@ fn resolve_advertised_name(
     }
     // MCP tools: match exact name, or any advertised tool ending with __{tool}.
     if mapped_name.starts_with("mcp__") || mapped_name.contains("__") {
+        if let Some(hit) = allowed
+            .iter()
+            .find(|candidate| cursor_mcp_wire_name(candidate) == mapped_name)
+        {
+            return Some(hit.clone());
+        }
         if let Some(hit) = allowed.iter().find(|n| *n == mapped_name) {
             return Some(hit.clone());
         }
@@ -10174,13 +10188,47 @@ fn live_sse_on_driver_drop(encoder: &CursorSseEncoder) -> Option<Vec<u8>> {
     ))
 }
 
-/// No-byte live events keep `recv()` ready. If the Anthropic ping deadline
-/// has already passed, emit that ping instead of draining another counter.
+/// No-byte live events keep `recv()` ready. If the Anthropic heartbeat deadline
+/// has already passed, emit the watchdog-safe heartbeat instead of draining
+/// another counter.
 fn sse_keepalive_after_empty_event(
     now: tokio::time::Instant,
     ping_deadline: tokio::time::Instant,
 ) -> bool {
     now >= ping_deadline
+}
+
+/// Emit a wire-level heartbeat that also resets Claude Code's event watchdog.
+///
+/// Claude Code deliberately ignores Anthropic `ping` events when refreshing
+/// its "no chunks received" timer.  A nullable `message_delta` is a valid
+/// no-op message-level update: it carries no output usage and leaves the
+/// `stop_reason` unset, while still traversing the normal stream-event path.
+/// Keep the conventional `ping` beside it for clients that use SSE pings as
+/// their keep-alive signal.
+fn anthropic_sse_keepalive_bytes() -> Vec<u8> {
+    let mut bytes = format_sse_event_bytes(
+        EVENT_MESSAGE_DELTA,
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "container": null,
+                "stop_reason": null,
+                "stop_sequence": null
+            },
+            "usage": {
+                "input_tokens": null,
+                "output_tokens": null,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null
+            }
+        }),
+    );
+    bytes.extend(format_sse_event_bytes(
+        EVENT_PING,
+        &serde_json::json!({ "type": "ping" }),
+    ));
+    bytes
 }
 
 pub fn live_sse_response(
@@ -10199,8 +10247,8 @@ pub fn live_sse_response(
         pending_monitor_bytes: u64,
         pending_monitor_chunks: u64,
         last_monitor_publish: Instant,
-        /// Periodic Anthropic `ping` so Claude Code's stream idle watchdog
-        /// (≥300s by default) does not abort during quiet Cursor thinking.
+        /// Periodic Anthropic heartbeat so Claude Code's short stream idle
+        /// watchdog does not abort during quiet Cursor thinking.
         ping: tokio::time::Interval,
         ping_period: Duration,
         next_ping_at: tokio::time::Instant,
@@ -10217,9 +10265,11 @@ pub fn live_sse_response(
         );
     }
 
-    // Claude Code: Math.max(CLAUDE_STREAM_IDLE_TIMEOUT_MS||0, 300000). Keep
-    // well under that; Cursor BiDi heartbeats alone do not produce SSE bytes.
-    let ping_secs = env_u64("CCP_ANTHROPIC_SSE_PING_SECS", 15).clamp(5, 120);
+    // Claude Code's event watchdog is 10s in current releases. Keep the
+    // effective SSE heartbeat comfortably below that; Cursor BiDi heartbeats
+    // alone do not produce downstream SSE bytes, and Anthropic `ping` events
+    // are ignored by that watchdog unless paired with message_delta.
+    let ping_secs = env_u64("CCP_ANTHROPIC_SSE_PING_SECS", 5).clamp(2, 120);
     let mut ping = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(ping_secs),
         Duration::from_secs(ping_secs),
@@ -10292,11 +10342,10 @@ pub fn live_sse_response(
                                         let now = tokio::time::Instant::now();
                                         state.ping.reset();
                                         state.next_ping_at = now + state.ping_period;
-                                        let ping = format_sse_event_bytes(
-                                            EVENT_PING,
-                                            &serde_json::json!({ "type": "ping" }),
-                                        );
-                                        return Some((Ok(Bytes::from(ping)), state));
+                                        return Some((
+                                            Ok(Bytes::from(anthropic_sse_keepalive_bytes())),
+                                            state,
+                                        ));
                                     }
                                 } else {
                                     state.next_ping_at =
@@ -10405,11 +10454,10 @@ pub fn live_sse_response(
                         // quiet thinking (Cursor may only send BiDi heartbeats).
                         state.next_ping_at =
                             tokio::time::Instant::now() + state.ping_period;
-                        let ping = format_sse_event_bytes(
-                            EVENT_PING,
-                            &serde_json::json!({ "type": "ping" }),
-                        );
-                        return Some((Ok(Bytes::from(ping)), state));
+                        return Some((
+                            Ok(Bytes::from(anthropic_sse_keepalive_bytes())),
+                            state,
+                        ));
                     }
                 }
             }
@@ -16053,6 +16101,18 @@ mod tests {
     }
 
     #[test]
+    fn advertised_name_restores_truncated_mcp_alias() {
+        let original = "mcp__plugin_claude-mem_mcp-search__session_start_context_with_more_details"
+            .to_string();
+        let wire = cursor_mcp_wire_name(&original);
+        let allowed = BTreeSet::from([original.clone()]);
+        assert_eq!(
+            resolve_advertised_name(&wire, Some(&allowed)).as_deref(),
+            Some(original.as_str())
+        );
+    }
+
+    #[test]
     fn advertised_name_prefers_claude_bash_when_both_clients_listed() {
         let both = BTreeSet::from([
             "Bash".to_string(),
@@ -20591,6 +20651,21 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("event: ping"));
         assert!(text.contains(r#""type":"ping"#) || text.contains(r#""type": "ping"#));
+    }
+
+    #[test]
+    fn anthropic_keepalive_resets_event_watchdog_without_advancing_usage() {
+        let bytes = anthropic_sse_keepalive_bytes();
+        let text = String::from_utf8(bytes).expect("keepalive must be UTF-8 SSE");
+        let events = text
+            .split("\n\n")
+            .filter(|event| !event.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2, "message_delta + ping heartbeat expected");
+        assert!(events[0].contains("event: message_delta"));
+        assert!(events[0].contains(r#""stop_reason":null"#));
+        assert!(events[0].contains(r#""output_tokens":null"#));
+        assert!(events[1].contains("event: ping"));
     }
 
     #[test]

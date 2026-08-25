@@ -16,6 +16,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::native_tools::{
     adapt_tool_input_for_client, advertised_name_fallbacks,
 };
+use crate::providers::cursor::request::{cursor_mcp_wire_name, is_model_visible_tool_definition};
 use crate::providers::cursor::response::CursorStreamEvent;
 use crate::providers::cursor::sse::CursorSseFramer;
 use crate::providers::cursor::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
@@ -117,7 +118,14 @@ impl PendingCursorTool {
     }
 }
 
-/// Bridge state stored per session.
+/// Bridge state stored per live-run key.
+///
+/// The parent Claude session id is not sufficient for nested Claude Code
+/// agents: nested Workflow requests intentionally reuse that header and are
+/// distinguished by `x-claude-code-agent-id`. Callers pass the same
+/// length-prefixed key used by the live registry (`p:...` / `a:...`) so a
+/// pending tool from one agent can never be consumed by another agent in the
+/// same Claude session.
 #[derive(Debug)]
 pub struct CursorBridgeState {
     pub session_id: String,
@@ -178,19 +186,31 @@ impl BridgeRegistryInner {
 pub struct BridgeRegistry;
 
 impl BridgeRegistry {
-    /// Insert a new bridge state for a session.
+    /// Insert a new bridge state for a live-run key.
+    ///
+    /// There is at most one paused bridge per key. Replacing an older entry is
+    /// important after a client retry: retaining both would make `find()` pick
+    /// a stale pending tool and resume the wrong generation.
     pub fn insert(state: CursorBridgeState) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
-        reg.sessions.push(state);
+        if let Some(pos) = reg
+            .sessions
+            .iter()
+            .position(|existing| existing.session_id == state.session_id)
+        {
+            reg.sessions[pos] = state;
+        } else {
+            reg.sessions.push(state);
+        }
     }
 
-    /// Get the bridge state for a session.
+    /// Get the bridge state index for a live-run key.
     pub fn get(session_id: &str) -> Option<usize> {
         let reg = BRIDGE_REGISTRY.lock().unwrap();
         reg.sessions.iter().position(|s| s.session_id == session_id)
     }
 
-    /// Get the pending tool for a session (if any).
+    /// Get the pending tool for a live-run key (if any).
     pub fn pending_tool(session_id: &str) -> Option<PendingCursorTool> {
         let reg = BRIDGE_REGISTRY.lock().unwrap();
         reg.sessions
@@ -199,7 +219,7 @@ impl BridgeRegistry {
             .and_then(|s| s.pending_tool.clone())
     }
 
-    /// Take the bridge state for a session (removes it).
+    /// Take the bridge state for a live-run key (removes it).
     pub fn take(session_id: &str) -> Option<CursorBridgeState> {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
         let pos = reg
@@ -209,13 +229,13 @@ impl BridgeRegistry {
         Some(reg.sessions.swap_remove(pos))
     }
 
-    /// Remove a bridge state for a session.
+    /// Remove a bridge state for a live-run key.
     pub fn remove(session_id: &str) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
         reg.sessions.retain(|s| s.session_id != session_id);
     }
 
-    /// Insert or update the pending tool for a session.
+    /// Insert or update the pending tool for a live-run key.
     pub fn set_pending_tool(session_id: &str, tool: PendingCursorTool) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
         if let Some(state) = reg.sessions.iter_mut().find(|s| s.session_id == session_id) {
@@ -223,7 +243,7 @@ impl BridgeRegistry {
         }
     }
 
-    /// Update usage for a session.
+    /// Update usage for a live-run key.
     pub fn record_usage(session_id: &str, input_tokens: u64, output_tokens: u64) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
         if let Some(state) = reg.sessions.iter_mut().find(|s| s.session_id == session_id) {
@@ -263,6 +283,7 @@ pub fn advertised_tool_names(body: &MessagesRequest) -> Option<BTreeSet<String>>
     }
     let names: BTreeSet<String> = tools
         .iter()
+        .filter(|tool| is_model_visible_tool_definition(tool))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .map(|n| n.to_string())
         .collect();
@@ -727,7 +748,7 @@ pub fn start_cursor_tool_bridge(
 
 /// Resume a paused tool bridge session.
 ///
-/// Finds the stored state by session_id, resolves the pending tool with
+/// Finds the stored state by live-run key, resolves the pending tool with
 /// Claude's `tool_result`, and continues producing SSE from remaining events.
 pub fn resume_cursor_tool_bridge(
     session_id: &str,
@@ -937,6 +958,12 @@ fn resolve_advertised_name(
         }
     }
     if mapped_name.contains("__") {
+        if let Some(hit) = allowed
+            .iter()
+            .find(|candidate| cursor_mcp_wire_name(candidate) == mapped_name)
+        {
+            return Some(hit.clone());
+        }
         if let Some(hit) = allowed.iter().find(|n| n.as_str() == mapped_name) {
             return Some(hit.clone());
         }
@@ -1344,6 +1371,28 @@ mod tests {
     }
 
     #[test]
+    fn advertised_tool_names_filters_internal_hooks_and_deprecated_tools() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "Read", "description": "read", "input_schema": {}},
+                {"name": "TaskOutput", "description": "deprecated", "input_schema": {}},
+                {"name": "mcp__plugin_lobster-channel_lobster-channel__notify_messa00a7caa", "description": "internal", "input_schema": {}},
+                {"name": "mcp__plugin_lobster-channel_lobster-channel__lobster_reply", "description": "public", "input_schema": {}}
+            ]
+        }))
+        .unwrap();
+        let names = advertised_tool_names(&body).expect("Read and public tool remain");
+        assert!(names.contains("Read"));
+        assert!(names.contains("mcp__plugin_lobster-channel_lobster-channel__lobster_reply"));
+        assert!(!names.contains("TaskOutput"));
+        assert!(
+            !names.contains("mcp__plugin_lobster-channel_lobster-channel__notify_messa00a7caa")
+        );
+    }
+
+    #[test]
     fn can_bridge_returns_true_for_stream_with_read_tool() {
         let body: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
@@ -1428,6 +1477,87 @@ mod tests {
         let retrieved = BridgeRegistry::pending_tool("session-pt");
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name(), "Read");
+
+        BridgeRegistry::clear();
+    }
+
+    #[test]
+    fn bridge_registry_isolates_nested_keys_and_replaces_stale_duplicates() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+
+        let parent = CursorBridgeState::new(
+            "p:13:shared-session".into(),
+            "msg-parent".into(),
+            "cursor-test".into(),
+            None,
+            Box::new(|| "parent-id".into()),
+        );
+        BridgeRegistry::insert(parent);
+        BridgeRegistry::set_pending_tool(
+            "p:13:shared-session",
+            PendingCursorTool::Read {
+                tool_use_id: "parent-tool".into(),
+                path: "/tmp/parent".into(),
+            },
+        );
+
+        let child = CursorBridgeState::new(
+            "a:13:shared-session9:child".into(),
+            "msg-child".into(),
+            "cursor-test".into(),
+            None,
+            Box::new(|| "child-id".into()),
+        );
+        BridgeRegistry::insert(child);
+        BridgeRegistry::set_pending_tool(
+            "a:13:shared-session9:child",
+            PendingCursorTool::Write {
+                tool_use_id: "child-tool".into(),
+                path: "/tmp/child".into(),
+                content: "child".into(),
+            },
+        );
+
+        assert_eq!(BridgeRegistry::active_count(), 2);
+        assert_eq!(
+            BridgeRegistry::pending_tool("p:13:shared-session")
+                .as_ref()
+                .map(PendingCursorTool::tool_use_id),
+            Some("parent-tool")
+        );
+        assert_eq!(
+            BridgeRegistry::pending_tool("a:13:shared-session9:child")
+                .as_ref()
+                .map(PendingCursorTool::tool_use_id),
+            Some("child-tool")
+        );
+
+        // A retry for the same key must replace the stale paused generation,
+        // rather than leaving two entries where `find()` could pick the old one.
+        let replacement = CursorBridgeState::new(
+            "a:13:shared-session9:child".into(),
+            "msg-child-retry".into(),
+            "cursor-test".into(),
+            None,
+            Box::new(|| "child-retry-id".into()),
+        );
+        BridgeRegistry::insert(replacement);
+        BridgeRegistry::set_pending_tool(
+            "a:13:shared-session9:child",
+            PendingCursorTool::Generic {
+                tool_use_id: "child-tool-retry".into(),
+                name: "Workflow".into(),
+                input: serde_json::json!({"name":"deep-research"}),
+            },
+        );
+        assert_eq!(BridgeRegistry::active_count(), 2);
+        assert_eq!(
+            BridgeRegistry::pending_tool("a:13:shared-session9:child")
+                .as_ref()
+                .map(PendingCursorTool::tool_use_id),
+            Some("child-tool-retry")
+        );
 
         BridgeRegistry::clear();
     }

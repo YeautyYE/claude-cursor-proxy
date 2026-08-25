@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.73 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.74 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -336,8 +336,10 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_LIVE_CONCURRENCY` | `32` | 批量类（`cursor-grok-*`）generation start 的公平并发上限（1–128） |
 | `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `8` | 为非 Grok 模型（Gemini/Claude 等子代理）保留的受保护 start 容量；交互类可借用空闲批量槽，批量类永不可占用保留槽（0–32） |
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | 本地准入最多等待多久后返回可重试 HTTP 503（1–300 秒） |
-| `CCP_CURSOR_LIVE_ATTACH_WAIT_MS` | `2500` | 同一操作等待 attach 交接的时间，超时后才返回本地 busy（250–10000 毫秒） |
-| `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `2500` | 不同操作等待当前 session Run 前进的短暂时间（250–10000 毫秒） |
+| `CCP_CURSOR_LIVE_ATTACH_WAIT_MS` | `15000` | 同一操作等待 attach 交接的时间，超时后才返回本地 busy（500–60000 毫秒） |
+| `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `30000` | 等待不同操作观察当前 session Run 前进（500–120000 毫秒） |
+| `CCP_CURSOR_LIVE_RESUME_WAIT_MS` | `5000` | 响应提交前等待工具结果交接；保持低于客户端 stream watchdog（500–15000 毫秒） |
+| `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | 响应提交前等待嵌套 agent 交接（500–15000 毫秒） |
 | `CCP_CURSOR_RESOURCE_RETRIES` | `6` | Cursor 瞬时 `ERROR_RESOURCE_EXHAUSTED` 的同请求自动重试次数（1–12）；账单、额度和 High Load 等策略型 429 不会隐藏重试 |
 | `CCP_CURSOR_STEP_FAILURE_RETRIES` | `4` | 输出产生前 Cursor `Failed to run step, exceeded max retries` 的同请求自动重试次数（1–8）；输出产生后直接转发错误 |
 | `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | 为暂停后需要提交工具结果的 Run 额外保留的容量（0–16） |
@@ -347,7 +349,7 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | 只有心跳而没有模型进展时的最长思考时间 |
 | `CCP_CURSOR_H2_SHARDS` | `4` | 隔离并发 conversation 的稳定 H2 客户端池数量（1–16） |
 | `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `4` | 进程内同时打开 ResumeAction 替代连接的上限（1–16） |
-| `CCP_ANTHROPIC_SSE_PING_SECS` | `15` | 下游 keep-alive 间隔（秒） |
+| `CCP_ANTHROPIC_SSE_PING_SECS` | `5` | 下游 SSE 心跳间隔（秒，包含 message_delta + ping；低于 Claude Code 的 10 秒 watchdog） |
 | `CCP_CURSOR_NO_PROXY` | 关 | 对 Cursor API 跳过 HTTP(S)_PROXY（`1` / `true`） |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | 未设置 | 调试日志 |
 
@@ -404,8 +406,8 @@ TUI、模型发现和用量说明见 [Sand 模式](#sand-模式)。
 | grok-build 报 `Cursor tool result wait expired`，或心跳卡顿先报 502、重试后才报 409 | 升级到 ≥0.1.62 并重启 serve。工具计时从 Grok 收到批次时开始，不再消耗下一段模型生成预算；已准入的工具结果会越过 TTL 边界完成派发。无法确认结束状态的心跳 Run 会立即返回 409，因为重放可能造成重复执行。 |
 | Claude Code 的 Bash 标题是整段 `python3 -c` 脚本 | 升级到 ≥0.1.48 并重启 serve。Cursor Shell 没有 description，代理会补一行短标题。 |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
-| 出现 `Stream idle timeout - no chunks received`，尤其是首轮会话或后台工具结果恢复前 | 升级到 ≥0.1.73 并重启 serve。`/v1/messages` 会先提交 Anthropic SSE 生命周期，再等待 Cursor live 建连；客户端立即收到字节，静默思考期间每 15 秒发送 `ping`。首个客户端可见输出前的 Cursor 建连/步骤瞬时错误会在代理内部按上限重试；`/v1/responses` 为正确映射 `response.failed` 仍保留 held-HTTP。 |
-| Claude Code 显示 `Cursor live run cancelled` 后回合停止 | 升级到 ≥0.1.73 并重启 serve。首个文本/工具事件提交前的已确定取消会在同一个 SSE 请求内部自动重试；带有未决或 ambiguous acceptance 的取消仍保持 fail-closed，避免重复执行工具。 |
+| 出现 `Stream idle timeout - no chunks received`，尤其是首轮会话或后台工具结果恢复前 | 升级到当前版本并重启 serve。`/v1/messages` 会先提交 Anthropic SSE 生命周期，再等待 Cursor live 建连；客户端立即收到字节，默认每 5 秒发送可刷新 watchdog 的 `message_delta` + `ping` 心跳。首个客户端可见输出前的 Cursor 建连/步骤瞬时错误会在代理内部按上限重试；`/v1/responses` 为正确映射 `response.failed` 仍保留 held-HTTP。 |
+| Claude Code 显示 `Cursor live run cancelled` 后回合停止 | 升级到 ≥0.1.74 并重启 serve。首个文本/工具事件提交前的已确定取消会在同一个 SSE 请求内部自动重试；带有未决或 ambiguous acceptance 的取消仍保持 fail-closed，避免重复执行工具。 |
 | 纯文本回合却 502 `Image not found [internal]` | 升级到 ≥0.1.40 并重启 serve，然后把同一条消息再发一次（该错误会清掉带过期图片 id 的 conversation checkpoint）。新开一个 Claude Code session 也可以。 |
 | 502 `Conversation data missing` / `missing blobs`，且当前 session 无法恢复 | 升级到 ≥0.1.45 并重启 serve，然后重试同一条消息。失败回合会清除不可恢复的 Cursor conversation id、checkpoint 和 blob 缓存；第一次重试会在新的 Cursor conversation 中重放完整历史，无需新开 Claude Code chat。 |
 | 中断回合后或仍有后台 shell 时 400 `Missing tool_result blocks for pending tools` | 升级到 ≥0.1.45 并重启 serve。当前回合没有工具结果的新请求会接管已放弃的 live 回合；真正缺项的工具结果批次仍会被拒绝。 |

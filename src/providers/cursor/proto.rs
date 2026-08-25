@@ -1,3 +1,4 @@
+use bytes::{Buf, BufMut};
 use prost::Message;
 
 // ---------------------------------------------------------------------------
@@ -780,27 +781,147 @@ pub struct TaskToolCall {
 
 /// Wire args for model-initiated [`TaskToolCall`] (ToolCall tag 19).
 ///
-/// Layout matches 0xlane `TaskToolCallArgsProto` (string `subagent_type`)
-/// except tag 6. 0xlane documents `optional bool readonly = 6`, but live
-/// Cursor 2026-08 sends tag 6 as LengthDelimited. Declaring it as bool
-/// drops the entire InteractionUpdate (`spawn_subagent` never reaches
-/// grok-build). Tag 6 is left undeclared so any wire type is skipped.
+/// Layout matches 0xlane `TaskToolCallArgsProto` (string `subagent_type`).
+/// Cursor has shipped both the documented bool-varint representation and a
+/// length-delimited representation for the optional background flag (and has
+/// likewise varied the unused readonly field at tag 6). A generated `bool`
+/// field rejects the former representation and drops the entire
+/// `InteractionUpdate`, so this small decoder accepts both wire forms.
 /// This is not `ExecServerMessage.subagent_args` / `TaskArgs` (tag 28), whose
 /// `subagent_type` is a nested message.
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TaskToolCallArgsProto {
-    #[prost(string, tag = "1")]
     pub description: String,
-    #[prost(string, tag = "2")]
     pub prompt: String,
-    #[prost(string, optional, tag = "3")]
     pub model: Option<String>,
-    #[prost(string, tag = "4")]
     pub subagent_type: String,
-    #[prost(string, optional, tag = "5")]
     pub resume: Option<String>,
-    #[prost(bool, optional, tag = "7")]
     pub run_in_background: Option<bool>,
+}
+
+impl Message for TaskToolCallArgsProto {
+    fn encode_raw(&self, buf: &mut impl BufMut) {
+        if !self.description.is_empty() {
+            prost::encoding::string::encode(1, &self.description, buf);
+        }
+        if !self.prompt.is_empty() {
+            prost::encoding::string::encode(2, &self.prompt, buf);
+        }
+        if let Some(model) = &self.model {
+            prost::encoding::string::encode(3, model, buf);
+        }
+        if !self.subagent_type.is_empty() {
+            prost::encoding::string::encode(4, &self.subagent_type, buf);
+        }
+        if let Some(resume) = &self.resume {
+            prost::encoding::string::encode(5, resume, buf);
+        }
+        if let Some(background) = self.run_in_background {
+            prost::encoding::bool::encode(7, &background, buf);
+        }
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        use prost::encoding::{WireType, bool, bytes, skip_field, string};
+
+        match tag {
+            1 => string::merge(wire_type, &mut self.description, buf, ctx),
+            2 => string::merge(wire_type, &mut self.prompt, buf, ctx),
+            3 => string::merge(
+                wire_type,
+                self.model.get_or_insert_with(String::new),
+                buf,
+                ctx,
+            ),
+            4 => string::merge(wire_type, &mut self.subagent_type, buf, ctx),
+            5 => string::merge(
+                wire_type,
+                self.resume.get_or_insert_with(String::new),
+                buf,
+                ctx,
+            ),
+            6 => {
+                // `readonly` is not used by the bridge. Keep consuming it
+                // regardless of the wire type Cursor chooses.
+                skip_field(wire_type, tag, buf, ctx)
+            }
+            7 => match wire_type {
+                WireType::Varint => bool::merge(
+                    wire_type,
+                    self.run_in_background.get_or_insert(false),
+                    buf,
+                    ctx,
+                ),
+                WireType::LengthDelimited => {
+                    let mut raw = Vec::new();
+                    bytes::merge(wire_type, &mut raw, buf, ctx.clone())?;
+                    self.run_in_background = parse_flexible_background(&raw);
+                    Ok(())
+                }
+                _ => skip_field(wire_type, tag, buf, ctx),
+            },
+            _ => skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        let mut len = 0;
+        if !self.description.is_empty() {
+            len += prost::encoding::string::encoded_len(1, &self.description);
+        }
+        if !self.prompt.is_empty() {
+            len += prost::encoding::string::encoded_len(2, &self.prompt);
+        }
+        if let Some(model) = &self.model {
+            len += prost::encoding::string::encoded_len(3, model);
+        }
+        if !self.subagent_type.is_empty() {
+            len += prost::encoding::string::encoded_len(4, &self.subagent_type);
+        }
+        if let Some(resume) = &self.resume {
+            len += prost::encoding::string::encoded_len(5, resume);
+        }
+        if let Some(background) = self.run_in_background {
+            len += prost::encoding::bool::encoded_len(7, &background);
+        }
+        len
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn parse_flexible_background(raw: &[u8]) -> Option<bool> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    if text.eq_ignore_ascii_case("true") || text == "1" {
+        return Some(true);
+    }
+    if text.eq_ignore_ascii_case("false") || text == "0" {
+        return Some(false);
+    }
+
+    // Some protobuf wrappers encode a BoolValue as field 1 = varint.
+    let mut nested = raw;
+    let (tag, wire_type) = prost::encoding::decode_key(&mut nested).ok()?;
+    if tag != 1 || wire_type != prost::encoding::WireType::Varint {
+        return None;
+    }
+    let mut value = false;
+    prost::encoding::bool::merge(
+        wire_type,
+        &mut value,
+        &mut nested,
+        prost::encoding::DecodeContext::default(),
+    )
+    .ok()?;
+    Some(value)
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1826,6 +1947,29 @@ mod tests {
         assert_eq!(args.description, "explore live");
         assert_eq!(args.prompt, "look around");
         assert_eq!(args.subagent_type, "explore");
+        assert_eq!(args.run_in_background, Some(true));
+    }
+
+    #[test]
+    fn tool_call_task_accepts_length_delimited_background_flag() {
+        // A Cursor build observed in the wild encoded the optional bool as a
+        // length-delimited value. The flexible decoder must consume it without
+        // dropping the enclosing InteractionUpdate.
+        let mut args = Vec::new();
+        args.extend(proto_string(1, "explore live"));
+        args.extend(proto_string(2, "look around"));
+        args.extend(proto_string(4, "explore"));
+        args.extend(proto_string(7, "true"));
+        let task_tool_call = proto_len_delim_field(1, &args);
+        let buf = proto_len_delim_field(19, &task_tool_call);
+
+        let decoded = ToolCall::decode(&buf[..])
+            .expect("length-delimited run_in_background must not fail TaskToolCall decoding");
+        let args = decoded
+            .task_tool_call
+            .expect("tag 19 must decode as Task")
+            .args
+            .expect("TaskToolCall.args");
         assert_eq!(args.run_in_background, Some(true));
     }
 
