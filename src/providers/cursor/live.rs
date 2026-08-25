@@ -1590,6 +1590,19 @@ impl LiveRunReservation {
         mut self,
         handle: Arc<CursorLiveRunHandle>,
     ) -> Result<(), Arc<CursorLiveRunHandle>> {
+        // A live handle is constructed only after the upstream open. Bind its
+        // fingerprint before publishing it so a terminal driver race cannot
+        // be probed as an unscoped (zero-fingerprint) ambiguous generation.
+        // `compare_exchange` preserves a stage fingerprint already committed
+        // by a resume or a test fixture.
+        if self.operation_fingerprint != 0 {
+            let _ = handle.request_fingerprint.compare_exchange(
+                0,
+                self.operation_fingerprint,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         // Owned Starting slots publish normally. A vacant slot (cancel removed
         // Starting while the open was in flight) must adopt the accepted Run:
         // dropping it would let a retry open a second Run for the same turn.
@@ -1950,12 +1963,21 @@ impl LiveRunRegistry {
                         || handle.is_replaceable_for_fresh_request()) =>
             {
                 let handle = Arc::clone(handle);
+                let previous_fingerprint = handle.request_fingerprint();
                 runs.remove_key(&key);
                 match Self::reserve_key(&mut runs, key.clone()) {
-                    Some(reservation) => LiveReplacementClaim::Reserved {
-                        reservation,
-                        superseded: Some(handle),
-                    },
+                    Some(mut reservation) => {
+                        // The replacement owns the old generation until its
+                        // cancellation reaches a definitive boundary. Seed
+                        // its fingerprint now so a drop during teardown can
+                        // never create an unscoped (zero-fingerprint)
+                        // ambiguous tombstone.
+                        reservation.set_operation_fingerprint(previous_fingerprint);
+                        LiveReplacementClaim::Reserved {
+                            reservation,
+                            superseded: Some(handle),
+                        }
+                    }
                     None => {
                         runs.insert_key(key, LiveRunEntry::Running(handle));
                         LiveReplacementClaim::Conflict
@@ -2023,7 +2045,7 @@ impl LiveRunRegistry {
 /// (tool results become history). Restoring the dying handle and returning 409
 /// strands grok-build, which treats 409 as non-retryable.
 pub(crate) fn finish_replacement_after_cancel(
-    reservation: LiveRunReservation,
+    mut reservation: LiveRunReservation,
     handle: Arc<CursorLiveRunHandle>,
     _has_current_tool_results: bool,
     cancel_result: Result<(), CursorError>,
@@ -2039,6 +2061,13 @@ pub(crate) fn finish_replacement_after_cancel(
             Ok(reservation)
         }
         Err(error) => {
+            // `claim_replacement_for_run` creates a fresh reservation whose
+            // fingerprint is still unpublished. If cancellation itself is
+            // ambiguous, scope the replacement tombstone to the old Run
+            // before sealing it. Leaving this at zero turns the tombstone
+            // into a process-wide blocker for every later operation in the
+            // same session (the Grok 409 storm after compact).
+            reservation.set_operation_fingerprint(handle.request_fingerprint());
             persist_ambiguous_operation(
                 &reservation.session_id,
                 handle.request_fingerprint(),
@@ -14838,6 +14867,25 @@ mod tests {
     }
 
     #[test]
+    fn insert_publishes_reservation_fingerprint_before_terminal_probe() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("insert-fingerprint-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let mut reservation = LiveRunRegistry::reserve(&session).expect("reserve");
+        reservation.set_operation_fingerprint(31);
+        let handle = dummy_handle("fingerprint-bound-run");
+        reservation.insert(Arc::clone(&handle)).expect("insert");
+
+        assert_eq!(handle.request_fingerprint(), 31);
+        handle.completed.store(true, Ordering::Release);
+        assert!(matches!(
+            LiveRunRegistry::probe_run(&session, None),
+            LiveRunProbe::Free
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
     fn supersede_does_not_replace_a_starting_open() {
         let _registry = lock_live_registry_for_test();
         let session = format!("starting-supersede-{}", uuid::Uuid::new_v4());
@@ -15729,6 +15777,7 @@ mod tests {
         let session = format!("fresh-amb-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let handle = dummy_handle("amb-generation");
+        handle.set_request_fingerprint(11);
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
             .insert(Arc::clone(&handle))
@@ -15756,6 +15805,18 @@ mod tests {
             LiveRunRegistry::is_ambiguous_run(&session, None),
             "the slot must stay sealed until the old Run's acceptance is resolved"
         );
+        assert!(
+            LiveRunRegistry::is_ambiguous_for_operation(&session, None, 11),
+            "the unresolved old operation must remain fail-closed"
+        );
+        assert!(
+            !LiveRunRegistry::is_ambiguous_for_operation(&session, None, 22),
+            "a later operation must not inherit the old operation's 409"
+        );
+        let replacement =
+            LiveRunRegistry::claim_ambiguous_release_for_new_operation(&session, None, 22)
+                .expect("a different operation must be able to replace a scoped tombstone");
+        replacement.release();
         assert!(LiveRunRegistry::running_generation(&session, None).is_none());
         LiveRunRegistry::clear();
     }

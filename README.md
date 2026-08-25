@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.75 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.76 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -425,7 +425,7 @@ discovery, and usage guide.
 | Claude Code Bash widget titles a giant `python3 -c` script | Update to ≥0.1.48 and restart serve. Cursor Shell has no description; the proxy now fills a short one-line title. |
 | 45s 502 `idle timeout` / `0 response bytes` | Update to ≥0.1.39 and restart serve. Still set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`. Clash/Surge TUN: DIRECT `*.cursor.sh`. Optional: `CCP_CURSOR_HTTP1=1` |
 | `Stream idle timeout - no chunks received`, especially on the first turn or before a background tool result resumes | Update to the current release and restart serve. `/v1/messages` commits the Anthropic SSE lifecycle before Cursor live open, so the client receives bytes immediately and emits a watchdog-safe `message_delta` + `ping` heartbeat every 5s by default. Pre-output Cursor open/step failures stay inside the bounded retry loop; `/v1/responses` intentionally keeps held-HTTP mapping for `response.failed`. |
-| Claude Code shows `Cursor live run cancelled` or repeatedly reports `A Cursor live run is already active` after `/compact` | Update to ≥0.1.75 and restart serve. Resolved pre-output cancellation is retried inside the same SSE request; completed runs are replayed after an attach race, and a closed unresolved driver is sealed once so the next operation can proceed without a persistent 503 loop. |
+| Claude Code shows `Cursor live run cancelled` or repeatedly reports `A Cursor live run is already active` after `/compact` | Update to ≥0.1.76 and restart serve. Replacement reservations stay bound to the old operation while cancellation is unresolved, so later Grok stages do not inherit a zero-fingerprint 409 tombstone; completed runs are replayed after an attach race and resolved pre-output cancellation is retried inside the same SSE request. |
 | 502 `Image not found [internal]` on a text-only turn | Update to ≥0.1.40 and restart serve, then retry the same message once (the poisoned conversation checkpoint is cleared on that error). A new Claude Code session also works. |
 | 502 `Conversation data missing` / `missing blobs` and the session cannot recover | Update to ≥0.1.45 and restart serve, then retry the same message. The failed turn now resets the unrecoverable Cursor conversation binding; the first retry replays full history in a fresh Cursor conversation without requiring a new Claude Code chat. |
 | 400 `Missing tool_result blocks for pending tools` after an interrupted turn / with background shells | Update to ≥0.1.45 and restart serve. A new request without current-turn tool results now supersedes the abandoned live turn; partial tool-result batches are still rejected. |

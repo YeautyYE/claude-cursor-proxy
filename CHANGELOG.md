@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.76 (2026-08-26)
+
+- Bind replacement reservations and live handles to the superseded operation fingerprint before cancellation teardown. An ambiguous compact/next-turn handoff can no longer create a zero-fingerprint tombstone that blocks every later Grok 4.6 request with 409.
+- Allow the durable operation ledger to rotate an expired-owner ambiguous marker atomically when a distinct, known operation arrives, while keeping same-operation and pre-acceptance duplicate protection fail-closed.
+- Add regression coverage for fingerprint propagation through ambiguous replacement, terminal probing, and durable ownership rotation.
+
 ## v0.1.75 (2026-08-26)
 
 - Reconcile a live generation after attach handoff: completed replay, retryable terminal state, and closed control channels are now observed before returning local busy. This breaks the persistent `A Cursor live run is already active` loop that could strand Claude Code after `/compact`.

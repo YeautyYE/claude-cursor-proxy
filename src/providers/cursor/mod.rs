@@ -2379,10 +2379,20 @@ impl Provider for CursorProvider {
                                         return map_cursor_error_to_response(&error);
                                     }
                                     LiveReplacementClaim::Reserved {
-                                        reservation,
+                                        mut reservation,
                                         superseded,
                                     } => {
                                         if let Some(handle) = superseded {
+                                            // The replacement reservation starts
+                                            // with an unpublished fingerprint.
+                                            // Publish the old operation before
+                                            // protecting it: if the request is
+                                            // cancelled while awaiting the old
+                                            // driver's teardown, Drop may seal
+                                            // an ambiguous tombstone directly.
+                                            reservation.set_operation_fingerprint(
+                                                handle.request_fingerprint(),
+                                            );
                                             reservation.protect_on_drop();
                                             let cancel_result = handle.cancel_and_wait().await;
                                             match finish_replacement_after_cancel(

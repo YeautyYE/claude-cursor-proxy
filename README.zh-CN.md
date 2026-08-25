@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.75 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.76 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -408,7 +408,7 @@ TUI、模型发现和用量说明见 [Sand 模式](#sand-模式)。
 | Claude Code 的 Bash 标题是整段 `python3 -c` 脚本 | 升级到 ≥0.1.48 并重启 serve。Cursor Shell 没有 description，代理会补一行短标题。 |
 | 约 45 秒 502 `idle timeout` / `0 response bytes` | 升级到 ≥0.1.39 并重启 serve。仍建议 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`。Clash/Surge TUN 把 `*.cursor.sh` 设为 DIRECT；仍断可试 `CCP_CURSOR_HTTP1=1` |
 | 出现 `Stream idle timeout - no chunks received`，尤其是首轮会话或后台工具结果恢复前 | 升级到当前版本并重启 serve。`/v1/messages` 会先提交 Anthropic SSE 生命周期，再等待 Cursor live 建连；客户端立即收到字节，默认每 5 秒发送可刷新 watchdog 的 `message_delta` + `ping` 心跳。首个客户端可见输出前的 Cursor 建连/步骤瞬时错误会在代理内部按上限重试；`/v1/responses` 为正确映射 `response.failed` 仍保留 held-HTTP。 |
-| Claude Code 显示 `Cursor live run cancelled`，或 `/compact` 后反复出现 `A Cursor live run is already active` | 升级到 ≥0.1.75 并重启 serve。首个文本/工具事件提交前的已确定取消会在同一个 SSE 请求内部自动重试；attach 竞态会优先重放已完成回合，未决控制通道只封存一次并允许后续操作接管，避免 503 无限循环。 |
+| Claude Code 显示 `Cursor live run cancelled`，或 `/compact` 后反复出现 `A Cursor live run is already active` | 升级到 ≥0.1.76 并重启 serve。替换 reservation 会在取消未决时绑定旧操作指纹，后续 Grok 阶段不会继承零指纹 409 tombstone；首个文本/工具事件提交前的已确定取消会在同一个 SSE 请求内部重试，attach 竞态会优先重放已完成回合。 |
 | 纯文本回合却 502 `Image not found [internal]` | 升级到 ≥0.1.40 并重启 serve，然后把同一条消息再发一次（该错误会清掉带过期图片 id 的 conversation checkpoint）。新开一个 Claude Code session 也可以。 |
 | 502 `Conversation data missing` / `missing blobs`，且当前 session 无法恢复 | 升级到 ≥0.1.45 并重启 serve，然后重试同一条消息。失败回合会清除不可恢复的 Cursor conversation id、checkpoint 和 blob 缓存；第一次重试会在新的 Cursor conversation 中重放完整历史，无需新开 Claude Code chat。 |
 | 中断回合后或仍有后台 shell 时 400 `Missing tool_result blocks for pending tools` | 升级到 ≥0.1.45 并重启 serve。当前回合没有工具结果的新请求会接管已放弃的 live 回合；真正缺项的工具结果批次仍会被拒绝。 |

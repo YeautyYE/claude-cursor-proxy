@@ -664,7 +664,29 @@ pub(crate) fn claim(
         Ok(record) => record,
         Err(error) => return OperationAdmission::Unavailable(error.to_string()),
     };
-    let admission = classify(&payload, fingerprint);
+    // An ambiguous marker is scoped to the operation that may have crossed
+    // Cursor's acceptance boundary.  The in-memory live registry can
+    // atomically rotate that marker when a *different* Grok operation arrives;
+    // keep the durable record in lock-step with that decision.  Without this
+    // branch, the old owner remains ambiguous for the full unresolved
+    // retention window and every later stage is rejected before dispatch.
+    // Unknown fingerprints stay fail-closed: there is no identity proof that
+    // makes replacing that marker safe.
+    let can_rotate_ambiguous = payload.active.as_ref().is_some_and(|active| {
+        active.state == ActiveState::Ambiguous
+            && active.fingerprint != 0
+            && fingerprint != 0
+            && active.fingerprint != fingerprint
+            && !payload
+                .completed
+                .iter()
+                .any(|entry| entry.fingerprint == fingerprint)
+    });
+    let admission = if can_rotate_ambiguous {
+        OperationAdmission::Allowed
+    } else {
+        classify(&payload, fingerprint)
+    };
     if admission != OperationAdmission::Allowed {
         if changed && let Err(error) = persist_or_remove(&dir, &payload) {
             return OperationAdmission::Unavailable(error.to_string());
@@ -936,6 +958,105 @@ mod tests {
         );
         assert!(matches!(
             admit("session-a", 42),
+            OperationAdmission::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn different_operation_atomically_rotates_ambiguous_owner() {
+        let _guard = OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = LedgerEnv::new(dir.path());
+        dispatch("session-a-rotate", 41, "owner-a");
+        assert!(
+            mark_ambiguous_if_owner("session-a-rotate", 41, "owner-a", "acceptance is ambiguous")
+                .unwrap()
+        );
+
+        // This is the same atomic transition performed by the in-memory live
+        // registry when a later Grok stage has a different request id.
+        assert_eq!(
+            claim("session-a-rotate", 42, "owner-b"),
+            OperationAdmission::Allowed
+        );
+        // The replacement is now prepared under the new owner.  A retry of
+        // either the old or new operation remains fail-closed until that
+        // owner reaches a terminal state.
+        assert!(matches!(
+            admit("session-a-rotate", 41),
+            OperationAdmission::Ambiguous(_)
+        ));
+        assert!(matches!(
+            admit("session-a-rotate", 42),
+            OperationAdmission::Ambiguous(_)
+        ));
+        assert!(
+            !mark_dispatched_if_owner("session-a-rotate", 42, "owner-a").unwrap(),
+            "the superseded owner must not advance the replacement"
+        );
+        assert!(mark_dispatched_if_owner("session-a-rotate", 42, "owner-b").unwrap());
+    }
+
+    #[test]
+    fn unknown_or_same_ambiguous_fingerprint_stays_fail_closed() {
+        let _guard = OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = LedgerEnv::new(dir.path());
+
+        dispatch("session-a-closed", 51, "owner-a");
+        assert!(
+            mark_ambiguous_if_owner("session-a-closed", 51, "owner-a", "acceptance is ambiguous")
+                .unwrap()
+        );
+        assert!(matches!(
+            claim("session-a-closed", 51, "owner-retry"),
+            OperationAdmission::Ambiguous(_)
+        ));
+
+        dispatch("session-a-unknown", 0, "owner-zero");
+        assert!(
+            mark_ambiguous_if_owner(
+                "session-a-unknown",
+                0,
+                "owner-zero",
+                "acceptance is ambiguous"
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            claim("session-a-unknown", 52, "owner-new"),
+            OperationAdmission::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn different_fingerprint_cannot_rotate_before_acceptance_boundary() {
+        let _guard = OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = LedgerEnv::new(dir.path());
+
+        // Prepared is written before the upstream request is polled, and
+        // Dispatched means bytes may have crossed Cursor's acceptance
+        // boundary. Neither state can be replaced merely because a later
+        // request has a different x-grok-req-id.
+        assert_eq!(
+            claim("session-prepared", 61, "owner-prepared"),
+            OperationAdmission::Allowed
+        );
+        assert!(matches!(
+            claim("session-prepared", 62, "owner-new"),
+            OperationAdmission::Ambiguous(_)
+        ));
+
+        dispatch("session-dispatched", 71, "owner-dispatched");
+        assert!(matches!(
+            claim("session-dispatched", 72, "owner-new"),
             OperationAdmission::Ambiguous(_)
         ));
     }
