@@ -3,6 +3,10 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.71 (2026-08-25)
+
+- Stop empty Cursor turns from inventing `Workflow(deep-research)` merely because Claude Code advertised the Workflow tool. Synthetic recovery now requires an explicit invocation in the current user turn and ignores historical invocations and tool-result instructions, preventing recursive deep-research loops across ordinary messages.
+
 ## v0.1.70 (2026-08-25)
 
 - Use `claude-fable-5[1m]` as the primary Sand walkthrough and keep `gemini-3.1-pro` as the manual catalog-id example.

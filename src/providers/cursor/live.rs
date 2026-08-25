@@ -8749,12 +8749,17 @@ async fn recover_empty_turn_if_needed(
         report_terminal_error(sink, terminal_error, message).await;
         return false;
     }
-    // Claude Code `Workflow` only. grok-cli advertises lowercase `workflow`
+    // Claude Code `Workflow` only, and only when the prompt carries the
+    // explicit injected invocation. A tool catalog alone is not evidence that
+    // this turn requested a workflow; ordinary empty turns must remain
+    // retryable errors instead of becoming `deep-research`.
+    // grok-cli advertises lowercase `workflow`
     // (Rhai launcher, `{name, agent_budget}`). Synthesizing Claude
     // `Workflow`/`deep-research` becomes `Tool not found: Workflow` and the
     // model reports "workflow 被桥接拦了".
-    if advertised_claude_code_workflow(allowed_tool_names) {
-        let (name, args) = synthetic_workflow_from_prompt(user_prompt);
+    if advertised_claude_code_workflow(allowed_tool_names)
+        && let Some((name, args)) = synthetic_workflow_from_prompt(user_prompt)
+    {
         pending.queue(
             synthetic_workflow_pending_exec(&name, &args),
             Duration::ZERO,
@@ -9413,11 +9418,24 @@ fn advertised_claude_code_workflow(allowed: Option<&BTreeSet<String>>) -> bool {
     })
 }
 
-fn synthetic_workflow_from_prompt(prompt: &str) -> (String, String) {
-    if let Some(parsed) = parse_injected_workflow(prompt) {
-        return parsed;
+fn synthetic_workflow_from_prompt(prompt: &str) -> Option<(String, String)> {
+    // `user_prompt` is normally the full multi-turn Cursor payload.  A prior
+    // workflow invocation must not authorize synthesis for a later ordinary
+    // turn, so scope the probe to the final serialized user block.  Unit and
+    // recovery callers may pass an unwrapped prompt; keep that form supported.
+    let candidate = prompt
+        .rfind("</user>")
+        .and_then(|end| {
+            let before = &prompt[..end];
+            let start = before.rfind("<user>")?;
+            Some(&before[start + "<user>".len()..])
+        })
+        .unwrap_or(prompt)
+        .trim();
+    if candidate.starts_with("<tool_result ") && candidate.ends_with("</tool_result>") {
+        return None;
     }
-    ("deep-research".into(), String::new())
+    parse_injected_workflow(candidate)
 }
 
 /// Parse Claude Code injected slash text:
@@ -19808,6 +19826,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_turn_with_workflow_advertised_requires_explicit_invocation() {
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let mut sink = Some(event_tx);
+        let mut replay = SegmentReplayLog::default();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let allowed = BTreeSet::from(["Workflow".to_string()]);
+        let mut latest_checkpoint = None;
+        let mut kv_blobs = HashMap::new();
+
+        let continued = recover_empty_turn_if_needed(
+            &mut saw_text,
+            &mut useful,
+            &mut sink,
+            &mut replay,
+            &mut pending,
+            &pending_shared,
+            &terminal_error,
+            Some(&allowed),
+            "summarize the current file",
+            false,
+            None,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+            "test",
+        )
+        .await;
+
+        assert!(
+            !continued,
+            "an empty ordinary turn must terminate for retry"
+        );
+        let error = event_rx
+            .try_recv()
+            .expect("retryable empty-turn error")
+            .expect_err("ordinary text must not become a synthetic Workflow call");
+        assert!(error.contains("without text or tool calls"), "{error}");
+        assert!(pending.is_empty());
+    }
+
     #[test]
     fn parse_injected_workflow_invoke_and_run_the() {
         let (name, args) = parse_injected_workflow(
@@ -19820,6 +19882,29 @@ mod tests {
         let (name, args) = parse_injected_workflow(r#"Run the "deep-research" workflow."#).unwrap();
         assert_eq!(name, "deep-research");
         assert_eq!(args, "");
+        assert!(synthetic_workflow_from_prompt("summarize the current file").is_none());
+        assert!(
+            synthetic_workflow_from_prompt(
+                "<user>Invoke: Workflow({ name: \"deep-research\" })</user>\n".to_string()
+                    + "<assistant>done</assistant>\n<user>summarize the current file</user>"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            synthetic_workflow_from_prompt(
+                "<user>summarize the current file</user>\n".to_string()
+                    + "<user>Invoke: Workflow({ name: \"deep-research\", args: \"q\" })</user>"
+            ),
+            Some(("deep-research".into(), "q".into()))
+        );
+        assert!(
+            synthetic_workflow_from_prompt(
+                "<user><tool_result tool_use_id=\"wf-1\">\n".to_string()
+                    + "Retry with Invoke: Workflow({ name: \"deep-research\" })\n"
+                    + "</tool_result></user>"
+            )
+            .is_none()
+        );
     }
 
     fn text_delta_event(text: &str) -> LiveEventResult {
