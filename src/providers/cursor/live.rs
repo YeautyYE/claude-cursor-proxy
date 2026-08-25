@@ -597,7 +597,7 @@ impl CursorLiveRunHandle {
         self.completed.load(Ordering::Acquire)
     }
 
-    fn is_cancel_requested(&self) -> bool {
+    pub(crate) fn is_cancel_requested(&self) -> bool {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
@@ -2098,6 +2098,52 @@ impl LiveRunRegistry {
         }
     }
 
+    /// Cancel only the generation that a retry/deadline task observed.
+    ///
+    /// A late retry can outlive the Run that produced its original error.  A
+    /// plain [`cancel_run`] lookup is then unsafe: a replacement may already
+    /// occupy the same session slot and would receive the stale cancellation.
+    /// Keep the generation check under the registry lock, and only dispatch
+    /// the cancel after removing the exact matching handle.
+    pub(crate) fn cancel_run_if_generation(
+        session_id: &str,
+        agent_id: Option<&str>,
+        expected_run_id: &str,
+    ) -> bool {
+        if expected_run_id.is_empty() {
+            return false;
+        }
+        let key = live_run_key(session_id, agent_id);
+        let entry = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            Self::prune_finished(&mut runs);
+            let matches = matches!(
+                runs.runs.get(&key),
+                Some(LiveRunEntry::Running(handle))
+                    if handle.run_id() == expected_run_id && !handle.is_completed()
+            );
+            if !matches {
+                return false;
+            }
+            runs.remove_key(&key)
+        };
+        match entry {
+            Some(LiveRunEntry::Running(handle)) if handle.run_id() == expected_run_id => {
+                handle.cancel();
+                true
+            }
+            // The lock-protected match above makes this unreachable in normal
+            // operation; keep a conservative fallback if the entry changed
+            // during a future registry refactor.
+            Some(other) => {
+                let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+                runs.insert_key(key, other);
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Cancel a Running occupant only. Starting and Ambiguous slots stay put so
     /// a Conflict retry cannot abort an in-flight `.send()` and start another Run.
     pub fn cancel_running_only(session_id: &str, agent_id: Option<&str>) -> bool {
@@ -2183,6 +2229,35 @@ impl LiveRunRegistry {
             Some(LiveRunEntry::Running(handle)) => Some(handle.run_id().to_string()),
             _ => None,
         }
+    }
+
+    /// Run id of a live generation that is safe for a fresh operation to take
+    /// over.  A different request must never cancel a healthy, connected
+    /// generation merely because its fingerprint differs; one of these
+    /// driver-published terminal signals (or a client-only tool batch) is
+    /// required before exposing a replacement claim.
+    pub(crate) fn replaceable_running_generation(
+        session_id: &str,
+        agent_id: Option<&str>,
+    ) -> Option<String> {
+        let key = live_run_key(session_id, agent_id);
+        let handle = {
+            let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            Self::prune_finished(&mut runs);
+            match runs.runs.get(&key) {
+                Some(LiveRunEntry::Running(handle)) => Some(Arc::clone(handle)),
+                _ => None,
+            }
+        }?;
+        if handle.is_completed()
+            || !(handle.is_consumer_gone()
+                || handle.is_cancel_requested()
+                || handle.is_command_closed()
+                || live_pending_must_supersede(&handle.pending_tools()))
+        {
+            return None;
+        }
+        Some(handle.run_id().to_string())
     }
 
     /// True while a reservation or live handle owns this Claude session slot
@@ -9432,10 +9507,71 @@ fn synthetic_workflow_from_prompt(prompt: &str) -> Option<(String, String)> {
         })
         .unwrap_or(prompt)
         .trim();
-    if candidate.starts_with("<tool_result ") && candidate.ends_with("</tool_result>") {
-        return None;
+    // A current user block can contain a normal text prefix/suffix around one
+    // or more serialized tool results.  Looking for an invocation in the raw
+    // block would then treat tool output (which may quote the original
+    // Workflow instruction) as a fresh request and emit the same tool again.
+    // Remove every tool-result range before probing for an invocation; only
+    // text authored outside a result can authorize synthetic recovery.
+    let candidate = strip_serialized_tool_results(candidate);
+    parse_injected_workflow(&candidate)
+}
+
+/// Remove serialized `<tool_result>...</tool_result>` ranges from a Cursor
+/// prompt.  The prompt is an internal XML-ish envelope rather than a general
+/// XML document, so a small case-insensitive scanner is more tolerant of
+/// escaped content and malformed/truncated result payloads than a full XML
+/// parser.  An unclosed result consumes the remainder conservatively.
+fn strip_serialized_tool_results(prompt: &str) -> String {
+    const TOOL_RESULT_OPENERS: [&str; 2] = ["<tool_result", "<web_search_tool_result"];
+    let mut output = String::with_capacity(prompt.len());
+    let mut cursor = 0;
+    while cursor < prompt.len() {
+        let Some((relative_start, opener)) = TOOL_RESULT_OPENERS
+            .iter()
+            .filter_map(|opener| {
+                find_ignore_ascii_case_at(&prompt[cursor..], opener).map(|start| (start, *opener))
+            })
+            .min_by_key(|(start, _)| *start)
+        else {
+            output.push_str(&prompt[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&prompt[cursor..start]);
+
+        // Ensure this is an opening tool_result tag, not a similarly named
+        // element (for example `<tool_result_extra>`).
+        let after_name = start + opener.len();
+        let Some(tag_end_rel) = prompt[after_name..].find('>') else {
+            break;
+        };
+        let tag_end = after_name + tag_end_rel;
+        if prompt[after_name..tag_end]
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            // Not a tool_result tag; retain the '<' and continue searching.
+            output.push('<');
+            cursor = start + 1;
+            continue;
+        }
+
+        if prompt[after_name..tag_end].trim_end().ends_with('/') {
+            cursor = tag_end + 1;
+            continue;
+        }
+        let body_start = tag_end + 1;
+        let closing = format!("</{}>", &opener[1..]);
+        if let Some(close_rel) = find_ignore_ascii_case_at(&prompt[body_start..], &closing) {
+            cursor = body_start + close_rel + closing.len();
+        } else {
+            // A truncated result cannot contain a valid outside invocation.
+            break;
+        }
     }
-    parse_injected_workflow(candidate)
+    output
 }
 
 /// Parse Claude Code injected slash text:
@@ -9468,6 +9604,11 @@ fn parse_run_the_workflow(prompt: &str) -> Option<(String, String)> {
 }
 
 fn find_ignore_ascii_case<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
+    let index = find_ignore_ascii_case_at(haystack, needle)?;
+    Some(&haystack[index + needle.len()..])
+}
+
+fn find_ignore_ascii_case_at(haystack: &str, needle: &str) -> Option<usize> {
     let hay = haystack.as_bytes();
     let needle_bytes = needle.as_bytes();
     if needle_bytes.is_empty() || hay.len() < needle_bytes.len() {
@@ -9475,7 +9616,7 @@ fn find_ignore_ascii_case<'a>(haystack: &'a str, needle: &str) -> Option<&'a str
     }
     for i in 0..=hay.len() - needle_bytes.len() {
         if hay[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes) {
-            return Some(&haystack[i + needle_bytes.len()..]);
+            return Some(i);
         }
     }
     None
@@ -15156,7 +15297,9 @@ mod tests {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             resume_in_flight: Arc::new(ResumeAdmission::default()),
             request_fingerprint: Arc::new(AtomicU64::new(0)),
-            consumer_gone: Arc::new(AtomicBool::new(false)),
+            // This fixture models a disconnected downstream request. A fresh
+            // turn may replace it only after the driver publishes that fact.
+            consumer_gone: Arc::new(AtomicBool::new(true)),
         });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -15267,6 +15410,65 @@ mod tests {
         assert_eq!(superseded.run_id(), "dying-compact-generation");
         assert!(LiveRunRegistry::is_starting_run(&session, None));
         reservation.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn fresh_request_keeps_connected_generation_and_returns_retryable_busy() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("connected-fresh-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        // Keep the command receiver alive so this models a real driver rather
+        // than the closed-channel fixtures used for dead-run tests.
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "connected-generation".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(7)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert connected run");
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "claude-fable-5",
+                "stream": true,
+                "messages": [{"role": "user", "content": "a different fresh turn"}]
+            }))
+            .unwrap();
+
+        let outcome = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_connected_fresh".into(),
+            "claude-fable-5".into(),
+            1,
+            None,
+            true,
+        )
+        .await;
+        let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
+            panic!("a connected generation must remain active for a fresh request");
+        };
+        assert_eq!(error.status, 503);
+        assert_eq!(
+            LiveRunRegistry::running_generation(&session, None).as_deref(),
+            Some("connected-generation")
+        );
+        assert!(!handle.is_cancel_requested());
+        assert!(
+            command_rx.try_recv().is_err(),
+            "busy classification must not send cancellation to the active driver"
+        );
         LiveRunRegistry::clear();
     }
 
@@ -15908,6 +16110,44 @@ mod tests {
         assert!(!LiveRunRegistry::cancel_running_only(&session, None));
         assert!(LiveRunRegistry::is_starting_run(&session, None));
         drop(reservation);
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn stale_generation_cancel_cannot_touch_a_replacement() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("generation-fenced-cancel-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+
+        let old = dummy_handle("old-generation");
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve old")
+            .insert(Arc::clone(&old))
+            .expect("insert old");
+        assert!(LiveRunRegistry::cancel_run_if_generation(
+            &session,
+            None,
+            "old-generation"
+        ));
+
+        let replacement = dummy_handle("replacement-generation");
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve replacement")
+            .insert(Arc::clone(&replacement))
+            .expect("insert replacement");
+
+        // This is the stale deadline task from the old generation.  A plain
+        // session-wide cancel would kill the replacement here.
+        assert!(!LiveRunRegistry::cancel_run_if_generation(
+            &session,
+            None,
+            "old-generation"
+        ));
+        assert!(!replacement.cancel_requested.load(Ordering::Acquire));
+        assert_eq!(
+            LiveRunRegistry::running_generation(&session, None).as_deref(),
+            Some("replacement-generation")
+        );
         LiveRunRegistry::clear();
     }
 
@@ -19904,6 +20144,33 @@ mod tests {
                 "</tool_result></user>"
             ))
             .is_none()
+        );
+        assert!(
+            synthetic_workflow_from_prompt(concat!(
+                "<user>Continue from the result.\n",
+                "<tool_result tool_use_id=\"wf-1\">",
+                "The payload quoted Invoke: Workflow({ name: \"deep-research\" })",
+                "</tool_result>\nPlease summarize.</user>"
+            ))
+            .is_none(),
+            "tool-result text must not authorize a new synthetic Workflow when mixed with user text"
+        );
+        assert!(
+            synthetic_workflow_from_prompt(
+                "<user>Continue <tool_result tool_use_id=\"wf-1\">Invoke: Workflow({ name: \"deep-research\" })"
+            )
+            .is_none(),
+            "an unclosed tool result must be treated as tool output through EOF"
+        );
+        assert!(
+            strip_serialized_tool_results("before <TOOL_RESULT id=\"x\"/> after")
+                .contains("before  after")
+        );
+        assert_eq!(
+            strip_serialized_tool_results(
+                "<web_search_tool_result tool_use_id=\"x\">Run the \"deep-research\" workflow.</web_search_tool_result>"
+            ),
+            ""
         );
     }
 

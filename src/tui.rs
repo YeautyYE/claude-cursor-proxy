@@ -399,7 +399,7 @@ impl MonitorApp {
             .position(|candidate| candidate == &model)
             .unwrap_or(0);
 
-        if self.sand_policy.matches(&model) {
+        if self.sand_policy.matches_model(&model) {
             self.sand_message = Some("Model already uses Sand".to_string());
             return;
         }
@@ -452,7 +452,7 @@ impl MonitorApp {
         let mut patterns = self.sand_policy.patterns().to_vec();
         if let Some(index) = patterns.iter().position(|pattern| pattern == &normalized) {
             patterns.remove(index);
-        } else if self.sand_policy.matches(&normalized) {
+        } else if self.sand_policy.matches_model(&normalized) {
             self.sand_message = Some(
                 "This model is covered by a wildcard Sand pattern; edit config.json to change it"
                     .to_string(),
@@ -668,10 +668,12 @@ fn render_header(
     let usage_line = state.account_usage.header_line();
     let usage = Line::from(Span::styled(
         format!(" {usage_line}"),
-        Style::default().fg(usage_header_color(&state.account_usage)),
+        Style::default()
+            .fg(usage_header_color(&state.account_usage))
+            .bg(PANEL_BG),
     ));
     frame.render_widget(
-        Paragraph::new(vec![top, usage]).style(Style::default().bg(TEAL)),
+        Paragraph::new(vec![top, usage]).style(Style::default().bg(PANEL_BG)),
         area,
     );
 }
@@ -683,22 +685,36 @@ fn usage_header_color(usage: &crate::monitor::AccountUsageState) -> Color {
                 snapshot.total_percent,
                 snapshot.auto_percent,
                 snapshot.api_percent,
+                snapshot.grok_bot_percent,
+                usage_ratio_percent(snapshot.plan_used_usd, snapshot.plan_limit_usd),
+                usage_ratio_percent(snapshot.on_demand_used_usd, snapshot.on_demand_limit_usd),
             ]
             .into_iter()
             .flatten()
+            .filter(|value| value.is_finite())
             .fold(0.0_f64, f64::max);
             if hottest >= 90.0 {
                 RED
             } else if hottest >= 70.0 {
                 YELLOW
             } else {
-                BG
+                DIM_WHITE
             }
         }
         crate::monitor::AccountUsageState::Failed(_) => RED,
         crate::monitor::AccountUsageState::MissingAuth => YELLOW,
-        crate::monitor::AccountUsageState::Unknown => BG,
+        crate::monitor::AccountUsageState::Unknown => DIM_WHITE,
     }
+}
+
+fn usage_ratio_percent(used: Option<f64>, limit: Option<f64>) -> Option<f64> {
+    let (Some(used), Some(limit)) = (used, limit) else {
+        return None;
+    };
+    if !used.is_finite() || !limit.is_finite() || limit <= 0.0 {
+        return None;
+    }
+    Some((used / limit * 100.0).clamp(0.0, 100.0))
 }
 
 fn panel(title: &'static str, focused: bool) -> Block<'static> {
@@ -771,8 +787,26 @@ fn text_cell(value: impl Into<String>) -> Cell<'static> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
 }
 
-fn model_cell(value: Option<&str>, width: usize) -> Cell<'static> {
-    text_cell(ellipsize(value.unwrap_or("-"), width))
+fn model_cell(provider: Option<&str>, value: Option<&str>, width: usize) -> Cell<'static> {
+    let model = value.unwrap_or("-");
+    if provider != Some("cursor") || model == "-" {
+        return text_cell(ellipsize(model, width));
+    }
+
+    let client_type = config::cursor_client_type_for_model(model);
+    let marker = format!(" [{}]", client_type);
+    let marker_width = marker.chars().count();
+    if width <= marker_width {
+        return text_cell(ellipsize(&marker, width));
+    }
+
+    let model_width = width.saturating_sub(marker_width);
+    let model_text = ellipsize(model, model_width);
+    let marker_color = if client_type == "sand" { TEAL } else { DIM };
+    Cell::from(Line::from(vec![
+        Span::styled(model_text, Style::default().fg(DIM_WHITE)),
+        Span::styled(marker, Style::default().fg(marker_color)),
+    ]))
 }
 
 fn table_column_width(area: Rect, widths: &[Constraint], column: usize) -> usize {
@@ -989,7 +1023,13 @@ fn column_header<K>(columns: &[ColumnSpec<K>]) -> Row<'static> {
 fn target_cell(provider: Option<&str>, model: Option<&str>, width: usize) -> Cell<'static> {
     let provider = provider.unwrap_or("-");
     let model = model.unwrap_or("-");
-    text_cell(ellipsize(&format!("{provider}/{model}"), width))
+    let target = if provider == "cursor" && model != "-" {
+        let client_type = config::cursor_client_type_for_model(model);
+        format!("{provider}/{model} [{client_type}]")
+    } else {
+        format!("{provider}/{model}")
+    };
+    text_cell(ellipsize(&target, width))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1121,7 +1161,9 @@ fn render_sessions(
                         session.active_count, session.request_count, session.failure_count
                     )),
                     SessionColumn::Provider => provider_cell(session.provider.as_deref()),
-                    SessionColumn::Model => model_cell(session.model.as_deref(), width),
+                    SessionColumn::Model => {
+                        model_cell(session.provider.as_deref(), session.model.as_deref(), width)
+                    }
                     SessionColumn::Target => {
                         target_cell(session.provider.as_deref(), session.model.as_deref(), width)
                     }
@@ -1258,7 +1300,9 @@ fn render_active(
                         text_cell(display_session_id(request.session_id.as_deref()))
                     }
                     ActiveColumn::Provider => provider_cell(request.provider.as_deref()),
-                    ActiveColumn::Model => model_cell(request.model.as_deref(), width),
+                    ActiveColumn::Model => {
+                        model_cell(request.provider.as_deref(), request.model.as_deref(), width)
+                    }
                     ActiveColumn::Target => {
                         target_cell(request.provider.as_deref(), request.model.as_deref(), width)
                     }
@@ -1411,7 +1455,9 @@ fn render_recent(
                         text_cell(display_session_id(request.session_id.as_deref()))
                     }
                     RecentColumn::Provider => provider_cell(request.provider.as_deref()),
-                    RecentColumn::Model => model_cell(request.model.as_deref(), width),
+                    RecentColumn::Model => {
+                        model_cell(request.provider.as_deref(), request.model.as_deref(), width)
+                    }
                     RecentColumn::Target => {
                         target_cell(request.provider.as_deref(), request.model.as_deref(), width)
                     }
@@ -1530,7 +1576,9 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                         text_cell(display_session_id(request.session_id.as_deref()))
                     }
                     EventColumn::Provider => provider_cell(request.provider.as_deref()),
-                    EventColumn::Model => model_cell(request.model.as_deref(), width),
+                    EventColumn::Model => {
+                        model_cell(request.provider.as_deref(), request.model.as_deref(), width)
+                    }
                     EventColumn::Message => detail_cell(message),
                 }
             })
@@ -2071,7 +2119,7 @@ fn render_sand_settings_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, app:
         .take(visible_rows)
     {
         let selected = index == app.sand_selected;
-        let enabled = app.sand_policy.matches(model);
+        let enabled = app.sand_policy.matches_model(model);
         let marker = if enabled { "[sand]" } else { "[cli ]" };
         let style = if selected {
             Style::default().fg(WHITE).bg(SELECTED_BG)
@@ -3207,5 +3255,61 @@ mod tests {
         app.move_up(2, 3, false);
         assert_eq!(app.focus, FocusPane::Recent);
         assert_eq!(app.recent_selected, 0);
+    }
+
+    #[test]
+    fn cursor_model_rows_show_the_selected_client_surface() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("cursor-request", None, None, EndpointKind::Messages);
+        monitor.provider_selected("cursor-request", "cursor", "claude-fable-5", None);
+        let state = monitor.snapshot();
+
+        // Wide layout keeps enough room for the model and its route marker.
+        let active = draw(180, 8, |frame| {
+            render_active(frame, frame.area(), &state.active, 0)
+        });
+        let text = buffer_text(&active);
+        assert!(text.contains("claude-fable-5"), "{text}");
+        assert!(
+            text.contains("[sand]") || text.contains("[cli]"),
+            "Cursor rows must expose the client surface: {text}"
+        );
+    }
+
+    fn usage_state_with_sand_percent(percent: f64) -> crate::monitor::AccountUsageState {
+        crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+            email: None,
+            membership: None,
+            auto_percent: Some(5.0),
+            api_percent: Some(5.0),
+            total_percent: Some(5.0),
+            plan_used_usd: None,
+            plan_limit_usd: None,
+            on_demand_used_usd: None,
+            on_demand_limit_usd: None,
+            grok_bot_percent: Some(percent),
+            grok_bot_period_start: None,
+            grok_bot_reset: None,
+            total_cost_usd: None,
+            usage_event_count: None,
+            usage_events: Vec::new(),
+            fetched_at: SystemTime::now(),
+        })
+    }
+
+    #[test]
+    fn usage_header_color_includes_the_sand_quota() {
+        assert_eq!(
+            usage_header_color(&usage_state_with_sand_percent(69.9)),
+            DIM_WHITE
+        );
+        assert_eq!(
+            usage_header_color(&usage_state_with_sand_percent(70.0)),
+            YELLOW
+        );
+        assert_eq!(
+            usage_header_color(&usage_state_with_sand_percent(90.0)),
+            RED
+        );
     }
 }

@@ -103,28 +103,16 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
 
     // Strip known prefixes
     if let Some(rest) = model.strip_prefix("cursor-agent:") {
-        return Ok(CursorModelResolution {
-            model_id: strip_anthropic_context_suffix(rest).to_string(),
-            mode: CursorAgentMode::Agent,
-        });
+        return resolve_prefixed_cursor_model(rest, CursorAgentMode::Agent);
     }
     if let Some(rest) = model.strip_prefix("cursor-plan:") {
-        return Ok(CursorModelResolution {
-            model_id: strip_anthropic_context_suffix(rest).to_string(),
-            mode: CursorAgentMode::Plan,
-        });
+        return resolve_prefixed_cursor_model(rest, CursorAgentMode::Plan);
     }
     if let Some(rest) = model.strip_prefix("cursor-ask:") {
-        return Ok(CursorModelResolution {
-            model_id: strip_anthropic_context_suffix(rest).to_string(),
-            mode: CursorAgentMode::Ask,
-        });
+        return resolve_prefixed_cursor_model(rest, CursorAgentMode::Ask);
     }
     if let Some(rest) = model.strip_prefix("cursor:") {
-        return Ok(CursorModelResolution {
-            model_id: strip_anthropic_context_suffix(rest).to_string(),
-            mode: CursorAgentMode::Agent,
-        });
+        return resolve_prefixed_cursor_model(rest, CursorAgentMode::Agent);
     }
 
     // Legacy exact names + Anthropic-style aliases.
@@ -213,6 +201,17 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             "unknown cursor model: {model}. Use cursor:<id> with a CLI catalog id (e.g. cursor:claude-fable-5-thinking-max, cursor:composer-2.5)"
         )),
     }
+}
+
+fn resolve_prefixed_cursor_model(
+    rest: &str,
+    mode: CursorAgentMode,
+) -> Result<CursorModelResolution, String> {
+    let resolved = resolve_cursor_model(rest)?;
+    Ok(CursorModelResolution {
+        model_id: resolved.model_id,
+        mode,
+    })
 }
 
 /// Claude Code / ccstatusline treat bare `fable` as a ~200k window unless the
@@ -497,6 +496,17 @@ mod tests {
         let r = resolve_cursor_model("cursor:gpt-5.5").unwrap();
         assert_eq!(r.model_id, "gpt-5.5");
         assert_eq!(r.mode, CursorAgentMode::Agent);
+    }
+
+    #[test]
+    fn resolve_prefixed_fable_alias_to_catalog_id() {
+        let r = resolve_cursor_model("cursor:claude-fable-5[1m]").unwrap();
+        assert_eq!(r.model_id, "claude-fable-5-thinking-max");
+        assert_eq!(r.mode, CursorAgentMode::Agent);
+
+        let r = resolve_cursor_model("cursor-plan:fable[1m]").unwrap();
+        assert_eq!(r.model_id, "claude-fable-5-thinking-max");
+        assert_eq!(r.mode, CursorAgentMode::Plan);
     }
 
     #[test]

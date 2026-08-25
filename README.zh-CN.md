@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.71 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.72 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -232,6 +232,11 @@ claude-cursor-proxy serve              # 保持监控 TUI 打开
 回车切换，按 `a` 输入一个精确的 Cursor catalog ID。列表会标记
 `[sand]` 或 `[cli]`；修改只影响新请求，并以原子方式写入 `config.json`。
 TUI 需要终端；`serve --no-monitor` 仍可运行代理，但不会显示设置面板。
+
+Sessions、Active requests、Recent requests 和 Events 面板的 Cursor 模型列
+也会显示同样的 `[sand]`/`[cli]` 标记，不用打开设置就能确认请求面。Fable
+会先解析别名再匹配规则：`claude-fable-5-thinking-max` 规则也覆盖常用的
+`claude-fable-5[1m]`、`fable[1m]` 和 `cursor:` 写法。
 
 推荐优先使用这套 TUI 流程管理 Sand，不需要手动编辑配置文件，也不需要再
 启动第二个二进制。正在运行的 `serve` 会在下一条请求时使用保存后的规则。

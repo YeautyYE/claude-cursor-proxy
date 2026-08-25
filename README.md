@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.71 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.72 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -238,6 +238,12 @@ model, `Space` or `Enter` to toggle it, and `a` to enter an exact Cursor
 catalog id. The list is marked `[sand]` or `[cli]`; changes apply to new
 requests and are written atomically to `config.json`. The TUI requires a
 terminal; `serve --no-monitor` keeps the proxy running without it.
+
+Cursor model cells in the Sessions, Active requests, Recent requests, and
+Events panes carry the same `[sand]`/`[cli]` badge, so the selected request
+surface is visible without opening the editor. Fable aliases are resolved
+before matching: a rule for `claude-fable-5-thinking-max` also covers the
+usual `claude-fable-5[1m]`, `fable[1m]`, and `cursor:` forms.
 
 This TUI flow is the recommended way to manage Sand routing. You do not need
 to edit a file or launch another binary; the running `serve` process picks up

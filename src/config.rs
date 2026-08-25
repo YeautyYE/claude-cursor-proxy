@@ -196,8 +196,54 @@ impl SandRoutingPolicy {
     }
 
     pub fn matches_model(&self, model: &str) -> bool {
-        self.matches(model)
+        if self.matches(model) {
+            return true;
+        }
+
+        // Fable's public alias can be routed to low/medium/high/max thinking
+        // catalog ids by request effort. Selecting any concrete Fable id in
+        // the TUI therefore enables the whole Fable family; otherwise a
+        // Claude Code effort change would unexpectedly fall back to `cli`.
+        if is_fable_sand_family(model)
+            && self
+                .patterns
+                .iter()
+                .any(|pattern| is_fable_sand_family(pattern))
+        {
+            return true;
+        }
+
+        // The public Anthropic id is often an alias (for example
+        // `claude-fable-5[1m]`) while Cursor receives a concrete catalog id
+        // (`claude-fable-5-thinking-max`).  Check that resolved id as well so
+        // a model selected in the TUI remains Sand-routed across both forms.
+        let mut candidate = model.to_string();
+        // Prefix wrappers (`cursor:`/`cursor-plan:`/...) are resolved before
+        // Anthropic aliases, so walk the short alias chain once more when
+        // needed (`cursor:claude-fable-5` -> `claude-fable-5` -> thinking-max).
+        for _ in 0..2 {
+            let Some(resolved) =
+                crate::providers::cursor::model::resolve_cursor_model(&candidate).ok()
+            else {
+                break;
+            };
+            if self.matches(&resolved.model_id) {
+                return true;
+            }
+            if resolved.model_id == candidate {
+                break;
+            }
+            candidate = resolved.model_id;
+        }
+        false
     }
+}
+
+fn is_fable_sand_family(model: &str) -> bool {
+    let normalized = normalize_sand_model(model);
+    normalized == "fable"
+        || normalized == "claude-fable-5"
+        || normalized.starts_with("claude-fable-5-")
 }
 
 /// Normalize a model id for Sand policy matching.
@@ -288,7 +334,7 @@ pub fn cursor_sand_models() -> SandRoutingPolicy {
 }
 
 pub fn cursor_model_uses_sand(model: &str) -> bool {
-    cursor_sand_policy().matches(model)
+    cursor_sand_policy().matches_model(model)
 }
 
 /// Persist only `cursor.sandModels`, preserving all unrelated config keys.
@@ -895,7 +941,7 @@ pub fn cursor_client_type() -> String {
 /// resolved without mutating process-wide configuration, so concurrent model
 /// requests cannot leak their client type into one another.
 pub fn cursor_client_type_for_model(model: &str) -> String {
-    if cursor_sand_policy().matches(model) {
+    if cursor_sand_policy().matches_model(model) {
         "sand".to_string()
     } else {
         cursor_client_type()
@@ -1293,6 +1339,18 @@ mod tests {
         assert!(policy.matches("cursor-agent:claude-fable-5"));
         assert!(policy.matches("gpt-5.4"));
         assert!(!policy.matches("gpt-5.42"));
+    }
+
+    #[test]
+    fn sand_policy_matches_resolved_cursor_aliases() {
+        let policy = SandRoutingPolicy::new(["claude-fable-5-thinking-max"]);
+        assert!(policy.matches_model("claude-fable-5[1m]"));
+        assert!(policy.matches_model("fable"));
+        assert!(policy.matches_model("cursor:claude-fable-5"));
+        assert!(policy.matches_model("claude-fable-5-thinking-high"));
+        assert!(policy.matches_model("claude-fable-5-thinking-low[1m]"));
+        assert!(!policy.matches_model("claude-sonnet-5"));
+        assert!(!policy.matches_model("claude-fable-50-thinking-max"));
     }
 
     #[test]

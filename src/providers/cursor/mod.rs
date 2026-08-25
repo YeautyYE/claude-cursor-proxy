@@ -1015,9 +1015,14 @@ async fn forward_empty_turn_deadline(
     tx: &mpsc::Sender<LiveEventResult>,
     session_id: &str,
     agent_id: Option<&str>,
+    expected_run_id: Option<&str>,
     last_error: &str,
 ) {
-    LiveRunRegistry::cancel_run(session_id, agent_id);
+    // A late retry task may still be alive after its Run was superseded. Do
+    // not let its deadline cancel whichever generation now occupies the slot.
+    if let Some(run_id) = expected_run_id {
+        LiveRunRegistry::cancel_run_if_generation(session_id, agent_id, run_id);
+    }
     let _ = tx
         .send(Err(format!(
             "{last_error} (empty-turn recovery deadline exhausted)"
@@ -1053,6 +1058,10 @@ async fn forward_live_events_with_retries<F, Fut>(
     let mut empty_turn_retries = 0_u32;
     let mut empty_turn_deadline = None;
     let mut last_empty_turn_error = None::<String>;
+    // Event receivers do not carry their owning Run id. Capture the current
+    // generation and refresh it after each internal restart so deadline
+    // cancellation remains generation-bound.
+    let mut expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
     loop {
         let pump = pump_live_events_until_commit_or_retry(tx, events);
         tokio::pin!(pump);
@@ -1072,6 +1081,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                     tx,
                     session_id,
                     agent_id,
+                    expected_run_id.as_deref(),
                     last_empty_turn_error
                         .as_deref()
                         .unwrap_or("Cursor empty-turn recovery timed out"),
@@ -1107,6 +1117,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                             tx,
                             session_id,
                             agent_id,
+                            expected_run_id.as_deref(),
                             last_empty_turn_error.as_deref().unwrap_or(&error),
                         )
                         .await;
@@ -1135,6 +1146,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                                         tx,
                                         session_id,
                                         agent_id,
+                                        expected_run_id.as_deref(),
                                         last_empty_turn_error
                                             .as_deref()
                                             .unwrap_or(&error),
@@ -1162,6 +1174,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                             tx,
                             session_id,
                             agent_id,
+                            expected_run_id.as_deref(),
                             last_empty_turn_error.as_deref().unwrap_or(&error),
                         )
                         .await;
@@ -1186,6 +1199,7 @@ async fn forward_live_events_with_retries<F, Fut>(
                             tx,
                             session_id,
                             agent_id,
+                            expected_run_id.as_deref(),
                             last_empty_turn_error
                                 .as_deref()
                                 .unwrap_or("Cursor empty-turn recovery timed out"),
@@ -1201,6 +1215,10 @@ async fn forward_live_events_with_retries<F, Fut>(
                         return;
                     }
                 };
+                // `start_after_error` publishes the new handle before it
+                // returns its receiver. Fence future deadline cancellation to
+                // that newly accepted generation.
+                expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
             }
             LivePumpOutcome::Done => return,
         }
@@ -1466,6 +1484,18 @@ fn unresolved_live_tools_outcome(
     }
 }
 
+/// A fresh request may only take over a different live generation when the
+/// driver has already established that generation is no longer serving its
+/// downstream consumer.  Without one of these signals, cancelling the old
+/// run can turn a normal overlapping request into a spurious 502 and lose the
+/// original response.
+fn fresh_request_can_supersede(run: &CursorLiveRunHandle, pending: &[PendingCursorExec]) -> bool {
+    run.is_consumer_gone()
+        || run.is_cancel_requested()
+        || run.is_command_closed()
+        || live_pending_must_supersede(pending)
+}
+
 /// Classify a slot that `get_run` hides. A dying Running generation is
 /// superseded. Ambiguous stays occupied until its TTL and fails closed because
 /// retrying cannot prove whether the prior Run was accepted. A Succeeded
@@ -1476,8 +1506,18 @@ fn resume_when_slot_has_no_runnable_handle(
     agent_id: Option<&str>,
     fingerprint: u64,
     observed_run_id: Option<&str>,
+    has_tool_results: bool,
 ) -> Option<LiveResumeOutcome> {
-    if let Some(run_id) = LiveRunRegistry::running_generation(session_id, agent_id) {
+    // A hidden Running handle is only safe to replace for a fresh request when
+    // its own state proves that it is dying. Tool-result retries retain their
+    // historical stale-generation takeover behavior because the result ids
+    // cannot be delivered to an unknown replacement generation.
+    let replaceable_generation = if has_tool_results {
+        LiveRunRegistry::running_generation(session_id, agent_id)
+    } else {
+        LiveRunRegistry::replaceable_running_generation(session_id, agent_id)
+    };
+    if let Some(run_id) = replaceable_generation {
         // get_run hides cancel-requested / terminal handles. Compact and the
         // next grok turn close the previous SSE first; the dying generation
         // must be superseded, not 409'd.
@@ -1509,7 +1549,10 @@ fn resume_when_slot_has_no_runnable_handle(
     }
     if !LiveRunRegistry::is_occupied_run(session_id, agent_id) {
         if let Some(run_id) = observed_run_id {
-            return Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()));
+            if has_tool_results {
+                return Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()));
+            }
+            return Some(LiveResumeOutcome::ResumeError(live_run_busy_error()));
         }
         return Some(LiveResumeOutcome::Free(None));
     }
@@ -1519,14 +1562,22 @@ fn resume_when_slot_has_no_runnable_handle(
         }
         LiveRunProbe::TerminalError(_) => {
             if let Some(run_id) = observed_run_id {
-                Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
+                if has_tool_results {
+                    Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
+                } else {
+                    Some(LiveResumeOutcome::Free(None))
+                }
             } else {
                 Some(LiveResumeOutcome::Free(None))
             }
         }
         LiveRunProbe::Free => {
             if let Some(run_id) = observed_run_id {
-                Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
+                if has_tool_results {
+                    Some(LiveResumeOutcome::SupersedeRunning(run_id.to_string()))
+                } else {
+                    Some(LiveResumeOutcome::ResumeError(live_run_busy_error()))
+                }
             } else {
                 Some(LiveResumeOutcome::Free(None))
             }
@@ -1597,6 +1648,7 @@ async fn await_live_run_resume_for_operation(
                 agent_id,
                 fingerprint,
                 observed_run_id.as_deref(),
+                has_tool_results,
             ) {
                 return outcome;
             }
@@ -1624,7 +1676,11 @@ async fn await_live_run_resume_for_operation(
             if has_tool_results {
                 return LiveResumeOutcome::ResumeError(live_replacement_conflict_error(true));
             }
-            return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+            let pending = run.pending_tools();
+            if fresh_request_can_supersede(&run, &pending) {
+                return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+            }
+            return LiveResumeOutcome::ResumeError(live_run_busy_error());
         }
         match observed_run_id.as_deref() {
             Some(observed) if observed != run.run_id() => {
@@ -1683,11 +1739,9 @@ async fn await_live_run_resume_for_operation(
             agent_id,
             fingerprint,
             observed_run_id.as_deref(),
+            has_tool_results,
         ) {
             return outcome;
-        }
-        if let Some(run_id) = observed_run_id {
-            return LiveResumeOutcome::SupersedeRunning(run_id);
         }
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     };
@@ -1702,7 +1756,11 @@ async fn await_live_run_resume_for_operation(
         if has_tool_results {
             return LiveResumeOutcome::ResumeError(live_replacement_conflict_error(true));
         }
-        return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+        let pending = run.pending_tools();
+        if fresh_request_can_supersede(&run, &pending) {
+            return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+        }
+        return LiveResumeOutcome::ResumeError(live_run_busy_error());
     }
     match observed_run_id.as_deref() {
         Some(observed) if observed != run.run_id() => {
@@ -1732,7 +1790,10 @@ async fn await_live_run_resume_for_operation(
                 .iter()
                 .map(|exec| exec.tool_use_id.clone())
                 .collect();
-            return unresolved_live_tools_outcome(false, missing, observed_run_id.as_deref());
+            if fresh_request_can_supersede(&run, &pending) {
+                return unresolved_live_tools_outcome(false, missing, observed_run_id.as_deref());
+            }
+            return LiveResumeOutcome::ResumeError(live_run_busy_error());
         }
         match collect_live_tool_results(body, &pending) {
             Ok(tool_results) => match run
@@ -1760,9 +1821,15 @@ async fn await_live_run_resume_for_operation(
             }
         }
     }
-    LiveResumeOutcome::SupersedeRunning(
-        observed_run_id.expect("a live handle established the observed generation"),
-    )
+    if has_tool_results {
+        return LiveResumeOutcome::SupersedeRunning(
+            observed_run_id.expect("a live handle established the observed generation"),
+        );
+    }
+    if fresh_request_can_supersede(&run, &pending) {
+        return LiveResumeOutcome::SupersedeRunning(run.run_id().to_string());
+    }
+    LiveResumeOutcome::ResumeError(live_run_busy_error())
 }
 
 fn env_u64_millis(name: &str, default: u64) -> u64 {
@@ -2014,14 +2081,10 @@ impl Provider for CursorProvider {
         let routed_model =
             crate::providers::cursor::model::apply_effort_to_cursor_model(requested_model, effort);
         let model = routed_model.as_str();
-        let client_type = {
-            let policy = crate::config::cursor_sand_policy();
-            if policy.matches(requested_model) || policy.matches(model) {
-                "sand".to_string()
-            } else {
-                crate::config::cursor_client_type()
-            }
-        };
+        // Resolve Sand from the same request-scoped helper used by the direct
+        // Cursor client.  It checks both the public alias and the concrete
+        // catalog id, which is important for Fable's `[1m]`/thinking aliases.
+        let client_type = crate::config::cursor_client_type_for_model(model);
 
         let resolved = resolve_cursor_model(model);
         if let Err(e) = resolved {

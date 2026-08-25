@@ -3,6 +3,14 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.72 (2026-08-25)
+
+- Route Sand policy checks through resolved Cursor aliases and Fable thinking tiers, so `claude-fable-5[1m]`, `cursor:` forms, and high/low effort variants keep the selected Sand surface.
+- Show `[sand]`/`[cli]` beside Cursor models in the monitor tables and improve the account-usage header contrast, including the Sand quota meter.
+- Harden empty-turn Workflow recovery by stripping serialized tool-result text before checking for a new explicit invocation.
+- Keep healthy Cursor live generations attached when an overlapping fresh request arrives; only disconnected or explicitly dying generations may be replaced, eliminating the first-turn `Cursor live run cancelled` race.
+- Fence empty-turn deadline cancellation to the generation that created the retry loop so a stale retry cannot cancel a newer request in the same session.
+
 ## v0.1.71 (2026-08-25)
 
 - Stop empty Cursor turns from inventing `Workflow(deep-research)` merely because Claude Code advertised the Workflow tool. Synthetic recovery now requires an explicit invocation in the current user turn and ignores historical invocations and tool-result instructions, preventing recursive deep-research loops across ordinary messages.
