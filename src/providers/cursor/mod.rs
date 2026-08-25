@@ -390,14 +390,27 @@ const LIVE_CONFLICT_WAIT_MAX_MS: u64 = 120_000;
 // stay below Claude Code's stream watchdog.  The longer conflict wait above is
 // used only after the streaming response has been handed to the client.
 const LIVE_RESUME_WAIT_DEFAULT_MS: u64 = 5_000;
-const LIVE_RESUME_WAIT_MAX_MS: u64 = 15_000;
+// Both tool-result and nested-request admission happen before the downstream
+// response is committed. Do not allow an environment override to hold a
+// streaming Claude Code request silent beyond its event watchdog.
+const LIVE_RESUME_WAIT_MAX_MS: u64 = 5_000;
+// `await_live_run_resume_for_operation` runs before an HTTP response is
+// committed. Keep its attach probe below the downstream client's idle
+// watchdog; the post-SSE start path uses the longer attach budget above.
+const LIVE_RESUME_ATTACH_WAIT_DEFAULT_MS: u64 = 4_000;
+const LIVE_RESUME_ATTACH_WAIT_MAX_MS: u64 = 5_000;
 const LIVE_NESTED_WAIT_DEFAULT_MS: u64 = 1_500;
-const LIVE_NESTED_WAIT_MAX_MS: u64 = 15_000;
+const LIVE_NESTED_WAIT_MAX_MS: u64 = 5_000;
 
 fn live_run_busy_error() -> CursorError {
     let mut error = CursorError::new(503, LIVE_RUN_BUSY_MESSAGE, None);
     error.retry_after = Some(local_overload_retry_after());
     error
+}
+
+fn live_probe_cursor_error(message: String) -> CursorError {
+    let status = crate::retry::classify_proxy_error_status(502, &message);
+    CursorError::new(status, message, None)
 }
 
 /// A retry of the same logical operation can race the driver while it is
@@ -414,6 +427,26 @@ async fn attach_live_run_with_bounded_wait(
         LIVE_ATTACH_WAIT_DEFAULT_MS,
     )
     .clamp(500, LIVE_ATTACH_WAIT_MAX_MS);
+    attach_live_run_with_wait(run, fingerprint, wait_ms).await
+}
+
+async fn attach_live_run_with_pre_response_wait(
+    run: Arc<CursorLiveRunHandle>,
+    fingerprint: u64,
+) -> Option<mpsc::Receiver<LiveEventResult>> {
+    let wait_ms = env_u64_millis(
+        "CCP_CURSOR_LIVE_RESUME_ATTACH_WAIT_MS",
+        LIVE_RESUME_ATTACH_WAIT_DEFAULT_MS,
+    )
+    .clamp(500, LIVE_RESUME_ATTACH_WAIT_MAX_MS);
+    attach_live_run_with_wait(run, fingerprint, wait_ms).await
+}
+
+async fn attach_live_run_with_wait(
+    run: Arc<CursorLiveRunHandle>,
+    fingerprint: u64,
+    wait_ms: u64,
+) -> Option<mpsc::Receiver<LiveEventResult>> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     loop {
         if run.request_fingerprint() != fingerprint || run.is_completed() || run.is_command_closed()
@@ -635,14 +668,44 @@ async fn start_live_events_with_retries_with_client_type(
                         if let Some(run) =
                             LiveRunRegistry::get_run(identity.session_id, identity.agent_id)
                         {
-                            if run.request_fingerprint() == operation_fingerprint
-                                && let Some(events) = attach_live_run_with_bounded_wait(
+                            if run.request_fingerprint() == operation_fingerprint {
+                                if let Some(events) = attach_live_run_with_bounded_wait(
                                     Arc::clone(&run),
                                     operation_fingerprint,
                                 )
                                 .await
-                            {
-                                return Ok(events);
+                                {
+                                    return Ok(events);
+                                }
+                                // The generation may have completed between
+                                // get_run() and attach_for_operation().
+                                // Reconcile the terminal state before
+                                // surfacing 503, otherwise an identical retry
+                                // loops on "already active" until the
+                                // tombstone expires and loses the replay.
+                                if let Some(events) = LiveRunRegistry::completed_replay_for(
+                                    identity.session_id,
+                                    identity.agent_id,
+                                    operation_fingerprint,
+                                ) {
+                                    return Ok(replay_completed_turn_channel(
+                                        identity.session_id,
+                                        &events,
+                                    ));
+                                }
+                                match LiveRunRegistry::probe_run(
+                                    identity.session_id,
+                                    identity.agent_id,
+                                ) {
+                                    LiveRunProbe::Free => continue,
+                                    LiveRunProbe::TerminalError(error)
+                                        if live_probe_error_blocks_new_run(&error) =>
+                                    {
+                                        return Err(live_probe_cursor_error(error));
+                                    }
+                                    LiveRunProbe::TerminalError(_) => continue,
+                                    LiveRunProbe::Occupied => {}
+                                }
                             }
                             // A different operation while the previous run's
                             // consumer vanished: the client moved on (ESC +
@@ -668,6 +731,27 @@ async fn start_live_events_with_retries_with_client_type(
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
+                        }
+                        // A completed handle can be hidden by get_run(). Give
+                        // the registry one final chance to expose its replay
+                        // or clear a retryable terminal outcome before
+                        // returning local backpressure.
+                        if let Some(events) = LiveRunRegistry::completed_replay_for(
+                            identity.session_id,
+                            identity.agent_id,
+                            operation_fingerprint,
+                        ) {
+                            return Ok(replay_completed_turn_channel(identity.session_id, &events));
+                        }
+                        match LiveRunRegistry::probe_run(identity.session_id, identity.agent_id) {
+                            LiveRunProbe::Free => continue,
+                            LiveRunProbe::TerminalError(error)
+                                if live_probe_error_blocks_new_run(&error) =>
+                            {
+                                return Err(live_probe_cursor_error(error));
+                            }
+                            LiveRunProbe::TerminalError(_) => continue,
+                            LiveRunProbe::Occupied => {}
                         }
                         return Err(live_run_busy_error());
                     }
@@ -1692,9 +1776,29 @@ async fn await_live_run_resume_for_operation(
             // dies — grok-build retries 503 as transient overload and that
             // is the "already active" storm.
             if let Some(events) =
-                attach_live_run_with_bounded_wait(Arc::clone(&run), fingerprint).await
+                attach_live_run_with_pre_response_wait(Arc::clone(&run), fingerprint).await
             {
                 return LiveResumeOutcome::Resumed(events);
+            }
+            // The run can seal its terminal state after the attach waiter
+            // observes the old handle. Reconcile that transition before
+            // returning 503, so an identical retry receives the retained
+            // segment (or the real terminal error) instead of entering an
+            // "already active" retry loop.
+            if let Some(events) =
+                LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint)
+            {
+                return LiveResumeOutcome::Resumed(replay_completed_turn_channel(
+                    session_id, &events,
+                ));
+            }
+            match LiveRunRegistry::probe_run(session_id, agent_id) {
+                LiveRunProbe::Free => return LiveResumeOutcome::Free(None),
+                LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
+                    return LiveResumeOutcome::TerminalError(error);
+                }
+                LiveRunProbe::TerminalError(_) => return LiveResumeOutcome::Free(None),
+                LiveRunProbe::Occupied => {}
             }
             return LiveResumeOutcome::ResumeError(live_run_busy_error());
         }
@@ -1775,9 +1879,23 @@ async fn await_live_run_resume_for_operation(
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     };
     if run.request_fingerprint() == fingerprint {
-        if let Some(events) = attach_live_run_with_bounded_wait(Arc::clone(&run), fingerprint).await
+        if let Some(events) =
+            attach_live_run_with_pre_response_wait(Arc::clone(&run), fingerprint).await
         {
             return LiveResumeOutcome::Resumed(events);
+        }
+        if let Some(events) =
+            LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint)
+        {
+            return LiveResumeOutcome::Resumed(replay_completed_turn_channel(session_id, &events));
+        }
+        match LiveRunRegistry::probe_run(session_id, agent_id) {
+            LiveRunProbe::Free => return LiveResumeOutcome::Free(None),
+            LiveRunProbe::TerminalError(error) if live_probe_error_blocks_new_run(&error) => {
+                return LiveResumeOutcome::TerminalError(error);
+            }
+            LiveRunProbe::TerminalError(_) => return LiveResumeOutcome::Free(None),
+            LiveRunProbe::Occupied => {}
         }
         return LiveResumeOutcome::ResumeError(live_run_busy_error());
     }
@@ -4110,6 +4228,21 @@ mod tests {
             !commit_streaming_live_sse_before_start_live(false, false),
             "non-streaming JSON collection still waits for the live run"
         );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn pre_response_live_waits_stay_below_client_idle_watchdog() {
+        // These waits run before `live_sse_response` can emit its heartbeat.
+        // Keep every default and environment clamp within the 10s Claude Code
+        // event-watchdog budget, with headroom for scheduling and serialization.
+        const CLAUDE_CODE_EVENT_WATCHDOG_MS: u64 = 10_000;
+        assert!(LIVE_RESUME_WAIT_DEFAULT_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
+        assert!(LIVE_RESUME_WAIT_MAX_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
+        assert!(LIVE_NESTED_WAIT_DEFAULT_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
+        assert!(LIVE_NESTED_WAIT_MAX_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
+        assert!(LIVE_RESUME_ATTACH_WAIT_DEFAULT_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
+        assert!(LIVE_RESUME_ATTACH_WAIT_MAX_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
     }
 
     #[tokio::test]

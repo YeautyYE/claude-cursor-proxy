@@ -2309,11 +2309,22 @@ impl LiveRunRegistry {
         let key = live_run_key(session_id, agent_id);
         let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune_finished(&mut runs);
-        let (error, sealed_fingerprint) = match runs.runs.get(&key) {
-            Some(LiveRunEntry::Running(handle)) if handle.is_completed() => {
-                (handle.take_terminal_error(), handle.request_fingerprint())
+        let (error, sealed_fingerprint, owner_token) = match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(handle))
+                if handle.is_completed() || handle.is_command_closed() =>
+            {
+                let error = handle.take_terminal_error().or_else(|| {
+                    handle
+                        .is_command_closed()
+                        .then(|| live_control_close_message(true).to_string())
+                });
+                (
+                    error,
+                    handle.request_fingerprint(),
+                    handle.run_id().to_string(),
+                )
             }
-            _ => (None, 0),
+            _ => (None, 0, String::new()),
         };
         if let Some(error) = error {
             // Plain policy 429s are not same-request-retryable and not
@@ -2325,12 +2336,14 @@ impl LiveRunRegistry {
             }
             if terminal_error_is_ambiguous_accept(&error) {
                 runs.insert_key(
-                    key,
+                    key.clone(),
                     LiveRunEntry::Ambiguous {
                         until: Instant::now() + LIVE_AMBIGUOUS_OPEN_TTL,
                         fingerprint: sealed_fingerprint,
                     },
                 );
+                drop(runs);
+                persist_ambiguous_operation(&key, sealed_fingerprint, &owner_token, &error);
             } else {
                 runs.remove_key(&key);
             }
@@ -14557,6 +14570,24 @@ mod tests {
         })
     }
 
+    fn connected_dummy_handle(
+        run_id: &str,
+    ) -> (Arc<CursorLiveRunHandle>, mpsc::Receiver<RunCommand>) {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: run_id.into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        (handle, command_rx)
+    }
+
     fn lock_live_registry_for_test() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -15044,9 +15075,10 @@ mod tests {
         let _registry = lock_live_registry_for_test();
         let session = format!("running-start-busy-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
+        let (handle, _command_rx_guard) = connected_dummy_handle("running-generation");
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
-            .insert(dummy_handle("running-generation"))
+            .insert(handle)
             .expect("insert running");
 
         let error = super::super::start_live_events_with_retries(
@@ -15172,6 +15204,7 @@ mod tests {
         let session = format!("result-starting-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
         let reservation = LiveRunRegistry::reserve(&session).expect("reserve starting run");
+        let (run, _command_rx_guard) = connected_dummy_handle("starting-generation");
         let body: crate::anthropic::schema::MessagesRequest =
             serde_json::from_value(serde_json::json!({
                 "model": "claude-fable-5",
@@ -15186,7 +15219,6 @@ mod tests {
 
         let running = async {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            let run = dummy_handle("starting-generation");
             run.set_request_fingerprint(live_request_fingerprint(
                 &serde_json::to_vec(&body.messages).unwrap_or_default(),
             ));
@@ -15447,7 +15479,21 @@ mod tests {
         let _registry = lock_live_registry_for_test();
         let session = format!("dying-compact-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
-        let handle = dummy_handle("dying-compact-generation");
+        let (command_tx, command_rx) = mpsc::channel(1);
+        // Keep the control channel open: this fixture models a cancellation
+        // requested while the live driver is still winding down.
+        let _command_rx_guard = command_rx;
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "dying-compact-generation".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
             .insert(Arc::clone(&handle))
@@ -15497,6 +15543,42 @@ mod tests {
         };
         assert_eq!(superseded.run_id(), "dying-compact-generation");
         assert!(LiveRunRegistry::is_starting_run(&session, None));
+        reservation.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn closed_live_control_channel_is_sealed_as_ambiguous() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("closed-control-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let handle = dummy_handle("closed-control-generation");
+        handle.set_request_fingerprint(77);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert closed run");
+
+        let LiveRunProbe::TerminalError(error) = LiveRunRegistry::probe_run(&session, None) else {
+            panic!("a closed control channel must be terminal, not occupied");
+        };
+        assert!(
+            error.contains("completion is ambiguous"),
+            "closed control channel must fail closed: {error}"
+        );
+        assert!(LiveRunRegistry::is_ambiguous_for_operation(
+            &session, None, 77
+        ));
+        assert!(matches!(
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 77),
+            LiveSlotClaim::Ambiguous
+        ));
+
+        let LiveSlotClaim::Reserved(reservation) =
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 78)
+        else {
+            panic!("a new operation must release the stale ambiguous generation");
+        };
         reservation.release();
         LiveRunRegistry::clear();
     }
@@ -15908,7 +15990,7 @@ mod tests {
         let body = compact_turn_body();
         let fingerprint =
             live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
-        let handle = dummy_handle("identical-running-generation");
+        let (handle, _command_rx_guard) = connected_dummy_handle("identical-running-generation");
         handle.set_request_fingerprint(fingerprint);
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -15926,7 +16008,6 @@ mod tests {
             true,
         )
         .await;
-
         let super::super::LiveResumeOutcome::ResumeError(error) = outcome else {
             panic!("an identical HTTP retry must wait for the existing generation");
         };

@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.74 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.75 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -346,9 +346,10 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `8` | Protected start capacity for non-Grok models (Gemini/Claude/… subagents); interactive starts may also borrow idle bulk slots, but bulk never borrows the reserve (0–32) |
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | Maximum local admission wait before retryable HTTP 503 (1–300s) |
 | `CCP_CURSOR_LIVE_ATTACH_WAIT_MS` | `15000` | Same-operation attach handoff wait before local busy is returned (500–60000ms) |
+| `CCP_CURSOR_LIVE_RESUME_ATTACH_WAIT_MS` | `4000` | Pre-response same-operation attach wait (500–5000ms); kept below the Claude Code stream watchdog |
 | `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `30000` | Wait for a different operation to observe the current session Run advance (500–120000ms) |
-| `CCP_CURSOR_LIVE_RESUME_WAIT_MS` | `5000` | Pre-response tool-result handoff wait; kept below the client stream watchdog (500–15000ms) |
-| `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | Pre-response nested-agent handoff wait (500–15000ms) |
+| `CCP_CURSOR_LIVE_RESUME_WAIT_MS` | `5000` | Pre-response tool-result handoff wait; kept below the client stream watchdog (500–5000ms) |
+| `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | Pre-response nested-agent handoff wait (500–5000ms) |
 | `CCP_CURSOR_RESOURCE_RETRIES` | `6` | Same-request retries for transient Cursor `ERROR_RESOURCE_EXHAUSTED` responses (1–12); billing/quota/capacity policy 429s are never hidden-retried |
 | `CCP_CURSOR_STEP_FAILURE_RETRIES` | `4` | Same-request retries for pre-output Cursor `Failed to run step, exceeded max retries` failures (1–8); post-output failures are forwarded |
 | `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | Additional capacity reserved for paused Runs that need to submit tool results (0–16) |
@@ -424,7 +425,7 @@ discovery, and usage guide.
 | Claude Code Bash widget titles a giant `python3 -c` script | Update to ≥0.1.48 and restart serve. Cursor Shell has no description; the proxy now fills a short one-line title. |
 | 45s 502 `idle timeout` / `0 response bytes` | Update to ≥0.1.39 and restart serve. Still set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`. Clash/Surge TUN: DIRECT `*.cursor.sh`. Optional: `CCP_CURSOR_HTTP1=1` |
 | `Stream idle timeout - no chunks received`, especially on the first turn or before a background tool result resumes | Update to the current release and restart serve. `/v1/messages` commits the Anthropic SSE lifecycle before Cursor live open, so the client receives bytes immediately and emits a watchdog-safe `message_delta` + `ping` heartbeat every 5s by default. Pre-output Cursor open/step failures stay inside the bounded retry loop; `/v1/responses` intentionally keeps held-HTTP mapping for `response.failed`. |
-| Claude Code shows `Cursor live run cancelled` and the turn stops | Update to ≥0.1.74 and restart serve. A resolved cancellation before the first text/tool event is retried inside the same SSE request; cancellation reports that include unresolved/ambiguous acceptance are kept fail-closed to prevent duplicate tool execution. |
+| Claude Code shows `Cursor live run cancelled` or repeatedly reports `A Cursor live run is already active` after `/compact` | Update to ≥0.1.75 and restart serve. Resolved pre-output cancellation is retried inside the same SSE request; completed runs are replayed after an attach race, and a closed unresolved driver is sealed once so the next operation can proceed without a persistent 503 loop. |
 | 502 `Image not found [internal]` on a text-only turn | Update to ≥0.1.40 and restart serve, then retry the same message once (the poisoned conversation checkpoint is cleared on that error). A new Claude Code session also works. |
 | 502 `Conversation data missing` / `missing blobs` and the session cannot recover | Update to ≥0.1.45 and restart serve, then retry the same message. The failed turn now resets the unrecoverable Cursor conversation binding; the first retry replays full history in a fresh Cursor conversation without requiring a new Claude Code chat. |
 | 400 `Missing tool_result blocks for pending tools` after an interrupted turn / with background shells | Update to ≥0.1.45 and restart serve. A new request without current-turn tool results now supersedes the abandoned live turn; partial tool-result batches are still rejected. |

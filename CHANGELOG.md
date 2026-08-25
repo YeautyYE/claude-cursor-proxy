@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.75 (2026-08-26)
+
+- Reconcile a live generation after attach handoff: completed replay, retryable terminal state, and closed control channels are now observed before returning local busy. This breaks the persistent `A Cursor live run is already active` loop that could strand Claude Code after `/compact`.
+- Seal a driver whose control channel closes before completion as an ambiguous, fingerprint-bound tombstone and persist the marker, preventing duplicate execution while allowing a later operation to take over after the stale generation is retired.
+- Keep pre-response same-operation attach waits below the Claude Code stream watchdog (`CCP_CURSOR_LIVE_RESUME_ATTACH_WAIT_MS`, default 4s, maximum 5s); post-SSE live handoff retains its longer recovery budget.
+
 ## v0.1.74 (2026-08-25)
 
 - Keep the Claude Code tool contract aligned with the actual Cursor MCP catalog: remove synthetic provider-prefixed names, restore 64-character MCP aliases, deduplicate registrations, and filter internal/deprecated hook tools from the model-facing surface.
