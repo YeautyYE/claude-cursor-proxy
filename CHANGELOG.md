@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.77 (2026-08-26)
+
+- Keep the durable operation ledger owner bound to the superseded Cursor Run while a Grok replacement is waiting for cancellation. If that handoff future is dropped, the existing `Dispatched` marker is now sealed as a scoped ambiguous operation instead of stranding the session in repeated 409 responses.
+- Reset ownership to the fresh reservation only after definitive cancellation and add regression coverage for durable replacement teardown and next-operation rotation.
+
 ## v0.1.76 (2026-08-26)
 
 - Bind replacement reservations and live handles to the superseded operation fingerprint before cancellation teardown. An ambiguous compact/next-turn handoff can no longer create a zero-fingerprint tombstone that blocks every later Grok 4.6 request with 409.

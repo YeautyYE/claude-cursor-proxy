@@ -1448,6 +1448,15 @@ static LIVE_RUNS: LazyLock<Mutex<LiveRunMap>> = LazyLock::new(|| Mutex::new(Live
 pub struct LiveRunReservation {
     session_id: String,
     reservation_id: String,
+    /// Durable ledger owner while this reservation is replacing a live Run.
+    ///
+    /// A replacement keeps the previous Run's ledger record until its
+    /// cancellation reaches a definitive boundary.  During that window the
+    /// record is still owned by the previous `run_id`, not by this fresh
+    /// reservation UUID.  Carrying that owner lets `Drop` seal the record if
+    /// the cancellation future is abandoned instead of silently leaving a
+    /// Dispatched marker behind.
+    durable_owner_token: String,
     committed: bool,
     seal_on_drop: Arc<AtomicBool>,
     cancel: watch::Sender<bool>,
@@ -1479,6 +1488,18 @@ impl LiveUpstreamOpenGuard {
 }
 
 impl LiveRunReservation {
+    fn durable_owner_token(&self) -> &str {
+        &self.durable_owner_token
+    }
+
+    fn set_durable_owner_token(&mut self, owner_token: &str) {
+        self.durable_owner_token = owner_token.to_string();
+    }
+
+    fn reset_durable_owner_token(&mut self) {
+        self.durable_owner_token = self.reservation_id.clone();
+    }
+
     pub fn cancelled(&self) -> watch::Receiver<bool> {
         self.cancel.subscribe()
     }
@@ -1505,7 +1526,7 @@ impl LiveRunReservation {
             dispatched: Arc::clone(&self.seal_on_drop),
             operation_key: self.session_id.clone(),
             fingerprint: self.operation_fingerprint,
-            owner_token: self.reservation_id.clone(),
+            owner_token: self.durable_owner_token.clone(),
         })
     }
 
@@ -1517,7 +1538,7 @@ impl LiveRunReservation {
         super::operation_ledger::claim(
             &self.session_id,
             self.operation_fingerprint,
-            &self.reservation_id,
+            self.durable_owner_token(),
         )
     }
 
@@ -1540,7 +1561,7 @@ impl LiveRunReservation {
             clear_durable_operation(
                 &self.session_id,
                 self.operation_fingerprint,
-                &self.reservation_id,
+                self.durable_owner_token(),
             );
         }
         self.committed = true;
@@ -1573,7 +1594,7 @@ impl LiveRunReservation {
             persist_ambiguous_operation(
                 &key,
                 self.operation_fingerprint,
-                &self.reservation_id,
+                self.durable_owner_token(),
                 "Cursor live open acceptance is ambiguous",
             );
         }
@@ -1621,7 +1642,7 @@ impl LiveRunReservation {
             persist_ambiguous_operation(
                 &self.session_id,
                 self.operation_fingerprint,
-                &self.reservation_id,
+                self.durable_owner_token(),
                 "Cursor live Run opened after its reservation owner changed; completion is ambiguous",
             );
             self.committed = true;
@@ -1631,7 +1652,7 @@ impl LiveRunReservation {
         let transferred = super::operation_ledger::transfer_owner_if(
             &self.session_id,
             self.operation_fingerprint,
-            &self.reservation_id,
+            self.durable_owner_token(),
             handle.run_id(),
         );
         if !matches!(transferred, Ok(true)) {
@@ -1649,7 +1670,7 @@ impl LiveRunReservation {
             persist_ambiguous_operation(
                 &self.session_id,
                 self.operation_fingerprint,
-                &self.reservation_id,
+                self.durable_owner_token(),
                 "Cursor Run opened but durable ownership transfer failed; completion is ambiguous",
             );
             self.committed = true;
@@ -1726,14 +1747,14 @@ impl Drop for LiveRunReservation {
             persist_ambiguous_operation(
                 &key,
                 self.operation_fingerprint,
-                &self.reservation_id,
+                self.durable_owner_token(),
                 "Cursor live request owner was dropped after upstream dispatch; completion is ambiguous",
             );
         } else if clear_marker {
             clear_durable_operation(
                 &self.session_id,
                 self.operation_fingerprint,
-                &self.reservation_id,
+                self.durable_owner_token(),
             );
         }
     }
@@ -1973,6 +1994,11 @@ impl LiveRunRegistry {
                         // never create an unscoped (zero-fingerprint)
                         // ambiguous tombstone.
                         reservation.set_operation_fingerprint(previous_fingerprint);
+                        // The durable record is still owned by the old Run
+                        // until cancellation succeeds. Carry that token
+                        // through the protected teardown window so an
+                        // abandoned request can seal the existing marker.
+                        reservation.set_durable_owner_token(handle.run_id());
                         LiveReplacementClaim::Reserved {
                             reservation,
                             superseded: Some(handle),
@@ -2057,6 +2083,11 @@ pub(crate) fn finish_replacement_after_cancel(
                 handle.request_fingerprint(),
                 handle.run_id(),
             );
+            // The old Run's token was needed only while cancellation was in
+            // flight.  A fresh operation must claim the ledger under this
+            // reservation's own token so late cleanup from the superseded Run
+            // cannot mutate the replacement record.
+            reservation.reset_durable_owner_token();
             reservation.disarm_on_drop();
             Ok(reservation)
         }
@@ -2068,6 +2099,7 @@ pub(crate) fn finish_replacement_after_cancel(
             // into a process-wide blocker for every later operation in the
             // same session (the Grok 409 storm after compact).
             reservation.set_operation_fingerprint(handle.request_fingerprint());
+            reservation.set_durable_owner_token(handle.run_id());
             persist_ambiguous_operation(
                 &reservation.session_id,
                 handle.request_fingerprint(),
@@ -2096,7 +2128,8 @@ impl LiveRunRegistry {
         );
         Some(LiveRunReservation {
             session_id: key,
-            reservation_id,
+            reservation_id: reservation_id.clone(),
+            durable_owner_token: reservation_id,
             committed: false,
             seal_on_drop: Arc::new(AtomicBool::new(false)),
             cancel,
@@ -14812,6 +14845,73 @@ mod tests {
     }
 
     #[test]
+    fn dropped_replacement_seals_the_superseded_durable_owner() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
+        let session = format!("replacement-drop-owner-{}", uuid::Uuid::new_v4());
+        let key = live_run_key(&session, None);
+        LiveRunRegistry::clear();
+
+        // Establish the same durable state as an accepted live Run: the
+        // reservation owner is transferred to the Cursor run id at insert.
+        let mut initial = LiveRunRegistry::reserve(&session).expect("initial reserve");
+        initial.set_operation_fingerprint(77);
+        assert_eq!(
+            initial.begin_durable_operation(),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        assert!(
+            super::super::operation_ledger::mark_dispatched_if_owner(
+                &key,
+                77,
+                initial.durable_owner_token(),
+            )
+            .unwrap()
+        );
+        let old = dummy_handle("superseded-run");
+        old.set_request_fingerprint(77);
+        initial.insert(Arc::clone(&old)).expect("insert old run");
+
+        let LiveReplacementClaim::Reserved {
+            reservation,
+            superseded: Some(_superseded),
+        } = LiveRunRegistry::claim_replacement_for_run(&session, None, old.run_id())
+        else {
+            panic!("accepted run must be replaceable");
+        };
+        assert_eq!(reservation.durable_owner_token(), old.run_id());
+
+        // Simulate cancellation wait being abandoned while the replacement is
+        // protected. Drop must update the existing Dispatched record through
+        // the superseded run owner; using the fresh reservation UUID would
+        // fail the owner check and leave the marker permanently Dispatched.
+        reservation.protect_on_drop();
+        drop(reservation);
+        assert!(matches!(
+            super::super::operation_ledger::admit(&key, 77),
+            super::super::operation_ledger::OperationAdmission::Ambiguous(_)
+        ));
+
+        // A different operation can atomically rotate a known ambiguous
+        // marker. This is the distinguishing assertion: an uncleared
+        // Dispatched marker would reject this claim as Ambiguous.
+        let mut next =
+            LiveRunRegistry::claim_ambiguous_release_for_new_operation(&session, None, 88)
+                .expect("new operation should replace scoped tombstone");
+        next.set_operation_fingerprint(88);
+        assert_eq!(
+            next.begin_durable_operation(),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        next.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
     fn success_tombstone_blocks_identical_retry_but_allows_a_new_prompt() {
         let _registry = lock_live_registry_for_test();
         let session = format!("success-tombstone-{}", uuid::Uuid::new_v4());
@@ -15010,6 +15110,7 @@ mod tests {
             // Real reservations always carry the registry run key.
             session_id: live_run_key(&session, None),
             reservation_id: "stale".into(),
+            durable_owner_token: "stale".into(),
             committed: false,
             seal_on_drop: Arc::new(AtomicBool::new(false)),
             cancel,
