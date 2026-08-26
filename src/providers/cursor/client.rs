@@ -167,15 +167,23 @@ impl CursorHttpClient {
     ///
     /// Prefers Connect JSON (same as official CLI `agent models`); falls back to
     /// Connect protobuf unary when JSON fails. Results are cached in-process for
-    /// ~5 minutes via [`super::model::store_live_usable_models`].
+    /// ~5 minutes and partitioned by the active Cursor account.
     pub async fn fetch_usable_models(&self, token: &str) -> Result<Vec<String>, CursorError> {
+        // Capture the account generation before the network request. Auth can
+        // be hot-swapped by another process while this request is in flight;
+        // the generation-aware store below then drops a stale completion.
+        let account_generation = super::model::observe_live_usable_models_account(token);
         if let Some(cached) = super::model::cached_live_usable_models_for_account(token) {
             return Ok(cached);
         }
 
         match self.fetch_usable_models_json(token).await {
             Ok(models) if !models.is_empty() => {
-                super::model::store_live_usable_models_for_account(token, models.clone());
+                super::model::store_live_usable_models_for_account_at_generation(
+                    token,
+                    account_generation,
+                    models.clone(),
+                );
                 return Ok(models);
             }
             Ok(_) => { /* empty — try proto */ }
@@ -184,7 +192,11 @@ impl CursorHttpClient {
 
         let models = self.fetch_usable_models_proto(token).await?;
         if !models.is_empty() {
-            super::model::store_live_usable_models_for_account(token, models.clone());
+            super::model::store_live_usable_models_for_account_at_generation(
+                token,
+                account_generation,
+                models.clone(),
+            );
         }
         Ok(models)
     }

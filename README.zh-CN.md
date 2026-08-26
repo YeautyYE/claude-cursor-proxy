@@ -279,6 +279,7 @@ export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 代理启动会调用 `GetUsableModels`，请求 `GET /v1/models` 时也会刷新；账号
 返回的实时 catalog 会合并到 TUI 和模型列表。你仍可以按 `a` 填写任意精确
 ID，或直接写入环境变量，但当前 Cursor 账号必须在上游目录中提供该模型。
+热切换账号或登出会立即清掉旧目录；切换前账号的并发目录请求完成后也不会回写。
 
 ### 账号用量
 

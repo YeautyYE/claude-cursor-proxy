@@ -288,6 +288,8 @@ login, the proxy fetches `GetUsableModels` at startup and refreshes it when
 `GET /v1/models` is requested. The returned account catalog is merged into the
 TUI and the model list. You can still add an exact id with `a` or set it in the
 environment, but the signed-in Cursor account must expose that model upstream.
+The catalog is invalidated on a hot account switch/logout, and an in-flight
+response from the previous account is discarded.
 
 ### Account usage
 

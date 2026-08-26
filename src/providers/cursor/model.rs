@@ -378,27 +378,62 @@ struct LiveCatalogSnapshot {
     models: Vec<String>,
 }
 
-fn live_catalog_cache() -> &'static std::sync::Mutex<Option<LiveCatalogSnapshot>> {
+#[derive(Debug, Default)]
+struct LiveCatalogCache {
+    /// Account currently observed by the auth loader. Keeping this separate
+    /// from the snapshot prevents an old in-flight fetch from repopulating the
+    /// cache after a hot account switch.
+    active_account_key: Option<String>,
+    /// Monotonic (wrapping) generation for the active-account identity. A
+    /// fetch captures this value before going over the network; if auth is
+    /// switched while it is in flight, the completion is discarded even when
+    /// the account later switches back to the same token.
+    generation: u64,
+    snapshot: Option<LiveCatalogSnapshot>,
+}
+
+fn live_catalog_cache() -> &'static std::sync::Mutex<LiveCatalogCache> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<LiveCatalogSnapshot>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+    static CACHE: OnceLock<Mutex<LiveCatalogCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LiveCatalogCache::default()))
 }
 
 const LIVE_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Store a freshly fetched GetUsableModels catalog (5-minute TTL).
 pub fn store_live_usable_models(models: Vec<String>) {
-    store_live_usable_models_with_key(String::new(), models);
-}
-
-/// Store a freshly fetched catalog for the bearer that produced it.
-pub(crate) fn store_live_usable_models_for_account(token: &str, models: Vec<String>) {
-    store_live_usable_models_with_key(account_catalog_key(token), models);
-}
-
-fn store_live_usable_models_with_key(account_key: String, models: Vec<String>) {
     if let Ok(mut guard) = live_catalog_cache().lock() {
-        *guard = Some(LiveCatalogSnapshot {
+        // This legacy helper has no account identity. It is safe only before
+        // the auth loader has observed an account; account-aware fetches use
+        // `store_live_usable_models_for_account_at_generation` below.
+        if guard.active_account_key.is_some() {
+            return;
+        }
+        guard.snapshot = Some(LiveCatalogSnapshot {
+            fetched_at: std::time::Instant::now(),
+            account_key: String::new(),
+            models,
+        });
+    }
+}
+
+/// Store a catalog only when the account identity has remained unchanged
+/// since the fetch began. This is used by the asynchronous HTTP client; the
+/// generation check closes the A -> B -> A switch race that an account-key
+/// comparison alone cannot detect.
+pub(crate) fn store_live_usable_models_for_account_at_generation(
+    token: &str,
+    generation: u64,
+    models: Vec<String>,
+) {
+    let account_key = account_catalog_key(token);
+    if let Ok(mut guard) = live_catalog_cache().lock() {
+        if guard.active_account_key.as_deref() != Some(account_key.as_str())
+            || guard.generation != generation
+        {
+            return;
+        }
+        guard.snapshot = Some(LiveCatalogSnapshot {
             fetched_at: std::time::Instant::now(),
             account_key,
             models,
@@ -406,10 +441,49 @@ fn store_live_usable_models_with_key(account_key: String, models: Vec<String>) {
     }
 }
 
+/// Mark the account whose credentials are currently active. Switching or
+/// logging out immediately retires the previous catalog snapshot.
+pub(crate) fn observe_live_usable_models_account(token: &str) -> u64 {
+    let account_key = account_catalog_key(token);
+    if let Ok(mut guard) = live_catalog_cache().lock() {
+        if guard.active_account_key.as_deref() != Some(account_key.as_str()) {
+            guard.active_account_key = Some(account_key);
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.snapshot = None;
+        }
+        return guard.generation;
+    }
+    // A poisoned cache is treated as a new generation. Callers still proceed
+    // with the request, while the normal lock-recovery path prevents stale
+    // data from being returned.
+    0
+}
+
+/// Clear account identity and any catalog when authentication disappears.
+pub(crate) fn clear_live_usable_models_account() {
+    if let Ok(mut guard) = live_catalog_cache().lock() {
+        if guard.active_account_key.is_some() || guard.snapshot.is_some() {
+            guard.generation = guard.generation.wrapping_add(1);
+        }
+        guard.active_account_key = None;
+        guard.snapshot = None;
+    }
+}
+
 /// Return cached live model ids if still within TTL.
 pub fn cached_live_usable_models() -> Option<Vec<String>> {
     let guard = live_catalog_cache().lock().ok()?;
-    let snapshot = guard.as_ref()?;
+    let snapshot = guard.snapshot.as_ref()?;
+    if let Some(active) = guard.active_account_key.as_deref()
+        && snapshot.account_key != active
+    {
+        return None;
+    }
+    // An account-keyed snapshot must never be visible after logout/unknown
+    // auth. The empty key is reserved for the legacy pre-auth helper.
+    if guard.active_account_key.is_none() && !snapshot.account_key.is_empty() {
+        return None;
+    }
     (snapshot.fetched_at.elapsed() < LIVE_CATALOG_TTL).then(|| snapshot.models.clone())
 }
 
@@ -418,8 +492,10 @@ pub fn cached_live_usable_models() -> Option<Vec<String>> {
 /// preferable to presenting another account's model entitlements.
 pub(crate) fn cached_live_usable_models_for_account(token: &str) -> Option<Vec<String>> {
     let guard = live_catalog_cache().lock().ok()?;
-    let snapshot = guard.as_ref()?;
-    if snapshot.account_key != account_catalog_key(token)
+    let snapshot = guard.snapshot.as_ref()?;
+    let account_key = account_catalog_key(token);
+    if guard.active_account_key.as_deref() != Some(account_key.as_str())
+        || snapshot.account_key != account_key
         || snapshot.fetched_at.elapsed() >= LIVE_CATALOG_TTL
     {
         return None;
@@ -480,6 +556,17 @@ pub fn cursor_anthropic_surface_models() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The live catalog is process-global; serialize tests that mutate it so
+    // parallel test execution cannot make one account's snapshot look stale.
+    fn cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        CACHE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 
     #[test]
     fn fable_thinking_max_gets_thinking_effort_context_params() {
@@ -740,28 +827,97 @@ mod tests {
 
     #[test]
     fn live_catalog_cache_does_not_cross_account_switches() {
-        use std::sync::{Mutex, OnceLock};
-        static CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = CACHE_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _guard = cache_test_guard();
 
-        store_live_usable_models_for_account("account-a-token", vec!["gemini-a".into()]);
+        clear_live_usable_models_account();
+        let account_a_generation = observe_live_usable_models_account("account-a-token");
+        store_live_usable_models_for_account_at_generation(
+            "account-a-token",
+            account_a_generation,
+            vec!["gemini-a".into()],
+        );
         assert_eq!(
             cached_live_usable_models_for_account("account-a-token"),
             Some(vec!["gemini-a".into()])
         );
+
+        let account_b_generation = observe_live_usable_models_account("account-b-token");
         assert!(
             cached_live_usable_models_for_account("account-b-token").is_none(),
-            "a switched account must not reuse the previous account's model catalog"
+            "switching accounts must retire the previous snapshot before refetch"
+        );
+        assert!(
+            cached_live_usable_models().is_none(),
+            "unkeyed listing must not expose the previous account's catalog"
         );
 
-        store_live_usable_models_for_account("account-b-token", vec!["gemini-b".into()]);
+        // A response started under account A can finish after the switch; it
+        // must not repopulate the account-B cache.
+        store_live_usable_models_for_account_at_generation(
+            "account-a-token",
+            account_a_generation,
+            vec!["stale-a".into()],
+        );
+        assert!(cached_live_usable_models().is_none());
+
+        store_live_usable_models_for_account_at_generation(
+            "account-b-token",
+            account_b_generation,
+            vec!["gemini-b".into()],
+        );
         assert_eq!(
             cached_live_usable_models_for_account("account-b-token"),
             Some(vec!["gemini-b".into()])
         );
+        assert_eq!(cached_live_usable_models(), Some(vec!["gemini-b".into()]));
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn stale_catalog_completion_is_rejected_after_account_switch_back() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        let generation_a = observe_live_usable_models_account("account-a-token");
+        let _generation_b = observe_live_usable_models_account("account-b-token");
+        let generation_a_again = observe_live_usable_models_account("account-a-token");
+        assert_ne!(
+            generation_a, generation_a_again,
+            "each account identity transition must advance the cache generation"
+        );
+
+        // The first A request completed after A -> B -> A. A key-only check
+        // would incorrectly accept this response; the captured generation
+        // must reject it.
+        store_live_usable_models_for_account_at_generation(
+            "account-a-token",
+            generation_a,
+            vec!["stale-a".into()],
+        );
+        assert!(cached_live_usable_models().is_none());
+
+        store_live_usable_models_for_account_at_generation(
+            "account-a-token",
+            generation_a_again,
+            vec!["fresh-a".into()],
+        );
+        assert_eq!(cached_live_usable_models(), Some(vec!["fresh-a".into()]));
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn unkeyed_catalog_is_not_visible_after_account_observation() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        store_live_usable_models(vec!["legacy-model".into()]);
+        assert_eq!(
+            cached_live_usable_models(),
+            Some(vec!["legacy-model".into()])
+        );
+        observe_live_usable_models_account("account-a-token");
+        assert!(cached_live_usable_models().is_none());
+        clear_live_usable_models_account();
     }
 
     #[test]

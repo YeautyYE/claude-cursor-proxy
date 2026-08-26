@@ -12,7 +12,9 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 - Keep compaction identity stable across `xai-compact-*` retries and derive a
   deterministic lane for `compact_20260112` requests without an xAI id.
 - Scope the dynamically fetched Cursor model catalog to the account that
-  fetched it, so a hot account switch cannot expose stale entitlements.
+  fetched it, invalidate it immediately on hot account switch/logout, and
+  reject stale in-flight catalog responses so old entitlements cannot leak
+  into TUI or `/v1/models` discovery.
 
 ## v0.1.80 (2026-08-26)
 

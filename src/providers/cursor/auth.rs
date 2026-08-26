@@ -229,32 +229,46 @@ pub fn file_store() -> CursorTokenStore<DefaultCursorAuthStore> {
 }
 
 pub fn load_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
-    if let Some(token) = env_cursor_token() {
-        return Ok(Some(enrich(
-            StoredCursorAuth {
-                access_token: token,
-                refresh_token: None,
-                api_key: None,
-            },
-            "environment".to_string(),
-        )));
+    let result = (|| {
+        if let Some(token) = env_cursor_token() {
+            return Ok(Some(enrich(
+                StoredCursorAuth {
+                    access_token: token,
+                    refresh_token: None,
+                    api_key: None,
+                },
+                "environment".to_string(),
+            )));
+        }
+        if let Some(auth) = file_store().load_auth()? {
+            return Ok(Some(auth));
+        }
+        // Optional: reuse official Cursor CLI keychain when proxy store is empty.
+        if cli_keychain_fallback_enabled()
+            && let Some(auth) = load_official_cli_keychain_auth()?
+        {
+            return Ok(Some(auth));
+        }
+        // Non-macOS / file-store CLI credentials (~/.config/cursor/auth.json).
+        if cli_keychain_fallback_enabled()
+            && let Some(auth) = load_official_cli_auth_json()?
+        {
+            return Ok(Some(auth));
+        }
+        Ok(None)
+    })();
+
+    // Keep model discovery aligned with the credentials used by requests. A
+    // hot account switch retires the old catalog before any unkeyed listing
+    // helper (TUI/registry) can read it.
+    match &result {
+        Ok(Some(auth)) => {
+            crate::providers::cursor::model::observe_live_usable_models_account(&auth.access_token);
+        }
+        Ok(None) => crate::providers::cursor::model::clear_live_usable_models_account(),
+        Err(_) => {}
     }
-    if let Some(auth) = file_store().load_auth()? {
-        return Ok(Some(auth));
-    }
-    // Optional: reuse official Cursor CLI keychain when proxy store is empty.
-    if cli_keychain_fallback_enabled()
-        && let Some(auth) = load_official_cli_keychain_auth()?
-    {
-        return Ok(Some(auth));
-    }
-    // Non-macOS / file-store CLI credentials (~/.config/cursor/auth.json).
-    if cli_keychain_fallback_enabled()
-        && let Some(auth) = load_official_cli_auth_json()?
-    {
-        return Ok(Some(auth));
-    }
-    Ok(None)
+    result
 }
 
 /// Load the login state written by the Cursor desktop app on macOS.
@@ -547,7 +561,15 @@ pub fn force_refresh_cursor_auth(
             "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-proxy cursor auth login`, or supply a fresh token."
         );
     }
-    file_store().force_refresh(failed_access_token)
+    let result = file_store().force_refresh(failed_access_token);
+    match &result {
+        Ok(Some(auth)) => {
+            crate::providers::cursor::model::observe_live_usable_models_account(&auth.access_token);
+        }
+        Ok(None) => crate::providers::cursor::model::clear_live_usable_models_account(),
+        Err(_) => {}
+    }
+    result
 }
 
 /// Load only the bearer token for call sites that do not need auth metadata.
@@ -559,11 +581,19 @@ pub fn load_cursor_token() -> Option<String> {
 }
 
 pub fn save_cursor_auth(auth: StoredCursorAuth) -> anyhow::Result<CursorAuth> {
-    file_store().save_auth(auth)
+    let saved = file_store().save_auth(auth);
+    if let Ok(ref auth) = saved {
+        crate::providers::cursor::model::observe_live_usable_models_account(&auth.access_token);
+    }
+    saved
 }
 
 pub fn clear_cursor_auth() -> anyhow::Result<()> {
-    file_store().clear_auth()
+    let result = file_store().clear_auth();
+    if result.is_ok() {
+        crate::providers::cursor::model::clear_live_usable_models_account();
+    }
+    result
 }
 
 pub fn cursor_auth_location() -> String {
