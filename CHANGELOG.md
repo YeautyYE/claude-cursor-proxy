@@ -10,6 +10,8 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
   of returning a 1.5-second local 503 retry storm.
 - Keep healthy generations protected, while allowing stale client-only or
   cancelled generations to be replaced by a fresh turn.
+- Fence hidden cancel-requested generations by run id so a committed SSE does
+  not wait forever on an occupied slot during cancellation teardown.
 - Detect Anthropic `compact_20260112` context-management requests and isolate
   them from the ordinary Cursor live slot.
 - Harden Claude Code native tool input normalization and preserve explicit

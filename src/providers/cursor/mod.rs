@@ -770,6 +770,36 @@ async fn start_live_events_with_retries_with_client_type(
                         ));
                     }
                     LiveSlotClaim::Running => {
+                        // `get_run` hides cancel-requested/terminal-error
+                        // handles so attach/resume callers cannot race their
+                        // teardown. A fresh streamed start still needs to
+                        // take over a *different* replaceable generation;
+                        // otherwise the unbounded SSE wait would observe an
+                        // opaque Occupied slot forever.
+                        if unbounded_conflict_wait
+                            && let Some(hidden) = LiveRunRegistry::replaceable_run_for_fresh_request(
+                                identity.session_id,
+                                identity.agent_id,
+                                operation_fingerprint,
+                            )
+                        {
+                            match claim_hidden_fresh_replacement(
+                                identity.session_id,
+                                identity.agent_id,
+                                hidden.run_id(),
+                            )
+                            .await
+                            {
+                                Ok(Some(reservation)) => break Some(reservation),
+                                Ok(None) => {
+                                    // Another claimant won the generation
+                                    // fence; do not hold scarce capacity while
+                                    // the registry settles.
+                                    admission.take();
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                         if let Some(run) =
                             LiveRunRegistry::get_run(identity.session_id, identity.agent_id)
                         {
@@ -909,6 +939,20 @@ async fn start_live_events_with_retries_with_client_type(
                             }
                             LiveRunProbe::TerminalError(_) => continue,
                             LiveRunProbe::Occupied => {}
+                        }
+                        // A hidden Running handle is no longer attachable. If
+                        // it was not replaceable above, do not let an
+                        // already-committed SSE spin forever behind it. A
+                        // later client retry can observe the terminal state;
+                        // healthy visible generations still take the normal
+                        // heartbeat-backed wait path above.
+                        if LiveRunRegistry::running_generation(
+                            identity.session_id,
+                            identity.agent_id,
+                        )
+                        .is_some()
+                        {
+                            return Err(live_run_busy_error());
                         }
                         // `get_run` intentionally hides a cancel-requested or
                         // terminal handle. If that state changes between the
@@ -1799,6 +1843,41 @@ fn live_start_should_wait_without_admission(
         return false;
     }
     !run.is_replaceable_for_fresh_request()
+}
+
+/// Atomically take over a generation that has already been observed as
+/// replaceable. The registry re-checks the run id and predicate under its
+/// lock, then `cancel_and_wait` fences the old upstream before the caller
+/// opens a replacement. Returning `None` means another transition won the
+/// race and the caller should probe again.
+async fn claim_hidden_fresh_replacement(
+    session_id: &str,
+    agent_id: Option<&str>,
+    expected_run_id: &str,
+) -> Result<Option<LiveRunReservation>, CursorError> {
+    match LiveRunRegistry::claim_replacement_for_fresh_request(
+        session_id,
+        agent_id,
+        expected_run_id,
+    ) {
+        LiveReplacementClaim::Conflict => Ok(None),
+        LiveReplacementClaim::Reserved {
+            mut reservation,
+            superseded: Some(handle),
+        } => {
+            reservation.set_operation_fingerprint(handle.request_fingerprint());
+            reservation.protect_on_drop();
+            let cancel_result = handle.cancel_and_wait().await;
+            match finish_replacement_after_cancel(reservation, handle, false, cancel_result) {
+                Ok(reservation) => Ok(Some(reservation)),
+                Err(error) => Err(error),
+            }
+        }
+        LiveReplacementClaim::Reserved {
+            reservation,
+            superseded: None,
+        } => Ok(Some(reservation)),
+    }
 }
 
 /// Classify a slot that `get_run` hides. A dying Running generation is

@@ -2383,6 +2383,30 @@ impl LiveRunRegistry {
         }
     }
 
+    /// Return a hidden generation that a fresh operation may safely inspect
+    /// for replacement. `get_run` intentionally hides cancel-requested and
+    /// terminal handles so normal attach/resume callers do not race teardown;
+    /// the fresh streamed-start path still needs the handle to perform its
+    /// generation-bound cancellation instead of waiting on an occupied slot.
+    pub(crate) fn replaceable_run_for_fresh_request(
+        session_id: &str,
+        agent_id: Option<&str>,
+        fingerprint: u64,
+    ) -> Option<Arc<CursorLiveRunHandle>> {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        match runs.runs.get(&key) {
+            Some(LiveRunEntry::Running(handle))
+                if handle.request_fingerprint() != fingerprint
+                    && handle.is_replaceable_for_fresh_request() =>
+            {
+                Some(Arc::clone(handle))
+            }
+            _ => None,
+        }
+    }
+
     /// True while a reservation or live handle owns this Claude session slot
     /// (no agent id). Nested occupancy is [`Self::is_occupied_run`].
     pub fn is_occupied(session_id: &str) -> bool {
@@ -16148,6 +16172,33 @@ mod tests {
         assert_eq!(
             LiveRunRegistry::running_generation(&session, None).as_deref(),
             Some("reattached-generation")
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn fresh_replacement_lookup_handles_hidden_cancelled_generation() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("hidden-cancelled-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (handle, _command_rx) = connected_dummy_handle("hidden-cancelled-generation");
+        handle.set_request_fingerprint(11);
+        handle.cancel_requested.store(true, Ordering::Release);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert hidden generation");
+
+        assert!(
+            LiveRunRegistry::get_run(&session, None).is_none(),
+            "cancel-requested handles stay hidden from attach/resume"
+        );
+        let replacement = LiveRunRegistry::replaceable_run_for_fresh_request(&session, None, 22)
+            .expect("a different fresh operation must see the exact hidden generation");
+        assert_eq!(replacement.run_id(), "hidden-cancelled-generation");
+        assert!(
+            LiveRunRegistry::replaceable_run_for_fresh_request(&session, None, 11).is_none(),
+            "an identical retry must not replace its own hidden generation"
         );
         LiveRunRegistry::clear();
     }
