@@ -2,7 +2,7 @@
 //! onto Claude Code Anthropic tool_use shapes.
 
 use crate::providers::cursor::proto::{
-    ExecServerMessage, FetchArgs, ShellArgs, ToolCall, ToolCallStarted,
+    ExecServerMessage, FetchArgs, PiWriteExecArgs, ShellArgs, ToolCall, ToolCallStarted,
 };
 
 /// A tool call ready for Anthropic `tool_use` emission.
@@ -66,6 +66,9 @@ pub fn map_exec_server_message(exec: &ExecServerMessage) -> Option<MappedClaudeT
                 "content": args.file_text,
             }),
         });
+    }
+    if let Some(ref args) = exec.pi_write_args {
+        return Some(map_pi_write_args(args, id));
     }
     if let Some(ref args) = exec.delete_args {
         // Claude Code often has no Delete — use Bash.
@@ -134,6 +137,16 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
                 "content": content,
             }),
         });
+    }
+    if let Some(ref write) = tc.pi_write_tool_call {
+        let args = write.args.as_ref()?;
+        return Some(map_pi_write_args(
+            &crate::providers::cursor::proto::PiWriteExecArgs {
+                path: args.path.clone(),
+                content: args.content.clone(),
+            },
+            call_id,
+        ));
     }
     if let Some(ref grep) = tc.grep_tool_call {
         let args = grep.args.as_ref()?;
@@ -291,6 +304,17 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
                     serde_json::json!(args.subagent_type),
                 );
             }
+            if let Some(model) = args
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                // Preserve the native model override. The Claude-facing
+                // adapter validates its enum; the Grok spawn adapter keeps
+                // only model IDs it can route downstream.
+                input.insert("model".into(), serde_json::json!(model));
+            }
             if let Some(resume) = args
                 .resume
                 .as_deref()
@@ -331,6 +355,17 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
         });
     }
     None
+}
+
+fn map_pi_write_args(args: &PiWriteExecArgs, tool_use_id: String) -> MappedClaudeTool {
+    MappedClaudeTool {
+        tool_use_id,
+        name: "Write".into(),
+        input: serde_json::json!({
+            "file_path": args.path,
+            "content": args.content,
+        }),
+    }
 }
 
 fn map_fetch_args(args: &FetchArgs, call_id: String) -> Option<MappedClaudeTool> {
@@ -535,8 +570,59 @@ fn map_grep(
     }
 }
 
-fn shell_single_quote(s: &str) -> String {
+/// Quote one shell argument without allowing its contents to terminate the
+/// surrounding single-quoted string.  Cursor sends cwd/path values through
+/// the Claude Bash tool, so this must also handle apostrophes in paths.
+pub(crate) fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Cursor's Delete exec is represented as a synthetic POSIX `rm` command when
+/// it must be exposed through Claude's shell-shaped tool. PowerShell does not
+/// understand that command, so translate only this exact proxy-generated
+/// prefix and preserve paths containing apostrophes.
+fn rewrite_cursor_delete_for_powershell(command: &str) -> Option<String> {
+    const PREFIX: &str = "rm -f -- ";
+    let quoted = command.strip_prefix(PREFIX)?.trim();
+    let path = unquote_posix_single(quoted)?;
+    Some(format!(
+        "Remove-Item -Force -LiteralPath {}",
+        powershell_single_quote(&path)
+    ))
+}
+
+fn unquote_posix_single(value: &str) -> Option<String> {
+    if value.len() < 2 || !value.starts_with('\'') || !value.ends_with('\'') {
+        return None;
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while let Some(pos) = rest.find('\'') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + 1..];
+        if let Some(after_escape) = rest.strip_prefix("\\''") {
+            out.push('\'');
+            rest = after_escape;
+        } else {
+            // A lone quote cannot occur inside shell_single_quote output.
+            return None;
+        }
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+fn powershell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Read an integer supplied by protobuf/JSON adapters.  `google.protobuf.Value`
+/// numbers arrive as f64 and some clients serialize timeout values as strings;
+/// accepting whole-number representations keeps the Claude Bash contract
+/// stable while still rejecting fractions and negative values.
+pub(crate) fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    coerce_whole_integer(value).and_then(|value| value.as_u64())
 }
 
 /// Advertised-name aliases for Cursor native tools, including grok-build
@@ -548,13 +634,16 @@ pub fn advertised_name_fallbacks(mapped_name: &str) -> &'static [&'static str] {
     match mapped_name {
         "Bash" => &[
             "Bash",
+            "PowerShell",
             "Shell",
             "bash",
             "run_terminal_command",
             "run_terminal_cmd",
         ],
-        "Read" => &["Read", "read_file", "ReadFile"],
-        "Write" => &["Write", "write", "write_file", "WriteFile"],
+        "Read" | "read" | "read_file" | "ReadFile" => &["Read", "read", "read_file", "ReadFile"],
+        "Write" | "write" | "write_file" | "WriteFile" => {
+            &["Write", "write", "write_file", "WriteFile"]
+        }
         "Grep" => &["Grep", "grep", "Search"],
         "Glob" => &["Glob", "glob", "Find", "list_dir"],
         "LS" | "Ls" => &[
@@ -595,16 +684,20 @@ pub fn adapt_tool_input_for_client(
     advertised_name: &str,
     mut input: serde_json::Value,
 ) -> serde_json::Value {
-    if advertised_name == "spawn_subagent" {
+    // Older Claude clients keep the `mcp_claude-local_` provider prefix in
+    // tool_result history. Apply the same schema adapter to that spelling as
+    // to the current bare tool name; foreign MCP providers remain untouched.
+    let schema_name = crate::providers::cursor::request::strip_mcp_provider_prefix(advertised_name);
+    if schema_name == "spawn_subagent" {
         return adapt_native_task_to_spawn_subagent(input);
     }
-    if matches!(advertised_name, "Agent" | "Task") {
-        return remap_model_slug_subagent_type(input);
+    if matches!(schema_name, "Agent" | "Task") {
+        return adapt_claude_agent_input(input);
     }
     let Some(obj) = input.as_object_mut() else {
         return input;
     };
-    match advertised_name {
+    match schema_name {
         "read_file" | "ReadFile" => {
             coerce_integer_fields(obj, &["offset", "limit"]);
             if !has_nonempty_str(obj, "target_file") {
@@ -631,14 +724,20 @@ pub fn adapt_tool_input_for_client(
         }
         "run_terminal_command" | "run_terminal_cmd" => {
             coerce_integer_fields(obj, &["timeout"]);
-            adapt_shell_like(obj, true);
+            adapt_shell_like(obj, true, false);
         }
-        "Bash" | "Shell" | "bash" => {
+        "Bash" | "PowerShell" | "Shell" | "bash" => {
             coerce_integer_fields(obj, &["timeout"]);
+            if schema_name == "PowerShell"
+                && let Some(command) = obj.get("command").and_then(|value| value.as_str())
+                && let Some(command) = rewrite_cursor_delete_for_powershell(command)
+            {
+                obj.insert("command".into(), serde_json::Value::String(command));
+            }
             // Cursor ShellArgs has no description. Claude Code uses it as the
             // Bash widget title; without it the TUI dumps the whole command
             // (including python3 -c bodies) into the header.
-            adapt_shell_like(obj, true);
+            adapt_shell_like(obj, true, true);
         }
         "write" | "write_file" | "WriteFile" => {
             if !has_nonempty_str(obj, "file_path") {
@@ -817,6 +916,7 @@ fn coerce_whole_integer(value: &serde_json::Value) -> Option<serde_json::Value> 
 fn adapt_shell_like(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     require_description: bool,
+    claude_schema: bool,
 ) {
     if !has_nonempty_str(obj, "command") {
         if let Some(pattern) = nonempty_string(obj.get("pattern")) {
@@ -847,7 +947,42 @@ fn adapt_shell_like(
             );
         }
     }
-    if obj.get("background").is_none() {
+    if claude_schema {
+        // Claude Code's Bash/PowerShell schemas call this field
+        // `run_in_background`; Cursor/Grok use `background` or
+        // `is_background`. Prefer an already-canonical boolean and then
+        // translate the aliases, dropping all fields unknown to the strict
+        // PowerShell schema.
+        let run_in_background = obj
+            .get("run_in_background")
+            .filter(|value| value.is_boolean())
+            .cloned()
+            .or_else(|| {
+                obj.get("background")
+                    .filter(|value| value.is_boolean())
+                    .cloned()
+            })
+            .or_else(|| {
+                obj.get("is_background")
+                    .filter(|value| value.is_boolean())
+                    .cloned()
+            });
+        obj.remove("background");
+        obj.remove("is_background");
+        obj.remove("run_in_background");
+        for key in ["working_directory", "cwd", "shell"] {
+            obj.remove(key);
+        }
+        if obj.get("dangerouslyDisableSandbox").is_none()
+            && let Some(value) = obj.remove("dangerously_disable_sandbox")
+            && value.is_boolean()
+        {
+            obj.insert("dangerouslyDisableSandbox".into(), value);
+        }
+        if let Some(flag) = run_in_background {
+            obj.insert("run_in_background".into(), flag);
+        }
+    } else if obj.get("background").is_none() {
         if let Some(flag) = obj.remove("is_background") {
             obj.insert("background".into(), flag);
         }
@@ -934,6 +1069,30 @@ fn remap_model_slug_subagent_type(mut input: serde_json::Value) -> serde_json::V
     input
 }
 
+/// Keep Claude Code's native Agent/legacy Task payload within the exact
+/// contract exposed by Claude Code 2.1.x. Cursor may attach its own model slug
+/// (for example `cursor-grok4.6` or `claude-fable-5`) to a native Task call;
+/// forwarding that value makes Claude reject the whole tool_use because its
+/// `model` field is an enum of `sonnet`, `opus`, `haiku`, and `fable`.
+///
+/// Grok's `spawn_subagent` path has a separate allow-list adapter below. This
+/// helper is intentionally limited to the Claude-facing aliases so unknown
+/// model IDs are omitted and Claude falls back to the parent/agent default.
+fn adapt_claude_agent_input(input: serde_json::Value) -> serde_json::Value {
+    let mut input = remap_model_slug_subagent_type(input);
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    let valid = obj
+        .get("model")
+        .and_then(|value| value.as_str())
+        .is_some_and(|model| matches!(model, "sonnet" | "opus" | "haiku" | "fable"));
+    if !valid {
+        obj.remove("model");
+    }
+    input
+}
+
 fn normalize_spawn_subagent_type(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -990,8 +1149,10 @@ fn looks_like_named_agent_type(lower: &str) -> bool {
 
 /// Rebuild Cursor native Task args into grok-build `spawn_subagent` input.
 ///
-/// Only allowlisted keys survive. Cursor `model` / `readonly` and any smuggled
-/// MCP fields are dropped; `resume` and `run_in_background` are renamed.
+/// Only allowlisted keys survive. Cursor `readonly` and any smuggled MCP
+/// fields are dropped; `resume` and `run_in_background` are renamed. A native
+/// model override is retained when it is a downstream Grok model ID; Cursor
+/// slugs are omitted because Grok's spawn endpoint cannot route them.
 pub fn adapt_native_task_to_spawn_subagent(input: serde_json::Value) -> serde_json::Value {
     let Some(obj) = input.as_object() else {
         return serde_json::json!({});
@@ -1380,7 +1541,7 @@ mod tests {
                     args: Some(crate::providers::cursor::proto::TaskToolCallArgsProto {
                         description: "explore live".into(),
                         prompt: "find TaskToolCall".into(),
-                        model: None,
+                        model: Some("fable".into()),
                         subagent_type: "explore".into(),
                         resume: Some("sa-1".into()),
                         run_in_background: Some(true),
@@ -1394,6 +1555,7 @@ mod tests {
         assert_eq!(m.name, "Task");
         assert_eq!(m.input["description"], "explore live");
         assert_eq!(m.input["prompt"], "find TaskToolCall");
+        assert_eq!(m.input["model"], "fable");
         assert_eq!(m.input["subagent_type"], "explore");
         assert_eq!(m.input["resume"], "sa-1");
         assert_eq!(m.input["run_in_background"], true);
@@ -1420,6 +1582,46 @@ mod tests {
         assert!(m.input.get("path").is_none());
         assert!(m.input.get("file_text").is_none());
         assert!(m.input.get("contents").is_none());
+    }
+
+    #[test]
+    fn maps_pi_write_exec_args_to_claude_write_schema() {
+        let exec = ExecServerMessage {
+            id: 10,
+            exec_id: Some("pi-exec-w".into()),
+            pi_write_args: Some(crate::providers::cursor::proto::PiWriteExecArgs {
+                path: "/tmp/pi.md".into(),
+                content: "created\n".into(),
+            }),
+            ..Default::default()
+        };
+        let mapped = map_exec_server_message(&exec).expect("Pi write must map");
+        assert_eq!(mapped.name, "Write");
+        assert_eq!(mapped.tool_use_id, "pi-exec-w");
+        assert_eq!(mapped.input["file_path"], "/tmp/pi.md");
+        assert_eq!(mapped.input["content"], "created\n");
+    }
+
+    #[test]
+    fn maps_pi_write_tool_call_field_64() {
+        let started = ToolCallStarted {
+            call_id: "pi-tool-1".into(),
+            tool_call: Some(ToolCall {
+                pi_write_tool_call: Some(crate::providers::cursor::proto::PiWriteToolCall {
+                    args: Some(crate::providers::cursor::proto::PiWriteToolArgs {
+                        path: "/tmp/pi.txt".into(),
+                        content: "hello".into(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let mapped = map_tool_call_started(&started).expect("Pi tool must map");
+        assert_eq!(mapped.name, "Write");
+        assert_eq!(mapped.input["file_path"], "/tmp/pi.txt");
+        assert_eq!(mapped.input["content"], "hello");
     }
 
     #[test]
@@ -1689,6 +1891,56 @@ mod tests {
     }
 
     #[test]
+    fn adapt_claude_agent_keeps_supported_model_and_drops_provider_slugs() {
+        let supported = adapt_client_tool_input(
+            "Agent",
+            serde_json::json!({
+                "description": "inspect",
+                "prompt": "p",
+                "subagent_type": "Explore",
+                "model": "fable"
+            }),
+        );
+        assert_eq!(supported["model"], "fable");
+
+        for model in [
+            "cursor-grok4.6",
+            "claude-fable-5",
+            "grok-4.6",
+            "gemini-3.1-pro",
+            "unknown",
+        ] {
+            let adapted =
+                adapt_client_tool_input("Task", serde_json::json!({"prompt": "p", "model": model}));
+            assert!(
+                adapted.get("model").is_none(),
+                "provider model {model} must not reach Claude Task"
+            );
+        }
+    }
+
+    #[test]
+    fn adapt_provider_qualified_claude_tools_uses_leaf_schema() {
+        let agent = adapt_client_tool_input(
+            "mcp_claude-local_Agent",
+            serde_json::json!({"prompt": "p", "model": "cursor-grok4.6"}),
+        );
+        assert!(agent.get("model").is_none());
+
+        let powershell = adapt_client_tool_input(
+            "mcp__claude-local__PowerShell",
+            serde_json::json!({
+                "command": "Get-ChildItem",
+                "background": true,
+                "dangerously_disable_sandbox": true
+            }),
+        );
+        assert_eq!(powershell["run_in_background"], true);
+        assert_eq!(powershell["dangerouslyDisableSandbox"], true);
+        assert!(powershell.get("background").is_none());
+    }
+
+    #[test]
     fn adapt_spawn_subagent_renames_resume_and_background() {
         let adapted = adapt_tool_input_for_client(
             "spawn_subagent",
@@ -1854,6 +2106,76 @@ mod tests {
                 "{mapped} must map to grok-build {grok}"
             );
         }
+        assert!(
+            advertised_name_fallbacks("Bash").contains(&"PowerShell"),
+            "Cursor Shell must map to Claude Code's Windows-native PowerShell tool"
+        );
+    }
+
+    #[test]
+    fn powershell_native_shell_input_keeps_claude_contract() {
+        let adapted = adapt_tool_input_for_client(
+            "PowerShell",
+            serde_json::json!({
+                "command": "Get-ChildItem",
+                "working_directory": "C:\\work",
+                "timeout": 120000.0,
+                "background": true,
+                "is_background": false,
+                "dangerously_disable_sandbox": true
+            }),
+        );
+        assert_eq!(adapted["command"], "Get-ChildItem");
+        assert_eq!(adapted["timeout"], 120000);
+        assert!(adapted["description"].is_string());
+        assert_eq!(adapted["run_in_background"], true);
+        assert_eq!(adapted["dangerouslyDisableSandbox"], true);
+        for key in [
+            "background",
+            "is_background",
+            "working_directory",
+            "cwd",
+            "shell",
+        ] {
+            assert!(
+                adapted.get(key).is_none(),
+                "unexpected PowerShell key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_delete_fallback_uses_literal_path_on_powershell() {
+        let path = r"C:\work\O'Brien.txt";
+        let adapted = adapt_tool_input_for_client(
+            "PowerShell",
+            serde_json::json!({
+                "command": format!("rm -f -- {}", shell_single_quote(path))
+            }),
+        );
+        assert_eq!(
+            adapted["command"],
+            "Remove-Item -Force -LiteralPath 'C:\\work\\O''Brien.txt'"
+        );
+
+        let ordinary = adapt_tool_input_for_client(
+            "PowerShell",
+            serde_json::json!({"command": "rm -f -- $dynamicPath"}),
+        );
+        assert_eq!(ordinary["command"], "rm -f -- $dynamicPath");
+    }
+
+    #[test]
+    fn bash_translates_cursor_background_aliases_to_run_in_background() {
+        let adapted = adapt_tool_input_for_client(
+            "Bash",
+            serde_json::json!({
+                "command": "echo ok",
+                "background": false
+            }),
+        );
+        assert_eq!(adapted["run_in_background"], false);
+        assert!(adapted.get("background").is_none());
     }
 
     #[test]

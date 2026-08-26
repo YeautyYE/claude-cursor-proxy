@@ -14,7 +14,7 @@ use once_cell::sync::Lazy;
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::native_tools::{
-    adapt_tool_input_for_client, advertised_name_fallbacks,
+    adapt_tool_input_for_client, advertised_name_fallbacks, json_u64, shell_single_quote,
 };
 use crate::providers::cursor::request::{cursor_mcp_wire_name, is_model_visible_tool_definition};
 use crate::providers::cursor::response::CursorStreamEvent;
@@ -58,6 +58,19 @@ pub enum PendingCursorTool {
         working_directory: String,
         timeout_ms: u64,
     },
+    Delete {
+        tool_use_id: String,
+        path: String,
+    },
+    Grep {
+        tool_use_id: String,
+        pattern: String,
+        path: String,
+    },
+    Ls {
+        tool_use_id: String,
+        path: String,
+    },
     /// Any Claude tool name (Glob, Grep, …) from native Cursor mapping.
     Generic {
         tool_use_id: String,
@@ -72,6 +85,9 @@ impl PendingCursorTool {
             Self::Read { .. } => "Read",
             Self::Write { .. } => "Write",
             Self::Bash { .. } => "Bash",
+            Self::Delete { .. } => "Delete",
+            Self::Grep { .. } => "Grep",
+            Self::Ls { .. } => "LS",
             Self::Generic { name, .. } => name.as_str(),
         }
     }
@@ -81,6 +97,9 @@ impl PendingCursorTool {
             Self::Read { tool_use_id, .. }
             | Self::Write { tool_use_id, .. }
             | Self::Bash { tool_use_id, .. }
+            | Self::Delete { tool_use_id, .. }
+            | Self::Grep { tool_use_id, .. }
+            | Self::Ls { tool_use_id, .. }
             | Self::Generic { tool_use_id, .. } => tool_use_id,
         }
     }
@@ -104,7 +123,7 @@ impl PendingCursorTool {
                 let cmd = if working_directory.is_empty() {
                     command.clone()
                 } else {
-                    format!("cd '{}' && {command}", working_directory)
+                    format!("cd {} && {command}", shell_single_quote(working_directory))
                 };
                 serde_json::json!({
                     "command": cmd,
@@ -114,6 +133,16 @@ impl PendingCursorTool {
                     "dangerouslyDisableSandbox": false
                 })
             }
+            Self::Delete { path, .. } => serde_json::json!({ "path": path }),
+            Self::Grep { pattern, path, .. } => {
+                let mut input = serde_json::Map::new();
+                input.insert("pattern".into(), serde_json::Value::String(pattern.clone()));
+                if !path.is_empty() {
+                    input.insert("path".into(), serde_json::Value::String(path.clone()));
+                }
+                serde_json::Value::Object(input)
+            }
+            Self::Ls { path, .. } => serde_json::json!({ "path": path }),
         }
     }
 }
@@ -334,29 +363,49 @@ pub fn find_tool_result<'a>(
 
 /// Render the content of a `tool_result` block into a string.
 pub fn render_tool_result_content(result: &serde_json::Value) -> String {
-    let content = match result.get("content") {
-        Some(serde_json::Value::String(s)) => return s.clone(),
-        Some(serde_json::Value::Array(arr)) => arr.clone(),
-        _ => return String::new(),
+    let Some(content) = result.get("content") else {
+        // Structured tool implementations occasionally put their payload in
+        // `structured_output`/`data` instead of Anthropic's content field.
+        // Preserve it for Cursor rather than silently acknowledging an empty
+        // result, which makes the model repeat the same tool call.
+        return result
+            .get("structured_output")
+            .or_else(|| result.get("data"))
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_default();
     };
-    let parts: Vec<String> = content
-        .iter()
-        .map(|block| match block.get("type").and_then(|t| t.as_str()) {
-            Some("text") => block
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Some("image") => "[image result omitted]".to_string(),
-            Some("thinking") => block
-                .get("thinking")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
-            _ => serde_json::to_string(block).unwrap_or_default(),
-        })
-        .collect();
-    parts.join("\n")
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .map(render_tool_result_block)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(_) => render_tool_result_block(content),
+        serde_json::Value::Null => String::new(),
+        scalar => serde_json::to_string(scalar).unwrap_or_default(),
+    }
+}
+
+fn render_tool_result_block(block: &serde_json::Value) -> String {
+    if let serde_json::Value::String(text) = block {
+        return text.clone();
+    }
+    match block.get("type").and_then(|value| value.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|text| text.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Some("image") | Some("input_image") => "[image result omitted]".to_string(),
+        Some("thinking") => block
+            .get("thinking")
+            .and_then(|text| text.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => serde_json::to_string(block).unwrap_or_default(),
+    }
 }
 
 /// Whether a `tool_result` block indicates an error.
@@ -476,6 +525,141 @@ pub fn build_write_result_from_native(
 
     let mut map = serde_json::Map::new();
     map.insert("writeResult".into(), write_result);
+    with_exec_ids(exec, map)
+}
+
+/// Build the Cursor `deleteResult` message from a Claude `tool_result`.
+pub fn build_delete_result_from_native(
+    exec: &CursorExec,
+    result: &CursorNativeToolResult,
+) -> serde_json::Value {
+    let path = exec
+        .args
+        .get("path")
+        .or_else(|| exec.args.get("file_path"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let delete_result = if result.is_error {
+        serde_json::json!({
+            "error": {
+                "path": path,
+                "error": result.content
+            }
+        })
+    } else {
+        serde_json::json!({
+            "success": {
+                "path": path,
+                "deletedFile": path,
+                "fileSize": 0,
+                "prevContent": ""
+            }
+        })
+    };
+    let mut map = serde_json::Map::new();
+    map.insert("deleteResult".into(), delete_result);
+    with_exec_ids(exec, map)
+}
+
+/// Build the Cursor `grepResult` message from a Claude `tool_result`.
+pub fn build_grep_result_from_native(
+    exec: &CursorExec,
+    result: &CursorNativeToolResult,
+) -> serde_json::Value {
+    let pattern = exec
+        .args
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let path = exec
+        .args
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let grep_result = if result.is_error {
+        serde_json::json!({ "error": { "error": result.content } })
+    } else {
+        let matches: Vec<serde_json::Value> = result
+            .content
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                serde_json::json!({
+                    "lineNumber": index.saturating_add(1),
+                    "content": line,
+                    "contentTruncated": false,
+                    "isContextLine": false
+                })
+            })
+            .collect();
+        let line_count = matches.len();
+        serde_json::json!({
+            "success": {
+                "pattern": pattern,
+                "path": path,
+                "outputMode": "content",
+                "workspaceResults": {},
+                "activeEditorResult": {
+                    "content": {
+                        "matches": [{
+                            "file": path,
+                            "matches": matches
+                        }],
+                        "totalLines": line_count,
+                        "totalMatchedLines": line_count,
+                        "clientTruncated": false,
+                        "ripgrepTruncated": false
+                    }
+                }
+            }
+        })
+    };
+    let mut map = serde_json::Map::new();
+    map.insert("grepResult".into(), grep_result);
+    with_exec_ids(exec, map)
+}
+
+/// Build the Cursor `lsResult` message from a Claude `tool_result`.
+pub fn build_ls_result_from_native(
+    exec: &CursorExec,
+    result: &CursorNativeToolResult,
+) -> serde_json::Value {
+    let path = exec
+        .args
+        .get("path")
+        .or_else(|| exec.args.get("target_directory"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let ls_result = if result.is_error {
+        serde_json::json!({
+            "error": {
+                "path": path,
+                "error": result.content
+            }
+        })
+    } else {
+        let children_files: Vec<serde_json::Value> = result
+            .content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::json!({ "name": line }))
+            .collect();
+        serde_json::json!({
+            "success": {
+                "directoryTreeRoot": {
+                    "absPath": path,
+                    "childrenDirs": [],
+                    "numFiles": children_files.len(),
+                    "childrenFiles": children_files,
+                    "childrenWereProcessed": true,
+                    "fullSubtreeExtensionCounts": {}
+                }
+            }
+        })
+    };
+    let mut map = serde_json::Map::new();
+    map.insert("lsResult".into(), ls_result);
     with_exec_ids(exec, map)
 }
 
@@ -616,21 +800,29 @@ pub fn start_cursor_tool_bridge(
                 let input_json =
                     serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
                 framer.emit_tool_pause(tool_use_id, &emit_name, &input_json);
-                state.pending_tool = Some(PendingCursorTool::Generic {
-                    tool_use_id: tool_use_id.clone(),
-                    name: emit_name,
-                    input: adapted,
-                });
+                state.pending_tool =
+                    Some(pending_from_native_tool(tool_use_id, &emit_name, &adapted));
                 paused = true;
             }
             CursorStreamEvent::TextDelta { text } => {
                 let recovered = state.xml_parser.push(text);
                 for recovered_event in &recovered {
                     if paused {
-                        if let RecoveredCursorEvent::Text(t) = recovered_event {
-                            state
-                                .remaining_events
-                                .push(CursorStreamEvent::TextDelta { text: t.clone() });
+                        match recovered_event {
+                            RecoveredCursorEvent::Text(t) => {
+                                state
+                                    .remaining_events
+                                    .push(CursorStreamEvent::TextDelta { text: t.clone() });
+                            }
+                            RecoveredCursorEvent::ToolUse(tool_use) => {
+                                // Preserve a second tool recovered from the
+                                // same upstream delta for the next resume.
+                                state.remaining_events.push(CursorStreamEvent::NativeTool {
+                                    tool_use_id: tool_use.id.clone(),
+                                    name: tool_use.name.clone(),
+                                    input: serde_json::Value::Object(tool_use.input.clone()),
+                                });
+                            }
                         }
                         continue;
                     }
@@ -640,16 +832,22 @@ pub fn start_cursor_tool_bridge(
                         }
                         RecoveredCursorEvent::ToolUse(tool_use) => {
                             let input = serde_json::Value::Object(tool_use.input.clone());
-                            let (emit_name, input_json) = advertised_tool_payload(
+                            let Some(emit_name) = resolve_advertised_name(
                                 &tool_use.name,
-                                &input,
                                 state.allowed_tool_names.as_ref(),
-                            );
+                            ) else {
+                                // Never expose a recovered XML call that was
+                                // not part of Claude Code's advertised tool
+                                // set. Native execs use the same gate below.
+                                continue;
+                            };
+                            let adapted = adapt_tool_input_for_client(&emit_name, input);
+                            let input_json = serde_json::to_string(&adapted)
+                                .unwrap_or_else(|_| "{}".to_string());
                             framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
 
-                            if let Some(pending) = pending_from_recovered_tool(tool_use) {
-                                state.pending_tool = Some(pending);
-                            }
+                            state.pending_tool =
+                                Some(pending_from_native_tool(&tool_use.id, &emit_name, &adapted));
 
                             paused = true;
                         }
@@ -683,15 +881,28 @@ pub fn start_cursor_tool_bridge(
                 if !paused {
                     // Process any remaining XML before finalizing
                     let flushed = state.xml_parser.flush();
-                    for evt in &flushed {
-                        if let RecoveredCursorEvent::ToolUse(tool_use) = evt {
-                            let input_json = serde_json::to_string(&tool_use.input)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
-                            if let Some(pending) = pending_from_recovered_tool(tool_use) {
-                                state.pending_tool = Some(pending);
+                    for evt in flushed {
+                        match evt {
+                            RecoveredCursorEvent::Text(text) => framer.emit_text_delta(&text),
+                            RecoveredCursorEvent::ToolUse(tool_use) => {
+                                let input = serde_json::Value::Object(tool_use.input.clone());
+                                let Some(emit_name) = resolve_advertised_name(
+                                    &tool_use.name,
+                                    state.allowed_tool_names.as_ref(),
+                                ) else {
+                                    continue;
+                                };
+                                let adapted = adapt_tool_input_for_client(&emit_name, input);
+                                let input_json = serde_json::to_string(&adapted)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
+                                state.pending_tool = Some(pending_from_native_tool(
+                                    &tool_use.id,
+                                    &emit_name,
+                                    &adapted,
+                                ));
+                                paused = true;
                             }
-                            paused = true;
                         }
                     }
                     if !paused {
@@ -705,15 +916,24 @@ pub fn start_cursor_tool_bridge(
     if !paused {
         // Flush any remaining text from XML parser
         let flushed = state.xml_parser.flush();
-        for evt in &flushed {
-            if let RecoveredCursorEvent::ToolUse(tool_use) = evt {
-                let input_json =
-                    serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
-                framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
-                if let Some(pending) = pending_from_recovered_tool(tool_use) {
-                    state.pending_tool = Some(pending);
+        for evt in flushed {
+            match evt {
+                RecoveredCursorEvent::Text(text) => framer.emit_text_delta(&text),
+                RecoveredCursorEvent::ToolUse(tool_use) => {
+                    let input = serde_json::Value::Object(tool_use.input.clone());
+                    let Some(emit_name) =
+                        resolve_advertised_name(&tool_use.name, state.allowed_tool_names.as_ref())
+                    else {
+                        continue;
+                    };
+                    let adapted = adapt_tool_input_for_client(&emit_name, input);
+                    let input_json =
+                        serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
+                    framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
+                    state.pending_tool =
+                        Some(pending_from_native_tool(&tool_use.id, &emit_name, &adapted));
+                    paused = true;
                 }
-                paused = true;
             }
         }
         if !paused {
@@ -740,6 +960,11 @@ pub fn start_cursor_tool_bridge(
         stored_state.event_cursor = 0;
         stored_state.input_tokens = state.input_tokens;
         stored_state.output_tokens = state.output_tokens;
+        // Preserve the incremental parser across the pause. A second tool can
+        // begin in a delta before the first tool pause and finish only after
+        // Claude sends its result; rebuilding a fresh parser would lose that
+        // partial XML and could also forget the advertised-tool allow-list.
+        stored_state.xml_parser = state.xml_parser;
         BridgeRegistry::insert(stored_state);
     }
 
@@ -785,6 +1010,13 @@ pub fn resume_cursor_tool_bridge(
             std::time::Duration::from_millis(0),
             working_directory,
         ),
+        PendingCursorTool::Delete { .. } => {
+            vec![build_delete_result_from_native(&exec, &native_result)]
+        }
+        PendingCursorTool::Grep { .. } => {
+            vec![build_grep_result_from_native(&exec, &native_result)]
+        }
+        PendingCursorTool::Ls { .. } => vec![build_ls_result_from_native(&exec, &native_result)],
         PendingCursorTool::Generic { .. } => {
             // Generic tools are fulfilled by Claude Code; no Cursor protocol result needed.
             vec![]
@@ -795,40 +1027,79 @@ pub fn resume_cursor_tool_bridge(
     let mut sse = Vec::new();
     let mut framer = CursorSseFramer::new(&mut sse, new_message_id, new_model);
 
-    // Retrieve stored state for remaining events
-    let remaining: Vec<CursorStreamEvent> = BridgeRegistry::pending_tool(session_id)
-        .and_then(|_| BridgeRegistry::take(session_id))
-        .map(|state| state.remaining_events)
-        .unwrap_or_default();
+    // Retrieve the complete paused state. The old two-step pending_tool/take
+    // lookup discarded the parser and allowed-tool set, which made a second
+    // tool continuation diverge from the initial request.
+    let (remaining, allowed_tool_names, mut xml_parser, input_tokens, output_tokens) =
+        match BridgeRegistry::take(session_id) {
+            Some(state) => (
+                state.remaining_events,
+                state.allowed_tool_names,
+                state.xml_parser,
+                state.input_tokens,
+                state.output_tokens,
+            ),
+            None => (Vec::new(), None, CursorToolUseXmlParser::new(None), 0, 0),
+        };
 
     if remaining.is_empty() {
         // No remaining events: just finalize
         framer.finalize();
     } else {
-        let mut xml_parser = CursorToolUseXmlParser::new(None);
         let mut paused_again = false;
+        let mut next_pending_tool: Option<PendingCursorTool> = None;
+        let mut next_remaining_events: Vec<CursorStreamEvent> = Vec::new();
 
         for event in &remaining {
+            if paused_again {
+                next_remaining_events.push(event.clone());
+                continue;
+            }
+
             match event {
                 CursorStreamEvent::ThinkingDelta { text } => {
-                    if !paused_again {
-                        framer.emit_thinking_delta(text);
-                    }
+                    framer.emit_thinking_delta(text);
                 }
                 CursorStreamEvent::TextDelta { text } => {
-                    if paused_again {
-                        continue;
-                    }
                     let recovered = xml_parser.push(text);
-                    for evt in &recovered {
+                    for evt in recovered {
+                        if paused_again {
+                            match evt {
+                                RecoveredCursorEvent::Text(text) => {
+                                    next_remaining_events
+                                        .push(CursorStreamEvent::TextDelta { text });
+                                }
+                                RecoveredCursorEvent::ToolUse(tool_use) => {
+                                    next_remaining_events.push(CursorStreamEvent::NativeTool {
+                                        tool_use_id: tool_use.id,
+                                        name: tool_use.name,
+                                        input: serde_json::Value::Object(tool_use.input),
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         match evt {
-                            RecoveredCursorEvent::Text(t) => {
-                                framer.emit_text_delta(t);
+                            RecoveredCursorEvent::Text(text) => {
+                                framer.emit_text_delta(&text);
                             }
                             RecoveredCursorEvent::ToolUse(tool_use) => {
-                                let input_json = serde_json::to_string(&tool_use.input)
+                                let input = serde_json::Value::Object(tool_use.input.clone());
+                                let Some(emit_name) = resolve_advertised_name(
+                                    &tool_use.name,
+                                    allowed_tool_names.as_ref(),
+                                ) else {
+                                    continue;
+                                };
+                                let adapted = adapt_tool_input_for_client(&emit_name, input);
+                                let input_json = serde_json::to_string(&adapted)
                                     .unwrap_or_else(|_| "{}".to_string());
-                                framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
+                                framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
+                                next_pending_tool = Some(pending_from_native_tool(
+                                    &tool_use.id,
+                                    &emit_name,
+                                    &adapted,
+                                ));
                                 paused_again = true;
                             }
                         }
@@ -840,19 +1111,15 @@ pub fn resume_cursor_tool_bridge(
                     cache_read_tokens,
                     cache_write_tokens,
                 } => {
-                    if !paused_again {
-                        framer.record_usage(
-                            *input_tokens,
-                            *output_tokens,
-                            *cache_read_tokens,
-                            *cache_write_tokens,
-                        );
-                    }
+                    framer.record_usage(
+                        *input_tokens,
+                        *output_tokens,
+                        *cache_read_tokens,
+                        *cache_write_tokens,
+                    );
                 }
                 CursorStreamEvent::OutputTokenDelta { tokens } => {
-                    if !paused_again {
-                        framer.add_output_tokens(*tokens);
-                    }
+                    framer.add_output_tokens(*tokens);
                 }
                 CursorStreamEvent::Session { .. } => {}
                 CursorStreamEvent::NativeTool {
@@ -860,29 +1127,65 @@ pub fn resume_cursor_tool_bridge(
                     name,
                     input,
                 } => {
-                    if !paused_again {
-                        let adapted = adapt_tool_input_for_client(name, input.clone());
-                        let input_json =
-                            serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
-                        framer.emit_tool_pause(tool_use_id, name, &input_json);
-                        paused_again = true;
-                    }
+                    let Some(emit_name) =
+                        resolve_advertised_name(name, allowed_tool_names.as_ref())
+                    else {
+                        continue;
+                    };
+                    let adapted = adapt_tool_input_for_client(&emit_name, input.clone());
+                    let input_json =
+                        serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
+                    framer.emit_tool_pause(tool_use_id, &emit_name, &input_json);
+                    next_pending_tool =
+                        Some(pending_from_native_tool(tool_use_id, &emit_name, &adapted));
+                    paused_again = true;
                 }
                 CursorStreamEvent::End => {
-                    if !paused_again {
-                        // Flush before finalizing
-                        let flushed = xml_parser.flush();
-                        for evt in &flushed {
-                            if let RecoveredCursorEvent::ToolUse(tool_use) = evt {
-                                let input_json = serde_json::to_string(&tool_use.input)
+                    // Flush before finalizing. `flush` can yield trailing text
+                    // as well as a complete tool_use.
+                    let flushed = xml_parser.flush();
+                    for evt in flushed {
+                        if paused_again {
+                            match evt {
+                                RecoveredCursorEvent::Text(text) => {
+                                    next_remaining_events
+                                        .push(CursorStreamEvent::TextDelta { text });
+                                }
+                                RecoveredCursorEvent::ToolUse(tool_use) => {
+                                    next_remaining_events.push(CursorStreamEvent::NativeTool {
+                                        tool_use_id: tool_use.id,
+                                        name: tool_use.name,
+                                        input: serde_json::Value::Object(tool_use.input),
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                        match evt {
+                            RecoveredCursorEvent::Text(text) => framer.emit_text_delta(&text),
+                            RecoveredCursorEvent::ToolUse(tool_use) => {
+                                let input = serde_json::Value::Object(tool_use.input.clone());
+                                let Some(emit_name) = resolve_advertised_name(
+                                    &tool_use.name,
+                                    allowed_tool_names.as_ref(),
+                                ) else {
+                                    continue;
+                                };
+                                let adapted = adapt_tool_input_for_client(&emit_name, input);
+                                let input_json = serde_json::to_string(&adapted)
                                     .unwrap_or_else(|_| "{}".to_string());
-                                framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
+                                framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
+                                next_pending_tool = Some(pending_from_native_tool(
+                                    &tool_use.id,
+                                    &emit_name,
+                                    &adapted,
+                                ));
                                 paused_again = true;
                             }
                         }
-                        if !paused_again {
-                            framer.finalize();
-                        }
+                    }
+                    if !paused_again {
+                        framer.finalize();
                     }
                 }
             }
@@ -890,12 +1193,24 @@ pub fn resume_cursor_tool_bridge(
 
         if !paused_again {
             let flushed = xml_parser.flush();
-            for evt in &flushed {
-                if let RecoveredCursorEvent::ToolUse(tool_use) = evt {
-                    let input_json =
-                        serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
-                    framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
-                    paused_again = true;
+            for evt in flushed {
+                match evt {
+                    RecoveredCursorEvent::Text(text) => framer.emit_text_delta(&text),
+                    RecoveredCursorEvent::ToolUse(tool_use) => {
+                        let input = serde_json::Value::Object(tool_use.input.clone());
+                        let Some(emit_name) =
+                            resolve_advertised_name(&tool_use.name, allowed_tool_names.as_ref())
+                        else {
+                            continue;
+                        };
+                        let adapted = adapt_tool_input_for_client(&emit_name, input);
+                        let input_json =
+                            serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
+                        framer.emit_tool_pause(&tool_use.id, &emit_name, &input_json);
+                        next_pending_tool =
+                            Some(pending_from_native_tool(&tool_use.id, &emit_name, &adapted));
+                        paused_again = true;
+                    }
                 }
             }
             if !paused_again {
@@ -903,12 +1218,12 @@ pub fn resume_cursor_tool_bridge(
             }
         }
 
-        if paused_again && !remaining.is_empty() {
+        if paused_again {
             let state = CursorBridgeState::new(
                 session_id.to_string(),
                 new_message_id.to_string(),
                 new_model.to_string(),
-                None,
+                allowed_tool_names.clone(),
                 Box::new(|| {
                     format!(
                         "call_cursor_{}",
@@ -916,6 +1231,12 @@ pub fn resume_cursor_tool_bridge(
                     )
                 }),
             );
+            let mut state = state;
+            state.pending_tool = next_pending_tool;
+            state.remaining_events = next_remaining_events;
+            state.input_tokens = input_tokens;
+            state.output_tokens = output_tokens;
+            state.xml_parser = xml_parser;
             BridgeRegistry::insert(state);
         }
     }
@@ -927,16 +1248,79 @@ pub fn resume_cursor_tool_bridge(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Pick a Claude-advertised tool name for a mapped Cursor tool, or None to skip.
-fn advertised_tool_payload(
+/// Keep native tool events on their Cursor result path. The legacy buffered
+/// bridge can receive `NativeTool` events when the live BiDi path is skipped;
+/// storing a native Write as Generic would make the Claude result disappear
+/// instead of sending Cursor's `writeResult`, so the upstream repeats it.
+fn pending_from_native_tool(
+    tool_use_id: &str,
     name: &str,
     input: &serde_json::Value,
-    allowed: Option<&BTreeSet<String>>,
-) -> (String, String) {
-    let emit_name = resolve_advertised_name(name, allowed).unwrap_or_else(|| name.to_string());
-    let adapted = adapt_tool_input_for_client(&emit_name, input.clone());
-    let json = serde_json::to_string(&adapted).unwrap_or_else(|_| "{}".to_string());
-    (emit_name, json)
+) -> PendingCursorTool {
+    let object = input.as_object();
+    match name {
+        "Read" | "read" | "read_file" | "ReadFile" => PendingCursorTool::Read {
+            tool_use_id: tool_use_id.to_string(),
+            path: object.map(claude_file_path).unwrap_or_default(),
+        },
+        "Write" | "write" | "write_file" | "WriteFile" => PendingCursorTool::Write {
+            tool_use_id: tool_use_id.to_string(),
+            path: object.map(claude_file_path).unwrap_or_default(),
+            content: object.map(claude_write_content).unwrap_or_default(),
+        },
+        "Bash" | "PowerShell" | "Shell" | "bash" | "run_terminal_command" | "run_terminal_cmd" => {
+            let command = object
+                .and_then(|obj| obj.get("command"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let working_directory = object
+                .and_then(|obj| obj.get("working_directory").or_else(|| obj.get("cwd")))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let timeout_ms = object
+                .and_then(|obj| obj.get("timeout").or_else(|| obj.get("timeout_ms")))
+                .and_then(json_u64)
+                .unwrap_or(30_000);
+            PendingCursorTool::Bash {
+                tool_use_id: tool_use_id.to_string(),
+                command,
+                working_directory,
+                timeout_ms,
+            }
+        }
+        "Delete" | "delete" | "DeleteFile" => PendingCursorTool::Delete {
+            tool_use_id: tool_use_id.to_string(),
+            path: object.map(claude_file_path).unwrap_or_default(),
+        },
+        "Grep" | "grep" | "Search" => PendingCursorTool::Grep {
+            tool_use_id: tool_use_id.to_string(),
+            pattern: object
+                .and_then(|obj| obj.get("pattern"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            path: object
+                .and_then(|obj| obj.get("path"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "LS" | "Ls" | "ls" | "list_dir" => PendingCursorTool::Ls {
+            tool_use_id: tool_use_id.to_string(),
+            path: object
+                .and_then(|obj| obj.get("path").or_else(|| obj.get("target_directory")))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        _ => PendingCursorTool::Generic {
+            tool_use_id: tool_use_id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
+        },
+    }
 }
 
 fn resolve_advertised_name(
@@ -1009,18 +1393,23 @@ fn claude_write_content(input: &serde_json::Map<String, serde_json::Value>) -> S
 /// Claude-local tools (`Workflow`, `Skill`, `mcp__*`, …) map to
 /// [`PendingCursorTool::Generic`] so Claude Code can fulfill them and the
 /// bridge can resume without inventing a Cursor exec protocol result.
+#[allow(dead_code)]
 fn pending_from_recovered_tool(
     tool_use: &crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse,
 ) -> Option<PendingCursorTool> {
     match tool_use.name.as_str() {
-        "Read" | "read_file" | "ReadFile" => {
+        "Read" | "read" | "read_file" | "ReadFile" => {
             let file_path = claude_file_path(&tool_use.input);
             Some(PendingCursorTool::Read {
                 tool_use_id: tool_use.id.clone(),
                 path: file_path,
             })
         }
-        "Write" => {
+        // Cursor/grok clients have shipped all of these spellings. Keep them
+        // on the native Write result path instead of treating an alias as a
+        // generic client-only tool (which leaves Cursor waiting forever for
+        // writeResult and makes Claude retry the same Write repeatedly).
+        "Write" | "write" | "write_file" | "WriteFile" => {
             let file_path = claude_file_path(&tool_use.input);
             let content = claude_write_content(&tool_use.input);
             Some(PendingCursorTool::Write {
@@ -1029,18 +1418,25 @@ fn pending_from_recovered_tool(
                 content,
             })
         }
-        "Bash" | "Shell" | "run_terminal_command" | "run_terminal_cmd" => {
+        "Bash" | "PowerShell" | "Shell" | "bash" | "run_terminal_command" | "run_terminal_cmd" => {
             let command = tool_use
                 .input
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let working_directory = String::new();
+            let working_directory = tool_use
+                .input
+                .get("working_directory")
+                .or_else(|| tool_use.input.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let timeout_ms = tool_use
                 .input
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .or_else(|| tool_use.input.get("timeout_ms"))
+                .and_then(json_u64)
                 .unwrap_or(30_000);
             Some(PendingCursorTool::Bash {
                 tool_use_id: tool_use.id.clone(),
@@ -1049,6 +1445,35 @@ fn pending_from_recovered_tool(
                 timeout_ms,
             })
         }
+        "Delete" | "delete" | "DeleteFile" => Some(PendingCursorTool::Delete {
+            tool_use_id: tool_use.id.clone(),
+            path: claude_file_path(&tool_use.input),
+        }),
+        "Grep" | "grep" | "Search" => Some(PendingCursorTool::Grep {
+            tool_use_id: tool_use.id.clone(),
+            pattern: tool_use
+                .input
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            path: tool_use
+                .input
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        "LS" | "Ls" | "ls" | "list_dir" => Some(PendingCursorTool::Ls {
+            tool_use_id: tool_use.id.clone(),
+            path: tool_use
+                .input
+                .get("path")
+                .or_else(|| tool_use.input.get("target_directory"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
         name if !name.is_empty() => Some(PendingCursorTool::Generic {
             tool_use_id: tool_use.id.clone(),
             name: tool_use.name.clone(),
@@ -1098,6 +1523,305 @@ mod tests {
     }
 
     #[test]
+    fn write_aliases_use_native_write_result_path() {
+        for name in ["write", "write_file", "WriteFile"] {
+            let tool = RecoveredCursorToolUse {
+                id: format!("call_{name}"),
+                original_id: None,
+                name: name.into(),
+                input: serde_json::json!({
+                    "file_path": "/tmp/alias.txt",
+                    "content": "alias content"
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            };
+            let pending = pending_from_recovered_tool(&tool).expect("write alias pending");
+            assert!(matches!(pending, PendingCursorTool::Write { .. }));
+            assert_eq!(pending.name(), "Write");
+            assert_eq!(pending.input_json()["file_path"], "/tmp/alias.txt");
+        }
+    }
+
+    #[test]
+    fn native_write_event_is_not_downgraded_to_generic() {
+        let pending = pending_from_native_tool(
+            "native-write-1",
+            "Write",
+            &serde_json::json!({
+                "file_path": "/tmp/native.txt",
+                "content": "native content"
+            }),
+        );
+        assert!(matches!(pending, PendingCursorTool::Write { .. }));
+        assert_eq!(pending.tool_use_id(), "native-write-1");
+        assert_eq!(pending.input_json()["content"], "native content");
+    }
+
+    #[test]
+    fn native_write_bridge_resume_builds_write_result() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+        let events = vec![
+            CursorStreamEvent::NativeTool {
+                tool_use_id: "native-write-bridge".into(),
+                name: "Write".into(),
+                input: serde_json::json!({
+                    "file_path": "/tmp/native-bridge.txt",
+                    "content": "hello"
+                }),
+            },
+            CursorStreamEvent::End,
+        ];
+        let allowed = BTreeSet::from(["Write".to_string()]);
+        let (_, paused) = start_cursor_tool_bridge(
+            "msg-native-write",
+            "cursor-test",
+            "session-native-write",
+            &events,
+            Some(allowed),
+            Box::new(|| "unused".into()),
+        );
+        assert!(paused);
+        let pending = BridgeRegistry::pending_tool("session-native-write")
+            .expect("native write should be pending");
+        assert!(matches!(pending, PendingCursorTool::Write { .. }));
+        let (result_messages, _) = resume_cursor_tool_bridge(
+            "session-native-write",
+            "msg-native-write-resume",
+            "cursor-test",
+            &serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "native-write-bridge",
+                "content": "ok"
+            }),
+            &pending,
+        );
+        assert_eq!(result_messages.len(), 1);
+        assert_eq!(
+            result_messages[0]["writeResult"]["success"]["path"],
+            "/tmp/native-bridge.txt"
+        );
+        BridgeRegistry::remove("session-native-write");
+    }
+
+    #[test]
+    fn native_delete_grep_ls_events_use_matching_result_envelopes() {
+        let _lock = lock_bridge_registry_for_test();
+        for (index, (name, input, expected_result)) in [
+            (
+                "Delete",
+                serde_json::json!({"path": "/tmp/delete-me"}),
+                "deleteResult",
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "needle", "path": "/tmp/file"}),
+                "grepResult",
+            ),
+            ("LS", serde_json::json!({"path": "/tmp"}), "lsResult"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = format!("session-native-{name}");
+            let tool_id = format!("native-{name}");
+            BridgeRegistry::clear();
+            let events = vec![CursorStreamEvent::NativeTool {
+                tool_use_id: tool_id.clone(),
+                name: name.into(),
+                input,
+            }];
+            let allowed = BTreeSet::from([name.to_string()]);
+            let (_, paused) = start_cursor_tool_bridge(
+                &format!("msg-native-{index}"),
+                "cursor-test",
+                &session,
+                &events,
+                Some(allowed),
+                Box::new(|| "unused".into()),
+            );
+            assert!(paused);
+            let pending = BridgeRegistry::pending_tool(&session).expect("native tool pending");
+            let (messages, _) = resume_cursor_tool_bridge(
+                &session,
+                &format!("msg-native-resume-{index}"),
+                "cursor-test",
+                &serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": "line one\nline two"
+                }),
+                &pending,
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].get(expected_result).is_some(), "{messages:?}");
+        }
+        BridgeRegistry::clear();
+    }
+
+    #[test]
+    fn continuation_preserves_allow_list_and_pending_tool_for_second_tool() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+
+        let events = vec![
+            CursorStreamEvent::NativeTool {
+                tool_use_id: "first-read".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/tmp/first"}),
+            },
+            CursorStreamEvent::TextDelta {
+                text: concat!(
+                    "before-second ",
+                    r#"<tool_use name="Write">{"file_path":"/tmp/second","content":"body"}</tool_use>"#,
+                    " after-second"
+                )
+                .into(),
+            },
+            CursorStreamEvent::End,
+        ];
+        let allowed = BTreeSet::from(["Read".to_string(), "Write".to_string()]);
+        let mut next_id = 0u8;
+        let (_, paused) = start_cursor_tool_bridge(
+            "msg-first-tool",
+            "cursor-test",
+            "session-second-tool",
+            &events,
+            Some(allowed),
+            Box::new(move || {
+                next_id += 1;
+                format!("xml-tool-{next_id}")
+            }),
+        );
+        assert!(paused);
+
+        let first_pending =
+            BridgeRegistry::pending_tool("session-second-tool").expect("first pending tool");
+        assert_eq!(first_pending.name(), "Read");
+        let (_, second_sse) = resume_cursor_tool_bridge(
+            "session-second-tool",
+            "msg-second-tool",
+            "cursor-test",
+            &serde_json::json!({"type": "tool_result", "content": "read ok"}),
+            &first_pending,
+        );
+
+        let second_pending = BridgeRegistry::pending_tool("session-second-tool")
+            .expect("second pending tool must survive continuation");
+        assert_eq!(second_pending.name(), "Write");
+        assert_eq!(second_pending.input_json()["file_path"], "/tmp/second");
+        let second_sse_text = String::from_utf8_lossy(&second_sse);
+        assert!(
+            second_sse_text.contains("tool_use"),
+            "continuation should pause on the second tool"
+        );
+        assert!(
+            !second_sse_text.contains("after-second"),
+            "text after the second pause must wait for its result"
+        );
+
+        let (_, final_sse) = resume_cursor_tool_bridge(
+            "session-second-tool",
+            "msg-final-tool",
+            "cursor-test",
+            &serde_json::json!({"type": "tool_result", "content": "write ok"}),
+            &second_pending,
+        );
+        assert!(
+            String::from_utf8_lossy(&final_sse).contains("after-second"),
+            "text after the second tool should be emitted after its result"
+        );
+        BridgeRegistry::remove("session-second-tool");
+    }
+
+    #[test]
+    fn same_delta_second_xml_tool_is_queued_for_next_resume() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+        let events = vec![CursorStreamEvent::TextDelta {
+            text: concat!(
+                r#"<tool_use name="Read">{"file_path":"/tmp/first"}</tool_use>"#,
+                r#"<tool_use name="Write">{"file_path":"/tmp/second","content":"body"}</tool_use>"#,
+                " tail"
+            )
+            .into(),
+        }];
+        let allowed = BTreeSet::from(["Read".to_string(), "Write".to_string()]);
+        let (_, paused) = start_cursor_tool_bridge(
+            "msg-same-delta",
+            "cursor-test",
+            "session-same-delta",
+            &events,
+            Some(allowed),
+            Box::new(|| "xml-first".into()),
+        );
+        assert!(paused);
+        let first_pending =
+            BridgeRegistry::pending_tool("session-same-delta").expect("first XML tool");
+        assert_eq!(first_pending.name(), "Read");
+
+        let (_, second_sse) = resume_cursor_tool_bridge(
+            "session-same-delta",
+            "msg-same-delta-resume",
+            "cursor-test",
+            &serde_json::json!({"type": "tool_result", "content": "read ok"}),
+            &first_pending,
+        );
+        let second_pending = BridgeRegistry::pending_tool("session-same-delta")
+            .expect("second XML tool from same delta");
+        assert_eq!(second_pending.name(), "Write");
+        assert!(!String::from_utf8_lossy(&second_sse).contains(" tail"));
+        BridgeRegistry::remove("session-same-delta");
+    }
+
+    #[test]
+    fn partial_second_xml_survives_pause_and_resume() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+        let events = vec![
+            CursorStreamEvent::TextDelta {
+                text: concat!(
+                    r#"<tool_use name="Read">{"file_path":"/tmp/first"}</tool_use>"#,
+                    "<tool_use name=\"Write\">{\"file_path\":\"/tmp/second\",\"content\":\""
+                )
+                .into(),
+            },
+            CursorStreamEvent::TextDelta {
+                text: " body\"}</tool_use> tail".into(),
+            },
+        ];
+        let allowed = BTreeSet::from(["Read".to_string(), "Write".to_string()]);
+        let (_, paused) = start_cursor_tool_bridge(
+            "msg-partial-second",
+            "cursor-test",
+            "session-partial-second",
+            &events,
+            Some(allowed),
+            Box::new(|| "xml-partial-first".into()),
+        );
+        assert!(paused);
+        let first_pending =
+            BridgeRegistry::pending_tool("session-partial-second").expect("first XML tool");
+        assert_eq!(first_pending.name(), "Read");
+
+        let (_, second_sse) = resume_cursor_tool_bridge(
+            "session-partial-second",
+            "msg-partial-second-resume",
+            "cursor-test",
+            &serde_json::json!({"type": "tool_result", "content": "read ok"}),
+            &first_pending,
+        );
+        let second_pending = BridgeRegistry::pending_tool("session-partial-second")
+            .expect("partial second XML tool");
+        assert_eq!(second_pending.name(), "Write");
+        assert_eq!(second_pending.input_json()["content"], " body");
+        assert!(!String::from_utf8_lossy(&second_sse).contains(" tail"));
+        BridgeRegistry::remove("session-partial-second");
+    }
+
+    #[test]
     fn pending_bash_input_matches_claude_bash_tool() {
         let tool = PendingCursorTool::Bash {
             tool_use_id: "call_cursor_3".into(),
@@ -1123,6 +1847,81 @@ mod tests {
         let json = tool.input_json();
         // Without a working directory, command is passed as-is
         assert_eq!(json["command"], "ls");
+    }
+
+    #[test]
+    fn pending_bash_escapes_apostrophe_in_working_directory() {
+        let tool = PendingCursorTool::Bash {
+            tool_use_id: "call_cursor_quote".into(),
+            command: "pwd".into(),
+            working_directory: "/tmp/it's-here".into(),
+            timeout_ms: 5_000,
+        };
+        assert_eq!(
+            tool.input_json()["command"],
+            "cd '/tmp/it'\\''s-here' && pwd"
+        );
+    }
+
+    #[test]
+    fn recovered_bash_accepts_string_and_float_timeout() {
+        for timeout in [serde_json::json!("5000"), serde_json::json!(5000.0)] {
+            let tool = RecoveredCursorToolUse {
+                id: "call_bash_timeout".into(),
+                original_id: None,
+                name: "Bash".into(),
+                input: serde_json::json!({
+                    "command": "pwd",
+                    "timeout": timeout,
+                    "cwd": "/tmp/it's-here"
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            };
+            let pending = pending_from_recovered_tool(&tool).expect("Bash pending");
+            assert_eq!(pending.input_json()["timeout"], 5_000);
+            assert_eq!(
+                pending.input_json()["command"],
+                "cd '/tmp/it'\\''s-here' && pwd"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_alias_uses_native_shell_result_path() {
+        let tool = RecoveredCursorToolUse {
+            id: "call_powershell".into(),
+            original_id: None,
+            name: "PowerShell".into(),
+            input: serde_json::json!({
+                "command": "Get-ChildItem",
+                "timeout": 5000,
+                "cwd": "C:\\work"
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        };
+        let pending = pending_from_recovered_tool(&tool).expect("PowerShell pending");
+        assert!(matches!(pending, PendingCursorTool::Bash { .. }));
+        assert_eq!(pending.name(), "Bash");
+        assert_eq!(pending.input_json()["timeout"], 5000);
+    }
+
+    #[test]
+    fn native_powershell_alias_uses_native_shell_result_path() {
+        let pending = pending_from_native_tool(
+            "native-powershell",
+            "PowerShell",
+            &serde_json::json!({
+                "command": "Get-ChildItem",
+                "timeout": 5000,
+                "cwd": "C:\\work"
+            }),
+        );
+        assert!(matches!(pending, PendingCursorTool::Bash { .. }));
+        assert_eq!(pending.tool_use_id(), "native-powershell");
     }
 
     // -----------------------------------------------------------------------
@@ -1371,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_tool_names_filters_internal_hooks_and_deprecated_tools() {
+    fn advertised_tool_names_filters_internal_hooks_and_keeps_compat_tools() {
         let body: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1386,7 +2185,10 @@ mod tests {
         let names = advertised_tool_names(&body).expect("Read and public tool remain");
         assert!(names.contains("Read"));
         assert!(names.contains("mcp__plugin_lobster-channel_lobster-channel__lobster_reply"));
-        assert!(!names.contains("TaskOutput"));
+        // Claude Code 2.1.193 still advertises TaskOutput. It is deprecated in
+        // newer clients, but keeping it in the allow-list preserves older
+        // transcripts and lets a pending result complete normally.
+        assert!(names.contains("TaskOutput"));
         assert!(
             !names.contains("mcp__plugin_lobster-channel_lobster-channel__notify_messa00a7caa")
         );
@@ -1604,6 +2406,32 @@ mod tests {
     }
 
     #[test]
+    fn renders_structured_and_scalar_tool_result_content() {
+        let object = serde_json::json!({
+            "type": "tool_result",
+            "content": {"status": "ok", "items": [1, 2]}
+        });
+        let rendered = render_tool_result_content(&object);
+        assert!(rendered.contains("\"status\":\"ok\""));
+        assert!(rendered.contains("\"items\":[1,2]"));
+
+        let structured = serde_json::json!({
+            "type": "tool_result",
+            "structured_output": {"answer": 42}
+        });
+        assert_eq!(render_tool_result_content(&structured), r#"{"answer":42}"#);
+    }
+
+    #[test]
+    fn renders_string_items_in_tool_result_arrays_without_json_quotes() {
+        let result = serde_json::json!({
+            "type": "tool_result",
+            "content": ["first", "second"]
+        });
+        assert_eq!(render_tool_result_content(&result), "first\nsecond");
+    }
+
+    #[test]
     fn render_empty_tool_result() {
         let result = serde_json::json!({"type": "tool_result"});
         assert_eq!(render_tool_result_content(&result), "");
@@ -1637,6 +2465,23 @@ mod tests {
             resolve_advertised_name("Write", Some(&allowed)).as_deref(),
             Some("Write")
         );
+    }
+
+    #[test]
+    fn write_alias_resolution_uses_the_advertised_spelling() {
+        for alias in ["write", "write_file", "WriteFile"] {
+            let allowed: BTreeSet<String> = [alias.to_string()].into_iter().collect();
+            assert_eq!(
+                resolve_advertised_name("Write", Some(&allowed)).as_deref(),
+                Some(alias),
+                "native Write should follow the client's registered alias"
+            );
+            assert_eq!(
+                resolve_advertised_name(alias, Some(&allowed)).as_deref(),
+                Some(alias),
+                "recovered XML aliases should remain callable"
+            );
+        }
     }
 
     #[test]

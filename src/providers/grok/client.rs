@@ -99,8 +99,18 @@ impl GrokClient {
         body: &GrokResponsesRequest,
         traffic: Option<Arc<TrafficCapture>>,
     ) -> Result<GrokResponse, GrokError> {
+        self.post_with_headers(body, traffic, &[]).await
+    }
+
+    pub async fn post_with_headers(
+        &self,
+        body: &GrokResponsesRequest,
+        traffic: Option<Arc<TrafficCapture>>,
+        extra_headers: &[(String, String)],
+    ) -> Result<GrokResponse, GrokError> {
         let bytes = serde_json::to_vec(body).unwrap_or_default();
-        self.post_bytes(&bytes, traffic).await
+        self.post_bytes_with_headers(&bytes, traffic, extra_headers)
+            .await
     }
 
     pub async fn post_bytes(
@@ -165,6 +175,7 @@ impl GrokClient {
                 Ok(response) => break response,
                 Err(error)
                     if attempt < crate::retry::MAX_RATE_LIMIT_RETRIES
+                        && !is_context_window_overflow(&error.message)
                         && crate::retry::should_retry_upstream(
                             error.status.as_u16(),
                             &error.message,
@@ -266,6 +277,7 @@ pub fn extract_upstream_error_message(body: &[u8], fallback: &str) -> String {
         .and_then(|value| {
             value
                 .pointer("/error/message")
+                .or_else(|| value.pointer("/response/error/message"))
                 .or_else(|| value.get("message"))
                 .and_then(serde_json::Value::as_str)
         })
@@ -273,7 +285,39 @@ pub fn extract_upstream_error_message(body: &[u8], fallback: &str) -> String {
     sanitize_error_message(raw)
 }
 
-fn sanitize_error_message(raw: &str) -> String {
+/// Returns whether an upstream Grok error indicates that the prompt exceeded
+/// the model's usable context or compaction budget.
+pub fn is_context_window_overflow(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    let matched = [
+        "context window",
+        "context length",
+        "prompt is too long",
+        "prompt too long",
+        "too long for this model",
+        "maximum prompt length",
+        "input is too long",
+        "input too long",
+        "too many tokens",
+        "token limit exceeded",
+        "maximum context",
+        "max context",
+        "maximum number of tokens",
+        "exceeds context",
+        "context overflow",
+        "compaction failed",
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "prompt_too_long",
+        "too_many_tokens",
+        "compaction_failed",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle));
+    matched || (value.contains("current message") && value.contains("exceeds budget"))
+}
+
+pub(crate) fn sanitize_error_message(raw: &str) -> String {
     let truncated: String = raw.chars().take(512).collect();
     let mut out = String::new();
     let mut words = truncated.split_whitespace().peekable();

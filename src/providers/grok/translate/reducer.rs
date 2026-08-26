@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use serde_json::Value;
 
@@ -6,6 +7,50 @@ use super::stream::SseDecoder;
 
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
+
+/// Details carried by a terminal error event from the Grok Responses stream.
+///
+/// Keeping this as a typed error lets the live translator preserve the
+/// upstream error code/message while still using `anyhow` for parser and
+/// ordering failures elsewhere in the reducer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamStreamError {
+    pub code: String,
+    pub message: String,
+}
+
+impl fmt::Display for UpstreamStreamError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UpstreamStreamError {}
+
+/// Extract the stable error fields from either a Responses `response.failed`
+/// event or an API `error` event. Grok has emitted both shapes in practice.
+pub fn upstream_error_details(value: &Value) -> UpstreamStreamError {
+    let error = value
+        .pointer("/response/error")
+        .or_else(|| value.pointer("/error"));
+    let code = error
+        .and_then(|error| {
+            error
+                .get("code")
+                .or_else(|| error.get("type"))
+                .and_then(Value::as_str)
+        })
+        .filter(|code| !code.trim().is_empty())
+        .unwrap_or("server_error")
+        .to_owned();
+    let message = error
+        .and_then(|error| error.get("message").and_then(Value::as_str))
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("Upstream error")
+        .to_owned();
+    let message = crate::providers::grok::client::sanitize_error_message(&message);
+    UpstreamStreamError { code, message }
+}
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
@@ -15,6 +60,9 @@ pub enum ReducerEvent {
     TextStart(usize),
     TextDelta(usize, String),
     TextStop(usize),
+    CompactionStart(usize),
+    CompactionDelta(usize, String),
+    CompactionStop(usize),
     ToolStart(usize, String, String),
     ToolDelta(usize, String),
     ToolStop(usize),
@@ -72,6 +120,17 @@ impl Reducer {
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow::anyhow!("reasoning delta is invalid"))?,
                 ),
+            "response.compaction.delta" | "response.compaction_text.delta" => self.delta(
+                "compaction",
+                value
+                    .get("delta")
+                    .or_else(|| value.get("content"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("compaction delta is invalid"))?,
+            ),
+            "response.compaction.done" | "response.compaction_text.done" => {
+                self.close_kind("compaction")
+            }
             "response.custom_tool_call_input.delta" => {
                 let id = value
                     .get("item_id")
@@ -122,7 +181,19 @@ impl Reducer {
                     .get("item")
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("output item is invalid"))?;
-                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                if item.get("type").and_then(Value::as_str) == Some("compaction") {
+                    let mut out = self.close_active()?;
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    self.active = Some(("compaction".into(), index));
+                    out.push(ReducerEvent::CompactionStart(index));
+                    if let Some(content) = item.get("content").and_then(Value::as_str) {
+                        if !content.is_empty() {
+                            out.push(ReducerEvent::CompactionDelta(index, content.into()));
+                        }
+                    }
+                    Ok(out)
+                } else if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
                     let id = item
                         .get("id")
                         .and_then(Value::as_str)
@@ -249,6 +320,7 @@ impl Reducer {
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("completed output item is invalid"))?;
                 match item.get("type").and_then(Value::as_str) {
+                    Some("compaction") => self.close_kind("compaction"),
                     Some("web_search_call") => {
                         let id = item
                             .get("id")
@@ -362,7 +434,7 @@ impl Reducer {
                 });
                 Ok(out)
             }
-            "error" | "response.failed" => anyhow::bail!("upstream Grok stream failed"),
+            "error" | "response.failed" => Err(anyhow::Error::new(upstream_error_details(&value))),
             _ => Ok(vec![]),
         }
     }
@@ -377,23 +449,26 @@ impl Reducer {
             let index = self.next_index;
             self.next_index += 1;
             self.active = Some((kind.into(), index));
-            out.push(if kind == "thinking" {
-                ReducerEvent::ThinkingStart(index)
-            } else {
-                ReducerEvent::TextStart(index)
+            out.push(match kind {
+                "thinking" => ReducerEvent::ThinkingStart(index),
+                "compaction" => ReducerEvent::CompactionStart(index),
+                _ => ReducerEvent::TextStart(index),
             });
         }
         let index = self.active.as_ref().unwrap().1;
-        out.push(if kind == "thinking" {
-            ReducerEvent::ThinkingDelta(index, delta.into())
-        } else {
-            ReducerEvent::TextDelta(index, delta.into())
+        out.push(match kind {
+            "thinking" => ReducerEvent::ThinkingDelta(index, delta.into()),
+            "compaction" => ReducerEvent::CompactionDelta(index, delta.into()),
+            _ => ReducerEvent::TextDelta(index, delta.into()),
         });
         Ok(out)
     }
     fn close_active(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
         Ok(match self.active.take() {
             Some((kind, index)) if kind == "thinking" => vec![ReducerEvent::ThinkingStop(index)],
+            Some((kind, index)) if kind == "compaction" => {
+                vec![ReducerEvent::CompactionStop(index)]
+            }
             Some((_, index)) => vec![ReducerEvent::TextStop(index)],
             None => vec![],
         })
@@ -503,5 +578,33 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn grok_reducer_preserves_response_failed_details() {
+        let input = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long for the context window\"}}}\n\n";
+        let error = reduce_upstream_bytes(input).expect_err("failed event must stop reduction");
+        let error = error
+            .downcast_ref::<UpstreamStreamError>()
+            .expect("failed event should retain typed upstream details");
+        assert_eq!(error.code, "context_length_exceeded");
+        assert_eq!(error.message, "prompt is too long for the context window");
+    }
+
+    #[test]
+    fn grok_reducer_maps_compaction_output_to_anthropic_block_events() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"compaction\",\"content\":\"first\"}}\n\ndata: {\"type\":\"response.compaction.delta\",\"delta\":\" second\"}\n\ndata: {\"type\":\"response.compaction.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+        assert!(matches!(events[0], ReducerEvent::CompactionStart(0)));
+        assert!(matches!(
+            events[1],
+            ReducerEvent::CompactionDelta(0, ref text) if text == "first"
+        ));
+        assert!(matches!(
+            events[2],
+            ReducerEvent::CompactionDelta(0, ref text) if text == " second"
+        ));
+        assert!(matches!(events[3], ReducerEvent::CompactionStop(0)));
+        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
     }
 }

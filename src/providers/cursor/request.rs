@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 pub struct CursorSelectedImage {
     pub data: String,
     pub uuid: String,
+    /// Empty for Anthropic inline images. Cursor treats a non-empty path as
+    /// an asset/blob reference rather than the official inline-data shape.
     pub path: String,
     pub mime_type: String,
 }
@@ -102,9 +104,6 @@ const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "Write",
     "write_file",
     "WriteFile",
-    "Edit",
-    "MultiEdit",
-    "NotebookEdit",
     "Grep",
     "Search",
     "Glob",
@@ -122,6 +121,93 @@ const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "CreatePlan",
     "Plan",
 ];
+
+/// Claude Code tools that have no Cursor `ExecServerMessage` result envelope.
+///
+/// These are registered as Claude-local MCP tools when present in the incoming
+/// catalog.  Cursor can then emit a normal MCP call and the proxy hands it back
+/// to Claude Code as a ClientOnly tool_use; the next request carries the
+/// tool_result and starts a fresh Cursor segment.  Keeping this list explicit
+/// avoids accidentally exposing internal hooks while covering the built-ins in
+/// Claude Code 2.1.x and later.
+const CLAUDE_CLIENT_ONLY_TOOL_NAMES: &[&str] = &[
+    // Claude Code's current built-ins and the names still emitted by older
+    // 2.x clients.  These tools have no Cursor ExecServerMessage result
+    // envelope; they must be registered in the Cursor MCP catalog and
+    // returned as ClientOnly tool_use blocks for Claude Code to execute.
+    "Agent",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "NotebookRead",
+    "PowerShell",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TaskCreate",
+    "TaskGet",
+    "TaskUpdate",
+    "TaskList",
+    "TaskStop",
+    "TaskOutput",
+    "AgentOutputTool",
+    "BashOutputTool",
+    "AgentOutput",
+    "BashOutput",
+    "KillShell",
+    "KillBash",
+    "ListPeers",
+    "LSP",
+    // Claude Code 2.1.193 external built-ins without a Cursor exec envelope.
+    // They are client-executed after the proxy emits a ClientOnly tool_use.
+    "Monitor",
+    "StructuredOutput",
+    "Artifact",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "RemoteTrigger",
+    "SendMessage",
+    "Brief",
+    "ToolSearch",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "ReadMcpResourceDirTool",
+    "ListMcpResources",
+    "ReadMcpResource",
+    "ReadMcpResourceDir",
+    "ListAgents",
+    "WaitForMcpServers",
+    "SendUserMessage",
+    "SendUserFile",
+    "ReportFindings",
+    // Claude Code 2.1.211 SDK/runtime built-ins. These are client-owned
+    // control tools with no Cursor ExecServerMessage result envelope, so they
+    // must be advertised through the Claude-local MCP catalog when supplied
+    // by the client. TaskOutput remains available for older Claude clients.
+    "REPL",
+    "RefreshMcpTools",
+    "PushNotification",
+    "ClaudeDesign",
+    "DesignSync",
+    "Projects",
+    "ShareOnboardingGuide",
+    "ShowOnboardingRolePicker",
+    // Runtime-only names observed in the Claude CLI binary. They can appear
+    // in the incoming tool catalog even though they are not in sdk-tools.d.ts.
+    "ConnectGitHub",
+    "EndConversation",
+    "SendFile",
+    "SearchMcpRegistry",
+    "SuggestConnectors",
+    "ListConnectors",
+];
+
+pub(crate) fn is_claude_client_only_tool_name(name: &str) -> bool {
+    CLAUDE_CLIENT_ONLY_TOOL_NAMES.contains(&name)
+}
 
 const GROK_BUILD_CLIENT_TOOL_NAMES: &[&str] = &[
     "run_terminal_command",
@@ -162,6 +248,21 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
     !name.is_empty() && !is_cursor_native_tool_name(name)
 }
 
+/// Claude Code Edit-family tools that may arrive through Cursor's XML fallback
+/// stream.  They have no Cursor exec result envelope, so XML calls are exposed
+/// as ClientOnly only after the live driver validates their Claude schema and
+/// allow-list entry.
+pub(crate) fn is_xml_client_only_native_tool_name(name: &str) -> bool {
+    matches!(name, "Edit" | "MultiEdit" | "NotebookEdit")
+}
+
+/// Classify tool results that require a fresh Anthropic continuation rather
+/// than a Cursor native exec result.  The three XML-native tools above are
+/// included because their tool_use blocks are emitted directly to Claude Code.
+pub(crate) fn is_client_only_tool_name(name: &str) -> bool {
+    is_claude_local_tool_name(name) || is_xml_client_only_native_tool_name(name)
+}
+
 /// Claude Code/MCP entries that are implementation hooks rather than model
 /// capabilities.  Cursor truncates long MCP names to a prefix plus a hash, so
 /// the prefixes below intentionally match both the original and truncated
@@ -185,10 +286,9 @@ pub(crate) fn is_model_visible_tool_name(name: &str) -> bool {
         .rsplit(['/', ':'])
         .next()
         .unwrap_or(name);
-    leaf != "TaskOutput"
-        && !HIDDEN_MODEL_TOOL_LEAF_PREFIXES
-            .iter()
-            .any(|prefix| leaf.starts_with(prefix))
+    !HIDDEN_MODEL_TOOL_LEAF_PREFIXES
+        .iter()
+        .any(|prefix| leaf.starts_with(prefix))
         // `lobster_reply_from_stop` is truncated to `lobster_repl` + a
         // seven-character hash. Do not hide the public `lobster_reply` tool,
         // which shares the same initial characters but has no hash suffix.
@@ -210,6 +310,13 @@ pub(crate) fn is_model_visible_tool_definition(tool: &serde_json::Value) -> bool
     if !is_model_visible_tool_name(name) {
         return false;
     }
+    let leaf = name
+        .rsplit("__")
+        .next()
+        .unwrap_or(name)
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(name);
     let description = tool
         .get("description")
         .and_then(|description| description.as_str())
@@ -236,8 +343,11 @@ pub(crate) fn is_model_visible_tool_definition(tool: &serde_json::Value) -> bool
                 .next()
                 .is_some_and(|ch| !ch.is_ascii_alphanumeric())
     });
+    // TaskOutput is deprecated in current Claude Code, but older clients still
+    // send it explicitly. Preserve that compatibility path while continuing
+    // to hide deprecated hook tools.
     !(internal_marker
-        || deprecated_marker
+        || (deprecated_marker && leaf != "TaskOutput")
         || (lower.contains("do not call") && lower.contains("model output"))
         || lower.contains("not for model output"))
 }
@@ -276,11 +386,34 @@ fn advertise_as_cursor_mcp(name: &str, grok_build_request: bool) -> bool {
         return true;
     }
     let bare = strip_mcp_provider_prefix(name);
+    // Claude Code's Agent is fulfilled by Cursor's native Task event. A bare
+    // Agent entry in mcp_tools would create a second subagent route; qualified
+    // `claude-local/Agent` spellings remain eligible for explicit MCP calls.
+    if name == "Agent" {
+        return false;
+    }
     if grok_client_tool_uses_native_remap(name) || grok_client_tool_uses_native_remap(bare) {
         return false;
     }
     if is_grok_build_client_tool_name(name)
         || (is_grok_build_client_tool_name(bare) && is_claude_local_mcp_spelling(name))
+    {
+        return true;
+    }
+    // Claude Code built-ins without a Cursor-native result envelope must stay
+    // callable when another MCP tool is present.  In that case the compact
+    // prompt intentionally omits local schemas, so registering them on the
+    // Cursor catalog is the only way function-calling models can select them.
+    // Grok's lowercase lifecycle aliases and Cursor-native Task/Agent aliases
+    // are handled by their dedicated remap paths.  Registering the Claude
+    // `Agent` alias on a Grok request would create a second subagent catalog
+    // entry and make tool selection nondeterministic.
+    let grok_native_task_alias =
+        grok_build_request && matches!(bare, "Agent" | "Task" | "task" | "TaskOutput" | "TaskStop");
+    if (!grok_native_task_alias && is_claude_client_only_tool_name(name))
+        || (is_claude_local_mcp_spelling(name)
+            && !grok_native_task_alias
+            && is_claude_client_only_tool_name(bare))
     {
         return true;
     }
@@ -921,7 +1054,7 @@ pub(crate) fn request_has_client_only_tool_results(req: &MessagesRequest) -> boo
         return false;
     }
     ids.iter()
-        .any(|id| assistant_tool_name_for_id(req, id).is_some_and(is_claude_local_tool_name))
+        .any(|id| assistant_tool_name_for_id(req, id).is_some_and(is_client_only_tool_name))
 }
 
 /// True when a Free registry slot is being asked to replay native tool results
@@ -1141,12 +1274,35 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
         }
         ToolDumpMode::ClaudeLocalOnly => String::new(),
     };
+    // Claude Code's native Write has a client-side Read-before-Write guard.
+    // Cursor models do not see that local state, so a failed Write can be
+    // repeated indefinitely unless the contract is made explicit in the
+    // prompt. Keep this hint next to the advertised schemas in every dump
+    // mode, including the compact MCP path.
+    let write_hint = if has_write_tool_definition(tools) {
+        "Before calling Write (or write/write_file), call Read (or read_file) on the same path in an earlier tool turn; never write an unread file.\n"
+    } else {
+        ""
+    };
+    let preface = format!("{write_hint}{preface}");
     if tool_lines.is_empty() && preface.is_empty() {
         None
     } else {
         let body = tool_lines.join("\n");
         Some(format!("<tools>\n{preface}{body}\n</tools>"))
     }
+}
+
+fn has_write_tool_definition(tools: &[serde_json::Value]) -> bool {
+    tools.iter().any(|tool| {
+        let Some(name) = tool.get("name").and_then(|name| name.as_str()) else {
+            return false;
+        };
+        matches!(
+            name,
+            "Write" | "write" | "ReadWrite" | "write_file" | "WriteFile" | "Edit"
+        )
+    })
 }
 
 /// Return the exact MCP catalog spelling for every original Anthropic tool
@@ -1211,13 +1367,43 @@ fn tools_dump_preface(req: &MessagesRequest, mcp_catalog: bool) -> String {
 /// `selected_images` with fresh UUIDs makes Cursor look up stale asset ids and
 /// 502 `Image not found [internal]`.
 pub fn cursor_selected_images(req: &MessagesRequest) -> Vec<CursorSelectedImage> {
-    let mut images: Vec<CursorSelectedImage> = Vec::new();
-    let mut index: u32 = 0;
+    cursor_selected_images_with_history(req, false)
+}
 
-    for message in current_turn_user_messages(req) {
+/// Extract selected images for a new Cursor run.
+///
+/// When a conversation checkpoint exists, only the trailing user turn is sent
+/// because Cursor already owns the assets from earlier turns. A run that never
+/// produced a checkpoint is different: Claude Code may retry with an assistant
+/// error/partial turn in the history, placing the original image before the
+/// trailing user message. In that case replay all user images so a fresh Cursor
+/// conversation can reconstruct the request instead of silently dropping the
+/// attachment.
+pub(crate) fn cursor_selected_images_for_continuation(
+    req: &MessagesRequest,
+    has_checkpoint: bool,
+) -> Vec<CursorSelectedImage> {
+    cursor_selected_images_with_history(req, !has_checkpoint)
+}
+
+fn cursor_selected_images_with_history(
+    req: &MessagesRequest,
+    include_history: bool,
+) -> Vec<CursorSelectedImage> {
+    let mut images: Vec<CursorSelectedImage> = Vec::new();
+
+    let messages = if include_history {
+        req.messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect()
+    } else {
+        current_turn_user_messages(req)
+    };
+    for message in messages {
         let blocks = message_blocks(message);
         for block in &blocks {
-            collect_image_blocks(block, &mut index, &mut images);
+            collect_image_blocks(block, &mut images);
         }
     }
 
@@ -1238,12 +1424,12 @@ fn current_turn_user_messages(req: &MessagesRequest) -> Vec<&crate::anthropic::s
     trailing
 }
 
-fn stable_image_uuid(data: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(data.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    uuid::Uuid::from_bytes(bytes).to_string()
+/// Cursor's CLI assigns each inline image a fresh UUID. The UUID is metadata
+/// for the selected-image entry, while the actual payload is carried in the
+/// protobuf `data` field; reusing a content-derived UUID can make the server
+/// reuse a stale asset entry when the same bytes are pasted again.
+fn fresh_image_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,24 +1486,19 @@ fn render_block(block: &serde_json::Value) -> Option<String> {
             let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
             Some(format!("<thinking>\n{text}\n</thinking>"))
         }
-        "image" => {
-            let source = block.get("source")?;
-            match source.get("type").and_then(|t| t.as_str()) {
-                Some("url") => {
-                    let url = source.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                    Some(format!("[image: {url}]"))
-                }
-                _ => {
-                    let media_type = source
-                        .get("media_type")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown");
-                    let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                    Some(format!(
-                        "[image: {media_type}, {} base64 chars]",
-                        data.len()
-                    ))
-                }
+        "compaction" => {
+            let content = block
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            Some(format!("<compaction>\n{content}\n</compaction>"))
+        }
+        "image" | "input_image" | "image_url" => {
+            let (raw, hinted_mime) = image_candidate(block)?;
+            if let Some((data, mime_type)) = normalize_image_data(raw, hinted_mime) {
+                Some(format!("[image: {mime_type}, {} base64 chars]", data.len()))
+            } else {
+                Some(format!("[image: {raw}]"))
             }
         }
         "tool_use" => {
@@ -1384,6 +1565,9 @@ fn render_tool_result_content(block: &serde_json::Value) -> String {
     let content = match block.get("content") {
         Some(serde_json::Value::String(s)) => return s.clone(),
         Some(serde_json::Value::Array(arr)) => arr.clone(),
+        Some(serde_json::Value::Object(object)) if object.contains_key("type") => {
+            vec![serde_json::Value::Object(object.clone())]
+        }
         _ => return String::new(),
     };
 
@@ -1397,7 +1581,8 @@ fn render_tool_result_content(block: &serde_json::Value) -> String {
 fn render_tool_result_block(block: &serde_json::Value) -> Option<String> {
     let block_type = block.get("type").and_then(|t| t.as_str())?;
     match block_type {
-        "text" | "image" | "tool_use" | "tool_result" | "thinking" => render_block(block),
+        "text" | "image" | "input_image" | "image_url" | "tool_use" | "tool_result"
+        | "thinking" => render_block(block),
         _ => {
             let type_str = block_type.to_string();
             Some(format!("[unsupported tool result block: {type_str}]"))
@@ -1411,45 +1596,26 @@ fn message_blocks(message: &crate::anthropic::schema::Message) -> Vec<serde_json
             vec![serde_json::json!({"type": "text", "text": s})]
         }
         serde_json::Value::Array(arr) => arr.clone(),
+        serde_json::Value::Object(object) if object.contains_key("type") => {
+            vec![serde_json::Value::Object(object.clone())]
+        }
         _ => Vec::new(),
     }
 }
 
-fn collect_image_blocks(
-    block: &serde_json::Value,
-    index: &mut u32,
-    images: &mut Vec<CursorSelectedImage>,
-) {
-    if block.get("type").and_then(|t| t.as_str()) == Some("image") {
-        let source = match block.get("source") {
-            Some(s) => s,
-            None => return,
-        };
-        if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
-            return;
-        }
-        let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
-        if data.trim().is_empty() {
-            return;
-        }
-        if base64::engine::general_purpose::STANDARD
-            .decode(data.trim())
-            .is_err()
-        {
-            return;
-        }
-        let media_type = source
-            .get("media_type")
-            .and_then(|m| m.as_str())
-            .unwrap_or("image/png");
-        let uuid = stable_image_uuid(data);
-        *index += 1;
-        let extension = image_extension(media_type);
+fn collect_image_blocks(block: &serde_json::Value, images: &mut Vec<CursorSelectedImage>) {
+    if let Some((raw, hinted_mime)) = image_candidate(block)
+        && let Some((data, mime_type)) = normalize_image_data(raw, hinted_mime)
+    {
+        let uuid = fresh_image_uuid();
         images.push(CursorSelectedImage {
-            data: data.to_string(),
+            data,
             uuid,
-            path: format!("claude-image-{index}.{extension}"),
-            mime_type: media_type.to_string(),
+            // The official CLI leaves `path` empty when `data` is present.
+            // Supplying a synthetic path can make Cursor look up a stale
+            // asset and return `Image not found [internal]`.
+            path: String::new(),
+            mime_type,
         });
         return;
     }
@@ -1458,32 +1624,173 @@ fn collect_image_blocks(
     if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
         let content = match block.get("content") {
             Some(serde_json::Value::Array(arr)) => arr.clone(),
+            Some(serde_json::Value::Object(object)) if object.contains_key("type") => {
+                vec![serde_json::Value::Object(object.clone())]
+            }
             _ => return,
         };
         for child in &content {
             let child_type = child.get("type").and_then(|t| t.as_str());
-            matches!(
+            if matches!(
                 child_type,
-                Some("text" | "image" | "tool_use" | "tool_result" | "thinking")
-            );
-            collect_image_blocks(child, index, images);
+                Some(
+                    "text"
+                        | "image"
+                        | "input_image"
+                        | "image_url"
+                        | "tool_use"
+                        | "tool_result"
+                        | "thinking"
+                )
+            ) {
+                collect_image_blocks(child, images);
+            }
         }
     }
 }
 
-fn image_extension(media_type: &str) -> &'static str {
-    match media_type {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "img",
+/// Return an image payload from Anthropic blocks and the OpenAI-compatible
+/// `input_image`/`image_url` forms emitted by newer Claude Code clients.
+/// Remote URLs are intentionally returned to the normalizer and skipped there;
+/// the proxy only forwards bytes it received in the request.
+fn image_candidate(block: &serde_json::Value) -> Option<(&str, Option<&str>)> {
+    let block_type = block.get("type").and_then(|value| value.as_str())?;
+    match block_type {
+        "image" => {
+            let source = block.get("source");
+            if let Some(source) = source.and_then(|value| value.as_object()) {
+                let hinted = source
+                    .get("media_type")
+                    .or_else(|| source.get("mime_type"))
+                    .and_then(|value| value.as_str());
+                if let Some(data) = source.get("data").and_then(|value| value.as_str()) {
+                    return Some((data, hinted));
+                }
+                if let Some(url) = source.get("url").and_then(|value| value.as_str()) {
+                    return Some((url, hinted));
+                }
+            }
+            block
+                .get("data")
+                .and_then(|value| value.as_str())
+                .map(|data| (data, None))
+        }
+        "input_image" | "image_url" => {
+            // Newer Claude Code clients may preserve the Anthropic image
+            // source shape under `input_image.source` instead of converting
+            // it to OpenAI's `image_url` field. Accept both wire forms.
+            if let Some(source) = block.get("source").and_then(|value| value.as_object()) {
+                let hinted = source
+                    .get("media_type")
+                    .or_else(|| source.get("mime_type"))
+                    .and_then(|value| value.as_str());
+                if let Some(data) = source
+                    .get("data")
+                    .or_else(|| source.get("url"))
+                    .and_then(|value| value.as_str())
+                {
+                    return Some((data, hinted));
+                }
+            }
+            let value = block
+                .get("image_url")
+                .or_else(|| block.get("imageUrl"))
+                .or_else(|| block.get("url"))?;
+            if let Some(url) = value.as_str() {
+                return Some((url, None));
+            }
+            let object = value.as_object()?;
+            let hinted = object
+                .get("media_type")
+                .or_else(|| object.get("mime_type"))
+                .and_then(|value| value.as_str());
+            object
+                .get("url")
+                .or_else(|| object.get("data"))
+                .and_then(|value| value.as_str())
+                .map(|value| (value, hinted))
+        }
+        _ => None,
+    }
+}
+
+/// Decode a base64 image, accepting a data URI, whitespace/newline-wrapped
+/// payloads, URL-safe alphabets, and missing padding. The returned Base64 is
+/// canonical so the protobuf layer always receives the exact image bytes.
+fn normalize_image_data(raw: &str, hinted_mime: Option<&str>) -> Option<(String, String)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (uri_mime, encoded) = if let Some(rest) = raw.strip_prefix("data:") {
+        let (metadata, encoded) = rest.split_once(',')?;
+        if !metadata
+            .split(';')
+            .any(|part| part.eq_ignore_ascii_case("base64"))
+        {
+            return None;
+        }
+        (
+            metadata.split(';').next().filter(|mime| !mime.is_empty()),
+            encoded,
+        )
+    } else {
+        (None, raw)
+    };
+    let compact: String = encoded
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    let bytes = decode_base64_flexible(&compact)?;
+    let mime_type = normalize_mime_type(hinted_mime.or(uri_mime), &bytes);
+    Some((
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        mime_type,
+    ))
+}
+
+fn decode_base64_flexible(value: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    STANDARD
+        .decode(value)
+        .or_else(|_| STANDARD_NO_PAD.decode(value))
+        .or_else(|_| URL_SAFE.decode(value))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(value))
+        .ok()
+}
+
+fn normalize_mime_type(hinted: Option<&str>, data: &[u8]) -> String {
+    let hinted = hinted
+        .map(str::trim)
+        .filter(|mime| mime.starts_with("image/"))
+        .and_then(|mime| mime.split(';').next())
+        .filter(|mime| !mime.is_empty());
+    hinted
+        .map(str::to_ascii_lowercase)
+        .or_else(|| sniff_image_mime(data).map(str::to_string))
+        .unwrap_or_else(|| "image/png".to_string())
+}
+
+fn sniff_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(&[0xff, 0xd8]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if data.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     /// Serialize tests that mutate process-wide CCP_CURSOR_* env flags.
@@ -1607,6 +1914,142 @@ mod tests {
     }
 
     #[test]
+    fn claude_local_mcp_tools_registers_cursorless_claude_builtins() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "edit"}],
+            "tools": [
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "Edit", "description": "edit", "input_schema": {"type": "object"}},
+                {"name": "MultiEdit", "description": "multi edit", "input_schema": {"type": "object"}},
+                {"name": "NotebookEdit", "description": "notebook edit", "input_schema": {"type": "object"}},
+                {"name": "EnterPlanMode", "description": "plan", "input_schema": {"type": "object"}},
+                {"name": "LSP", "description": "language server", "input_schema": {"type": "object"}},
+                {"name": "CronCreate", "description": "schedule", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect("cursorless builtins must be registered");
+        let names: Vec<&str> = mcp.tools.iter().map(|tool| tool.name.as_str()).collect();
+        for required in [
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+            "EnterPlanMode",
+            "LSP",
+            "CronCreate",
+        ] {
+            assert!(
+                names.contains(&required),
+                "{required} missing from {names:?}"
+            );
+        }
+        assert!(!names.contains(&"Read"), "Cursor Read remains native");
+        assert!(!is_cursor_native_tool_name("Edit"));
+        assert!(is_claude_client_only_tool_name("NotebookEdit"));
+    }
+
+    #[test]
+    fn claude_local_mcp_tools_registers_current_claude_builtin_set() {
+        let names = [
+            "PowerShell",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "EnterWorktree",
+            "ExitWorktree",
+            "TaskCreate",
+            "TaskGet",
+            "TaskUpdate",
+            "TaskList",
+            "TaskStop",
+            "LSP",
+            "Monitor",
+            "StructuredOutput",
+            "Artifact",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "ScheduleWakeup",
+            "SendMessage",
+            "Brief",
+            "ToolSearch",
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            "ReadMcpResourceDirTool",
+            "ListAgents",
+            "WaitForMcpServers",
+            "SendUserMessage",
+            "SendUserFile",
+            "REPL",
+            "RefreshMcpTools",
+            "PushNotification",
+            "ClaudeDesign",
+            "DesignSync",
+            "Projects",
+            "ShareOnboardingGuide",
+            "ShowOnboardingRolePicker",
+            "ConnectGitHub",
+            "EndConversation",
+            "SendFile",
+            "SearchMcpRegistry",
+            "SuggestConnectors",
+            "ListConnectors",
+        ];
+        let tools: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "description": format!("{name} tool"),
+                    "input_schema": {"type": "object"}
+                })
+            })
+            .collect();
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "inspect"}],
+            "tools": tools
+        }))
+        .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect("built-ins must be registered");
+        let registered: BTreeSet<&str> = mcp.tools.iter().map(|tool| tool.name.as_str()).collect();
+        for name in names {
+            assert!(
+                registered.contains(name),
+                "{name} missing from {registered:?}"
+            );
+            assert!(is_client_only_tool_name(name));
+        }
+
+        // Agent is fulfilled by the Cursor-native Task event. It must remain
+        // in the client's allow-list but not be duplicated in mcp_tools.
+        let agent_req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "delegate"}],
+            "tools": [
+                {"name": "Agent", "description": "start a subagent", "input_schema": {"type": "object"}},
+                {"name": "Workflow", "description": "run a workflow", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let agent_mcp = claude_local_mcp_tools(&agent_req).expect("Workflow remains on MCP");
+        assert!(!agent_mcp.tools.iter().any(|tool| tool.name == "Agent"));
+
+        let qualified_req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "delegate"}],
+            "tools": [{
+                "name": "mcp_claude-local_Agent",
+                "description": "explicit provider-qualified agent",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        let qualified = claude_local_mcp_tools(&qualified_req).expect("qualified Agent MCP");
+        assert_eq!(qualified.tools[0].name, "mcp_claude-local_Agent");
+    }
+
+    #[test]
     fn claude_local_mcp_tools_advertises_task_but_skips_ask_user_question() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
@@ -1706,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_local_mcp_tools_hides_internal_hooks_and_deprecated_task_output() {
+    fn claude_local_mcp_tools_hides_internal_hooks_and_keeps_legacy_task_output() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
             "messages": [{"role": "user", "content": "go"}],
@@ -1729,11 +2172,12 @@ mod tests {
             names,
             vec![
                 "Workflow",
+                "TaskOutput",
                 "mcp__plugin_lobster-channel_lobster-channel__lobster_reply"
             ]
         );
         assert!(is_model_visible_tool_name("Workflow"));
-        assert!(!is_model_visible_tool_name("TaskOutput"));
+        assert!(is_model_visible_tool_name("TaskOutput"));
         assert!(!is_model_visible_tool_name(
             "mcp__plugin_lobster-channel_lobster-channel__notify_messa00a7caa"
         ));
@@ -2156,6 +2600,29 @@ mod tests {
     }
 
     #[test]
+    fn write_tool_dump_requires_a_prior_read() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "update the file"}],
+            "tools": [
+                {"name": "Read", "description": "read a file", "input_schema": {"type": "object"}},
+                {"name": "Write", "description": "write a file", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+
+        for mode in [ToolDumpMode::All, ToolDumpMode::CompactClaudeLocal] {
+            let dump = render_tools_block(&req, mode).expect("write tools should be rendered");
+            assert!(
+                dump.contains("Before calling Write")
+                    && dump.contains("call Read")
+                    && dump.contains("same path"),
+                "write dump must carry the Read-before-Write contract: {dump}"
+            );
+        }
+    }
+
+    #[test]
     fn request_context_empty_without_working_directory() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
@@ -2301,6 +2768,52 @@ mod tests {
             !parts.user_text.contains("mcp_claude-local_"),
             "checkpoint delta must not invent provider-prefixed MCP names"
         );
+    }
+
+    #[test]
+    fn edit_family_tool_results_use_client_only_continuation() {
+        for (name, input) in [
+            (
+                "Edit",
+                serde_json::json!({
+                    "file_path": "/tmp/a.rs",
+                    "old_string": "a",
+                    "new_string": "b"
+                }),
+            ),
+            (
+                "MultiEdit",
+                serde_json::json!({
+                    "file_path": "/tmp/a.rs",
+                    "edits": [{"old_string": "a", "new_string": "b"}]
+                }),
+            ),
+            (
+                "NotebookEdit",
+                serde_json::json!({
+                    "notebook_path": "/tmp/a.ipynb",
+                    "cell_id": "cell-1",
+                    "new_source": "1 + 1"
+                }),
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "fable",
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "edit-1", "name": name, "input": input}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "edit-1", "content": "ok"}
+                    ]}
+                ]
+            }))
+            .unwrap();
+            assert!(
+                request_has_client_only_tool_results(&req),
+                "{name} tool_result must route through ClientOnly continuation"
+            );
+        }
     }
 
     #[test]
@@ -2746,6 +3259,54 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/png");
         assert_eq!(images[0].data, "AAAA");
+        assert!(images[0].path.is_empty());
+    }
+
+    #[test]
+    fn normalizes_data_uri_and_input_image_payloads() {
+        let png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAC";
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "data": png_data_uri}},
+                    {"type": "input_image", "image_url": {"url": png_data_uri}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let images = cursor_selected_images(&req);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAC");
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, images[1].data);
+    }
+
+    #[test]
+    fn extracts_claude_code_input_image_source_shape() {
+        // Claude Code clipboard uploads can arrive as an OpenAI-compatible
+        // `input_image` block while retaining Anthropic's nested `source`.
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gemini-3.1-pro",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": "/9j/4AAQ"
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        let images = cursor_selected_images(&req);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "/9j/4AAQ");
+        assert_eq!(images[0].mime_type, "image/jpeg");
+        assert!(uuid::Uuid::parse_str(&images[0].uuid).is_ok());
     }
 
     #[test]
@@ -2757,7 +3318,7 @@ mod tests {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "old screenshot"},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "OLDIMG"}}
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "T0xESU1H"}}
                     ]
                 },
                 {"role": "assistant", "content": "ok"},
@@ -2768,6 +3329,37 @@ mod tests {
         assert!(
             cursor_selected_images(&req).is_empty(),
             "replaying historical screenshots as new selected_images causes Cursor Image not found"
+        );
+    }
+
+    #[test]
+    fn selected_images_restore_history_when_checkpoint_is_missing() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "old screenshot"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "T0xESU1H"}}
+                    ]
+                },
+                {"role": "assistant", "content": "upstream failed before a checkpoint"},
+                {"role": "user", "content": "retry this request"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            cursor_selected_images_for_continuation(&req, false)
+                .iter()
+                .map(|image| image.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["T0xESU1H"],
+            "a checkpoint-less retry must replay the original image"
+        );
+        assert!(
+            cursor_selected_images_for_continuation(&req, true).is_empty(),
+            "checkpoint-backed turns must keep history images out of selected_context"
         );
     }
 
@@ -2832,7 +3424,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_images_uuid_is_stable_for_same_bytes() {
+    fn selected_images_use_fresh_cli_style_uuids() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{
@@ -2845,7 +3437,9 @@ mod tests {
         .unwrap();
         let a = cursor_selected_images(&req);
         let b = cursor_selected_images(&req);
-        assert_eq!(a[0].uuid, b[0].uuid);
+        assert_ne!(a[0].uuid, b[0].uuid);
+        assert!(uuid::Uuid::parse_str(&a[0].uuid).is_ok());
+        assert!(uuid::Uuid::parse_str(&b[0].uuid).is_ok());
     }
 
     #[test]
@@ -2964,6 +3558,21 @@ mod tests {
         let images = cursor_selected_images(&req);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/jpeg");
+        assert_eq!(images[0].data, "BBBB");
+    }
+
+    #[test]
+    fn tool_result_with_single_object_image() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "content":
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}}
+            ]}]
+        }))
+        .unwrap();
+        let images = cursor_selected_images(&req);
+        assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "BBBB");
     }
 

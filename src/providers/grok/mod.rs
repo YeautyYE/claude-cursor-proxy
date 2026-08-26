@@ -30,7 +30,7 @@ use self::translate::{
     accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model},
     request::translate_request,
-    stream::{SseDecoder, StreamTranslator, stream_error},
+    stream::{SseDecoder, StreamTranslator},
 };
 
 pub struct GrokProvider {
@@ -73,7 +73,19 @@ impl GrokProvider {
             monitor.model_resolved(&ctx.req_id, &model);
             monitor.upstream_started(&ctx.req_id);
         }
-        let extra_headers = grok_passthrough_request_headers(inbound_headers);
+        let mut extra_headers = grok_passthrough_request_headers(inbound_headers);
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+            for (name, value) in translate::request::grok_compaction_headers_from_value(
+                value.get("context_management"),
+            ) {
+                if !extra_headers
+                    .iter()
+                    .any(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+                {
+                    extra_headers.push((name, value));
+                }
+            }
+        }
         let upstream = match self
             .client
             .post_bytes_with_headers(body, ctx.traffic.clone(), &extra_headers)
@@ -129,7 +141,12 @@ impl Provider for GrokProvider {
             monitor.model_resolved(&ctx.req_id, &resolved);
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match self.client.post(&translated, ctx.traffic.clone()).await {
+        let compaction_headers = translate::request::grok_compaction_headers(&body);
+        let upstream = match self
+            .client
+            .post_with_headers(&translated, ctx.traffic.clone(), &compaction_headers)
+            .await
+        {
             Ok(response) => response,
             Err(error) => return map_error(error),
         };
@@ -173,13 +190,9 @@ impl Provider for GrokProvider {
                     }
                     (StatusCode::OK, Json(value)).into_response()
                 }
-                Err(_) => {
+                Err(error) => {
                     write_error(ctx.traffic.as_deref(), "accumulate", "invalid_response");
-                    json_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        "Grok response is invalid",
-                    )
+                    map_translation_error(error)
                 }
             }
         }
@@ -239,7 +252,7 @@ const PASSTHROUGH_RESPONSE_HEADERS: &[&str] = &[
     "x-request-id",
 ];
 
-pub use self::client::extract_upstream_error_message;
+pub use self::client::{extract_upstream_error_message, is_context_window_overflow};
 
 pub fn is_passthrough_request_header(name: &str) -> bool {
     PASSTHROUGH_REQUEST_HEADERS
@@ -456,7 +469,14 @@ where
                     ));
                 }
                 Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => return Some(self.fail_at("transport", "upstream_stream")),
+                Ok(Some(Err(error))) => {
+                    return Some(self.fail_at_with_details(
+                        "transport",
+                        "upstream_stream",
+                        "api_error",
+                        &error.message,
+                    ));
+                }
                 Ok(None) => {
                     if self.decoder.finish().is_err() || !self.reducer.finished() {
                         return Some(self.fail_at("decoder", "incomplete_stream"));
@@ -496,7 +516,19 @@ where
                 }
                 let reduced = match self.reducer.push(value) {
                     Ok(events) => events,
-                    Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
+                    Err(error) => {
+                        if let Some(details) =
+                            error.downcast_ref::<translate::reducer::UpstreamStreamError>()
+                        {
+                            return Some(self.fail_at_with_details(
+                                "reducer",
+                                "upstream_failed",
+                                &details.code,
+                                &details.message,
+                            ));
+                        }
+                        return Some(self.fail_at("reducer", "invalid_event"));
+                    }
                 };
                 let usage = reduced.iter().find_map(|event| match event {
                     translate::reducer::ReducerEvent::Finish {
@@ -530,16 +562,42 @@ where
     }
 
     fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
+        self.fail_at_with_details(stage, kind, "api_error", "Grok stream is invalid")
+    }
+
+    fn fail_at_with_details(
+        &mut self,
+        stage: &str,
+        kind: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> Vec<u8> {
         self.error_sent = true;
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
-            capture.downstream_event("error", serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}}));
+            capture.downstream_event(
+                "error",
+                serde_json::json!({
+                    "type":"error",
+                    "error":{"type":"api_error","code":error_code,"message":error_message}
+                }),
+            );
         }
         if let Some(traffic) = self.traffic.as_ref() {
-            traffic.write_json("060-grok-stream-error", &serde_json::json!({"stage":stage,"kind":kind,"bytes":self.bytes,"chunks":self.chunks}));
+            traffic.write_json(
+                "060-grok-stream-error",
+                &serde_json::json!({
+                    "stage":stage,
+                    "kind":kind,
+                    "code":error_code,
+                    "message":error_message,
+                    "bytes":self.bytes,
+                    "chunks":self.chunks
+                }),
+            );
         }
         self.finish_capture(false);
-        stream_error()
+        translate::stream::stream_error_with_details(error_code, error_message)
     }
 
     fn capture_downstream(&mut self, bytes: &[u8]) {
@@ -620,7 +678,32 @@ pub fn mapped_upstream_status(status: StatusCode) -> StatusCode {
     }
 }
 
+fn map_translation_error(error: anyhow::Error) -> Response {
+    if let Some(details) = error.downcast_ref::<translate::reducer::UpstreamStreamError>() {
+        return map_upstream_failure(&details.code, &details.message);
+    }
+    json_error(
+        StatusCode::BAD_GATEWAY,
+        "api_error",
+        "Grok response is invalid",
+    )
+}
+
+fn map_upstream_failure(code: &str, message: &str) -> Response {
+    if is_context_window_overflow(message) || is_context_window_overflow(code) {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message);
+    }
+    json_error(StatusCode::BAD_GATEWAY, "api_error", message)
+}
+
 fn map_error(error: client::GrokError) -> Response {
+    if error.status == StatusCode::PAYLOAD_TOO_LARGE || is_context_window_overflow(&error.message) {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            error.message,
+        );
+    }
     let status = mapped_upstream_status(error.status);
     match status {
         StatusCode::UNAUTHORIZED => json_error(
@@ -949,6 +1032,54 @@ mod tests {
             assert!(captured.contains(&format!("\"stage\": \"{stage}\"")));
             assert!(captured.contains("stream_error"));
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_failed_event_preserves_upstream_error_details() {
+        let response = stream_body(
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long for the context window\"}}}\n\n",
+            ))]),
+            "msg_1".into(),
+            "grok-4.6".into(),
+            None,
+            "req_1".into(),
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("context_length_exceeded"), "{body}");
+        assert!(
+            body.contains("prompt is too long for the context window"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_overflow_maps_to_request_too_large() {
+        let response = map_error(client::GrokError {
+            status: StatusCode::BAD_REQUEST,
+            retry_after: None,
+            message: "prompt is too long for the context window".into(),
+        });
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "prompt is too long for the context window"
+        );
+
+        let response = map_error(client::GrokError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            retry_after: None,
+            message: "payload too large".into(),
+        });
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
     }
 
     #[test]

@@ -54,7 +54,8 @@ use super::proto::{
 use super::request::{
     CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, cursor_mcp_wire_name,
     is_claude_local_mcp_spelling, is_claude_local_tool_name, is_grok_build_subagent_lifecycle_tool,
-    normalize_grok_build_lifecycle_name, strip_mcp_provider_prefix,
+    is_xml_client_only_native_tool_name, normalize_grok_build_lifecycle_name,
+    strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
 use super::sse::{
@@ -4008,8 +4009,30 @@ fn live_heartbeat_thinking_budget(stream_idle: Duration) -> Duration {
     let minimum_secs = stream_idle.as_secs().saturating_mul(2).max(1);
     let maximum_secs = 1800.max(minimum_secs);
     Duration::from_secs(
-        env_u64("CCP_CURSOR_HEARTBEAT_PROGRESS_SECS", 600).clamp(minimum_secs, maximum_secs),
+        // Long-thinking models can legitimately emit only transport
+        // heartbeats for many minutes. Keep the recovery window below the
+        // 30-minute segment hard deadline, while avoiding a premature
+        // "no useful progress" terminal error at the former 10-minute mark.
+        env_u64("CCP_CURSOR_HEARTBEAT_PROGRESS_SECS", 1200).clamp(minimum_secs, maximum_secs),
     )
+}
+
+/// A post-tool continuation can spend a long time in Cursor's sampler while
+/// only emitting transport heartbeats. Its tool results have already crossed
+/// the outbound boundary, so aborting at the normal heartbeat budget creates
+/// an ambiguous error even though the same live conversation is still able to
+/// finish. Keep that continuation alive until the segment hard deadline; no
+/// tool result is replayed by this wait extension.
+fn live_thinking_idle_budget(
+    user_prompt: &str,
+    heartbeat_budget: Duration,
+    segment_hard_timeout: Duration,
+) -> Duration {
+    if user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT {
+        heartbeat_budget.max(segment_hard_timeout)
+    } else {
+        heartbeat_budget
+    }
 }
 
 pub(crate) fn local_overload_retry_after() -> String {
@@ -6994,7 +7017,7 @@ async fn drive_live_run(
             last_liveness.elapsed(),
             setup_idle,
             stream_idle,
-            heartbeat_progress_idle,
+            live_thinking_idle_budget(&user_prompt, heartbeat_progress_idle, hard),
         ) {
             if !live_idle_stall_can_reconnect(
                 useful,
@@ -8431,11 +8454,13 @@ async fn process_live_frame(
 
         let Some(mut native) = PendingCursorExec::from_server(&exec) else {
             logical_tools_waiting.resolve_server_exec_hint(&exec);
-            // Soft-fail: PiWriteExec / ApplyAgentDiff / unknown tags are not
-            // decoded — throw instead of inventing a Claude Write.
+            // Soft-fail unknown exec variants instead of inventing a Claude
+            // Write. PiWriteExec is decoded above and follows its own result
+            // envelope; ApplyAgentDiff and future tags still land here.
             if let Ok(frames) = encode_control_throw(
                 exec.id,
-                "Unsupported Cursor exec tool (mapped: shell/write/delete/grep/read/ls; not PiWrite/ApplyAgentDiff)".into(),
+                "Unsupported Cursor exec tool (mapped: shell/write/pi_write/delete/grep/read/ls)"
+                    .into(),
             ) {
                 for frame in frames {
                     if !send_frame_or_fail(
@@ -8789,9 +8814,11 @@ async fn process_interaction_update(
                     // Claude-local tools (Workflow/Skill/…) appear as XML in
                     // Fable text when advertised via `<tools>`. Native
                     // Read/Bash still come through ExecServerMessage.
-                    if let Some(emit_name) =
-                        client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
-                    {
+                    if let Some(emit_name) = xml_client_only_anthropic_name(
+                        &tool_use.name,
+                        &tool_use.input,
+                        allowed_tool_names,
+                    ) {
                         let mut exec = client_only_pending_exec(&tool_use);
                         exec.claude_name = emit_name.clone();
                         exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
@@ -9236,9 +9263,11 @@ async fn flush_xml_tool_uses(
             }
             RecoveredCursorEvent::Text(_) => {}
             RecoveredCursorEvent::ToolUse(tool_use) => {
-                if let Some(emit_name) =
-                    client_only_anthropic_name(&tool_use.name, "", allowed_tool_names)
-                {
+                if let Some(emit_name) = xml_client_only_anthropic_name(
+                    &tool_use.name,
+                    &tool_use.input,
+                    allowed_tool_names,
+                ) {
                     let mut exec = client_only_pending_exec(&tool_use);
                     exec.claude_name = emit_name.clone();
                     exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
@@ -9321,6 +9350,122 @@ fn lifecycle_client_only_name(
     Some(exact.to_string())
 }
 
+/// Resolve a tool recovered from Cursor's text/XML stream into a Claude Code
+/// ClientOnly call.  Edit-family payloads use Claude's local contract and must
+/// not be mapped to Cursor's overwrite/edit exec.  Require an exact advertised
+/// name and a complete schema before exposing one; malformed XML is discarded
+/// by the caller instead of being leaked as transcript text.
+fn xml_client_only_anthropic_name(
+    mapped_name: &str,
+    input: &serde_json::Map<String, serde_json::Value>,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    if is_xml_client_only_native_tool_name(mapped_name) {
+        let allowed = allowed.filter(|set| !set.is_empty())?;
+        if !allowed.contains(mapped_name) {
+            return None;
+        }
+        return valid_xml_native_tool_input(mapped_name, input).then(|| mapped_name.to_string());
+    }
+    client_only_anthropic_name(mapped_name, "", allowed)
+}
+
+fn valid_xml_native_tool_input(
+    name: &str,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    fn nonempty_string(input: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        input
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    fn optional_bool(input: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        input.get(key).is_none_or(serde_json::Value::is_boolean)
+    }
+
+    fn optional_enum(
+        input: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        values: &[&str],
+    ) -> bool {
+        input
+            .get(key)
+            .is_none_or(|value| value.as_str().is_some_and(|value| values.contains(&value)))
+    }
+
+    fn integer_number(value: &serde_json::Value) -> bool {
+        value.as_u64().is_some()
+            || value.as_i64().is_some_and(|value| value >= 0)
+            || value
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && value >= 0.0 && value.fract() == 0.0)
+    }
+
+    match name {
+        "Edit" => {
+            nonempty_string(input, "file_path")
+                && input
+                    .get("old_string")
+                    .is_some_and(serde_json::Value::is_string)
+                && input
+                    .get("new_string")
+                    .is_some_and(serde_json::Value::is_string)
+                && optional_bool(input, "replace_all")
+        }
+        "MultiEdit" => {
+            if !nonempty_string(input, "file_path") || !optional_bool(input, "replace_all") {
+                return false;
+            }
+            let Some(edits) = input.get("edits").and_then(|value| value.as_array()) else {
+                return false;
+            };
+            !edits.is_empty()
+                && edits.iter().all(|edit| {
+                    let Some(edit) = edit.as_object() else {
+                        return false;
+                    };
+                    edit.get("old_string")
+                        .is_some_and(serde_json::Value::is_string)
+                        && edit
+                            .get("new_string")
+                            .is_some_and(serde_json::Value::is_string)
+                        && optional_bool(edit, "replace_all")
+                })
+        }
+        "NotebookEdit" => {
+            if !nonempty_string(input, "notebook_path")
+                || !input
+                    .get("new_source")
+                    .is_some_and(serde_json::Value::is_string)
+                || !optional_enum(input, "cell_type", &["code", "markdown"])
+                || !optional_enum(input, "edit_mode", &["replace", "insert", "delete"])
+            {
+                return false;
+            }
+            // Claude Code 2.1.193 uses an optional string `cell_id`; older
+            // clients used an integer `cell_number`.  Insert may omit either
+            // selector, while replace/delete require one at runtime.
+            let has_cell_id = input
+                .get("cell_id")
+                .is_some_and(|value| value.as_str().is_some_and(|value| !value.is_empty()));
+            let has_cell_number = input.get("cell_number").is_some_and(integer_number);
+            if input.get("cell_id").is_some() && !has_cell_id
+                || input.get("cell_number").is_some() && !has_cell_number
+            {
+                return false;
+            }
+            let mode = input
+                .get("edit_mode")
+                .and_then(|value| value.as_str())
+                .unwrap_or("replace");
+            mode == "insert" || has_cell_id || has_cell_number
+        }
+        _ => false,
+    }
+}
+
 fn client_only_anthropic_name(
     mapped_name: &str,
     provider_identifier: &str,
@@ -9335,20 +9480,44 @@ fn client_only_anthropic_name(
     {
         return lifecycle_client_only_name(mapped_name, provider_identifier, allowed);
     }
-    // Bare Task/task/Agent must not become ClientOnly via this path: Cursor
-    // native Task (which never carries an MCP provider) is translated only by
-    // the dedicated native-Task branch, and internal aliases stay dead. A
-    // claude-local-qualified exact `Task` is different — that is the model
-    // invoking the advertised `mcp_claude-local_Task` (Claude Code
-    // subagents). Map it back to the client's task tool, or advertising Task
-    // hands function-calling models a tool that errors on every call.
+    // Bare Task/task must not become ClientOnly via this path: Cursor native
+    // Task (which never carries an MCP provider) is translated only by the
+    // dedicated native-Task branch. A claude-local-qualified exact `Task` is
+    // different: it is the model invoking the advertised Claude Code task
+    // tool. `Agent` has no Cursor-native counterpart, so accept its exact
+    // advertised spelling in the same MCP path.
     if matches!(mapped_name, "Task" | "task" | "Agent")
         || matches!(stripped, "Task" | "task" | "Agent")
     {
         let claude_local_qualified = provider_identifier == CLAUDE_LOCAL_MCP_PROVIDER
             || (provider_identifier.is_empty() && is_claude_local_mcp_spelling(mapped_name));
-        if stripped == "Task" && claude_local_qualified {
+        if matches!(stripped, "Task" | "Agent") && claude_local_qualified {
+            // Preserve a provider-qualified spelling when that is the exact
+            // tool name Claude Code advertised. This matters for older clients
+            // that keep `mcp_claude-local_Agent` in their tool_result history.
+            if let Some(set) = allowed.filter(|set| !set.is_empty()) {
+                if set.contains(mapped_name) {
+                    return Some(mapped_name.to_string());
+                }
+                if let Some(hit) = set
+                    .iter()
+                    .find(|candidate| cursor_mcp_wire_name(candidate) == mapped_name)
+                {
+                    return Some(hit.clone());
+                }
+            }
             return advertised_client_task_name(allowed);
+        }
+        if stripped == "Agent"
+            && !claude_local_qualified
+            && let Some(set) = allowed.filter(|set| !set.is_empty())
+        {
+            // XML fallback may omit the provider attribute. Agent is not a
+            // Cursor native name, so an exact advertised Agent is still safe
+            // to expose; bare Task remains reserved for Cursor's Task path.
+            if let Some(agent) = set.get("Agent") {
+                return Some(agent.clone());
+            }
         }
         return None;
     }
@@ -10035,6 +10204,7 @@ fn encode_request_context_reply(
                 error: None,
             }),
             shell_stream: None,
+            pi_write_result: None,
         }),
         kv_client_message: None,
         exec_client_control_message: None,
@@ -13056,6 +13226,30 @@ mod tests {
         assert!(
             live_idle_stall_can_reconnect(true, idle, setup, idle),
             "a transport-silent stream may still use checkpoint recovery"
+        );
+    }
+
+    #[test]
+    fn post_tool_continuation_waits_until_segment_deadline() {
+        let heartbeat_budget = Duration::from_secs(600);
+        let segment_hard_timeout = Duration::from_secs(1_800);
+        assert_eq!(
+            live_thinking_idle_budget(
+                EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
+                heartbeat_budget,
+                segment_hard_timeout,
+            ),
+            segment_hard_timeout,
+            "a heartbeat-only post-tool continuation must not fail at the shorter 10-minute sampler budget"
+        );
+        assert_eq!(
+            live_thinking_idle_budget(
+                "continue the user's request",
+                heartbeat_budget,
+                segment_hard_timeout
+            ),
+            heartbeat_budget,
+            "ordinary turns keep the normal heartbeat stall budget"
         );
     }
 
@@ -17032,6 +17226,113 @@ mod tests {
     }
 
     #[test]
+    fn xml_native_edit_requires_advertised_complete_schema() {
+        let allowed = BTreeSet::from(["Edit".to_string()]);
+        let valid = serde_json::json!({
+            "file_path": "/tmp/example.rs",
+            "old_string": "before",
+            "new_string": "after",
+            "replace_all": true,
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name("Edit", valid.as_object().unwrap(), Some(&allowed))
+                .as_deref(),
+            Some("Edit")
+        );
+        let missing = serde_json::json!({
+            "file_path": "/tmp/example.rs",
+            "old_string": "before",
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name("Edit", missing.as_object().unwrap(), Some(&allowed)),
+            None,
+            "incomplete XML Edit must be dropped"
+        );
+        assert_eq!(
+            xml_client_only_anthropic_name("Edit", valid.as_object().unwrap(), None),
+            None,
+            "XML native tools require an exact downstream allow-list entry"
+        );
+    }
+
+    #[test]
+    fn xml_native_multi_edit_validates_each_edit() {
+        let allowed = BTreeSet::from(["MultiEdit".to_string()]);
+        let valid = serde_json::json!({
+            "file_path": "/tmp/example.rs",
+            "edits": [
+                {"old_string": "one", "new_string": "two"},
+                {"old_string": "three", "new_string": "four", "replace_all": true}
+            ]
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name("MultiEdit", valid.as_object().unwrap(), Some(&allowed))
+                .as_deref(),
+            Some("MultiEdit")
+        );
+        let malformed = serde_json::json!({
+            "file_path": "/tmp/example.rs",
+            "edits": [{"old_string": "one"}]
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name(
+                "MultiEdit",
+                malformed.as_object().unwrap(),
+                Some(&allowed)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn xml_native_notebook_edit_accepts_current_and_legacy_selector() {
+        let allowed = BTreeSet::from(["NotebookEdit".to_string()]);
+        let current = serde_json::json!({
+            "notebook_path": "/tmp/example.ipynb",
+            "cell_id": "cell-1",
+            "new_source": "print(1)",
+            "cell_type": "code",
+            "edit_mode": "replace"
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name(
+                "NotebookEdit",
+                current.as_object().unwrap(),
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("NotebookEdit")
+        );
+        let legacy = serde_json::json!({
+            "notebook_path": "/tmp/example.ipynb",
+            "cell_number": 2,
+            "new_source": "print(2)"
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name(
+                "NotebookEdit",
+                legacy.as_object().unwrap(),
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("NotebookEdit")
+        );
+        let malformed = serde_json::json!({
+            "notebook_path": "/tmp/example.ipynb",
+            "cell_id": 1,
+            "new_source": "print(1)"
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name(
+                "NotebookEdit",
+                malformed.as_object().unwrap(),
+                Some(&allowed)
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn client_only_anthropic_name_rejects_lifecycle_spoof() {
         let allowed = BTreeSet::from(["spawn_subagent".to_string()]);
         assert_eq!(
@@ -17153,6 +17454,17 @@ mod tests {
             client_only_anthropic_name("mcp_claude-local_Task", "claude-local", Some(&grok))
                 .as_deref(),
             Some("spawn_subagent")
+        );
+        let agent_only = BTreeSet::from(["Agent".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("mcp_claude-local_Agent", "claude-local", Some(&agent_only))
+                .as_deref(),
+            Some("Agent")
+        );
+        assert_eq!(
+            client_only_anthropic_name("Agent", "", Some(&agent_only)).as_deref(),
+            Some("Agent"),
+            "Agent has no Cursor-native counterpart and may arrive from XML without provider metadata"
         );
     }
 
@@ -18627,6 +18939,67 @@ mod tests {
                 );
             }
             other => panic!("unexpected event for unadvertised XML web_search: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xml_edit_family_exposes_only_valid_client_tools() {
+        let cases = [
+            (
+                "Edit",
+                serde_json::json!({
+                    "file_path": "/tmp/a.rs",
+                    "old_string": "one",
+                    "new_string": "two"
+                }),
+                true,
+            ),
+            (
+                "MultiEdit",
+                serde_json::json!({
+                    "file_path": "/tmp/a.rs",
+                    "edits": [{"old_string": "one", "new_string": "two"}]
+                }),
+                true,
+            ),
+            (
+                "NotebookEdit",
+                serde_json::json!({
+                    "notebook_path": "/tmp/a.ipynb",
+                    "cell_id": "cell-1",
+                    "new_source": "print(1)",
+                    "edit_mode": "replace"
+                }),
+                true,
+            ),
+            (
+                "Edit",
+                serde_json::json!({"file_path": "/tmp/a.rs", "old_string": "one"}),
+                false,
+            ),
+        ];
+        for (name, input, should_expose) in cases {
+            let allowed = BTreeSet::from([name.to_string()]);
+            let xml = format!(
+                r#"<tool_use id="xml-{name}" name="{name}">{}</tool_use>"#,
+                serde_json::to_string(&input).unwrap()
+            );
+            let (cont, event, pending) =
+                drive_native_task_frame(xml_tool_use_frame(&xml), Some(&allowed), None).await;
+            if should_expose {
+                assert!(!cont, "valid {name} XML must end the segment");
+                match event.expect("ClientOnly tool batch") {
+                    Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                        assert_eq!(tools.len(), 1);
+                        assert_eq!(tools[0].name, name);
+                    }
+                    other => panic!("expected {name} ClientOnly batch, got {other:?}"),
+                }
+            } else {
+                assert!(cont, "malformed {name} XML must remain dropped");
+                assert!(pending.is_empty());
+                assert!(!matches!(event, Some(Ok(LiveRunEvent::NativeToolBatch(_)))));
+            }
         }
     }
 

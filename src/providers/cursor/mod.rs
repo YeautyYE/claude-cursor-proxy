@@ -64,7 +64,7 @@ use crate::providers::cursor::request::{
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream,
-    decode_upstream_response, estimate_request_input_tokens,
+    decode_upstream_response, estimate_rendered_prompt_tokens, estimate_request_input_tokens,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
@@ -252,6 +252,17 @@ fn tap_session_usage(
 
 fn live_path_eligible(_want_stream: bool, has_session: bool, bidi_enabled: bool) -> bool {
     has_session && bidi_enabled
+}
+
+/// Grok Build uses a stable `xai-compact-*` client request id for server-side
+/// context compaction. Compaction is a separate operation: it must not join
+/// the ordinary Cursor live-run slot or reuse the conversation checkpoint that
+/// the preceding turn is still draining.
+pub(crate) fn is_xai_compact_request(client_request_id: Option<&str>) -> bool {
+    client_request_id.map(str::trim).is_some_and(|id| {
+        id.strip_prefix("xai-compact-")
+            .is_some_and(|suffix| !suffix.is_empty())
+    })
 }
 
 fn live_path_skip_reason(
@@ -714,12 +725,53 @@ async fn start_live_events_with_retries_with_client_type(
                             if run.request_fingerprint() != operation_fingerprint
                                 && run.is_consumer_gone()
                                 && !run.has_pending_execs()
-                                && let Some(reservation) = LiveRunRegistry::supersede_run(
+                            {
+                                match LiveRunRegistry::claim_replacement_for_fresh_request(
                                     identity.session_id,
                                     identity.agent_id,
-                                )
-                            {
-                                break Some(reservation);
+                                    run.run_id(),
+                                ) {
+                                    LiveReplacementClaim::Reserved {
+                                        mut reservation,
+                                        superseded: Some(handle),
+                                    } => {
+                                        reservation.set_operation_fingerprint(
+                                            handle.request_fingerprint(),
+                                        );
+                                        reservation.protect_on_drop();
+                                        match handle.cancel_and_wait().await {
+                                            Ok(()) => {
+                                                match finish_replacement_after_cancel(
+                                                    reservation,
+                                                    handle,
+                                                    false,
+                                                    Ok(()),
+                                                ) {
+                                                    Ok(reservation) => break Some(reservation),
+                                                    Err(error) => return Err(error),
+                                                }
+                                            }
+                                            Err(error) => {
+                                                match finish_replacement_after_cancel(
+                                                    reservation,
+                                                    handle,
+                                                    false,
+                                                    Err(error),
+                                                ) {
+                                                    Ok(_) => unreachable!(
+                                                        "failed cancellation must not authorize replacement"
+                                                    ),
+                                                    Err(error) => return Err(error),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    LiveReplacementClaim::Reserved {
+                                        reservation,
+                                        superseded: None,
+                                    } => break Some(reservation),
+                                    LiveReplacementClaim::Conflict => {}
+                                }
                             }
                             // A different operation must never attach to or
                             // cancel a live generation. Give the old request
@@ -1027,17 +1079,17 @@ enum LivePumpOutcome {
     ClientGone,
 }
 
+/// Thinking deltas are speculative and remain buffered until an answer,
+/// native tool, or terminal event commits the turn. This lets a heartbeat-only
+/// stall restart without exposing a terminal error after hidden reasoning.
 fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
     match event {
         LiveRunEvent::NativeToolBatch(_) => true,
+        LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) => !text.is_empty(),
+        LiveRunEvent::Cursor(CursorStreamEvent::NativeTool { .. } | CursorStreamEvent::End) => true,
         LiveRunEvent::Cursor(
             CursorStreamEvent::ThinkingDelta { .. }
-            | CursorStreamEvent::TextDelta { .. }
-            | CursorStreamEvent::NativeTool { .. }
-            | CursorStreamEvent::End,
-        ) => true,
-        LiveRunEvent::Cursor(
-            CursorStreamEvent::Session { .. }
+            | CursorStreamEvent::Session { .. }
             | CursorStreamEvent::Usage { .. }
             | CursorStreamEvent::OutputTokenDelta { .. },
         ) => false,
@@ -2213,6 +2265,7 @@ impl Provider for CursorProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
+        let xai_compact = is_xai_compact_request(ctx.client_request_id.as_deref());
         let requested_model = body.model.as_deref().unwrap_or("cursor");
         let wire_model = anthropic_wire_model(requested_model);
         let effort = match crate::providers::translate_shared::read_effort(&body) {
@@ -2248,7 +2301,7 @@ impl Provider for CursorProvider {
         // instead of replaying the whole conversation as a fresh Cursor run.
         let mut preclaimed_live_reservation = None;
         let mut resumed_live_events = None;
-        if let Some(session_id) = ctx.session_id.as_deref() {
+        if !xai_compact && let Some(session_id) = ctx.session_id.as_deref() {
             let agent_id = claude_agent_id(&ctx);
             let fingerprint_payload =
                 live_operation_fingerprint_payload(&body, ctx.client_request_id.as_deref());
@@ -2446,7 +2499,8 @@ impl Provider for CursorProvider {
         // tool_result in `messages` and expects a *new* model turn (full history),
         // not an empty resume of leftover Cursor frames. Clear bridge pending and
         // fall through to run_agent with the complete Anthropic conversation.
-        if let Some(bridge_key) = bridge_registry_key(&ctx)
+        if !xai_compact
+            && let Some(bridge_key) = bridge_registry_key(&ctx)
             && let Some(pending) = BridgeRegistry::pending_tool(&bridge_key)
             && find_tool_result(&body, pending.tool_use_id()).is_some()
         {
@@ -2514,7 +2568,31 @@ impl Provider for CursorProvider {
             return resp;
         }
 
-        let session_id = ctx.session_id.as_deref();
+        // A compaction request carries the full history needed for its summary
+        // and must run as a fresh non-live request. Reusing the normal session
+        // here would re-enter the live registry and the persisted checkpoint,
+        // recreating the 503/compaction loop seen by grok-build.
+        let session_id = if xai_compact {
+            None
+        } else {
+            ctx.session_id.as_deref()
+        };
+        if xai_compact {
+            create_logger("cursor").info(
+                "compaction_isolated",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".into(), serde_json::json!(&ctx.req_id)),
+                    (
+                        "clientRequestId".into(),
+                        serde_json::json!(ctx.client_request_id.as_deref()),
+                    ),
+                    (
+                        "sessionId".into(),
+                        serde_json::json!(ctx.session_id.as_deref()),
+                    ),
+                ])),
+            );
+        }
         let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
         let bridge_key = bridge_registry_key(&ctx);
         let continuation_key = session_id
@@ -2535,7 +2613,8 @@ impl Provider for CursorProvider {
                 delta_only: continuation.has_checkpoint && !client_only_continuation,
             },
         );
-        let images = request::cursor_selected_images(&body);
+        let images =
+            request::cursor_selected_images_for_continuation(&body, continuation.has_checkpoint);
         if !images.is_empty() {
             create_logger("cursor").info(
                 "selected_images",
@@ -2560,7 +2639,7 @@ impl Provider for CursorProvider {
         if let Some(events) = resumed_live_events.take() {
             let sid = session_id.expect("a resumed live run requires a session id");
             let identity = live_run_identity(sid, &ctx);
-            let estimated_input = estimate_request_input_tokens(&body);
+            let estimated_input = estimate_rendered_prompt_tokens(&parts);
             let monitor = ctx
                 .monitor
                 .clone()
@@ -2628,7 +2707,7 @@ impl Provider for CursorProvider {
             log_live_start_claude_headers(&ctx, sid);
             let allowed = advertised_tool_names(&body);
             let mcp_tools = claude_local_mcp_tools(&body);
-            let estimated_input = estimate_request_input_tokens(&body);
+            let estimated_input = estimate_rendered_prompt_tokens(&parts);
             let monitor = ctx
                 .monitor
                 .clone()
@@ -3073,6 +3152,16 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 mod tests {
     use super::*;
     use crate::providers::cursor::live::live_error_allows_fresh_conversation;
+
+    #[test]
+    fn xai_compact_request_ids_are_detected_without_matching_other_operations() {
+        assert!(is_xai_compact_request(Some("xai-compact-123")));
+        assert!(is_xai_compact_request(Some(" xai-compact-123 ")));
+        assert!(!is_xai_compact_request(Some("xai-compact")));
+        assert!(!is_xai_compact_request(Some("xai-compactible-123")));
+        assert!(!is_xai_compact_request(Some("xai-turn-123")));
+        assert!(!is_xai_compact_request(None));
+    }
 
     fn pending(tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
@@ -3752,6 +3841,26 @@ mod tests {
             ),
             LivePumpAction::Buffer
         );
+        assert_eq!(
+            classify_live_pump_item(
+                false,
+                &Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                    text: "speculative reasoning".into(),
+                }))
+            ),
+            LivePumpAction::Buffer,
+            "thinking-only output must remain retryable until text/tool output commits"
+        );
+        assert_eq!(
+            classify_live_pump_item(
+                false,
+                &Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                    text: String::new(),
+                }))
+            ),
+            LivePumpAction::Buffer,
+            "an empty text delta must not commit output before a stall"
+        );
 
         let (src_tx, src_rx) = mpsc::channel(8);
         let (out_tx, mut out_rx) = mpsc::channel(8);
@@ -3820,13 +3929,14 @@ mod tests {
         .await;
 
         assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let mut saw_thinking = false;
         let mut saw_recovered = false;
         while let Ok(item) = out_rx.try_recv() {
             match item {
-                Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta { .. })) => {
-                    saw_thinking = true;
-                }
+                // Thinking is speculative and intentionally buffered until a
+                // committed answer/tool event. The empty-turn retry therefore
+                // drops it rather than exposing stale reasoning from the
+                // failed generation.
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta { .. })) => {}
                 Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
                     saw_recovered |= text == "recovered";
                 }
@@ -3834,8 +3944,67 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(saw_thinking);
         assert!(saw_recovered);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stall_after_thinking_retries_without_leaking_error() {
+        let (first_tx, first_rx) = mpsc::channel(8);
+        first_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                text: "speculative reasoning".into(),
+            })))
+            .await
+            .unwrap();
+        first_tx
+            .send(Err("Cursor recovery exhausted without producing output \
+                 (stale Cursor conversation reset; retry this message to continue)"
+                .into()))
+            .await
+            .unwrap();
+        drop(first_tx);
+
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-thinking-stall-retry",
+            None,
+            move |_| {
+                restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (retry_tx, retry_rx) = mpsc::channel(8);
+                retry_tx
+                    .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                        text: "recovered".into(),
+                    })))
+                    .unwrap();
+                retry_tx
+                    .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+                    .unwrap();
+                drop(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut saw_recovered = false;
+        while let Ok(item) = out_rx.try_recv() {
+            match item {
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                    saw_recovered |= text == "recovered";
+                }
+                Err(error) => panic!("internal heartbeat-stall error leaked: {error}"),
+                _ => {}
+            }
+        }
+        assert!(
+            saw_recovered,
+            "retry output should reach the downstream client"
+        );
     }
 
     #[test]

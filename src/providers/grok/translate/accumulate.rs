@@ -93,6 +93,22 @@ pub fn accumulate_response_with_traffic(
                         Value::String(format!("{}{}", block["text"].as_str().unwrap_or(""), text));
                 }
             }
+            ReducerEvent::CompactionStart(index) => {
+                block_positions.insert(index, blocks.len());
+                blocks.push(serde_json::json!({"type":"compaction","content":""}))
+            }
+            ReducerEvent::CompactionDelta(index, text) => {
+                if let Some(block) = block_positions
+                    .get(&index)
+                    .and_then(|position| blocks.get_mut(*position))
+                {
+                    block["content"] = Value::String(format!(
+                        "{}{}",
+                        block["content"].as_str().unwrap_or(""),
+                        text
+                    ));
+                }
+            }
             ReducerEvent::ToolStart(index, id, name) => {
                 block_positions.insert(index, blocks.len());
                 blocks.push(serde_json::json!({"type":"tool_use","id":id,"name":name,"input":{}}))

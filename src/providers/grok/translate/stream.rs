@@ -151,6 +151,7 @@ impl StreamTranslator {
                     event,
                     ReducerEvent::ThinkingStart(_)
                         | ReducerEvent::TextStart(_)
+                        | ReducerEvent::CompactionStart(_)
                         | ReducerEvent::ToolStart(_, _, _)
                         | ReducerEvent::HostedSearch { .. }
                         | ReducerEvent::Finish { .. }
@@ -194,7 +195,22 @@ pub fn translate_stream_bytes(
 }
 
 pub fn stream_error() -> Vec<u8> {
-    let data = serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}});
+    stream_error_with_details("api_error", "Grok stream is invalid")
+}
+
+pub fn stream_error_with_details(code: &str, message: &str) -> Vec<u8> {
+    let code = code
+        .trim()
+        .chars()
+        .take(128)
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        .collect::<String>();
+    let code = if code.is_empty() { "api_error" } else { &code };
+    let message = crate::providers::grok::client::sanitize_error_message(message);
+    let data = serde_json::json!({
+        "type":"error",
+        "error":{"type":"api_error","code":code,"message":message}
+    });
     encode_sse_event(Some("error"), &data.to_string())
 }
 
@@ -214,13 +230,14 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent) {
             "content_block_delta",
             serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":t}}),
         ),
-        ReducerEvent::ThinkingStop(i) | ReducerEvent::TextStop(i) | ReducerEvent::ToolStop(i) => {
-            emit(
-                out,
-                "content_block_stop",
-                serde_json::json!({"type":"content_block_stop","index":i}),
-            )
-        }
+        ReducerEvent::ThinkingStop(i)
+        | ReducerEvent::TextStop(i)
+        | ReducerEvent::CompactionStop(i)
+        | ReducerEvent::ToolStop(i) => emit(
+            out,
+            "content_block_stop",
+            serde_json::json!({"type":"content_block_stop","index":i}),
+        ),
         ReducerEvent::TextStart(i) => emit(
             out,
             "content_block_start",
@@ -230,6 +247,16 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent) {
             out,
             "content_block_delta",
             serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"text_delta","text":t}}),
+        ),
+        ReducerEvent::CompactionStart(i) => emit(
+            out,
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"compaction","content":""}}),
+        ),
+        ReducerEvent::CompactionDelta(i, t) => emit(
+            out,
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"compaction_delta","content":t}}),
         ),
         ReducerEvent::ToolStart(i, id, name) => emit(
             out,
@@ -381,5 +408,16 @@ mod tests {
             .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n")
             .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("first"));
+    }
+
+    #[test]
+    fn stream_translates_compaction_block_and_delta() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"compaction\",\"content\":\"summary\"}}\n\ndata: {\"type\":\"response.compaction.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_compact", "grok-4.6").unwrap())
+                .unwrap();
+        assert!(output.contains("\"type\":\"compaction\""), "{output}");
+        assert!(output.contains("\"content\":\"summary\""), "{output}");
+        assert!(output.contains("message_stop"), "{output}");
     }
 }

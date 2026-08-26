@@ -211,6 +211,62 @@ pub fn translate_request(
     })
 }
 
+/// Translate Anthropic's context-management edits into the headers consumed
+/// by grok-build. The Grok Responses body has no equivalent field, while the
+/// official client communicates the compaction trigger and remaining budget
+/// as request headers.
+pub fn grok_compaction_headers(req: &MessagesRequest) -> Vec<(String, String)> {
+    grok_compaction_headers_from_value(req.extra.get("context_management"))
+}
+
+/// Extract compaction headers from a raw request value. This is shared by the
+/// Anthropic Messages path and the OpenAI Responses passthrough path.
+pub fn grok_compaction_headers_from_value(value: Option<&Value>) -> Vec<(String, String)> {
+    let Some(edits) = value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("edits"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut thresholds = edits
+        .iter()
+        .filter(|edit| {
+            matches!(
+                edit.get("type").and_then(Value::as_str),
+                Some("clear_tool_uses_20250919" | "compact_20260112")
+            )
+        })
+        .filter_map(|edit| {
+            // Immediate server-side compaction has no input-token threshold.
+            // It is handled by the isolated xai-compact request path; only
+            // context-edit thresholds become Grok headers here.
+            if edit.get("type").and_then(Value::as_str) == Some("compact_20260112") {
+                return None;
+            }
+            let trigger = edit.get("trigger").and_then(Value::as_object)?;
+            if trigger.get("type").and_then(Value::as_str) != Some("input_tokens") {
+                return None;
+            }
+            let value = trigger.get("value").and_then(Value::as_u64)?;
+            (value > 0 && value <= 999_999_999).then_some(value)
+        })
+        .collect::<Vec<_>>();
+    if thresholds.is_empty() {
+        return Vec::new();
+    }
+
+    thresholds.sort_unstable();
+    vec![
+        ("x-compaction-at".into(), thresholds[0].to_string()),
+        (
+            "x-compactions-remaining".into(),
+            thresholds.len().to_string(),
+        ),
+    ]
+}
+
 fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
     *instructions = Some(match instructions.take() {
         Some(existing) if !existing.is_empty() => format!("{existing}\n\n{guidance}"),
@@ -477,6 +533,31 @@ fn parse_message(
             }
             ("assistant", "web_search_tool_result" | "x_search_tool_result")
             | ("user", "web_search_tool_result" | "x_search_tool_result") => {}
+            ("assistant", "compaction") => {
+                if object
+                    .keys()
+                    .any(|key| !["type", "content"].contains(&key.as_str()))
+                {
+                    anyhow::bail!("unsupported compaction field");
+                }
+                // The API marks compaction content nullable when a summary is
+                // unavailable. Preserve the block as an empty summary rather
+                // than rejecting the whole follow-up request.
+                let summary = object
+                    .get("content")
+                    .and_then(|value| value.as_str().or_else(|| value.is_null().then_some("")))
+                    .ok_or_else(|| anyhow::anyhow!("compaction content is invalid"))?;
+                // Responses has no separate input compaction item. Preserve the
+                // summary as assistant output_text so it survives the next
+                // turn instead of being discarded as an unknown block.
+                flush_message(&message.role, &mut content, out);
+                out.push(GrokInputItem::Message {
+                    role: "assistant".into(),
+                    content: vec![GrokContentPart::OutputText {
+                        text: summary.to_string(),
+                    }],
+                });
+            }
             ("assistant", "tool_use") => {
                 if object.keys().any(|key| {
                     !["type", "id", "name", "input", "cache_control"].contains(&key.as_str())
@@ -778,6 +859,62 @@ mod tests {
         .unwrap();
         let translated = translate_request(&request, "grok-composer-2.5-fast".into()).unwrap();
         assert_eq!(translated.input.len(), 1);
+        assert_eq!(
+            grok_compaction_headers(&request),
+            vec![
+                ("x-compaction-at".into(), "100000".into()),
+                ("x-compactions-remaining".into(), "1".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_compaction_headers_ignore_unknown_and_invalid_edits() {
+        let value = serde_json::json!({
+            "edits": [
+                {"type":"clear_tool_uses_20250919", "trigger":{"type":"input_tokens","value":0}},
+                {"type":"clear_tool_uses_20250919", "trigger":{"type":"output_tokens","value":10}},
+                {"type":"other", "trigger":{"type":"input_tokens","value":20}},
+                {"type":"clear_tool_uses_20250919", "trigger":{"type":"input_tokens","value":300}}
+            ]
+        });
+        assert_eq!(
+            grok_compaction_headers_from_value(Some(&value)),
+            vec![
+                ("x-compaction-at".into(), "300".into()),
+                ("x-compactions-remaining".into(), "1".into())
+            ]
+        );
+        assert!(
+            grok_compaction_headers_from_value(Some(&serde_json::json!({
+                "edits": true
+            })))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn grok_translation_accepts_compaction_edit_and_replays_summary_block() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.6",
+            "messages":[
+                {"role":"assistant","content":[{"type":"compaction","content":"summary of prior work"}]},
+                {"role":"user","content":"continue"}
+            ],
+            "context_management":{"edits":[{"type":"compact_20260112"}]}
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.6".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["input"][0],
+            serde_json::json!({
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"summary of prior work"}]
+            })
+        );
+        assert!(grok_compaction_headers(&request).is_empty());
     }
 
     #[test]

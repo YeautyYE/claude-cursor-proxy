@@ -213,18 +213,42 @@ pub struct ModelParameter {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct SelectedImage {
-    // Cursor CLI 2026.08 uses a `data_or_blob_id` oneof. Field 1 is now
-    // `blob_id` (bytes); inline image bytes belong in field 8. Encoding base64
-    // text in field 1 makes Cursor treat it as an asset id and return
-    // `Image not found [internal]`.
+    // Cursor CLI uses a `data_or_blob_id` oneof. Field 1 is a blob id and
+    // field 8 is the inline byte payload. Encoding image bytes in field 1
+    // makes Cursor treat them as an asset id and return `Image not found`.
+    #[prost(bytes = "vec", tag = "1")]
+    pub blob_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "8")]
     pub data: Vec<u8>,
+    /// Optional blob id plus inline bytes. This is part of the current Cursor
+    /// wire schema; inline Anthropic images use `data` above because there is
+    /// no server blob id available to the proxy.
+    #[prost(message, optional, tag = "9")]
+    pub blob_id_with_data: Option<SelectedImageBlobIdWithData>,
     #[prost(string, tag = "2")]
     pub uuid: String,
     #[prost(string, tag = "3")]
     pub path: String,
+    #[prost(message, optional, tag = "4")]
+    pub dimension: Option<SelectedImageDimension>,
     #[prost(string, tag = "7")]
     pub mime_type: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SelectedImageBlobIdWithData {
+    #[prost(bytes = "vec", tag = "1")]
+    pub blob_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SelectedImageDimension {
+    #[prost(int32, tag = "1")]
+    pub width: i32,
+    #[prost(int32, tag = "2")]
+    pub height: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -616,9 +640,8 @@ pub struct EditToolCallDelta {
 
 /// ToolCall oneof (CLI 2026.07) — tools we map to Claude Code.
 ///
-/// Unmapped CLI siblings (intentionally omitted): `PiWriteToolCall`,
-/// `PiEditToolCall`, `ApplyAgentDiffToolCall`. Interaction updates are
-/// transcript-only in live BiDi; FS mutations use [`ExecServerMessage`].
+/// Pi tool siblings are decoded for transcript correlation. Filesystem
+/// mutations still arrive on the matching `ExecServerMessage` exec path.
 #[derive(Clone, PartialEq, Message)]
 pub struct ToolCall {
     #[prost(message, optional, tag = "1")]
@@ -656,6 +679,55 @@ pub struct ToolCall {
     /// Distinct from `fetch_tool_call` (24). Cursor.app + 0xlane `agent_v1.proto`.
     #[prost(message, optional, tag = "37")]
     pub web_fetch_tool_call: Option<WebFetchToolCall>,
+    /// Cursor 3.12+ Pi write tool (field 64). The matching filesystem exec is
+    /// `ExecServerMessage.pi_write_args` (field 48).
+    #[prost(message, optional, tag = "64")]
+    pub pi_write_tool_call: Option<PiWriteToolCall>,
+}
+
+/// Cursor Pi write tool call used in `InteractionUpdate.tool_call_started`.
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteToolCall {
+    #[prost(message, optional, tag = "1")]
+    pub args: Option<PiWriteToolArgs>,
+    #[prost(message, optional, tag = "2")]
+    pub result: Option<PiWriteToolResult>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteToolArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub content: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteToolResult {
+    #[prost(message, optional, tag = "1")]
+    pub success: Option<PiWriteToolSuccess>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<PiWriteToolError>,
+    #[prost(message, optional, tag = "3")]
+    pub rejected: Option<PiWriteToolRejected>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteToolSuccess {
+    #[prost(string, tag = "1")]
+    pub output: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteToolError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteToolRejected {
+    #[prost(string, tag = "1")]
+    pub reason: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1100,10 +1172,9 @@ pub struct TurnEnded {
 
 /// Server → client tool/exec request (AgentServerMessage tag 2).
 ///
-/// Decoded payloads: shell / write / delete / grep / read / ls / request_context /
-/// shell_stream. CLI also defines `PiWriteExecArgs` and `ApplyAgentDiff*` (and
-/// matching ToolCall oneofs); those are intentionally unmapped — unknown exec
-/// soft-fails via control throw rather than inventing a Claude Write.
+/// Decoded payloads include both the legacy `write_args` and the modern Pi
+/// `pi_write_args` shape. Keeping both is required because Cursor has shipped
+/// both exec variants in otherwise identical agent runs.
 #[derive(Clone, PartialEq, Message)]
 pub struct ExecServerMessage {
     #[prost(uint32, tag = "1")]
@@ -1128,6 +1199,17 @@ pub struct ExecServerMessage {
     pub request_context_args: Option<RequestContextArgs>,
     #[prost(message, optional, tag = "14")]
     pub shell_stream_args: Option<ShellArgs>,
+    /// Cursor 3.12+ Pi write exec (field 48).
+    #[prost(message, optional, tag = "48")]
+    pub pi_write_args: Option<PiWriteExecArgs>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteExecArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub content: String,
 }
 
 /// ExecServerMessage.read_args (tag 7) — NOT the same layout as ReadToolArgs.
@@ -1176,6 +1258,9 @@ pub struct ExecClientMessage {
     pub request_context_result: Option<RequestContextResult>,
     #[prost(message, optional, tag = "14")]
     pub shell_stream: Option<ShellStream>,
+    /// Result for `ExecServerMessage.pi_write_args` (field 49).
+    #[prost(message, optional, tag = "49")]
+    pub pi_write_result: Option<PiWriteExecResult>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1210,6 +1295,34 @@ pub struct ExecClientThrow {
 pub struct ExecClientHeartbeat {
     #[prost(uint32, tag = "1")]
     pub id: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteExecResult {
+    #[prost(message, optional, tag = "1")]
+    pub success: Option<PiWriteExecSuccess>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<PiWriteExecError>,
+    #[prost(message, optional, tag = "3")]
+    pub rejected: Option<PiWriteExecRejected>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteExecSuccess {
+    #[prost(string, tag = "1")]
+    pub output: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteExecError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiWriteExecRejected {
+    #[prost(string, tag = "1")]
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,6 +1972,56 @@ mod tests {
         assert_eq!(args.subagent_type, "explore");
         assert_eq!(args.run_in_background, Some(true));
         assert!(decoded.web_search_tool_call.is_none());
+    }
+
+    #[test]
+    fn pi_write_exec_uses_modern_cursor_tags() {
+        let exec = ExecServerMessage {
+            id: 44,
+            exec_id: Some("pi-44".into()),
+            pi_write_args: Some(PiWriteExecArgs {
+                path: "new.txt".into(),
+                content: "hello".into(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        exec.encode(&mut buf).unwrap();
+        // field 48, length-delimited -> 0x82 0x03.
+        assert!(
+            buf.windows(2).any(|w| w == [0x82, 0x03]),
+            "pi_write_args field 48 missing from {buf:?}"
+        );
+        let decoded = ExecServerMessage::decode(&buf[..]).unwrap();
+        let args = decoded.pi_write_args.unwrap();
+        assert_eq!(args.path, "new.txt");
+        assert_eq!(args.content, "hello");
+    }
+
+    #[test]
+    fn pi_write_tool_uses_field_64() {
+        let call = ToolCall {
+            pi_write_tool_call: Some(PiWriteToolCall {
+                args: Some(PiWriteToolArgs {
+                    path: "new.txt".into(),
+                    content: "hello".into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        call.encode(&mut buf).unwrap();
+        // field 64, length-delimited -> 0x82 0x04.
+        assert!(
+            buf.windows(2).any(|w| w == [0x82, 0x04]),
+            "pi_write_tool_call field 64 missing from {buf:?}"
+        );
+        let decoded = ToolCall::decode(&buf[..]).unwrap();
+        assert_eq!(
+            decoded.pi_write_tool_call.unwrap().args.unwrap().path,
+            "new.txt"
+        );
     }
 
     fn proto_varint(mut value: u32) -> Vec<u8> {

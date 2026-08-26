@@ -3,6 +3,13 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.78 (2026-08-26)
+
+- Isolate Grok Build `xai-compact-*` requests from the ordinary Cursor live Run and checkpoint. Compaction now uses a fresh Cursor request, preventing repeated `503 A Cursor live run is already active for this session` loops after context reaches 100%.
+- Preserve compaction control and summary blocks across Responses/Messages translation, and keep upstream context-overflow details visible to the client.
+- Harden Cursor native tool and image passthrough for current Pi/PowerShell/XML variants, including correct inline image protobuf fields and Write result shapes.
+- Keep thinking-only live stalls retryable until visible text, native tools, or a terminal event commits the turn.
+
 ## v0.1.77 (2026-08-26)
 
 - Keep the durable operation ledger owner bound to the superseded Cursor Run while a Grok replacement is waiting for cancellation. If that handoff future is dropped, the existing `Dispatched` marker is now sealed as a scoped ambiguous operation instead of stranding the session in repeated 409 responses.

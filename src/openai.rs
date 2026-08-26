@@ -196,6 +196,12 @@ pub fn responses_to_messages(body: &Value) -> anyhow::Result<MessagesRequest> {
     if let Some(metadata) = body.get("metadata") {
         extra.insert("metadata".into(), metadata.clone());
     }
+    // Responses clients may use Anthropic's server-side compaction extension.
+    // Keep it in the flattened Messages request so providers can translate
+    // the edit or isolate the dedicated xai-compact operation.
+    if let Some(context_management) = body.get("context_management") {
+        extra.insert("context_management".into(), context_management.clone());
+    }
     let (messages, system_parts) = convert_input(body.get("input"))?;
     if !system_parts.is_empty() {
         let existing = extra
@@ -373,6 +379,20 @@ fn convert_input(input: Option<&Value>) -> anyhow::Result<(Vec<Message>, Vec<Str
                     }]),
                 });
             }
+            // Responses may carry a compaction result as a standalone item.
+            // Preserve it as an assistant compaction block instead of silently
+            // dropping the summary before it reaches the provider.
+            "compaction" => {
+                let content = item
+                    .get("content")
+                    .or_else(|| item.get("text"))
+                    .cloned()
+                    .unwrap_or_else(|| json!(""));
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: json!([{"type":"compaction","content":content}]),
+                });
+            }
             _ => {}
         }
     }
@@ -451,6 +471,14 @@ fn convert_message_content(content: Option<&Value>) -> anyhow::Result<Value> {
                     blocks.push(json!({"type":"image","source": source}));
                 }
             }
+            "compaction" => {
+                let content = part
+                    .get("content")
+                    .or_else(|| part.get("text"))
+                    .cloned()
+                    .unwrap_or_else(|| json!(""));
+                blocks.push(json!({"type":"compaction","content":content}));
+            }
             _ => {}
         }
     }
@@ -508,6 +536,10 @@ pub struct AnthropicToResponses {
     text_item_id: Option<String>,
     text: String,
     reasoning_text: String,
+    compaction_text: String,
+    compaction_item_id: Option<String>,
+    compaction_output_index: Option<usize>,
+    compaction_active_index: Option<usize>,
     tool_item_ids: Vec<String>,
     output_items: Vec<Value>,
     stop_reason: Option<String>,
@@ -648,13 +680,39 @@ impl AnthropicToResponses {
                             Vec::new()
                         }
                     }
+                    Some("compaction_delta") => {
+                        let Some(text) = delta.get("content").and_then(Value::as_str) else {
+                            return Vec::new();
+                        };
+                        self.compaction_text.push_str(text);
+                        if let Some(item_id) = self.compaction_item_id.as_deref()
+                            && let Some(item) = self.output_items.iter_mut().find(|item| {
+                                item.get("id").and_then(Value::as_str) == Some(item_id)
+                            })
+                        {
+                            item["content"] = json!(self.compaction_text.clone());
+                        }
+                        let item_id = self.compaction_item_id.clone().unwrap_or_default();
+                        let output_index = self.compaction_output_index.unwrap_or(0);
+                        self.emit(json!({
+                            "type": "response.compaction.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": text
+                        }))
+                    }
                     Some("text_delta") => {
                         self.text_delta(delta.get("text").and_then(Value::as_str))
                     }
                     Some("input_json_delta") => {
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             let index = self.tool_index.saturating_sub(1);
-                            if let Some(item) = self.output_items.get_mut(index) {
+                            let tool_item_id = self.tool_item_ids.get(index).map(String::as_str);
+                            if let Some(item) = self.output_items.iter_mut().find(|item| {
+                                tool_item_id.is_some_and(|id| {
+                                    item.get("id").and_then(Value::as_str) == Some(id)
+                                })
+                            }) {
                                 let current = item
                                     .get("arguments")
                                     .and_then(Value::as_str)
@@ -682,7 +740,31 @@ impl AnthropicToResponses {
             }
             "content_block_start" => {
                 let block = value.get("content_block").cloned().unwrap_or(Value::Null);
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                if block.get("type").and_then(Value::as_str) == Some("compaction") {
+                    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let item_id = format!("cmp_{}_{}", self.id, index);
+                    let output_index = self.allocate_output_index();
+                    self.compaction_item_id = Some(item_id.clone());
+                    self.compaction_output_index = Some(output_index);
+                    self.compaction_active_index = Some(index);
+                    self.compaction_text = block
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let item = json!({
+                        "type": "compaction",
+                        "id": item_id,
+                        "status": "in_progress",
+                        "content": self.compaction_text
+                    });
+                    self.output_items.push(item.clone());
+                    self.emit(json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": item
+                    }))
+                } else if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     self.tool_index += 1;
                     let call_id = block
                         .get("id")
@@ -724,6 +806,31 @@ impl AnthropicToResponses {
                     self.ingest_usage(usage);
                 }
                 Vec::new()
+            }
+            "content_block_stop" => {
+                let index = value
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(usize::MAX as u64) as usize;
+                if self.compaction_active_index == Some(index) {
+                    self.compaction_active_index = None;
+                    let item_id = self.compaction_item_id.clone().unwrap_or_default();
+                    let output_index = self.compaction_output_index.unwrap_or(0);
+                    if let Some(item) = self.output_items.iter_mut().find(|item| {
+                        item.get("id").and_then(Value::as_str) == Some(item_id.as_str())
+                    }) {
+                        item["status"] = json!("completed");
+                        item["content"] = json!(self.compaction_text.clone());
+                    }
+                    self.emit(json!({
+                        "type": "response.compaction.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content": self.compaction_text
+                    }))
+                } else {
+                    Vec::new()
+                }
             }
             "message_stop" => self.completed(),
             "error" => {
@@ -881,16 +988,39 @@ impl AnthropicToResponses {
             })));
         }
         for (index, mut item) in self.output_items.clone().into_iter().enumerate() {
+            if item.get("status").and_then(Value::as_str) == Some("completed") {
+                continue;
+            }
+            let output_index = if item.get("type").and_then(Value::as_str) == Some("function_call")
+            {
+                let item_id = item.get("id").and_then(Value::as_str);
+                self.tool_item_ids
+                    .iter()
+                    .position(|id| Some(id.as_str()) == item_id)
+                    .map(|tool_index| self.tool_output_index(tool_index))
+                    .unwrap_or(index)
+            } else {
+                self.compaction_output_index.unwrap_or(index)
+            };
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                item["status"] = json!("completed");
+                out.extend(self.emit(json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item
+                })));
+                continue;
+            }
             item["status"] = json!("completed");
             out.extend(self.emit(json!({
                 "type": "response.function_call_arguments.done",
                 "item_id": item.get("id").cloned().unwrap_or(json!("")),
-                "output_index": self.tool_output_index(index),
+                "output_index": output_index,
                 "arguments": item.get("arguments").cloned().unwrap_or(json!(""))
             })));
             out.extend(self.emit(json!({
                 "type": "response.output_item.done",
-                "output_index": self.tool_output_index(index),
+                "output_index": output_index,
                 "item": item
             })));
         }
@@ -1112,6 +1242,33 @@ fn anthropic_message_to_sse(value: &Value, model: &str) -> Vec<u8> {
                     .to_string(),
                 ));
             }
+            "compaction" => {
+                let content = block.get("content").and_then(Value::as_str).unwrap_or("");
+                events.extend(encode_sse_event(
+                    Some("content_block_start"),
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "compaction", "content": content}
+                    })
+                    .to_string(),
+                ));
+                if !content.is_empty() {
+                    events.extend(encode_sse_event(
+                        Some("content_block_delta"),
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "compaction_delta", "content": content}
+                        })
+                        .to_string(),
+                    ));
+                }
+                events.extend(encode_sse_event(
+                    Some("content_block_stop"),
+                    &json!({"type":"content_block_stop","index":index}).to_string(),
+                ));
+            }
             _ => {}
         }
     }
@@ -1211,6 +1368,44 @@ mod tests {
         assert_eq!(request.messages.len(), 3);
         assert_eq!(request.extra["output_config"]["effort"], "high");
         assert_eq!(request.extra["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn responses_to_messages_preserves_compaction_control_and_summary() {
+        let body = json!({
+            "model": "claude-fable-5[1m]",
+            "context_management": {"edits": [{"type": "compact_20260112"}]},
+            "input": [
+                {"type":"message","role":"assistant","content":[
+                    {"type":"compaction","content":"summary"}
+                ]}
+            ]
+        });
+        let request = responses_to_messages(&body).unwrap();
+        assert_eq!(
+            request.extra["context_management"]["edits"][0]["type"],
+            "compact_20260112"
+        );
+        assert_eq!(request.messages[0].role, "assistant");
+        assert_eq!(request.messages[0].content[0]["type"], "compaction");
+        assert_eq!(request.messages[0].content[0]["content"], "summary");
+    }
+
+    #[test]
+    fn messages_to_responses_preserves_compaction_output_block() {
+        let response = messages_json_to_responses(
+            &json!({
+                "model":"claude-fable-5[1m]",
+                "content":[{"type":"compaction","content":"summary"}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":4,"output_tokens":2}
+            }),
+            "resp_compact",
+            "claude-fable-5[1m]",
+        );
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["type"], "compaction");
+        assert_eq!(response["output"][0]["content"], "summary");
     }
 
     #[test]

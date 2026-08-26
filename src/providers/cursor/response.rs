@@ -225,6 +225,7 @@ pub fn decode_cursor_upstream(
     let events = decode_upstream_response(&upstream.body)?;
 
     let mut text_content = String::new();
+    let mut tool_content: Vec<serde_json::Value> = Vec::new();
     let mut final_input_tokens: u64 = 0;
     let mut final_output_tokens: u64 = 0;
     let mut final_cache_read: u64 = 0;
@@ -247,6 +248,16 @@ pub fn decode_cursor_upstream(
             CursorStreamEvent::OutputTokenDelta { tokens } => {
                 final_output_tokens = final_output_tokens.saturating_add(*tokens);
             }
+            CursorStreamEvent::NativeTool {
+                tool_use_id,
+                name,
+                input,
+            } => tool_content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": name,
+                "input": input,
+            })),
             CursorStreamEvent::End => break,
             _ => {}
         }
@@ -260,15 +271,27 @@ pub fn decode_cursor_upstream(
             final_cache_write,
         );
 
+    let mut content = Vec::new();
+    if !text_content.is_empty() || tool_content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": text_content}));
+    }
+    content.extend(tool_content);
+    let stop_reason = if content
+        .iter()
+        .any(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
+    {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+
     Ok(serde_json::json!({
         "id": message_id,
         "type": "message",
         "role": "assistant",
-        "content": [
-            {"type": "text", "text": text_content}
-        ],
+        "content": content,
         "model": model,
-        "stop_reason": "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
             "input_tokens": input_tokens,
@@ -377,79 +400,31 @@ fn push_interaction_stream_events(
     }
 }
 
-/// Cheap input-token estimate for `message_start` seeding.
+/// Input-token estimate for `message_start` seeding.
 ///
-/// Avoids re-running [`super::request::render_cursor_prompt`] (full history +
-/// tools JSON), which can cost tens–hundreds of ms on large Claude Code turns
-/// and delays TTFT. `turn_ended` usage replaces this seed when available.
+/// Keep this estimate tied to the exact prompt renderer used by the live
+/// request. In particular, MCP schemas are registered in Cursor's catalog and
+/// are omitted (or compacted) from the text prompt; counting the raw Anthropic
+/// `tools` JSON here can inflate `Ctx` by hundreds of thousands of tokens when
+/// the upstream later fails before sending authoritative `turn_ended` usage.
+/// `turn_ended` usage replaces this provisional seed when available.
 pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
-    let mut chars = 0usize;
-    for message in &req.messages {
-        chars += match &message.content {
-            serde_json::Value::String(s) => s.len(),
-            serde_json::Value::Array(blocks) => blocks
-                .iter()
-                .map(|block| match block.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => block
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .map_or(0, str::len),
-                    Some("thinking") => block
-                        .get("thinking")
-                        .and_then(|t| t.as_str())
-                        .map_or(0, str::len),
-                    Some("tool_result") => match block.get("content") {
-                        Some(serde_json::Value::String(s)) => s.len(),
-                        Some(serde_json::Value::Array(parts)) => parts
-                            .iter()
-                            .map(|p| p.get("text").and_then(|t| t.as_str()).map_or(0, str::len))
-                            .sum(),
-                        _ => 64,
-                    },
-                    _ => 64,
-                })
-                .sum(),
-            _ => 0,
-        };
-    }
-    if let Some(tools) = req.extra.get("tools") {
-        // Schema dump dominates Ctx. Walk the Value tree for a size estimate —
-        // `tools.to_string()` re-serializes the full tools array (often 100KB+)
-        // on every request and only delayed TTFT / burned CPU before first byte.
-        chars = chars.saturating_add(json_size_estimate(tools));
-    }
-    (chars / 4).max(1) as u64
+    let parts = super::request::render_cursor_prompt_parts(req);
+    estimate_rendered_prompt_tokens(&parts)
 }
 
-/// Approximate serialized JSON size without allocating the full string.
-fn json_size_estimate(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Null => 4,
-        serde_json::Value::Bool(true) => 4,
-        serde_json::Value::Bool(false) => 5,
-        serde_json::Value::Number(n) => n.to_string().len(),
-        serde_json::Value::String(s) => s.len().saturating_add(2),
-        serde_json::Value::Array(items) => {
-            let inner: usize = items.iter().map(json_size_estimate).sum();
-            // brackets + commas
-            inner
-                .saturating_add(2)
-                .saturating_add(items.len().saturating_sub(1))
-        }
-        serde_json::Value::Object(map) => {
-            let inner: usize = map
-                .iter()
-                .map(|(k, v)| {
-                    k.len()
-                        .saturating_add(3)
-                        .saturating_add(json_size_estimate(v))
-                })
-                .sum();
-            inner
-                .saturating_add(2)
-                .saturating_add(map.len().saturating_sub(1))
-        }
-    }
+/// Estimate the text actually handed to Cursor for a request.
+///
+/// This is public so the request handler can reuse the already-rendered
+/// `CursorPromptParts` when it has applied checkpoint/delta options, avoiding a
+/// second full history render on the hot path.
+pub fn estimate_rendered_prompt_tokens(parts: &super::request::CursorPromptParts) -> u64 {
+    let system_chars = parts.custom_system_prompt.as_ref().map_or(0, String::len);
+    (system_chars
+        .saturating_add(parts.user_text.len())
+        .saturating_add(3)
+        / 4)
+    .max(1) as u64
 }
 
 #[cfg(test)]
@@ -508,6 +483,7 @@ mod tests {
                 ls_args: None,
                 request_context_args: None,
                 shell_stream_args: None,
+                pi_write_args: None,
             }),
         };
         let mut payload = Vec::new();
@@ -840,7 +816,7 @@ mod tests {
     #[test]
     fn estimate_request_input_tokens_avoids_tools_tostring_blowup() {
         // Large tools schema must not require a full JSON re-serialize of the
-        // tools array (previously `tools.to_string().len()` on every request).
+        // tools array just to seed the provisional context counter.
         let tools = serde_json::json!([
             {
                 "name": "Read",
@@ -875,6 +851,43 @@ mod tests {
         assert!(
             elapsed.as_millis() < 50,
             "tools size estimate too slow: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn estimate_request_input_tokens_uses_compact_mcp_prompt() {
+        let tools = serde_json::json!([
+            {
+                "name": "mcp__workspace__search",
+                "description": "search",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "z".repeat(80_000)
+                        }
+                    }
+                }
+            }
+        ]);
+        let raw_chars = serde_json::to_string(&tools).unwrap().len();
+        let mut extra = serde_json::Map::new();
+        extra.insert("tools".into(), tools);
+        let req = MessagesRequest {
+            model: Some("claude-fable-5".into()),
+            messages: vec![crate::anthropic::schema::Message {
+                role: "user".into(),
+                content: serde_json::json!("hi"),
+            }],
+            max_tokens: Some(16),
+            stream: true,
+            extra,
+        };
+        let tokens = estimate_request_input_tokens(&req);
+        assert!(
+            tokens < (raw_chars / 4) as u64 / 10,
+            "MCP schema should not be counted as raw prompt text: raw={raw_chars}, estimate={tokens}"
         );
     }
 }

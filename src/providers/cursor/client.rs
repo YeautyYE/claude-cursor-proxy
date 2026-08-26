@@ -1304,6 +1304,7 @@ fn build_request_context_reply(frame: &ConnectFrame) -> Result<Option<Bytes>, Cu
                 error: None,
             }),
             shell_stream: None,
+            pi_write_result: None,
         }),
         kv_client_message: None,
         exec_client_control_message: None,
@@ -1352,9 +1353,15 @@ pub(crate) fn build_run_request_with_continuation(
                 .decode(img.data.trim())
                 .ok()?;
             Some(proto::SelectedImage {
+                // Inline bytes belong to field 8. Keep blob_id and the
+                // blob_id_with_data oneof arm empty: Anthropic supplies the
+                // bytes directly and does not give us a Cursor blob id.
+                blob_id: Vec::new(),
                 data,
+                blob_id_with_data: None,
                 uuid: img.uuid.clone(),
                 path: img.path.clone(),
+                dimension: None,
                 mime_type: img.mime_type.clone(),
             })
         })
@@ -1686,7 +1693,7 @@ mod tests {
         let image = CursorSelectedImage {
             data: "AAAA".into(),
             uuid: "image-uuid".into(),
-            path: "image.png".into(),
+            path: String::new(),
             mime_type: "image/png".into(),
         };
         let req = build_run_request("describe", &resolved, &[image], "req-image", None);
@@ -1699,6 +1706,10 @@ mod tests {
             .expect("selected context")
             .selected_images[0];
         assert_eq!(selected.data, vec![0, 0, 0]);
+        assert!(
+            selected.path.is_empty(),
+            "inline images must not carry a path"
+        );
 
         let mut encoded = Vec::new();
         selected

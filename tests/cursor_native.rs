@@ -386,7 +386,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
             &[CursorSelectedImage {
                 data: "aGVsbG8=".into(),
                 uuid: "image-id".into(),
-                path: "claude-image-1.png".into(),
+                path: String::new(),
                 mime_type: "image/png".into(),
             }],
             Some("custom system from test"),
@@ -487,7 +487,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         .unwrap();
     assert_eq!(image.data, b"hello");
     assert_eq!(image.uuid, "image-id");
-    assert_eq!(image.path, "claude-image-1.png");
+    assert!(image.path.is_empty(), "inline images must not carry a path");
     assert_eq!(image.mime_type, "image/png");
 
     unsafe {
@@ -1449,6 +1449,7 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                 ls_args: None,
                 request_context_args: None,
                 shell_stream_args: None,
+                pi_write_args: None,
             }),
         })
     }
@@ -2017,6 +2018,7 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
                 ls_args: None,
                 request_context_args: None,
                 shell_stream_args: None,
+                pi_write_args: None,
             }),
             kv_server_message: None,
             interaction_query: None,

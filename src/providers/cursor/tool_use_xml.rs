@@ -230,7 +230,11 @@ impl CursorToolUseXmlParser {
     fn canonicalize_allowed_tool_name(&self, name: &str) -> Option<String> {
         match &self.allowed_tool_names {
             Some(allowed) => allowed.get(name).cloned().or_else(|| {
-                if !matches!(name, "Workflow" | "workflow" | "Skill" | "skill") {
+                // Built-in Claude/Cursor tool names are sometimes lower-cased
+                // by XML-oriented models.  Preserve exact matching for MCP
+                // server names, but accept case variants for this bounded
+                // built-in set and emit the client's advertised spelling.
+                if !is_case_insensitive_builtin_tool(name) {
                     return None;
                 }
                 allowed
@@ -272,6 +276,81 @@ impl CursorToolUseXmlParser {
         }
         events.push(RecoveredCursorEvent::Text(text.to_string()));
     }
+}
+
+fn is_case_insensitive_builtin_tool(name: &str) -> bool {
+    // Only Claude-local tools are safe to recover case-insensitively.  Cursor
+    // native names such as Read/Grep/Glob and Grok wire names are deliberately
+    // excluded: accepting `Grep` for an advertised `grep` would turn a native
+    // transcript fragment into a client tool call and bypass the native bridge.
+    const CLAUDE_LOCAL_CASE_NAMES: &[&str] = &[
+        "Agent",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "NotebookRead",
+        "PowerShell",
+        "Task",
+        "TaskCreate",
+        "TaskGet",
+        "TaskUpdate",
+        "TaskList",
+        "TaskStop",
+        "AgentOutputTool",
+        "BashOutputTool",
+        "AgentOutput",
+        "BashOutput",
+        "KillShell",
+        "KillBash",
+        "ListPeers",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "ExitWorktree",
+        "LSP",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "ScheduleWakeup",
+        "RemoteTrigger",
+        "SendMessage",
+        "Brief",
+        "ToolSearch",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+        "ReadMcpResourceDirTool",
+        "ListMcpResources",
+        "ReadMcpResource",
+        "ReadMcpResourceDir",
+        "ListAgents",
+        "WaitForMcpServers",
+        "SendUserMessage",
+        "SendUserFile",
+        "ReportFindings",
+        "TaskOutput",
+        "Monitor",
+        "StructuredOutput",
+        "Artifact",
+        "REPL",
+        "RefreshMcpTools",
+        "PushNotification",
+        "DesignSync",
+        "Projects",
+        "ShareOnboardingGuide",
+        "ClaudeDesign",
+        "ShowOnboardingRolePicker",
+        "ConnectGitHub",
+        "EndConversation",
+        "SendFile",
+        "SearchMcpRegistry",
+        "SuggestConnectors",
+        "ListConnectors",
+        "Workflow",
+        "Skill",
+    ];
+    CLAUDE_LOCAL_CASE_NAMES
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 fn default_id_factory() -> Box<dyn FnMut() -> String + Send> {
@@ -604,6 +683,46 @@ mod tests {
             assert_eq!(tool.name, "Write");
         } else {
             panic!("expected ToolUse");
+        }
+    }
+
+    #[test]
+    fn canonicalizes_case_variant_for_known_builtin_tools() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["Edit".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let events = parser.push(r#"<tool_use name="edit">{"file_path":"a"}</tool_use>"#);
+        assert!(matches!(
+            &events[..],
+            [RecoveredCursorEvent::ToolUse(tool)] if tool.name == "Edit"
+        ));
+    }
+
+    #[test]
+    fn canonicalizes_new_claude_builtin_case_variants() {
+        for (wire_name, advertised_name) in [
+            ("taskoutput", "TaskOutput"),
+            ("monitor", "Monitor"),
+            ("structuredoutput", "StructuredOutput"),
+            ("artifact", "Artifact"),
+            ("repl", "REPL"),
+            ("designsync", "DesignSync"),
+            ("projects", "Projects"),
+            ("pushnotification", "PushNotification"),
+            ("connectgithub", "ConnectGitHub"),
+            ("brief", "Brief"),
+        ] {
+            let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+                Some([advertised_name.to_string()].into_iter().collect()),
+                test_id_factory(),
+            );
+            let xml = format!(r#"<tool_use name="{wire_name}">{{}}</tool_use>"#);
+            let events = parser.push(&xml);
+            assert!(
+                matches!(&events[..], [RecoveredCursorEvent::ToolUse(tool)] if tool.name == advertised_name),
+                "{wire_name} should recover as {advertised_name}: {events:?}"
+            );
         }
     }
 
@@ -1258,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive_recovery_is_limited_to_workflow_and_skill() {
+    fn case_insensitive_recovery_does_not_invent_cursor_native_tools() {
         let mut parser = CursorToolUseXmlParser::new_with_id_factory(
             Some(["grep".to_string()].into_iter().collect()),
             test_id_factory(),

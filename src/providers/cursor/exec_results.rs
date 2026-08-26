@@ -17,6 +17,12 @@ pub enum CursorExecKind {
         path: String,
         content: String,
     },
+    /// Cursor 3.12+ Pi write exec. Its result lives on field 49 and has a
+    /// compact `{success|error|rejected}` payload rather than WriteResult.
+    PiWrite {
+        path: String,
+        content: String,
+    },
     Delete {
         path: String,
     },
@@ -60,6 +66,11 @@ impl PendingCursorExec {
             CursorExecKind::Write {
                 path: args.path.clone(),
                 content: args.file_text.clone(),
+            }
+        } else if let Some(args) = exec.pi_write_args.as_ref() {
+            CursorExecKind::PiWrite {
+                path: args.path.clone(),
+                content: args.content.clone(),
             }
         } else if let Some(args) = exec.delete_args.as_ref() {
             CursorExecKind::Delete {
@@ -156,6 +167,28 @@ pub fn encode_tool_result_frames(
                         file_content_after_write: Some(file.clone()),
                     }),
                     error: None,
+                }
+            }),
+        )?],
+        CursorExecKind::PiWrite { path, .. } => vec![encode_exec_message(
+            pending,
+            ExecPayload::PiWrite(if is_error {
+                PiWriteExecResult {
+                    success: None,
+                    error: Some(PiWriteExecError { error: content }),
+                    rejected: None,
+                }
+            } else {
+                PiWriteExecResult {
+                    success: Some(PiWriteExecSuccess {
+                        output: if content.is_empty() {
+                            format!("Wrote contents to {path}")
+                        } else {
+                            content
+                        },
+                    }),
+                    error: None,
+                    rejected: None,
                 }
             }),
         )?],
@@ -389,6 +422,7 @@ pub fn encode_control_throw(id: u32, error: String) -> Result<Vec<Bytes>, prost:
 enum ExecPayload {
     Read(ReadResult),
     Write(WriteResult),
+    PiWrite(PiWriteExecResult),
     Delete(DeleteResult),
     Grep(GrepResult),
     Ls(LsResult),
@@ -412,10 +446,12 @@ fn encode_exec_message(
         ls_result: None,
         request_context_result: None,
         shell_stream: None,
+        pi_write_result: None,
     };
     match payload {
         ExecPayload::Read(value) => exec.read_result = Some(value),
         ExecPayload::Write(value) => exec.write_result = Some(value),
+        ExecPayload::PiWrite(value) => exec.pi_write_result = Some(value),
         ExecPayload::Delete(value) => exec.delete_result = Some(value),
         ExecPayload::Grep(value) => exec.grep_result = Some(value),
         ExecPayload::Ls(value) => exec.ls_result = Some(value),
@@ -506,5 +542,62 @@ mod tests {
         let result = msg.exec_client_message.unwrap().read_result.unwrap();
         assert!(result.success.is_none());
         assert_eq!(result.error.unwrap().error, "missing");
+    }
+
+    #[test]
+    fn pi_write_success_uses_pi_result_tag_and_closes_exec() {
+        let pending = PendingCursorExec {
+            id: 8,
+            exec_id: Some("pi-write-8".into()),
+            tool_use_id: "write-8".into(),
+            claude_name: "Write".into(),
+            claude_input: serde_json::json!({
+                "file_path": "/tmp/new.txt",
+                "content": "one\ntwo\n"
+            }),
+            kind: CursorExecKind::PiWrite {
+                path: "/tmp/new.txt".into(),
+                content: "one\ntwo\n".into(),
+            },
+        };
+        let frames = encode_tool_result_frames(
+            &pending,
+            &serde_json::json!({"type":"tool_result","content":"Wrote contents"}),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
+        let decoded = decode_upstream_frames(&frames[0]).unwrap();
+        let msg = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        let exec = msg.exec_client_message.unwrap();
+        let result = exec.pi_write_result.unwrap();
+        assert_eq!(result.success.unwrap().output, "Wrote contents");
+        assert!(result.error.is_none());
+        assert_eq!(exec.id, 8);
+        assert_eq!(exec.exec_id.as_deref(), Some("pi-write-8"));
+    }
+
+    #[test]
+    fn pi_write_error_uses_error_variant() {
+        let pending = PendingCursorExec {
+            id: 9,
+            exec_id: None,
+            tool_use_id: "write-9".into(),
+            claude_name: "Write".into(),
+            claude_input: serde_json::json!({"file_path":"/tmp/nope"}),
+            kind: CursorExecKind::PiWrite {
+                path: "/tmp/nope".into(),
+                content: String::new(),
+            },
+        };
+        let frames = encode_tool_result_frames(
+            &pending,
+            &serde_json::json!({"type":"tool_result","content":"permission denied","is_error":true}),
+        )
+        .unwrap();
+        let decoded = decode_upstream_frames(&frames[0]).unwrap();
+        let msg = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        let result = msg.exec_client_message.unwrap().pi_write_result.unwrap();
+        assert!(result.success.is_none());
+        assert_eq!(result.error.unwrap().error, "permission denied");
     }
 }
