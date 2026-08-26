@@ -605,6 +605,71 @@ mod tests {
     }
 
     #[test]
+    fn non_streaming_native_tools_require_an_advertised_name() {
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: Some(ExecServerMessage {
+                id: 7,
+                exec_id: Some("read-7".into()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/example.txt".into(),
+                    tool_call_id: "read-7".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
+                pi_write_args: None,
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let mut body = encode_connect_frame(&payload, 0).to_vec();
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+
+        let empty = BTreeSet::new();
+        let plain = decode_cursor_upstream_with_allowed(
+            &upstream,
+            "msg_no_tools",
+            "cursor-test",
+            Some(&empty),
+        )
+        .unwrap();
+        assert_eq!(plain["stop_reason"], "end_turn");
+        assert_eq!(plain["content"].as_array().unwrap().len(), 1);
+        assert_eq!(plain["content"][0]["type"], "text");
+
+        let allowed = BTreeSet::from(["Read".to_string()]);
+        let with_tool = decode_cursor_upstream_with_allowed(
+            &upstream,
+            "msg_read",
+            "cursor-test",
+            Some(&allowed),
+        )
+        .unwrap();
+        assert_eq!(with_tool["stop_reason"], "tool_use");
+        assert_eq!(with_tool["content"][0]["type"], "tool_use");
+        assert_eq!(with_tool["content"][0]["name"], "Read");
+        assert_eq!(
+            with_tool["content"][0]["input"]["file_path"],
+            "/tmp/example.txt"
+        );
+    }
+
+    #[test]
     fn connect_end_frame_with_error_is_rejected() {
         let json_err = serde_json::json!({
             "error": {"code": "resource_exhausted", "message": "quota exceeded"}
