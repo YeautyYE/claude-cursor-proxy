@@ -3,7 +3,10 @@ use crate::providers::cursor::client::{
     CursorUpstreamResponse, decode_frame_payload, decode_upstream_frames,
 };
 use crate::providers::cursor::connect::{ConnectEndError, FLAG_END, parse_connect_error};
+use crate::providers::cursor::native_tools::adapt_tool_input_for_client;
 use crate::providers::cursor::proto::AgentServerMessage;
+use crate::providers::cursor::tool_bridge::resolve_advertised_name;
+use std::collections::BTreeSet;
 
 /// A decoded event from the Cursor upstream response stream.
 #[derive(Debug, Clone)]
@@ -222,6 +225,21 @@ pub fn decode_cursor_upstream(
     message_id: &str,
     model: &str,
 ) -> Result<serde_json::Value, CursorDecodeError> {
+    decode_cursor_upstream_with_allowed(upstream, message_id, model, None)
+}
+
+/// Build a non-streaming Anthropic response while filtering native tool calls
+/// against the tools advertised by the downstream request.
+///
+/// `None` preserves the historical unfiltered behavior of
+/// [`decode_cursor_upstream`]. Callers handling an actual Claude request should
+/// pass `Some(&allowed)`; an empty set then suppresses every native tool call.
+pub fn decode_cursor_upstream_with_allowed(
+    upstream: &CursorUpstreamResponse,
+    message_id: &str,
+    model: &str,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+) -> Result<serde_json::Value, CursorDecodeError> {
     let events = decode_upstream_response(&upstream.body)?;
 
     let mut text_content = String::new();
@@ -252,12 +270,24 @@ pub fn decode_cursor_upstream(
                 tool_use_id,
                 name,
                 input,
-            } => tool_content.push(serde_json::json!({
-                "type": "tool_use",
-                "id": tool_use_id,
-                "name": name,
-                "input": input,
-            })),
+            } => {
+                let (name, input) = match allowed_tool_names {
+                    Some(allowed) => {
+                        let Some(name) = resolve_advertised_name(name, Some(allowed)) else {
+                            continue;
+                        };
+                        let input = adapt_tool_input_for_client(&name, input.clone());
+                        (name, input)
+                    }
+                    None => (name.clone(), input.clone()),
+                };
+                tool_content.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": input,
+                }));
+            }
             CursorStreamEvent::End => break,
             _ => {}
         }

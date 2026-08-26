@@ -39,8 +39,8 @@ use super::exec_results::{
 use super::http1::{self, BidiAppendSession};
 use super::native_tools::{
     accumulate_partial_args_text, adapt_client_tool_input, adapt_native_task_to_spawn_subagent,
-    adapt_tool_input_for_client, advertised_name_fallbacks, map_tool_call_started,
-    merge_partial_args_json, resolve_glob_client_name,
+    adapt_tool_input_for_client, advertised_name_fallbacks, map_ask_question_args,
+    map_tool_call_started, merge_partial_args_json, resolve_glob_client_name,
 };
 use super::proto::{
     self, AgentClientMessage, AskQuestionArgs, AskQuestionInteractionQuery,
@@ -8682,8 +8682,12 @@ async fn process_interaction_update(
                     return false;
                 }
                 let mut exec = mcp_client_only_pending_exec(&mapped);
-                exec.claude_name = emit_name;
-                exec.claude_input = ask_user_question_input_from_mapped(&mapped.input);
+                exec.claude_name = emit_name.clone();
+                // `map_tool_call_started` already emits Claude Code's
+                // canonical AskUserQuestion shape. Preserve its header and
+                // option descriptions instead of rebuilding it through the
+                // legacy Cursor title/prompt representation.
+                exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
@@ -9715,52 +9719,22 @@ fn ask_user_question_pending_exec(
 }
 
 fn ask_user_question_input(args: Option<&AskQuestionArgs>) -> serde_json::Value {
-    let title = args.map(|a| a.title.as_str()).unwrap_or("");
-    let items: Vec<(String, Option<Vec<serde_json::Value>>)> = args
-        .map(|a| {
-            a.questions
-                .iter()
-                .map(|q| (q.prompt.clone(), None))
-                .collect()
-        })
-        .unwrap_or_default();
-    ask_user_question_input_from_parts(title, &items)
-}
-
-fn ask_user_question_input_from_mapped(input: &serde_json::Value) -> serde_json::Value {
-    let title = input.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let items: Vec<(String, Option<Vec<serde_json::Value>>)> = input
-        .get("questions")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|q| {
-                    let prompt = q
-                        .get("question")
-                        .or_else(|| q.get("prompt"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let options = q.get("options").and_then(|v| v.as_array()).cloned();
-                    (prompt, options)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    ask_user_question_input_from_parts(title, &items)
+    args.map(map_ask_question_args)
+        .unwrap_or_else(|| ask_user_question_input_from_parts("", &[]))
 }
 
 /// Map Cursor `AskQuestionArgs` onto Claude Code 2.1.193 `AskUserQuestion`.
 ///
-/// proto.rs `AskQuestionItem` only has `id` + `prompt` — no `options` /
-/// `allow_multiple`. Synthesize the required 2–4 options when missing.
+/// Cursor may omit options or send an invalid option count. Synthesize the
+/// required 2–4 options when missing, while preserving valid labels and
+/// multiple-selection semantics.
 fn ask_user_question_input_from_parts(
     title: &str,
-    items: &[(String, Option<Vec<serde_json::Value>>)],
+    items: &[(String, Option<Vec<serde_json::Value>>, bool)],
 ) -> serde_json::Value {
     let header = truncate_ask_header(title);
     let mut questions = Vec::new();
-    for (prompt, options) in items.iter().take(4) {
+    for (prompt, options, multi_select) in items.iter().take(4) {
         let mut question = prompt.trim().to_string();
         if question.is_empty() {
             question = title.trim().to_string();
@@ -9784,6 +9758,7 @@ fn ask_user_question_input_from_parts(
             "question": question,
             "header": header,
             "options": options,
+            "multiSelect": multi_select,
         }));
     }
     if questions.is_empty() {
@@ -9801,6 +9776,7 @@ fn ask_user_question_input_from_parts(
                 header
             },
             "options": default_ask_options(),
+            "multiSelect": false,
         }));
     }
     serde_json::json!({ "questions": questions })
@@ -10336,9 +10312,12 @@ fn encode_interaction_auto_response(
     if query.ask_question_interaction_query.is_some() {
         response.ask_question_interaction_response = Some(AskQuestionInteractionResponse {
             result: Some(AskQuestionResult {
+                success: None,
+                error: None,
                 rejected: Some(AskQuestionRejected {
                     reason: "claude-cursor-proxy has no interactive AskQuestion UI; answer via Claude tools instead".into(),
                 }),
+                r#async: None,
             }),
         });
         matched = true;
@@ -21206,7 +21185,9 @@ mod tests {
                         questions: vec![AskQuestionItem {
                             id: "q1".into(),
                             prompt: "Which approach".into(),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }),
                     tool_call_id: "ask-1".into(),
                 }),
@@ -21320,7 +21301,9 @@ mod tests {
                         questions: vec![AskQuestionItem {
                             id: "q1".into(),
                             prompt: "Go?".into(),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }),
                     tool_call_id: "ask-2".into(),
                 }),

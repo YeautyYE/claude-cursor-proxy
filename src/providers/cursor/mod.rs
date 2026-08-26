@@ -63,7 +63,7 @@ use crate::providers::cursor::request::{
     render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
-    AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream,
+    AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_with_allowed,
     decode_upstream_response, estimate_rendered_prompt_tokens, estimate_request_input_tokens,
 };
 use crate::providers::cursor::tool_bridge::{
@@ -2877,7 +2877,17 @@ impl Provider for CursorProvider {
                 ];
                 (headers, sse_bytes).into_response()
             } else {
-                let sse_bytes = sse::frame_cursor_stream(&upstream, &message_id, &wire_model);
+                // Legacy/non-bridge responses must honor Claude Code's
+                // advertised tool set too. Native Cursor exec events are
+                // ignored when the request advertises no tools, preventing
+                // synthetic tool_use blocks from leaking into plain chats.
+                let allowed = advertised_tool_names(&body).unwrap_or_default();
+                let sse_bytes = sse::frame_cursor_stream_with_allowed(
+                    &upstream,
+                    &message_id,
+                    &wire_model,
+                    Some(&allowed),
+                );
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
                     remember_input_tokens(session_id, input_tokens);
@@ -2900,7 +2910,13 @@ impl Provider for CursorProvider {
                 (headers, sse_bytes).into_response()
             }
         } else {
-            match decode_cursor_upstream(&upstream, &message_id, &wire_model) {
+            let allowed = advertised_tool_names(&body).unwrap_or_default();
+            match decode_cursor_upstream_with_allowed(
+                &upstream,
+                &message_id,
+                &wire_model,
+                Some(&allowed),
+            ) {
                 Ok(json) => {
                     let input_tokens = json.pointer("/usage/input_tokens").and_then(|v| v.as_u64());
                     remember_input_tokens(session_id, input_tokens);

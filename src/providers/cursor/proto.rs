@@ -414,9 +414,44 @@ pub struct AskQuestionInteractionResponse {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct AskQuestionResult {
+    /// Successful answers from the Cursor interaction UI.  Claude-local
+    /// AskUserQuestion calls are normally handed back to Claude Code instead
+    /// of being answered here, but keeping the complete wire shape is
+    /// important for decoding/rejecting native queries and future UI paths.
+    #[prost(message, optional, tag = "1")]
+    pub success: Option<AskQuestionSuccess>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<AskQuestionError>,
     #[prost(message, optional, tag = "3")]
     pub rejected: Option<AskQuestionRejected>,
+    #[prost(message, optional, tag = "4")]
+    pub r#async: Option<AskQuestionAsync>,
 }
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AskQuestionSuccess {
+    #[prost(message, repeated, tag = "1")]
+    pub answers: Vec<AskQuestionAnswer>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AskQuestionAnswer {
+    #[prost(string, tag = "1")]
+    pub question_id: String,
+    #[prost(string, repeated, tag = "2")]
+    pub selected_option_ids: Vec<String>,
+    #[prost(string, optional, tag = "3")]
+    pub freeform_text: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AskQuestionError {
+    #[prost(string, tag = "1")]
+    pub error_message: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AskQuestionAsync {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct AskQuestionRejected {
@@ -1008,6 +1043,10 @@ pub struct AskQuestionArgs {
     pub title: String,
     #[prost(message, repeated, tag = "2")]
     pub questions: Vec<AskQuestionItem>,
+    #[prost(bool, tag = "5")]
+    pub run_async: bool,
+    #[prost(string, tag = "6")]
+    pub async_original_tool_call_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1016,6 +1055,18 @@ pub struct AskQuestionItem {
     pub id: String,
     #[prost(string, tag = "2")]
     pub prompt: String,
+    #[prost(message, repeated, tag = "3")]
+    pub options: Vec<AskQuestionOption>,
+    #[prost(bool, tag = "4")]
+    pub allow_multiple: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AskQuestionOption {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(string, tag = "2")]
+    pub label: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

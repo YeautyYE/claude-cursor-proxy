@@ -2,7 +2,10 @@ use std::time::{Duration, Instant};
 
 use crate::providers::cursor::client::CursorUpstreamResponse;
 use crate::providers::cursor::connect::anthropic_error_type_from_live_error;
+use crate::providers::cursor::native_tools::adapt_tool_input_for_client;
 use crate::providers::cursor::response::{CursorStreamEvent, decode_upstream_response};
+use crate::providers::cursor::tool_bridge::resolve_advertised_name;
+use std::collections::BTreeSet;
 
 /// SSE event name constants.
 pub const EVENT_MESSAGE_START: &str = "message_start";
@@ -40,6 +43,21 @@ pub fn frame_cursor_stream(
     upstream: &CursorUpstreamResponse,
     message_id: &str,
     model: &str,
+) -> Vec<u8> {
+    frame_cursor_stream_with_allowed(upstream, message_id, model, None)
+}
+
+/// Frame a Cursor response as Anthropic SSE while filtering native tool calls
+/// against the downstream request's advertised tool set.
+///
+/// `None` preserves the historical unfiltered behavior of
+/// [`frame_cursor_stream`]. Request handlers should pass `Some(&allowed)`;
+/// passing an empty set suppresses every native tool call.
+pub fn frame_cursor_stream_with_allowed(
+    upstream: &CursorUpstreamResponse,
+    message_id: &str,
+    model: &str,
+    allowed_tool_names: Option<&BTreeSet<String>>,
 ) -> Vec<u8> {
     let events = match decode_upstream_response(&upstream.body) {
         Ok(e) => e,
@@ -86,8 +104,18 @@ pub fn frame_cursor_stream(
                 name,
                 input,
             } => {
-                let input_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-                framer.emit_tool_pause(tool_use_id, name, &input_json);
+                let (name, input) = match allowed_tool_names {
+                    Some(allowed) => {
+                        let Some(name) = resolve_advertised_name(name, Some(allowed)) else {
+                            continue;
+                        };
+                        let input = adapt_tool_input_for_client(&name, input.clone());
+                        (name, input)
+                    }
+                    None => (name.clone(), input.clone()),
+                };
+                let input_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                framer.emit_tool_pause(tool_use_id, &name, &input_json);
             }
         }
     }

@@ -1323,7 +1323,7 @@ fn pending_from_native_tool(
     }
 }
 
-fn resolve_advertised_name(
+pub(crate) fn resolve_advertised_name(
     mapped_name: &str,
     allowed: Option<&BTreeSet<String>>,
 ) -> Option<String> {

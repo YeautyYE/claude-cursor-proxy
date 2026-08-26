@@ -2,8 +2,11 @@
 //! onto Claude Code Anthropic tool_use shapes.
 
 use crate::providers::cursor::proto::{
-    ExecServerMessage, FetchArgs, PiWriteExecArgs, ShellArgs, ToolCall, ToolCallStarted,
+    AskQuestionArgs, ExecServerMessage, FetchArgs, PiWriteExecArgs, ShellArgs, ToolCall,
+    ToolCallStarted,
 };
+
+const ASK_USER_QUESTION_HEADER_MAX: usize = 12;
 
 /// A tool call ready for Anthropic `tool_use` emission.
 #[derive(Debug, Clone)]
@@ -335,26 +338,116 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
     }
     if let Some(ref ask) = tc.ask_question_tool_call {
         let args = ask.args.as_ref()?;
-        let questions: Vec<serde_json::Value> = args
-            .questions
-            .iter()
-            .map(|q| {
-                serde_json::json!({
-                    "id": q.id,
-                    "prompt": q.prompt,
-                })
-            })
-            .collect();
         return Some(MappedClaudeTool {
             tool_use_id: call_id,
             name: "AskUserQuestion".into(),
-            input: serde_json::json!({
-                "title": args.title,
-                "questions": questions,
-            }),
+            input: map_ask_question_args(args),
         });
     }
     None
+}
+
+/// Convert Cursor's native AskQuestion args to Claude Code 2.1.193's
+/// AskUserQuestion schema. Cursor carries stable option ids and an
+/// `allow_multiple` flag; Claude Code presents labels and calls the latter
+/// `multiSelect`. The title is a Cursor UI field and is folded into the short
+/// question header because Claude's schema has no top-level title.
+pub(crate) fn map_ask_question_args(args: &AskQuestionArgs) -> serde_json::Value {
+    let title = args.title.trim();
+    let title_header = truncate_ask_header(title);
+    let mut questions = Vec::new();
+
+    for item in args.questions.iter().take(4) {
+        let mut question = item.prompt.trim().to_string();
+        if question.is_empty() {
+            question = title.to_string();
+        }
+        if question.is_empty() {
+            question = "Continue?".into();
+        }
+        if !question.ends_with('?') {
+            question.push('?');
+        }
+        let header = if title_header.is_empty() {
+            truncate_ask_header(&question)
+        } else {
+            title_header.clone()
+        };
+        let options = map_ask_question_options(&item.options);
+        questions.push(serde_json::json!({
+            "question": question,
+            "header": header,
+            "options": options,
+            "multiSelect": item.allow_multiple,
+        }));
+    }
+
+    if questions.is_empty() {
+        let question = if title.is_empty() {
+            "Continue?".to_string()
+        } else if title.ends_with('?') {
+            title.to_string()
+        } else {
+            format!("{title}?")
+        };
+        questions.push(serde_json::json!({
+            "question": question,
+            "header": if title_header.is_empty() {
+                truncate_ask_header(&question)
+            } else {
+                title_header
+            },
+            "options": default_ask_question_options(),
+            "multiSelect": false,
+        }));
+    }
+
+    serde_json::json!({ "questions": questions })
+}
+
+fn map_ask_question_options(
+    options: &[crate::providers::cursor::proto::AskQuestionOption],
+) -> Vec<serde_json::Value> {
+    if !(2..=4).contains(&options.len()) {
+        return default_ask_question_options();
+    }
+    options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let label = if option.label.trim().is_empty() {
+                option.id.trim()
+            } else {
+                option.label.trim()
+            };
+            let label = if label.is_empty() {
+                format!("Option {}", index + 1)
+            } else {
+                label.to_string()
+            };
+            serde_json::json!({
+                "label": label,
+                "description": format!("Select {label}"),
+            })
+        })
+        .collect()
+}
+
+fn default_ask_question_options() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "label": "Continue",
+            "description": "Accept this option and continue",
+        }),
+        serde_json::json!({
+            "label": "Skip",
+            "description": "Skip this question",
+        }),
+    ]
+}
+
+fn truncate_ask_header(text: &str) -> String {
+    text.chars().take(ASK_USER_QUESTION_HEADER_MAX).collect()
 }
 
 fn map_pi_write_args(args: &PiWriteExecArgs, tool_use_id: String) -> MappedClaudeTool {
@@ -601,13 +694,9 @@ fn unquote_posix_single(value: &str) -> Option<String> {
     while let Some(pos) = rest.find('\'') {
         out.push_str(&rest[..pos]);
         rest = &rest[pos + 1..];
-        if let Some(after_escape) = rest.strip_prefix("\\''") {
-            out.push('\'');
-            rest = after_escape;
-        } else {
-            // A lone quote cannot occur inside shell_single_quote output.
-            return None;
-        }
+        let after_escape = rest.strip_prefix("\\''")?;
+        out.push('\'');
+        rest = after_escape;
     }
     out.push_str(rest);
     Some(out)
@@ -1240,7 +1329,8 @@ fn spawn_client_model(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::providers::cursor::proto::{
-        ExecServerMessage, ReadToolArgs, ReadToolCall, ShellToolCall, ToolCall, ToolCallStarted,
+        AskQuestionItem, AskQuestionOption, AskQuestionToolCall, ExecServerMessage, ReadToolArgs,
+        ReadToolCall, ShellToolCall, ToolCall, ToolCallStarted,
     };
 
     #[test]
@@ -1393,6 +1483,48 @@ mod tests {
         assert_eq!(m.name, "TodoWrite");
         assert_eq!(m.input["merge"], true);
         assert_eq!(m.input["todos"][0]["status"], "in_progress");
+    }
+
+    #[test]
+    fn maps_ask_question_to_claude_schema_with_options_and_multiselect() {
+        let started = ToolCallStarted {
+            call_id: "ask-full".into(),
+            tool_call: Some(ToolCall {
+                ask_question_tool_call: Some(AskQuestionToolCall {
+                    args: Some(crate::providers::cursor::proto::AskQuestionArgs {
+                        title: "Choose implementation".into(),
+                        questions: vec![AskQuestionItem {
+                            id: "approach".into(),
+                            prompt: "Which approach should we use".into(),
+                            options: vec![
+                                AskQuestionOption {
+                                    id: "a".into(),
+                                    label: "Approach A".into(),
+                                },
+                                AskQuestionOption {
+                                    id: "b".into(),
+                                    label: "Approach B".into(),
+                                },
+                            ],
+                            allow_multiple: true,
+                        }],
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+
+        let mapped = map_tool_call_started(&started).expect("AskQuestion maps");
+        assert_eq!(mapped.name, "AskUserQuestion");
+        assert!(mapped.input.get("title").is_none());
+        let question = &mapped.input["questions"][0];
+        assert_eq!(question["question"], "Which approach should we use?");
+        assert_eq!(question["header"], "Choose imple");
+        assert_eq!(question["multiSelect"], true);
+        assert_eq!(question["options"][0]["label"], "Approach A");
+        assert_eq!(question["options"][1]["label"], "Approach B");
     }
 
     #[test]

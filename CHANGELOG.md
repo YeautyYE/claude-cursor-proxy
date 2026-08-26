@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.79 (2026-08-26)
+
+- Emit each Grok Build compaction summary exactly once across Responses/Messages translation, avoiding duplicated summaries after a successful context compaction.
+- Satisfy current Clippy checks in the native Cursor shell-quoting bridge.
+
 ## v0.1.78 (2026-08-26)
 
 - Isolate Grok Build `xai-compact-*` requests from the ordinary Cursor live Run and checkpoint. Compaction now uses a fresh Cursor request, preventing repeated `503 A Cursor live run is already active for this session` loops after context reaches 100%.
