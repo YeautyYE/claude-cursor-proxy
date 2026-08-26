@@ -1154,6 +1154,66 @@ mod tests {
     }
 
     #[test]
+    fn filtered_sse_does_not_emit_unadvertised_native_tool() {
+        use crate::providers::cursor::proto::{
+            AgentServerMessage, ExecReadArgs, ExecServerMessage,
+        };
+        use crate::providers::cursor::test_frames;
+        use prost::Message;
+        use std::collections::BTreeSet;
+
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: Some(ExecServerMessage {
+                id: 8,
+                exec_id: Some("read-8".into()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/example.txt".into(),
+                    tool_call_id: "read-8".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
+                pi_write_args: None,
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let mut body =
+            crate::providers::cursor::connect::encode_connect_frame(&payload, 0).to_vec();
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+
+        let empty = BTreeSet::new();
+        let sse = frame_cursor_stream_with_allowed(
+            &upstream,
+            "msg_no_tools",
+            "cursor-test",
+            Some(&empty),
+        );
+        let events = parse_sse_events(&String::from_utf8_lossy(&sse));
+        assert!(
+            events
+                .iter()
+                .all(|(_, data)| data["type"] != "content_block_start"
+                    || data["content_block"]["type"] != "tool_use")
+        );
+    }
+
+    #[test]
     fn incremental_encoder_emits_strict_tool_sequence_and_preserves_usage() {
         let mut encoder = CursorSseEncoder::new("msg_incremental", "cursor-test");
         let mut bytes = Vec::new();
