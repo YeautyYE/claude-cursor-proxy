@@ -2407,6 +2407,22 @@ impl LiveRunRegistry {
         }
     }
 
+    /// Whether a hidden Running handle is still waiting for its driver to
+    /// publish a terminal transition. `get_run` deliberately omits cancelled
+    /// and terminal-error handles; callers that are waiting without a
+    /// generation permit need to distinguish that transient state from a
+    /// completed handle that should be probed immediately.
+    pub(crate) fn hidden_running_requires_wait(session_id: &str, agent_id: Option<&str>) -> bool {
+        let key = live_run_key(session_id, agent_id);
+        let mut runs = LIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_finished(&mut runs);
+        matches!(
+            runs.runs.get(&key),
+            Some(LiveRunEntry::Running(handle))
+                if !handle.is_completed() && !handle.has_terminal_error()
+        )
+    }
+
     /// True while a reservation or live handle owns this Claude session slot
     /// (no agent id). Nested occupancy is [`Self::is_occupied_run`].
     pub fn is_occupied(session_id: &str) -> bool {
@@ -16199,6 +16215,43 @@ mod tests {
         assert!(
             LiveRunRegistry::replaceable_run_for_fresh_request(&session, None, 11).is_none(),
             "an identical retry must not replace its own hidden generation"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn fresh_start_waits_on_hidden_identical_generation_but_can_claim_different_one() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("hidden-start-wait-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (handle, _command_rx) = connected_dummy_handle("hidden-start-generation");
+        handle.set_request_fingerprint(11);
+        handle.cancel_requested.store(true, Ordering::Release);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert hidden generation");
+
+        assert!(
+            LiveRunRegistry::hidden_running_requires_wait(&session, None),
+            "an incomplete hidden driver needs a transition wait"
+        );
+        assert!(
+            super::super::live_start_should_wait_without_admission(&session, None, 11),
+            "an identical retry must wait for the hidden generation to publish replay/terminal state"
+        );
+        assert!(
+            !super::super::live_start_should_wait_without_admission(&session, None, 22),
+            "a different fresh operation may reacquire capacity and claim the replaceable generation"
+        );
+        store_terminal_error(&handle.terminal_error, "Cursor live run cancelled");
+        assert!(
+            !LiveRunRegistry::hidden_running_requires_wait(&session, None),
+            "once a terminal outcome is published, the next loop must reacquire and probe it"
+        );
+        assert!(
+            !super::super::live_start_should_wait_without_admission(&session, None, 11),
+            "a terminal hidden generation must be probed instead of waited forever"
         );
         LiveRunRegistry::clear();
     }

@@ -288,6 +288,38 @@ fn is_compact_request(body: &MessagesRequest, client_request_id: Option<&str>) -
     is_xai_compact_request(client_request_id) || is_context_management_compact_request(body)
 }
 
+/// Give a context-compaction operation its own live-run/conversation lane
+/// while keeping the key stable across transport retries.  Grok Build supplies
+/// `xai-compact-*` for this purpose; Anthropic's `compact_20260112` extension
+/// does not, so its canonical request payload is the fallback identity.
+fn compact_agent_id(body: &MessagesRequest, ctx: &RequestContext) -> String {
+    let mut payload = b"ccp-compact-agent\0".to_vec();
+    if let Some(request_id) = ctx
+        .client_request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| is_xai_compact_request(Some(id)))
+    {
+        // The xAI id is explicitly retry-stable. Prefer it over the complete
+        // body because clients may rewrite stream-only fields on a retry.
+        payload.extend_from_slice(request_id.as_bytes());
+    } else {
+        payload.extend_from_slice(&live_operation_fingerprint_payload(body, None));
+    }
+    // Nested Claude agents can share a session and occasionally reuse a
+    // compaction payload. Keep their isolated lanes distinct as well.
+    for value in [
+        ctx.claude_code.agent_id.as_deref(),
+        ctx.claude_code.parent_agent_id.as_deref(),
+    ] {
+        payload.push(0);
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            payload.extend_from_slice(value.as_bytes());
+        }
+    }
+    format!("ccp-compact-{:016x}", live_request_fingerprint(&payload))
+}
+
 fn live_path_skip_reason(
     _want_stream: bool,
     has_session: bool,
@@ -952,6 +984,23 @@ async fn start_live_events_with_retries_with_client_type(
                         )
                         .is_some()
                         {
+                            if unbounded_conflict_wait {
+                                // A hidden cancel-requested/terminaling Run
+                                // cannot accept AttachReplay yet. Keep the
+                                // already-committed SSE alive while its driver
+                                // publishes the terminal transition; the
+                                // next probe can then replay or reserve it.
+                                // Returning local 503 here recreates the
+                                // duplicate retry storm this path is meant to
+                                // absorb.
+                                admission.take();
+                                // Drop the permit and let the next loop
+                                // iteration either wait on an incomplete
+                                // hidden driver or reacquire and probe a
+                                // completed/terminal one.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
                             return Err(live_run_busy_error());
                         }
                         // `get_run` intentionally hides a cancel-requested or
@@ -1837,7 +1886,16 @@ fn live_start_should_wait_without_admission(
         return true;
     }
     let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
-        return false;
+        // `get_run` intentionally hides cancel-requested/terminaling handles.
+        // A different operation may claim a hidden generation only when the
+        // replacement predicate is true; an identical retry must instead
+        // leave capacity released while it waits for replay/terminal cleanup.
+        if LiveRunRegistry::replaceable_run_for_fresh_request(session_id, agent_id, fingerprint)
+            .is_some()
+        {
+            return false;
+        }
+        return LiveRunRegistry::hidden_running_requires_wait(session_id, agent_id);
     };
     if run.request_fingerprint() == fingerprint {
         return false;
@@ -2490,9 +2548,19 @@ impl Provider for CursorProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let mut ctx = ctx;
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let xai_compact = is_compact_request(&body, ctx.client_request_id.as_deref());
+        if xai_compact {
+            // Context compaction is a distinct operation on the same Claude
+            // session.  Keep the session for Cursor's long-lived transport,
+            // but isolate registry/checkpoint/bridge state with a stable lane
+            // identity so retries never collide with the preceding turn.
+            let compact_id = compact_agent_id(&body, &ctx);
+            ctx.claude_code.agent_id = Some(compact_id);
+            ctx.claude_code.parent_agent_id = None;
+        }
         let requested_model = body.model.as_deref().unwrap_or("cursor");
         let wire_model = anthropic_wire_model(requested_model);
         let effort = match crate::providers::translate_shared::read_effort(&body) {
@@ -2820,15 +2888,10 @@ impl Provider for CursorProvider {
             return resp;
         }
 
-        // A compaction request carries the full history needed for its summary
-        // and must run as a fresh non-live request. Reusing the normal session
-        // here would re-enter the live registry and the persisted checkpoint,
-        // recreating the 503/compaction loop seen by grok-build.
-        let session_id = if xai_compact {
-            None
-        } else {
-            ctx.session_id.as_deref()
-        };
+        // Compaction uses the original session with its synthetic agent lane;
+        // this keeps the BiDi heartbeat/reconnect path while preventing it from
+        // sharing the ordinary turn's live slot or conversation checkpoint.
+        let session_id = ctx.session_id.as_deref();
         if xai_compact {
             create_logger("cursor").info(
                 "compaction_isolated",
@@ -2841,6 +2904,10 @@ impl Provider for CursorProvider {
                     (
                         "sessionId".into(),
                         serde_json::json!(ctx.session_id.as_deref()),
+                    ),
+                    (
+                        "syntheticAgentId".into(),
+                        serde_json::json!(ctx.claude_code.agent_id.as_deref()),
                     ),
                 ])),
             );
@@ -3447,6 +3514,84 @@ mod tests {
         .expect("valid context-management request");
         assert!(is_context_management_compact_request(&body));
         assert!(is_compact_request(&body, None));
+    }
+
+    fn compact_test_context(client_request_id: Option<&str>) -> RequestContext {
+        RequestContext {
+            req_id: "compact-test-req".into(),
+            client_request_id: client_request_id.map(str::to_owned),
+            session_id: Some("compact-test-session".into()),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders::default(),
+            hold_http_until_live_open: false,
+        }
+    }
+
+    #[test]
+    fn compact_agent_id_is_stable_for_xai_retries_with_stream_changes() {
+        let first = hello_body();
+        let mut retry = first.clone();
+        retry.stream = !first.stream;
+        let ctx = compact_test_context(Some("xai-compact-42"));
+        assert_eq!(
+            compact_agent_id(&first, &ctx),
+            compact_agent_id(&retry, &ctx)
+        );
+    }
+
+    #[test]
+    fn compact_agent_id_separates_xai_operations() {
+        let body = hello_body();
+        let first = compact_agent_id(&body, &compact_test_context(Some("xai-compact-1")));
+        let second = compact_agent_id(&body, &compact_test_context(Some("xai-compact-2")));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn compact_agent_id_without_xai_header_is_stable_for_same_body() {
+        let body = hello_body();
+        let ctx = compact_test_context(None);
+        assert_eq!(compact_agent_id(&body, &ctx), compact_agent_id(&body, &ctx));
+    }
+
+    #[test]
+    fn compact_agent_id_uses_body_for_non_xai_request_ids() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "compact"}],
+            "context_management": {
+                "edits": [{"type": "compact_20260112"}]
+            }
+        }))
+        .expect("valid compact request");
+        let first = compact_agent_id(&body, &compact_test_context(Some("xai-turn-1")));
+        let second = compact_agent_id(&body, &compact_test_context(Some("xai-turn-2")));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn compact_identity_does_not_change_regular_agent_identity() {
+        let body = hello_body();
+        let ctx = compact_test_context(Some("xai-turn-1"));
+        let original = ctx.claude_code.agent_id.clone();
+        assert!(!is_compact_request(&body, ctx.client_request_id.as_deref()));
+        assert_eq!(ctx.claude_code.agent_id, original);
+    }
+
+    #[test]
+    fn compact_identity_keeps_session_and_live_path_eligible() {
+        let body = hello_body();
+        let mut ctx = compact_test_context(Some("xai-compact-live"));
+        let compact = compact_agent_id(&body, &ctx);
+        ctx.claude_code.agent_id = Some(compact);
+        ctx.claude_code.parent_agent_id = None;
+        let session = ctx.session_id.as_deref().expect("test session");
+        let identity = live_run_identity(session, &ctx);
+        assert!(identity.agent_id.is_some());
+        assert!(live_path_eligible(true, true, true));
     }
 
     #[test]

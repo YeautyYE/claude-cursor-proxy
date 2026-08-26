@@ -169,13 +169,13 @@ impl CursorHttpClient {
     /// Connect protobuf unary when JSON fails. Results are cached in-process for
     /// ~5 minutes via [`super::model::store_live_usable_models`].
     pub async fn fetch_usable_models(&self, token: &str) -> Result<Vec<String>, CursorError> {
-        if let Some(cached) = super::model::cached_live_usable_models() {
+        if let Some(cached) = super::model::cached_live_usable_models_for_account(token) {
             return Ok(cached);
         }
 
         match self.fetch_usable_models_json(token).await {
             Ok(models) if !models.is_empty() => {
-                super::model::store_live_usable_models(models.clone());
+                super::model::store_live_usable_models_for_account(token, models.clone());
                 return Ok(models);
             }
             Ok(_) => { /* empty — try proto */ }
@@ -184,7 +184,7 @@ impl CursorHttpClient {
 
         let models = self.fetch_usable_models_proto(token).await?;
         if !models.is_empty() {
-            super::model::store_live_usable_models(models.clone());
+            super::model::store_live_usable_models_for_account(token, models.clone());
         }
         Ok(models)
     }

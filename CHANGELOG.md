@@ -3,6 +3,17 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.81 (2026-08-26)
+
+- Route Grok Build and Anthropic context compaction through an isolated,
+  stable Cursor live lane instead of the buffered 45-second setup watchdog.
+  Connect heartbeats, reconnects, and retries now remain active during long
+  compactions without colliding with the ordinary session Run.
+- Keep compaction identity stable across `xai-compact-*` retries and derive a
+  deterministic lane for `compact_20260112` requests without an xAI id.
+- Scope the dynamically fetched Cursor model catalog to the account that
+  fetched it, so a hot account switch cannot expose stale entitlements.
+
 ## v0.1.80 (2026-08-26)
 
 - Start ordinary Claude Code streaming responses before waiting on an occupied

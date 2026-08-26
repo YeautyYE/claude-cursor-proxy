@@ -8,6 +8,8 @@
 //!   `composer-2.5-fast` are recognized.
 //! - `cursor-agent:` is also supported for agent mode routing.
 
+use sha2::Digest;
+
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "claude-opus-4-7",
     "claude-opus-4-8",
@@ -364,10 +366,21 @@ pub fn requested_model_parameters(
 /// Process-wide live catalog from `GetUsableModels` (filled by the HTTP client).
 /// Merged into [`cursor_supported_models`] for listing only — does not affect
 /// [`resolve_cursor_model`].
-fn live_catalog_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>> {
+///
+/// The cache is account-scoped. Cursor account switches happen in a separate
+/// CLI process while `serve` remains alive; a process-wide, unkeyed catalog
+/// would otherwise keep returning the previous account's model list until the
+/// TTL elapsed. We retain only a short token digest, never the bearer itself.
+#[derive(Debug, Clone)]
+struct LiveCatalogSnapshot {
+    fetched_at: std::time::Instant,
+    account_key: String,
+    models: Vec<String>,
+}
+
+fn live_catalog_cache() -> &'static std::sync::Mutex<Option<LiveCatalogSnapshot>> {
     use std::sync::{Mutex, OnceLock};
-    #[allow(clippy::type_complexity)]
-    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, Vec<String>)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Option<LiveCatalogSnapshot>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
@@ -375,20 +388,50 @@ const LIVE_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(5 *
 
 /// Store a freshly fetched GetUsableModels catalog (5-minute TTL).
 pub fn store_live_usable_models(models: Vec<String>) {
+    store_live_usable_models_with_key(String::new(), models);
+}
+
+/// Store a freshly fetched catalog for the bearer that produced it.
+pub(crate) fn store_live_usable_models_for_account(token: &str, models: Vec<String>) {
+    store_live_usable_models_with_key(account_catalog_key(token), models);
+}
+
+fn store_live_usable_models_with_key(account_key: String, models: Vec<String>) {
     if let Ok(mut guard) = live_catalog_cache().lock() {
-        *guard = Some((std::time::Instant::now(), models));
+        *guard = Some(LiveCatalogSnapshot {
+            fetched_at: std::time::Instant::now(),
+            account_key,
+            models,
+        });
     }
 }
 
 /// Return cached live model ids if still within TTL.
 pub fn cached_live_usable_models() -> Option<Vec<String>> {
     let guard = live_catalog_cache().lock().ok()?;
-    let (at, models) = guard.as_ref()?;
-    if at.elapsed() < LIVE_CATALOG_TTL {
-        Some(models.clone())
-    } else {
-        None
+    let snapshot = guard.as_ref()?;
+    (snapshot.fetched_at.elapsed() < LIVE_CATALOG_TTL).then(|| snapshot.models.clone())
+}
+
+/// Return a cached catalog only when it was fetched with the current account.
+/// A token rotation for the same account may cause one extra refresh, which is
+/// preferable to presenting another account's model entitlements.
+pub(crate) fn cached_live_usable_models_for_account(token: &str) -> Option<Vec<String>> {
+    let guard = live_catalog_cache().lock().ok()?;
+    let snapshot = guard.as_ref()?;
+    if snapshot.account_key != account_catalog_key(token)
+        || snapshot.fetched_at.elapsed() >= LIVE_CATALOG_TTL
+    {
+        return None;
     }
+    Some(snapshot.models.clone())
+}
+
+fn account_catalog_key(token: &str) -> String {
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    // A compact digest is sufficient for cache partitioning and avoids
+    // retaining or logging bearer credentials in process state.
+    format!("{digest:x}")
 }
 
 /// Build the list of supported Cursor model names.
@@ -693,6 +736,32 @@ mod tests {
         for m in CURSOR_LEGACY_MODELS {
             assert!(models.contains(&m.to_string()), "missing {m}");
         }
+    }
+
+    #[test]
+    fn live_catalog_cache_does_not_cross_account_switches() {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = CACHE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        store_live_usable_models_for_account("account-a-token", vec!["gemini-a".into()]);
+        assert_eq!(
+            cached_live_usable_models_for_account("account-a-token"),
+            Some(vec!["gemini-a".into()])
+        );
+        assert!(
+            cached_live_usable_models_for_account("account-b-token").is_none(),
+            "a switched account must not reuse the previous account's model catalog"
+        );
+
+        store_live_usable_models_for_account("account-b-token", vec!["gemini-b".into()]);
+        assert_eq!(
+            cached_live_usable_models_for_account("account-b-token"),
+            Some(vec!["gemini-b".into()])
+        );
     }
 
     #[test]
