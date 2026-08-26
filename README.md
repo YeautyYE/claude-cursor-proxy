@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.79 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.80 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -256,8 +256,8 @@ After enabling a model with `s`, point Claude Code at that model:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
 export ANTHROPIC_AUTH_TOKEN=unused
-export ANTHROPIC_MODEL="cursor:claude-fable-5[1m]"
-export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5[1m]"
+export ANTHROPIC_MODEL="cursor:claude-fable-5"
+export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5"
 claude
 ```
 
@@ -347,7 +347,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | Maximum local admission wait before retryable HTTP 503 (1–300s) |
 | `CCP_CURSOR_LIVE_ATTACH_WAIT_MS` | `15000` | Same-operation attach handoff wait before local busy is returned (500–60000ms) |
 | `CCP_CURSOR_LIVE_RESUME_ATTACH_WAIT_MS` | `4000` | Pre-response same-operation attach wait (500–5000ms); kept below the Claude Code stream watchdog |
-| `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `30000` | Wait for a different operation to observe the current session Run advance (500–120000ms) |
+| `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `180000` | Wait for a different operation to observe the current session Run advance (500–600000ms) |
 | `CCP_CURSOR_LIVE_RESUME_WAIT_MS` | `5000` | Pre-response tool-result handoff wait; kept below the client stream watchdog (500–5000ms) |
 | `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | Pre-response nested-agent handoff wait (500–5000ms) |
 | `CCP_CURSOR_RESOURCE_RETRIES` | `6` | Same-request retries for transient Cursor `ERROR_RESOURCE_EXHAUSTED` responses (1–12); billing/quota/capacity policy 429s are never hidden-retried |
@@ -357,7 +357,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_LIVE_TIMEOUT_SECS` | `1800` | Active model-generation budget for each live segment (max 3600s; paused while downstream tools run) |
 | `CCP_CURSOR_TOOL_TTL_SECS` | same as live timeout | Maximum wait after a tool batch reaches the downstream client; an admitted result is allowed to finish dispatch |
 | `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | Maximum heartbeat-only thinking period without model progress |
-| `CCP_CURSOR_H2_SHARDS` | `4` | Stable H2 client pools used to isolate concurrent conversations (1–16) |
+| `CCP_CURSOR_H2_SHARDS` | `16` | Stable H2 client pools used to isolate concurrent conversations (1–64) |
 | `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `4` | Process-wide cap for simultaneous ResumeAction replacement opens (1–16) |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `5` | SSE heartbeat interval (message_delta + ping; keep below Claude Code's 10s stream watchdog) |
 | `CCP_CURSOR_NO_PROXY` | off | Skip HTTP(S)_PROXY for Cursor API (`1` / `true`) |

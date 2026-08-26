@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.79 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.80 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -248,8 +248,8 @@ Sessions、Active requests、Recent requests 和 Events 面板的 Cursor 模型�
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
 export ANTHROPIC_AUTH_TOKEN=unused
-export ANTHROPIC_MODEL="cursor:claude-fable-5[1m]"
-export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5[1m]"
+export ANTHROPIC_MODEL="cursor:claude-fable-5"
+export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5"
 claude
 ```
 
@@ -338,7 +338,7 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | 本地准入最多等待多久后返回可重试 HTTP 503（1–300 秒） |
 | `CCP_CURSOR_LIVE_ATTACH_WAIT_MS` | `15000` | 同一操作等待 attach 交接的时间，超时后才返回本地 busy（500–60000 毫秒） |
 | `CCP_CURSOR_LIVE_RESUME_ATTACH_WAIT_MS` | `4000` | 响应提交前同一操作的 attach 等待（500–5000 毫秒），保持低于 Claude Code 的 stream watchdog |
-| `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `30000` | 等待不同操作观察当前 session Run 前进（500–120000 毫秒） |
+| `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `180000` | 等待不同操作观察当前 session Run 前进（500–600000 毫秒） |
 | `CCP_CURSOR_LIVE_RESUME_WAIT_MS` | `5000` | 响应提交前等待工具结果交接；保持低于客户端 stream watchdog（500–5000 毫秒） |
 | `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | 响应提交前等待嵌套 agent 交接（500–5000 毫秒） |
 | `CCP_CURSOR_RESOURCE_RETRIES` | `6` | Cursor 瞬时 `ERROR_RESOURCE_EXHAUSTED` 的同请求自动重试次数（1–12）；账单、额度和 High Load 等策略型 429 不会隐藏重试 |
@@ -348,7 +348,7 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_LIVE_TIMEOUT_SECS` | `1800` | 每段活跃模型生成的预算（最多 3600 秒；下游工具执行期间暂停） |
 | `CCP_CURSOR_TOOL_TTL_SECS` | 与 live timeout 相同 | 工具批次送达下游后的最长等待时间；已准入的结果允许完成派发 |
 | `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | 只有心跳而没有模型进展时的最长思考时间 |
-| `CCP_CURSOR_H2_SHARDS` | `4` | 隔离并发 conversation 的稳定 H2 客户端池数量（1–16） |
+| `CCP_CURSOR_H2_SHARDS` | `16` | 隔离并发 conversation 的稳定 H2 客户端池数量（1–64） |
 | `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `4` | 进程内同时打开 ResumeAction 替代连接的上限（1–16） |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `5` | 下游 SSE 心跳间隔（秒，包含 message_delta + ping；低于 Claude Code 的 10 秒 watchdog） |
 | `CCP_CURSOR_NO_PROXY` | 关 | 对 Cursor API 跳过 HTTP(S)_PROXY（`1` / `true`） |

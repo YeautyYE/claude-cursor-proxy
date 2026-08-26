@@ -265,6 +265,29 @@ pub(crate) fn is_xai_compact_request(client_request_id: Option<&str>) -> bool {
     })
 }
 
+/// Anthropic's context-management extension can request compaction without
+/// the Grok-specific `x-grok-req-id` marker.  Such a request carries the full
+/// history and must be isolated from the ordinary Cursor live slot just like
+/// the xAI compact operation; otherwise it can race the preceding generation
+/// and re-enter its checkpoint.
+fn is_context_management_compact_request(body: &MessagesRequest) -> bool {
+    body.extra
+        .get("context_management")
+        .and_then(|value| value.get("edits"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|edits| {
+            edits.iter().any(|edit| {
+                edit.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("compact_20260112"))
+            })
+        })
+}
+
+fn is_compact_request(body: &MessagesRequest, client_request_id: Option<&str>) -> bool {
+    is_xai_compact_request(client_request_id) || is_context_management_compact_request(body)
+}
+
 fn live_path_skip_reason(
     _want_stream: bool,
     has_session: bool,
@@ -317,6 +340,12 @@ struct LiveRetryStart {
     request_context: crate::providers::cursor::proto::RequestContext,
     fingerprint: Vec<u8>,
     has_refresh: bool,
+    /// Fresh Anthropic streaming requests have already committed their SSE
+    /// response (and therefore emit heartbeats while they wait). Keep their
+    /// same-session admission wait open until the observed generation reaches
+    /// a terminal/replacement state. Pre-response callers leave this false so
+    /// `/v1/responses` and tool-result continuations retain bounded waits.
+    unbounded_conflict_wait: bool,
     /// Captured when the logical request starts; retries must keep the same
     /// client identity even if the live routing config is edited meanwhile.
     client_type: String,
@@ -375,6 +404,7 @@ impl LiveRetryStart {
             reservation,
             self.has_refresh,
             &self.client_type,
+            self.unbounded_conflict_wait,
         )
         .await
     }
@@ -395,8 +425,12 @@ const LIVE_RUN_BUSY_MESSAGE: &str =
 // window; SSE callers continue receiving heartbeats while this task waits.
 const LIVE_ATTACH_WAIT_DEFAULT_MS: u64 = 15_000;
 const LIVE_ATTACH_WAIT_MAX_MS: u64 = 60_000;
-const LIVE_CONFLICT_WAIT_DEFAULT_MS: u64 = 30_000;
-const LIVE_CONFLICT_WAIT_MAX_MS: u64 = 120_000;
+// A normal Claude Code turn can legitimately overlap the tail of the prior
+// turn (for example an edited prompt arriving while Fable is still thinking).
+// Streaming callers get an SSE heartbeat while this bounded single-flight
+// handoff runs, so a short pre-admission timeout only creates a retry storm.
+const LIVE_CONFLICT_WAIT_DEFAULT_MS: u64 = 180_000;
+const LIVE_CONFLICT_WAIT_MAX_MS: u64 = 600_000;
 // This wait runs before the Anthropic response has been committed, so it must
 // stay below Claude Code's stream watchdog.  The longer conflict wait above is
 // used only after the streaming response has been handed to the client.
@@ -417,6 +451,48 @@ fn live_run_busy_error() -> CursorError {
     let mut error = CursorError::new(503, LIVE_RUN_BUSY_MESSAGE, None);
     error.retry_after = Some(local_overload_retry_after());
     error
+}
+
+/// Return the deadline used while waiting for a different operation in the
+/// same session. Once an SSE response is committed, the downstream heartbeat
+/// keeps the connection alive and there is no useful reason to fail a healthy
+/// long-running generation merely because it crossed an arbitrary wall clock
+/// limit. `None` is therefore intentional for fresh streaming starts.
+fn live_conflict_wait_deadline(unbounded: bool) -> Option<Instant> {
+    if unbounded {
+        None
+    } else {
+        Some(
+            Instant::now()
+                + Duration::from_millis(
+                    env_u64_millis(
+                        "CCP_CURSOR_LIVE_CONFLICT_WAIT_MS",
+                        LIVE_CONFLICT_WAIT_DEFAULT_MS,
+                    )
+                    .clamp(500, LIVE_CONFLICT_WAIT_MAX_MS),
+                ),
+        )
+    }
+}
+
+fn conflict_wait_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn conflict_wait_active(deadline: Option<Instant>) -> bool {
+    !conflict_wait_expired(deadline)
+}
+
+/// Whether an occupied live slot may be handed to the asynchronous streaming
+/// admission path.  The path emits Anthropic heartbeats immediately, while
+/// tool-result continuations and `/v1/responses` keep their pre-response
+/// semantics so they can return a structured JSON error when needed.
+fn defer_fresh_stream_admission(
+    want_stream: bool,
+    hold_http_until_live_open: bool,
+    has_tool_results: bool,
+) -> bool {
+    want_stream && !hold_http_until_live_open && !has_tool_results
 }
 
 fn live_probe_cursor_error(message: String) -> CursorError {
@@ -601,6 +677,7 @@ async fn start_live_events_with_retries(
         initial_reservation,
         has_refresh,
         &client_type,
+        false,
     )
     .await
 }
@@ -621,16 +698,9 @@ async fn start_live_events_with_retries_with_client_type(
     mut initial_reservation: Option<LiveRunReservation>,
     has_refresh: bool,
     client_type: &str,
+    unbounded_conflict_wait: bool,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
-    let conflict_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
-    let operation_conflict_deadline = Instant::now()
-        + Duration::from_millis(
-            env_u64_millis(
-                "CCP_CURSOR_LIVE_CONFLICT_WAIT_MS",
-                LIVE_CONFLICT_WAIT_DEFAULT_MS,
-            )
-            .clamp(500, LIVE_CONFLICT_WAIT_MAX_MS),
-        );
+    let operation_conflict_deadline = live_conflict_wait_deadline(unbounded_conflict_wait);
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
@@ -640,11 +710,29 @@ async fn start_live_events_with_retries_with_client_type(
         // that is only queued for local capacity must stay invisible to
         // concurrent duplicates; otherwise a 15s admission queue turns into
         // "already active for this session" for every overlapping retry.
-        let admission = live::admit_live_start(model).await?;
+        let mut admission = Some(live::admit_live_start(model).await?);
         let mut reservation = if let Some(reservation) = initial_reservation.take() {
             reservation
         } else {
             let claimed = loop {
+                if admission.is_none() {
+                    // A healthy different-operation Run still owns the
+                    // session. Poll its registry state without repeatedly
+                    // reacquiring scarce generation capacity; tombstones and
+                    // replaceable generations fall through to a real claim.
+                    if live_start_should_wait_without_admission(
+                        identity.session_id,
+                        identity.agent_id,
+                        operation_fingerprint,
+                    ) {
+                        if conflict_wait_expired(operation_conflict_deadline) {
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    admission = Some(live::admit_live_start(model).await?);
+                }
                 match LiveRunRegistry::try_claim_run_for_operation(
                     identity.session_id,
                     identity.agent_id,
@@ -652,7 +740,13 @@ async fn start_live_events_with_retries_with_client_type(
                 ) {
                     LiveSlotClaim::Reserved(reservation) => break Some(reservation),
                     LiveSlotClaim::Starting => {
-                        if Instant::now() >= conflict_deadline {
+                        // Do not let a queued same-session request consume a
+                        // scarce generation permit while it waits for the
+                        // existing starter to publish or release its slot.
+                        // The permit is reacquired at the next outer-loop
+                        // iteration after the slot transition is observed.
+                        admission.take();
+                        if conflict_wait_expired(operation_conflict_deadline) {
                             break None;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -680,6 +774,11 @@ async fn start_live_events_with_retries_with_client_type(
                             LiveRunRegistry::get_run(identity.session_id, identity.agent_id)
                         {
                             if run.request_fingerprint() == operation_fingerprint {
+                                // Attaching waits for the current segment's
+                                // handoff and does not consume a new
+                                // generation. Release the start permit while
+                                // that bounded wait runs.
+                                admission.take();
                                 if let Some(events) = attach_live_run_with_bounded_wait(
                                     Arc::clone(&run),
                                     operation_fingerprint,
@@ -723,9 +822,14 @@ async fn start_live_events_with_retries_with_client_type(
                             // new message). Supersede the orphan instead of
                             // busy-bouncing until it finishes generating.
                             if run.request_fingerprint() != operation_fingerprint
-                                && run.is_consumer_gone()
-                                && !run.has_pending_execs()
+                                && run.is_replaceable_for_fresh_request()
                             {
+                                // A fresh streamed turn may arrive while the
+                                // previous downstream has already gone away,
+                                // or while a client-only tool batch has made
+                                // that generation non-resumable. Claim the
+                                // exact generation under the registry lock;
+                                // connected, resumable runs remain protected.
                                 match LiveRunRegistry::claim_replacement_for_fresh_request(
                                     identity.session_id,
                                     identity.agent_id,
@@ -778,8 +882,9 @@ async fn start_live_events_with_retries_with_client_type(
                             // a short chance to finish before surfacing local
                             // backpressure to a client retry.
                             if !run.is_command_closed()
-                                && Instant::now() < operation_conflict_deadline
+                                && conflict_wait_active(operation_conflict_deadline)
                             {
+                                admission.take();
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
@@ -805,6 +910,16 @@ async fn start_live_events_with_retries_with_client_type(
                             LiveRunProbe::TerminalError(_) => continue,
                             LiveRunProbe::Occupied => {}
                         }
+                        // `get_run` intentionally hides a cancel-requested or
+                        // terminal handle. If that state changes between the
+                        // claim and terminal probe, keep the same bounded
+                        // handoff wait instead of leaking an early busy error
+                        // from this narrow registry transition window.
+                        if conflict_wait_active(operation_conflict_deadline) {
+                            admission.take();
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
                         return Err(live_run_busy_error());
                     }
                 }
@@ -814,6 +929,7 @@ async fn start_live_events_with_retries_with_client_type(
                 None => break,
             }
         };
+        let admission = admission.expect("live admission is present for a claimed slot");
         reservation.set_operation_fingerprint(operation_fingerprint);
         match reservation.begin_durable_operation() {
             operation_ledger::OperationAdmission::Allowed => {}
@@ -993,6 +1109,7 @@ fn spawn_streaming_live_sse(
     fingerprint: Vec<u8>,
     initial_reservation: Option<LiveRunReservation>,
     has_refresh: bool,
+    unbounded_conflict_wait: bool,
     client_type: String,
     message_id: String,
     wire_model: String,
@@ -1017,6 +1134,10 @@ fn spawn_streaming_live_sse(
             fingerprint,
             has_refresh,
             client_type,
+            // Only a fresh request may wait indefinitely. Tool-result
+            // continuations keep the bounded, generation-specific handoff
+            // semantics even though their SSE lifecycle is already open.
+            unbounded_conflict_wait,
         },
         initial_reservation,
         None,
@@ -1653,6 +1774,33 @@ fn fresh_request_can_supersede(run: &CursorLiveRunHandle, pending: &[PendingCurs
         || live_pending_must_supersede(pending)
 }
 
+/// A live start permit represents scarce generation capacity.  Once a
+/// claimant has observed a healthy, different-operation generation, release
+/// that permit and wait for the registry transition before reacquiring it;
+/// otherwise every 50ms conflict probe repeatedly takes and drops a semaphore
+/// permit, starving unrelated starts while the same session is still busy.
+///
+/// Succeeded/Ambiguous tombstones are deliberately not included: a different
+/// fingerprint can atomically rotate those entries on the next claim.  A
+/// replaceable Running generation is also left to the claimant so its
+/// generation-bound cancellation can happen without another polling round.
+fn live_start_should_wait_without_admission(
+    session_id: &str,
+    agent_id: Option<&str>,
+    fingerprint: u64,
+) -> bool {
+    if LiveRunRegistry::is_starting_run(session_id, agent_id) {
+        return true;
+    }
+    let Some(run) = LiveRunRegistry::get_run(session_id, agent_id) else {
+        return false;
+    };
+    if run.request_fingerprint() == fingerprint {
+        return false;
+    }
+    !run.is_replaceable_for_fresh_request()
+}
+
 /// Classify a slot that `get_run` hides. A dying Running generation is
 /// superseded. Ambiguous stays occupied until its TTL and fails closed because
 /// retrying cannot prove whether the prior Run was accepted. A Succeeded
@@ -2265,7 +2413,7 @@ impl Provider for CursorProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let xai_compact = is_xai_compact_request(ctx.client_request_id.as_deref());
+        let xai_compact = is_compact_request(&body, ctx.client_request_id.as_deref());
         let requested_model = body.model.as_deref().unwrap_or("cursor");
         let wire_model = anthropic_wire_model(requested_model);
         let effort = match crate::providers::translate_shared::read_effort(&body) {
@@ -2301,6 +2449,12 @@ impl Provider for CursorProvider {
         // instead of replaying the whole conversation as a fresh Cursor run.
         let mut preclaimed_live_reservation = None;
         let mut resumed_live_events = None;
+        let has_tool_results = request_has_current_tool_result(&body);
+        let defer_fresh_stream = defer_fresh_stream_admission(
+            want_stream,
+            ctx.hold_http_until_live_open,
+            has_tool_results,
+        );
         if !xai_compact && let Some(session_id) = ctx.session_id.as_deref() {
             let agent_id = claude_agent_id(&ctx);
             let fingerprint_payload =
@@ -2366,6 +2520,26 @@ impl Provider for CursorProvider {
                             );
                         }
                     }
+                    LiveRunProbe::Occupied if defer_fresh_stream => {
+                        // Do not hold the HTTP handler in the pre-response
+                        // resume waiter for a fresh streaming turn. The
+                        // downstream SSE starts now (and emits heartbeats),
+                        // while `start_live_events_with_retries...` performs
+                        // the same-session single-flight wait and claims the
+                        // slot once the observed generation advances.
+                        create_logger("cursor").info(
+                            "live_request_queued_behind_active_run",
+                            Some(serde_json::Map::from_iter([
+                                ("sessionId".into(), serde_json::json!(session_id)),
+                                ("agentId".into(), serde_json::json!(agent_id)),
+                                ("reqId".into(), serde_json::json!(&ctx.req_id)),
+                                (
+                                    "clientRequestId".into(),
+                                    serde_json::json!(ctx.client_request_id.as_deref()),
+                                ),
+                            ])),
+                        );
+                    }
                     LiveRunProbe::Occupied => {
                         let estimated_input = estimate_request_input_tokens(&body);
                         let monitor = ctx
@@ -2415,7 +2589,6 @@ impl Provider for CursorProvider {
                                 );
                             }
                             LiveResumeOutcome::SupersedeRunning(run_id) => {
-                                let has_tool_results = request_has_current_tool_result(&body);
                                 let replacement = if has_tool_results {
                                     LiveRunRegistry::claim_replacement_for_run(
                                         session_id, agent_id, &run_id,
@@ -2663,6 +2836,7 @@ impl Provider for CursorProvider {
                 ),
                 has_refresh: auth.refresh_token.is_some(),
                 client_type: client_type.clone(),
+                unbounded_conflict_wait: false,
             };
             let events = spawn_live_events_with_late_retries(retry_start, None, Some(events));
             return live_downstream_response(
@@ -2742,6 +2916,7 @@ impl Provider for CursorProvider {
                     fingerprint,
                     initial_reservation,
                     has_refresh,
+                    defer_fresh_stream,
                     client_type.clone(),
                     message_id,
                     wire_model,
@@ -2765,6 +2940,7 @@ impl Provider for CursorProvider {
                 fingerprint,
                 has_refresh,
                 client_type: client_type.clone(),
+                unbounded_conflict_wait: false,
             };
             match retry_start.start(initial_reservation).await {
                 Ok(events) => {
@@ -3177,6 +3353,35 @@ mod tests {
         assert!(!is_xai_compact_request(Some("xai-compactible-123")));
         assert!(!is_xai_compact_request(Some("xai-turn-123")));
         assert!(!is_xai_compact_request(None));
+    }
+
+    #[test]
+    fn anthropic_context_management_compaction_is_detected_without_xai_header() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5[1m]",
+            "stream": true,
+            "messages": [{"role": "user", "content": "compact"}],
+            "context_management": {
+                "edits": [{"type": "compact_20260112"}]
+            }
+        }))
+        .expect("valid context-management request");
+        assert!(is_context_management_compact_request(&body));
+        assert!(is_compact_request(&body, None));
+    }
+
+    #[test]
+    fn unrelated_context_management_edits_do_not_isolate_a_request() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "continue"}],
+            "context_management": {
+                "edits": [{"type": "clear_tool_uses_20250919"}]
+            }
+        }))
+        .expect("valid context-management request");
+        assert!(!is_context_management_compact_request(&body));
+        assert!(!is_compact_request(&body, Some("xai-turn-123")));
     }
 
     fn pending(tool_use_id: &str) -> PendingCursorExec {
@@ -4438,6 +4643,58 @@ mod tests {
         assert!(LIVE_NESTED_WAIT_MAX_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
         assert!(LIVE_RESUME_ATTACH_WAIT_DEFAULT_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
         assert!(LIVE_RESUME_ATTACH_WAIT_MAX_MS < CLAUDE_CODE_EVENT_WATCHDOG_MS);
+    }
+
+    #[test]
+    fn fresh_stream_admission_is_deferred_until_sse_is_live() {
+        assert!(defer_fresh_stream_admission(true, false, false));
+        assert!(
+            !defer_fresh_stream_admission(true, false, true),
+            "tool-result continuations need the pre-response resume waiter"
+        );
+        assert!(
+            !defer_fresh_stream_admission(true, true, false),
+            "Responses callers must retain JSON-before-open semantics"
+        );
+        assert!(!defer_fresh_stream_admission(false, false, false));
+    }
+
+    #[test]
+    fn start_wait_helper_drops_capacity_while_slot_is_starting() {
+        let session = format!("admission-wait-{}", uuid::Uuid::new_v4());
+        assert!(!live_start_should_wait_without_admission(&session, None, 1));
+        let reservation = LiveRunRegistry::reserve(&session).expect("reserve starting slot");
+        assert!(live_start_should_wait_without_admission(&session, None, 1));
+        reservation.release();
+        assert!(!live_start_should_wait_without_admission(&session, None, 1));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn active_run_conflict_budget_covers_long_fable_turns() {
+        assert!(LIVE_CONFLICT_WAIT_DEFAULT_MS >= 120_000);
+        assert!(LIVE_CONFLICT_WAIT_MAX_MS >= LIVE_CONFLICT_WAIT_DEFAULT_MS);
+    }
+
+    #[test]
+    fn fresh_stream_conflict_wait_has_no_wall_clock_deadline() {
+        assert!(
+            live_conflict_wait_deadline(true).is_none(),
+            "an already-committed SSE must keep waiting while the healthy prior Run advances"
+        );
+        let bounded = live_conflict_wait_deadline(false).expect("pre-response wait is bounded");
+        assert!(bounded > Instant::now());
+    }
+
+    #[test]
+    fn unbounded_conflict_wait_remains_active_until_registry_transition() {
+        assert!(!conflict_wait_expired(None));
+        assert!(conflict_wait_active(None));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("instant subtraction");
+        assert!(conflict_wait_expired(Some(past)));
+        assert!(!conflict_wait_active(Some(past)));
     }
 
     #[tokio::test]

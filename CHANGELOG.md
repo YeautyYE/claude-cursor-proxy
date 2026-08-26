@@ -3,6 +3,18 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.80 (2026-08-26)
+
+- Start ordinary Claude Code streaming responses before waiting on an occupied
+  Cursor live generation, keeping the SSE channel alive with heartbeats instead
+  of returning a 1.5-second local 503 retry storm.
+- Keep healthy generations protected, while allowing stale client-only or
+  cancelled generations to be replaced by a fresh turn.
+- Detect Anthropic `compact_20260112` context-management requests and isolate
+  them from the ordinary Cursor live slot.
+- Harden Claude Code native tool input normalization and preserve explicit
+  empty tool catalogs.
+
 ## v0.1.79 (2026-08-26)
 
 - Emit each Grok Build compaction summary exactly once across Responses/Messages translation, avoiding duplicated summaries after a successful context compaction.

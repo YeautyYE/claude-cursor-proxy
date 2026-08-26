@@ -60,7 +60,11 @@ impl PendingCursorExec {
         let kind = if let Some(args) = exec.read_args.as_ref() {
             CursorExecKind::Read {
                 path: args.path.clone(),
-                range_applied: args.offset.is_some() || args.limit.is_some(),
+                // The mapper drops ranges that violate Claude Read's
+                // non-negative/positive constraints. Keep the result flag in
+                // sync with what was actually sent to the client.
+                range_applied: args.offset.is_some_and(|offset| offset >= 0)
+                    || args.limit.is_some_and(|limit| limit > 0),
             }
         } else if let Some(args) = exec.write_args.as_ref() {
             CursorExecKind::Write {

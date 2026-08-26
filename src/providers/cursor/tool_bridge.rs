@@ -307,16 +307,18 @@ pub fn lock_bridge_registry_for_test() -> std::sync::MutexGuard<'static, ()> {
 /// Extract advertised tool names from a MessagesRequest.
 pub fn advertised_tool_names(body: &MessagesRequest) -> Option<BTreeSet<String>> {
     let tools = body.extra.get("tools")?.as_array()?;
-    if tools.is_empty() {
-        return None;
-    }
     let names: BTreeSet<String> = tools
         .iter()
         .filter(|tool| is_model_visible_tool_definition(tool))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .map(|n| n.to_string())
         .collect();
-    if names.is_empty() { None } else { Some(names) }
+    // `tools` absent and `tools: []` have different meanings at the protocol
+    // boundary. An explicit empty catalog must suppress native Cursor tool
+    // emission; returning `None` here makes the live path interpret it as an
+    // unfiltered legacy request and can inject synthetic tool_use blocks into
+    // a plain chat response.
+    Some(names)
 }
 
 /// Whether the request can use the Cursor native / XML tool bridge.
@@ -2167,6 +2169,19 @@ mod tests {
         }))
         .unwrap();
         assert!(advertised_tool_names(&body).is_none());
+    }
+
+    #[test]
+    fn advertised_tool_names_preserves_explicit_empty_catalog() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": []
+        }))
+        .unwrap();
+        let names = advertised_tool_names(&body).expect("explicit empty catalog");
+        assert!(names.is_empty());
+        assert!(!can_bridge_cursor_native_tools(&body, Some("session-1")));
     }
 
     #[test]

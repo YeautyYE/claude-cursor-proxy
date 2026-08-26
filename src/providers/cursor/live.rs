@@ -574,10 +574,6 @@ impl CursorLiveRunHandle {
         self.consumer_gone.load(Ordering::Acquire)
     }
 
-    pub(crate) fn has_pending_execs(&self) -> bool {
-        !self.pending_tools().is_empty()
-    }
-
     pub(crate) fn is_command_closed(&self) -> bool {
         self.command_tx.is_closed()
     }
@@ -15472,6 +15468,25 @@ mod tests {
         let _registry = lock_live_registry_for_test();
         let session = format!("running-start-busy-{}", uuid::Uuid::new_v4());
         LiveRunRegistry::clear();
+        // This regression only verifies the terminal classification. Keep its
+        // conflict probe short so the production handoff budget does not turn
+        // the serial CI suite into a three-minute test.
+        let previous_conflict_wait = std::env::var_os("CCP_CURSOR_LIVE_CONFLICT_WAIT_MS");
+        unsafe {
+            std::env::set_var("CCP_CURSOR_LIVE_CONFLICT_WAIT_MS", "500");
+        }
+        struct RestoreConflictWait(Option<std::ffi::OsString>);
+        impl Drop for RestoreConflictWait {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("CCP_CURSOR_LIVE_CONFLICT_WAIT_MS", value),
+                        None => std::env::remove_var("CCP_CURSOR_LIVE_CONFLICT_WAIT_MS"),
+                    }
+                }
+            }
+        }
+        let _restore_conflict_wait = RestoreConflictWait(previous_conflict_wait);
         let (handle, _command_rx_guard) = connected_dummy_handle("running-generation");
         LiveRunRegistry::reserve(&session)
             .expect("reserve")
@@ -16037,6 +16052,60 @@ mod tests {
             "busy classification must not send cancellation to the active driver"
         );
         LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn fresh_replacement_predicate_only_accepts_dead_or_client_only_generations() {
+        // A connected native-tool run still owns its downstream response and
+        // must not be cancelled merely because a different prompt arrived.
+        let (connected_tx, connected_rx) = mpsc::channel(1);
+        let connected = Arc::new(CursorLiveRunHandle {
+            run_id: "connected-native".into(),
+            command_tx: connected_tx,
+            pending: Arc::new(Mutex::new(vec![pending_exec(1, "read-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(1)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        let _connected_rx = connected_rx;
+        assert!(!connected.is_replaceable_for_fresh_request());
+
+        // Client-only batches intentionally tear down the BiDi worker after
+        // exposing the tool, so a fresh turn must be allowed to take over.
+        let (client_tx, client_rx) = mpsc::channel(1);
+        let client_only = Arc::new(CursorLiveRunHandle {
+            run_id: "client-only".into(),
+            command_tx: client_tx,
+            pending: Arc::new(Mutex::new(vec![pending_client_only(2, "workflow-1")])),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(2)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        let _client_rx = client_rx;
+        assert!(client_only.is_replaceable_for_fresh_request());
+
+        // A cancellation signal is a generation-bound stale marker even when
+        // the control channel is still winding down.
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let cancelled = Arc::new(CursorLiveRunHandle {
+            run_id: "cancelled".into(),
+            command_tx: cancel_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(3)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        let _cancel_rx = cancel_rx;
+        assert!(cancelled.is_replaceable_for_fresh_request());
     }
 
     #[test]

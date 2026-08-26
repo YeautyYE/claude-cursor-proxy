@@ -48,11 +48,14 @@ pub fn map_exec_server_message(exec: &ExecServerMessage) -> Option<MappedClaudeT
             id
         };
         let mut input = serde_json::json!({ "file_path": args.path });
-        if let Some(o) = args.offset {
-            input["offset"] = serde_json::json!(o);
+        if let Some(offset) = args.offset.filter(|offset| *offset >= 0) {
+            // Claude Code's Read contract is non-negative for offset and
+            // strictly positive for limit. Cursor's exec protobuf uses a
+            // signed offset, so malformed negative values must be omitted.
+            input["offset"] = serde_json::json!(offset);
         }
-        if let Some(l) = args.limit {
-            input["limit"] = serde_json::json!(l);
+        if let Some(limit) = args.limit.filter(|limit| *limit > 0) {
+            input["limit"] = serde_json::json!(limit);
         }
         return Some(MappedClaudeTool {
             tool_use_id: tool_id,
@@ -111,10 +114,10 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
     if let Some(ref read) = tc.read_tool_call {
         let args = read.args.as_ref()?;
         let mut input = serde_json::json!({ "file_path": args.path });
-        if let Some(offset) = args.offset {
+        if let Some(offset) = args.offset.filter(|offset| *offset >= 0) {
             input["offset"] = serde_json::json!(offset);
         }
-        if let Some(limit) = args.limit {
+        if let Some(limit) = args.limit.filter(|limit| *limit > 0) {
             input["limit"] = serde_json::json!(limit);
         }
         return Some(MappedClaudeTool {
@@ -227,7 +230,6 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
             .iter()
             .map(|t| {
                 serde_json::json!({
-                    "id": t.id,
                     "content": t.content,
                     "status": todo_status_name(t.status),
                 })
@@ -324,6 +326,9 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
+                // Keep Cursor's resume identity in the intermediate mapped
+                // shape. The Claude-facing adapter removes it, while the
+                // Grok spawn adapter translates it to `resume_from`.
                 input.insert("resume".into(), serde_json::json!(resume));
             }
             if let Some(background) = args.run_in_background {
@@ -750,14 +755,36 @@ pub fn advertised_name_fallbacks(mapped_name: &str) -> &'static [&'static str] {
         "AskUserQuestion" => &["AskUserQuestion", "AskQuestion", "ask_user_question"],
         "CreatePlan" => &["CreatePlan", "Plan", "EnterPlanMode", "enter_plan_mode"],
         "Task" => &["Task", "spawn_subagent", "Agent", "task"],
-        "TaskOutput" | "BashOutput" | "BashOutputTool" | "AgentOutputTool" => &[
+        "TaskOutput"
+        | "BashOutput"
+        | "BashOutputTool"
+        | "AgentOutputTool"
+        | "AgentOutput"
+        | "get_command_or_subagent_output"
+        | "get_terminal_command_output"
+        | "wait_commands_or_subagents" => &[
+            // Claude Code 2.1.193 exposes TaskOutput and keeps the four
+            // historical aliases on the same implementation. Grok-build's
+            // lifecycle names are included in both directions so a native
+            // Cursor event can resolve against whichever spelling the client
+            // advertised.
             "TaskOutput",
             "BashOutput",
+            "BashOutputTool",
+            "AgentOutputTool",
+            "AgentOutput",
             "get_command_or_subagent_output",
             "get_terminal_command_output",
+            "wait_commands_or_subagents",
         ],
-        "TaskStop" | "KillShell" | "KillBash" => &[
+        "TaskStop"
+        | "KillShell"
+        | "KillBash"
+        | "kill_command_or_subagent"
+        | "kill_terminal_command" => &[
+            "TaskStop",
             "KillShell",
+            "KillBash",
             "kill_command_or_subagent",
             "kill_terminal_command",
         ],
@@ -787,8 +814,44 @@ pub fn adapt_tool_input_for_client(
         return input;
     };
     match schema_name {
+        "Read" => {
+            coerce_integer_fields(obj, &["offset", "limit"]);
+            normalize_read_range(obj, "offset", "limit");
+        }
+        "Edit" => {
+            // Claude Code's Edit schema is strict. Cursor/MCP wrappers may
+            // attach transport metadata (or use `path`/`content` aliases),
+            // but none of that belongs in the Claude tool input.
+            copy_alias_if_missing(obj, "file_path", &["path", "target_file"]);
+            copy_alias_if_missing(obj, "old_string", &["oldText", "old_text"]);
+            copy_alias_if_missing(obj, "new_string", &["newText", "new_text", "content"]);
+            copy_alias_if_missing(obj, "replace_all", &["replaceAll"]);
+            retain_object_keys(
+                obj,
+                &["file_path", "old_string", "new_string", "replace_all"],
+            );
+        }
+        "MultiEdit" => {
+            copy_alias_if_missing(obj, "file_path", &["path", "target_file"]);
+            copy_alias_if_missing(obj, "replace_all", &["replaceAll"]);
+            retain_object_keys(obj, &["file_path", "edits", "replace_all"]);
+            if let Some(serde_json::Value::Array(edits)) = obj.get_mut("edits") {
+                for edit in edits {
+                    if let Some(edit) = edit.as_object_mut() {
+                        copy_alias_if_missing(edit, "old_string", &["oldText", "old_text"]);
+                        copy_alias_if_missing(edit, "new_string", &["newText", "new_text"]);
+                        copy_alias_if_missing(edit, "replace_all", &["replaceAll"]);
+                        retain_object_keys(edit, &["old_string", "new_string", "replace_all"]);
+                    }
+                }
+            }
+        }
+        "NotebookEdit" => {
+            normalize_notebook_edit(obj);
+        }
         "read_file" | "ReadFile" => {
             coerce_integer_fields(obj, &["offset", "limit"]);
+            normalize_read_range(obj, "offset", "limit");
             if !has_nonempty_str(obj, "target_file") {
                 if let Some(path) = obj.get("file_path").or_else(|| obj.get("path")).cloned() {
                     obj.insert("target_file".into(), path);
@@ -881,11 +944,26 @@ pub fn adapt_tool_input_for_client(
                     let Some(item) = todo.as_object_mut() else {
                         continue;
                     };
+                    // Cursor includes an internal id and may send an empty or
+                    // unknown status. Claude Code 2.1.193's strict TodoWrite
+                    // item contract only accepts content/status/activeForm.
+                    item.remove("id");
+                    let content = item
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("todo")
+                        .to_string();
+                    item.insert("content".into(), serde_json::json!(content));
+                    let status = item
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .filter(|status| matches!(*status, "pending" | "in_progress" | "completed"))
+                        .unwrap_or("pending")
+                        .to_string();
+                    item.insert("status".into(), serde_json::json!(status));
                     if !has_nonempty_str(item, "activeForm") {
-                        let content = item
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("todo");
                         item.insert(
                             "activeForm".into(),
                             serde_json::json!(format!("Working on {content}")),
@@ -901,18 +979,14 @@ pub fn adapt_tool_input_for_client(
             coerce_integer_fields(obj, &["timeout_ms"]);
             adapt_task_ids_list(obj);
         }
+        "TaskOutput" | "BashOutput" | "BashOutputTool" | "AgentOutputTool" | "AgentOutput" => {
+            normalize_task_output(obj);
+        }
         "kill_command_or_subagent" | "kill_terminal_command" => {
-            if !has_nonempty_str(obj, "task_id") {
-                let first = obj
-                    .get("task_ids")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                if let Some(id) = first {
-                    obj.insert("task_id".into(), serde_json::json!(id));
-                }
-            }
+            normalize_grok_task_stop(obj);
+        }
+        "TaskStop" | "KillShell" | "KillBash" => {
+            normalize_claude_task_stop(obj);
         }
         "enter_plan_mode" | "EnterPlanMode" => {
             obj.clear();
@@ -977,6 +1051,234 @@ fn coerce_integer_fields(obj: &mut serde_json::Map<String, serde_json::Value>, k
             }
         }
     }
+}
+
+/// Enforce Claude Code Read's range constraints after integer coercion.
+/// Invalid optional fields are omitted so Claude applies its normal defaults;
+/// clamping would silently change a caller's requested range.
+fn normalize_read_range(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    offset_key: &str,
+    limit_key: &str,
+) {
+    if obj
+        .get(offset_key)
+        .is_some_and(|value| value.as_i64().is_some_and(|offset| offset < 0))
+    {
+        obj.remove(offset_key);
+    }
+    if obj
+        .get(limit_key)
+        .is_some_and(|value| value.as_i64().is_some_and(|limit| limit <= 0))
+    {
+        obj.remove(limit_key);
+    }
+}
+
+/// Keep only fields that belong to a strict Claude tool schema.  The
+/// downstream Claude Code validator uses `strictObject` for several built-ins;
+/// forwarding Cursor transport metadata causes the whole tool call to be
+/// rejected even when its required fields are valid.
+fn retain_object_keys(obj: &mut serde_json::Map<String, serde_json::Value>, allowed: &[&str]) {
+    obj.retain(|key, _| allowed.contains(&key.as_str()));
+}
+
+fn copy_alias_if_missing(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    aliases: &[&str],
+) {
+    if obj.contains_key(canonical) {
+        return;
+    }
+    if let Some(value) = aliases.iter().find_map(|alias| obj.get(*alias).cloned()) {
+        obj.insert(canonical.into(), value);
+    }
+}
+
+fn normalize_notebook_edit(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    // A few older clients used the generic `path`/`source` spellings. Preserve
+    // a canonical value before removing those aliases from the strict schema.
+    if !has_nonempty_str(obj, "notebook_path")
+        && let Some(path) = obj.get("path").cloned()
+    {
+        obj.insert("notebook_path".into(), path);
+    }
+    if !obj.contains_key("new_source")
+        && let Some(source) = obj.get("source").cloned()
+    {
+        obj.insert("new_source".into(), source);
+    }
+
+    // Claude Code treats `cell-N` as an index for compatibility with old
+    // notebooks. Convert the former numeric `cell_number` field into that
+    // string selector before applying the strict key allow-list. Numeric
+    // `cell_id` values are handled the same way.
+    let cell_id_is_canonical = obj
+        .get("cell_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|id| !id.trim().is_empty() && !is_numeric_cell_id(id));
+    if !cell_id_is_canonical {
+        let legacy_index = obj
+            .get("cell_number")
+            .and_then(legacy_cell_index)
+            .or_else(|| obj.get("cell_id").and_then(legacy_cell_index));
+        if let Some(index) = legacy_index {
+            obj.insert("cell_id".into(), serde_json::json!(format!("cell-{index}")));
+        }
+    }
+    retain_object_keys(
+        obj,
+        &[
+            "notebook_path",
+            "cell_id",
+            "new_source",
+            "cell_type",
+            "edit_mode",
+        ],
+    );
+}
+
+fn is_numeric_cell_id(value: &str) -> bool {
+    value.trim().parse::<i64>().is_ok()
+}
+
+fn legacy_cell_index(value: &serde_json::Value) -> Option<i64> {
+    if let Some(index) = value.as_i64() {
+        return (index >= 0).then_some(index);
+    }
+    if let Some(index) = value.as_u64() {
+        return i64::try_from(index).ok();
+    }
+    if let Some(index) = value.as_f64()
+        && index.is_finite()
+        && index.fract() == 0.0
+        && index >= 0.0
+        && index <= i64::MAX as f64
+    {
+        return Some(index as i64);
+    }
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|index| *index >= 0)
+}
+
+fn normalize_task_output(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(task_id) = obj.get("task_id").and_then(task_id_string) {
+        obj.insert("task_id".into(), serde_json::json!(task_id));
+    }
+    if !has_nonempty_str(obj, "task_id") {
+        let candidate = obj
+            .get("task_ids")
+            .and_then(|value| value.as_array())
+            .and_then(|ids| ids.iter().find_map(task_id_string))
+            .or_else(|| obj.get("shell_id").and_then(task_id_string));
+        if let Some(task_id) = candidate {
+            obj.insert("task_id".into(), serde_json::json!(task_id));
+        }
+    }
+    if !obj.get("block").is_some_and(serde_json::Value::is_boolean) {
+        let block = obj
+            .get("wait")
+            .and_then(bool_value)
+            .or_else(|| obj.get("blocking").and_then(bool_value));
+        if let Some(block) = block {
+            obj.insert("block".into(), serde_json::json!(block));
+        }
+    }
+    if !obj.contains_key("timeout")
+        && let Some(timeout) = obj.get("timeout_ms").and_then(coerce_timeout_value)
+    {
+        obj.insert("timeout".into(), timeout);
+    }
+    if let Some(timeout) = obj.get("timeout").cloned() {
+        let valid = timeout.as_u64().is_some_and(|timeout| timeout <= 600_000)
+            || timeout
+                .as_i64()
+                .is_some_and(|timeout| (0..=600_000).contains(&timeout))
+            || timeout
+                .as_f64()
+                .is_some_and(|timeout| timeout.is_finite() && (0.0..=600_000.0).contains(&timeout));
+        if !valid {
+            obj.remove("timeout");
+        }
+    }
+    retain_object_keys(obj, &["task_id", "block", "timeout"]);
+}
+
+fn normalize_claude_task_stop(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(task_id) = obj.get("task_id").and_then(task_id_string) {
+        obj.insert("task_id".into(), serde_json::json!(task_id));
+    }
+    if let Some(shell_id) = obj.get("shell_id").and_then(task_id_string) {
+        obj.insert("shell_id".into(), serde_json::json!(shell_id));
+    }
+    if !has_nonempty_str(obj, "task_id") {
+        let candidate = obj.get("shell_id").and_then(task_id_string).or_else(|| {
+            obj.get("task_ids")
+                .and_then(|value| value.as_array())
+                .and_then(|ids| ids.iter().find_map(task_id_string))
+        });
+        if let Some(task_id) = candidate {
+            obj.insert("task_id".into(), serde_json::json!(task_id));
+        }
+    }
+    // `shell_id` is an official deprecated Claude alias and remains accepted
+    // by TaskStop/KillShell/KillBash. Keep it, while dropping Cursor-only
+    // arrays and transport metadata.
+    retain_object_keys(obj, &["task_id", "shell_id"]);
+}
+
+fn normalize_grok_task_stop(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if !has_nonempty_str(obj, "task_id") {
+        let candidate = obj.get("shell_id").and_then(task_id_string).or_else(|| {
+            obj.get("task_ids")
+                .and_then(|value| value.as_array())
+                .and_then(|ids| ids.iter().find_map(task_id_string))
+        });
+        if let Some(task_id) = candidate {
+            obj.insert("task_id".into(), serde_json::json!(task_id));
+        }
+    }
+    // Keep both spellings: current grok-build accepts the singular ID while
+    // older Cursor/grok clients still require the `task_ids` array.
+    retain_object_keys(obj, &["task_id", "task_ids"]);
+}
+
+fn task_id_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|id| id.to_string()))
+        .or_else(|| {
+            value
+                .as_i64()
+                .filter(|id| *id >= 0)
+                .map(|id| id.to_string())
+        })
+}
+
+fn bool_value(value: &serde_json::Value) -> Option<bool> {
+    value.as_bool().or_else(|| {
+        value.as_str().and_then(|text| match text.trim() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        })
+    })
+}
+
+fn coerce_timeout_value(value: &serde_json::Value) -> Option<serde_json::Value> {
+    coerce_whole_integer(value).and_then(|value| {
+        value
+            .as_i64()
+            .filter(|timeout| *timeout >= 0)
+            .map(|timeout| serde_json::json!(timeout))
+            .or_else(|| value.as_u64().map(|timeout| serde_json::json!(timeout)))
+    })
 }
 
 fn coerce_whole_integer(value: &serde_json::Value) -> Option<serde_json::Value> {
@@ -1172,6 +1474,12 @@ fn adapt_claude_agent_input(input: serde_json::Value) -> serde_json::Value {
     let Some(obj) = input.as_object_mut() else {
         return input;
     };
+    // Cursor's native Task carries resume state for its own child registry.
+    // Claude Code 2.1.193 Agent/Task has no resume field; forwarding it can
+    // make strict clients reject an otherwise valid tool_use.
+    for key in ["resume", "resume_from"] {
+        obj.remove(key);
+    }
     let valid = obj
         .get("model")
         .and_then(|value| value.as_str())
@@ -1437,6 +1745,42 @@ mod tests {
         let mapped = map_tool_call_started(&started).unwrap();
         assert_eq!(mapped.name, "Read");
         assert_eq!(mapped.input["file_path"], "/a/README.md");
+        assert!(mapped.input.get("offset").is_none());
+        assert!(mapped.input.get("limit").is_none());
+    }
+
+    #[test]
+    fn maps_read_drops_ranges_that_violate_claude_contract() {
+        let started = ToolCallStarted {
+            call_id: "r-invalid".into(),
+            tool_call: Some(ToolCall {
+                read_tool_call: Some(ReadToolCall {
+                    args: Some(ReadToolArgs {
+                        path: "/tmp/a.rs".into(),
+                        offset: Some(-1),
+                        limit: Some(0),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let mapped = map_tool_call_started(&started).expect("Read maps");
+        assert!(mapped.input.get("offset").is_none());
+        assert!(mapped.input.get("limit").is_none());
+
+        let exec = ExecServerMessage {
+            id: 1,
+            exec_id: Some("exec-invalid".into()),
+            read_args: Some(crate::providers::cursor::proto::ExecReadArgs {
+                path: "/tmp/a.rs".into(),
+                tool_call_id: "read-invalid".into(),
+                offset: Some(-4),
+                limit: Some(0),
+            }),
+            ..Default::default()
+        };
+        let mapped = map_exec_server_message(&exec).expect("exec Read maps");
         assert!(mapped.input.get("offset").is_none());
         assert!(mapped.input.get("limit").is_none());
     }
@@ -1872,6 +2216,25 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_fallbacks_are_bidirectional_for_all_claude_aliases() {
+        let output_aliases = [
+            "TaskOutput",
+            "BashOutput",
+            "BashOutputTool",
+            "AgentOutputTool",
+            "AgentOutput",
+        ];
+        for alias in output_aliases {
+            assert!(advertised_name_fallbacks(alias).contains(&"get_command_or_subagent_output"));
+            assert!(advertised_name_fallbacks("get_command_or_subagent_output").contains(&alias));
+        }
+        for alias in ["TaskStop", "KillShell", "KillBash"] {
+            assert!(advertised_name_fallbacks(alias).contains(&"kill_command_or_subagent"));
+            assert!(advertised_name_fallbacks("kill_command_or_subagent").contains(&alias));
+        }
+    }
+
+    #[test]
     fn adapt_native_task_to_spawn_rebuilds_allowlist() {
         let adapted = adapt_native_task_to_spawn_subagent(serde_json::json!({
             "description": "explore live",
@@ -2034,6 +2397,18 @@ mod tests {
             }),
         );
         assert_eq!(supported["model"], "fable");
+
+        let resumed = adapt_client_tool_input(
+            "Agent",
+            serde_json::json!({
+                "description": "resume",
+                "prompt": "continue",
+                "resume": "cursor-child-1",
+                "resume_from": "cursor-child-2"
+            }),
+        );
+        assert!(resumed.get("resume").is_none());
+        assert!(resumed.get("resume_from").is_none());
 
         for model in [
             "cursor-grok4.6",
@@ -2415,6 +2790,96 @@ mod tests {
     }
 
     #[test]
+    fn adapt_task_output_normalizes_grok_fields_to_claude_schema() {
+        let adapted = adapt_tool_input_for_client(
+            "TaskOutput",
+            serde_json::json!({
+                "task_ids": ["sa-1"],
+                "timeout_ms": 8000.0,
+                "wait": false,
+                "provider_identifier": "claude-local"
+            }),
+        );
+        assert_eq!(
+            adapted,
+            serde_json::json!({"task_id": "sa-1", "timeout": 8000, "block": false})
+        );
+    }
+
+    #[test]
+    fn adapt_task_stop_accepts_shell_alias_and_drops_transport_fields() {
+        let adapted = adapt_tool_input_for_client(
+            "KillShell",
+            serde_json::json!({
+                "shell_id": "shell-1",
+                "task_ids": ["ignored"],
+                "provider_identifier": "claude-local"
+            }),
+        );
+        assert_eq!(
+            adapted,
+            serde_json::json!({"task_id": "shell-1", "shell_id": "shell-1"})
+        );
+
+        let grok = adapt_tool_input_for_client(
+            "kill_command_or_subagent",
+            serde_json::json!({"task_ids": ["sa-2"], "provider_identifier": "claude-local"}),
+        );
+        assert_eq!(grok["task_id"], "sa-2");
+        assert_eq!(grok["task_ids"], serde_json::json!(["sa-2"]));
+    }
+
+    #[test]
+    fn adapt_edit_family_removes_unknown_fields_and_converts_legacy_notebook_index() {
+        let edit = adapt_tool_input_for_client(
+            "Edit",
+            serde_json::json!({
+                "file_path": "/tmp/a.rs",
+                "old_string": "one",
+                "new_string": "two",
+                "replace_all": false,
+                "tool_use_id": "transport"
+            }),
+        );
+        assert_eq!(
+            edit,
+            serde_json::json!({
+                "file_path": "/tmp/a.rs",
+                "old_string": "one",
+                "new_string": "two",
+                "replace_all": false
+            })
+        );
+
+        let multi = adapt_tool_input_for_client(
+            "MultiEdit",
+            serde_json::json!({
+                "file_path": "/tmp/a.rs",
+                "edits": [{"old_string": "one", "new_string": "two", "id": 1}],
+                "replace_all": true,
+                "debug": true
+            }),
+        );
+        assert_eq!(multi["edits"][0].get("id"), None);
+        assert_eq!(multi.get("debug"), None);
+
+        let notebook = adapt_tool_input_for_client(
+            "NotebookEdit",
+            serde_json::json!({
+                "notebook_path": "/tmp/a.ipynb",
+                "cell_number": 2,
+                "new_source": "print(2)",
+                "cell_type": "code",
+                "edit_mode": "replace",
+                "verbose": true
+            }),
+        );
+        assert_eq!(notebook["cell_id"], "cell-2");
+        assert!(notebook.get("cell_number").is_none());
+        assert!(notebook.get("verbose").is_none());
+    }
+
+    #[test]
     fn adapt_ls_path_to_list_dir_or_shell() {
         let listed =
             adapt_tool_input_for_client("list_dir", serde_json::json!({"path": "/tmp/carve"}));
@@ -2466,6 +2931,7 @@ mod tests {
         assert!(adapted.get("merge").is_none());
         assert_eq!(adapted["todos"][0]["content"], "collect");
         assert_eq!(adapted["todos"][0]["activeForm"], "Working on collect");
+        assert!(adapted["todos"][0].get("id").is_none());
         let grok = adapt_tool_input_for_client(
             "todo_write",
             serde_json::json!({
@@ -2475,6 +2941,24 @@ mod tests {
         );
         assert_eq!(grok["merge"], true);
         assert!(grok["todos"][0].get("activeForm").is_none());
+    }
+
+    #[test]
+    fn adapt_todo_write_repairs_empty_items_to_strict_schema() {
+        let adapted = adapt_tool_input_for_client(
+            "TodoWrite",
+            serde_json::json!({
+                "todos": [{"id": "internal", "content": " ", "status": "bogus", "activeForm": ""}]
+            }),
+        );
+        assert_eq!(
+            adapted["todos"][0],
+            serde_json::json!({
+                "content": "todo",
+                "status": "pending",
+                "activeForm": "Working on todo"
+            })
+        );
     }
 
     #[test]
