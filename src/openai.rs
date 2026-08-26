@@ -1249,7 +1249,10 @@ fn anthropic_message_to_sse(value: &Value, model: &str) -> Vec<u8> {
                     &json!({
                         "type": "content_block_start",
                         "index": index,
-                        "content_block": {"type": "compaction", "content": content}
+                        // Keep the initial block empty. The summary is emitted
+                        // once through `compaction_delta`; putting it in both
+                        // places makes downstream aggregation duplicate it.
+                        "content_block": {"type": "compaction", "content": ""}
                     })
                     .to_string(),
                 ));
