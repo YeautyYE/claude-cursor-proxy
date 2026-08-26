@@ -106,6 +106,11 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
 #[derive(Debug)]
 pub struct AnthropicJsonAcc {
     text: String,
+    compaction_mode: bool,
+    /// Reasoning is only a compaction fallback. Keep it retractable until we
+    /// know whether Cursor emits an authoritative text summary later.
+    compaction_thinking_fallback: String,
+    compaction_seen_text: bool,
     tools: Vec<(String, String, serde_json::Value)>,
     input_tokens: u64,
     output_tokens: u64,
@@ -116,8 +121,17 @@ pub struct AnthropicJsonAcc {
 
 impl AnthropicJsonAcc {
     pub fn new(estimated_input: u64) -> Self {
+        Self::new_mode(estimated_input, false)
+    }
+
+    /// Create an accumulator for a context compaction turn. Actual text is
+    /// authoritative; reasoning becomes assistant text only as a final fallback.
+    pub fn new_mode(estimated_input: u64, compaction_mode: bool) -> Self {
         Self {
             text: String::new(),
+            compaction_mode,
+            compaction_thinking_fallback: String::new(),
+            compaction_seen_text: false,
             tools: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
@@ -129,7 +143,13 @@ impl AnthropicJsonAcc {
 
     pub fn push(&mut self, event: &CursorStreamEvent) {
         match event {
-            CursorStreamEvent::TextDelta { text } => self.text.push_str(text),
+            CursorStreamEvent::TextDelta { text } => {
+                if self.compaction_mode && !self.compaction_seen_text {
+                    self.compaction_seen_text = true;
+                    self.compaction_thinking_fallback.clear();
+                }
+                self.text.push_str(text);
+            }
             CursorStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
@@ -149,6 +169,11 @@ impl AnthropicJsonAcc {
                 name,
                 input,
             } => self.push_native_tool(tool_use_id.clone(), name.clone(), input.clone()),
+            CursorStreamEvent::ThinkingDelta { text } if self.compaction_mode => {
+                if !self.compaction_seen_text {
+                    self.compaction_thinking_fallback.push_str(text);
+                }
+            }
             CursorStreamEvent::ThinkingDelta { .. }
             | CursorStreamEvent::Session { .. }
             | CursorStreamEvent::End => {}
@@ -160,7 +185,9 @@ impl AnthropicJsonAcc {
     }
 
     pub fn has_useful(&self) -> bool {
-        !self.text.is_empty() || !self.tools.is_empty()
+        !self.text.is_empty()
+            || (self.compaction_mode && !self.compaction_thinking_fallback.is_empty())
+            || !self.tools.is_empty()
     }
 
     pub fn usage_pair(&self) -> (u64, u64) {
@@ -177,12 +204,17 @@ impl AnthropicJsonAcc {
         )
     }
 
-    pub fn into_message_json(self, message_id: &str, model: &str) -> serde_json::Value {
+    pub fn into_message_json(mut self, message_id: &str, model: &str) -> serde_json::Value {
+        let text = if self.compaction_mode && self.text.is_empty() {
+            std::mem::take(&mut self.compaction_thinking_fallback)
+        } else {
+            std::mem::take(&mut self.text)
+        };
         let mut content = Vec::new();
-        if !self.text.is_empty() || self.tools.is_empty() {
+        if !text.is_empty() || self.tools.is_empty() {
             content.push(serde_json::json!({
                 "type": "text",
-                "text": self.text,
+                "text": text,
             }));
         }
         for (id, name, input) in &self.tools {
@@ -240,9 +272,40 @@ pub fn decode_cursor_upstream_with_allowed(
     model: &str,
     allowed_tool_names: Option<&BTreeSet<String>>,
 ) -> Result<serde_json::Value, CursorDecodeError> {
+    decode_cursor_upstream_with_allowed_mode(upstream, message_id, model, allowed_tool_names, false)
+}
+
+/// Build a non-streaming Anthropic response for a context-compaction turn.
+///
+/// The Responses compaction collector only consumes output text. This variant
+/// prefers real `text_delta` content and falls back to reasoning only when no
+/// text summary arrives, while leaving the normal response path unchanged.
+pub fn decode_cursor_upstream_compaction(
+    upstream: &CursorUpstreamResponse,
+    message_id: &str,
+    model: &str,
+) -> Result<serde_json::Value, CursorDecodeError> {
+    decode_cursor_upstream_with_allowed_mode(
+        upstream,
+        message_id,
+        model,
+        Some(&BTreeSet::new()),
+        true,
+    )
+}
+
+fn decode_cursor_upstream_with_allowed_mode(
+    upstream: &CursorUpstreamResponse,
+    message_id: &str,
+    model: &str,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    compaction_mode: bool,
+) -> Result<serde_json::Value, CursorDecodeError> {
     let events = decode_upstream_response(&upstream.body)?;
 
     let mut text_content = String::new();
+    let mut compaction_thinking_fallback = String::new();
+    let mut compaction_seen_text = false;
     let mut tool_content: Vec<serde_json::Value> = Vec::new();
     let mut final_input_tokens: u64 = 0;
     let mut final_output_tokens: u64 = 0;
@@ -251,7 +314,18 @@ pub fn decode_cursor_upstream_with_allowed(
 
     for event in &events {
         match event {
-            CursorStreamEvent::TextDelta { text } => text_content.push_str(text),
+            CursorStreamEvent::TextDelta { text } => {
+                if compaction_mode && !compaction_seen_text {
+                    compaction_seen_text = true;
+                    compaction_thinking_fallback.clear();
+                }
+                text_content.push_str(text);
+            }
+            CursorStreamEvent::ThinkingDelta { text } if compaction_mode => {
+                if !compaction_seen_text {
+                    compaction_thinking_fallback.push_str(text);
+                }
+            }
             CursorStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
@@ -291,6 +365,10 @@ pub fn decode_cursor_upstream_with_allowed(
             CursorStreamEvent::End => break,
             _ => {}
         }
+    }
+
+    if compaction_mode && text_content.is_empty() {
+        text_content = compaction_thinking_fallback;
     }
 
     let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
@@ -556,6 +634,42 @@ mod tests {
     }
 
     #[test]
+    fn compaction_json_promotes_thinking_summary_to_text() {
+        let mut body = test_frames::thinking_frame("summary from reasoning");
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+
+        let json =
+            decode_cursor_upstream_compaction(&upstream, "msg_compact_json", "claude-fable-5")
+                .expect("compaction response should decode");
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "summary from reasoning");
+        assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn compaction_json_prefers_text_over_mixed_reasoning() {
+        let mut body = test_frames::thinking_frame("private reasoning");
+        body.extend_from_slice(&test_frames::text_frame("actual summary"));
+        body.extend_from_slice(&test_frames::thinking_frame("later private reasoning"));
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+
+        let json =
+            decode_cursor_upstream_compaction(&upstream, "msg_compact_mixed", "claude-fable-5")
+                .expect("mixed compaction response should decode");
+        assert_eq!(json["content"][0]["text"], "actual summary");
+    }
+
+    #[test]
     fn json_acc_collects_text_usage_and_end_turn() {
         let mut acc = AnthropicJsonAcc::new(9);
         acc.push(&CursorStreamEvent::TextDelta {
@@ -575,6 +689,34 @@ mod tests {
         assert_eq!(json["stop_reason"], "end_turn");
         assert_eq!(json["usage"]["input_tokens"].as_u64(), Some(12));
         assert_eq!(json["usage"]["output_tokens"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn compaction_json_acc_prefers_text_and_uses_reasoning_only_as_fallback() {
+        let mut mixed = AnthropicJsonAcc::new_mode(9, true);
+        mixed.push(&CursorStreamEvent::ThinkingDelta {
+            text: "private reasoning".into(),
+        });
+        assert!(mixed.has_useful());
+        mixed.push(&CursorStreamEvent::TextDelta {
+            text: "actual summary".into(),
+        });
+        mixed.push(&CursorStreamEvent::ThinkingDelta {
+            text: "later private reasoning".into(),
+        });
+        assert_eq!(
+            mixed.into_message_json("msg_mixed", "claude-fable-5")["content"][0]["text"],
+            "actual summary"
+        );
+
+        let mut fallback = AnthropicJsonAcc::new_mode(9, true);
+        fallback.push(&CursorStreamEvent::ThinkingDelta {
+            text: "summary from reasoning".into(),
+        });
+        assert_eq!(
+            fallback.into_message_json("msg_fallback", "claude-fable-5")["content"][0]["text"],
+            "summary from reasoning"
+        );
     }
 
     #[test]

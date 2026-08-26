@@ -158,6 +158,16 @@ const CLAUDE_CLIENT_ONLY_TOOL_NAMES: &[&str] = &[
     "KillShell",
     "KillBash",
     "ListPeers",
+    // Claude Code 2.1.193 renamed these controls while retaining the legacy
+    // spellings as aliases. Keep both names in the catalog classifier so a
+    // Cursor/Fable event can be matched to whichever spelling the client sent.
+    "ListAgents",
+    "Workflow",
+    "RunWorkflow",
+    // Claude Code 2.1.193's disabled end-to-end permission probe can still be
+    // present in the incoming tool catalog. Keep it routable when explicitly
+    // advertised; ordinary internal hooks remain filtered by description.
+    "TestingPermission",
     "LSP",
     // Claude Code 2.1.193 external built-ins without a Cursor exec envelope.
     // They are client-executed after the proxy emits a ClientOnly tool_use.
@@ -178,7 +188,6 @@ const CLAUDE_CLIENT_ONLY_TOOL_NAMES: &[&str] = &[
     "ListMcpResources",
     "ReadMcpResource",
     "ReadMcpResourceDir",
-    "ListAgents",
     "WaitForMcpServers",
     "SendUserMessage",
     "SendUserFile",
@@ -206,7 +215,75 @@ const CLAUDE_CLIENT_ONLY_TOOL_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn is_claude_client_only_tool_name(name: &str) -> bool {
-    CLAUDE_CLIENT_ONLY_TOOL_NAMES.contains(&name)
+    CLAUDE_CLIENT_ONLY_TOOL_NAMES
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
+/// Names that Claude Code's bundled runtime treats as aliases of one tool.
+///
+/// The client may advertise either spelling while Cursor's MCP layer can emit
+/// the other (for example `Brief` vs `SendUserMessage`).  Keep these families
+/// deliberately explicit: broad case-folding or fuzzy matching would let a
+/// foreign MCP tool accidentally resolve to a Claude-local built-in.
+pub(crate) fn claude_tool_aliases(name: &str) -> &'static [&'static str] {
+    const GROUPS: &[&[&str]] = &[
+        &["Agent", "Task"],
+        &["TaskStop", "KillShell", "KillBash"],
+        &[
+            "TaskOutput",
+            "AgentOutputTool",
+            "BashOutputTool",
+            "AgentOutput",
+            "BashOutput",
+        ],
+        &["ListAgents", "ListPeers"],
+        &["SendUserMessage", "Brief"],
+        &["ListMcpResourcesTool", "ListMcpResources"],
+        &["ReadMcpResourceTool", "ReadMcpResource"],
+        &["ReadMcpResourceDirTool", "ReadMcpResourceDir"],
+        &["Workflow", "RunWorkflow"],
+    ];
+    GROUPS
+        .iter()
+        .copied()
+        .find(|group| {
+            group
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(&[])
+}
+
+/// Return true when two names are an exact or known Claude runtime alias
+/// match. Alias families are compared case-insensitively because XML-oriented
+/// model output occasionally lowercases tool names; callers still enforce the
+/// provider/allow-list boundary before using this predicate.
+pub(crate) fn claude_tool_names_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    // Case folding is limited to names that Claude Code explicitly owns. Do
+    // not make arbitrary MCP names equivalent merely because their spelling
+    // differs by case.
+    if left.eq_ignore_ascii_case(right)
+        && (is_claude_client_only_tool_name(left) || is_claude_client_only_tool_name(right))
+    {
+        return true;
+    }
+    let left_aliases = claude_tool_aliases(left);
+    if !left_aliases.is_empty()
+        && left_aliases
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(right))
+    {
+        return true;
+    }
+    let right_aliases = claude_tool_aliases(right);
+    !right_aliases.is_empty()
+        && right_aliases
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(left))
 }
 
 const GROK_BUILD_CLIENT_TOOL_NAMES: &[&str] = &[
@@ -408,8 +485,10 @@ fn advertise_as_cursor_mcp(name: &str, grok_build_request: bool) -> bool {
     // are handled by their dedicated remap paths.  Registering the Claude
     // `Agent` alias on a Grok request would create a second subagent catalog
     // entry and make tool selection nondeterministic.
-    let grok_native_task_alias =
-        grok_build_request && matches!(bare, "Agent" | "Task" | "task" | "TaskOutput" | "TaskStop");
+    let grok_native_task_alias = grok_build_request
+        && ["Agent", "Task", "task", "TaskOutput", "TaskStop"]
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(bare));
     if (!grok_native_task_alias && is_claude_client_only_tool_name(name))
         || (is_claude_local_mcp_spelling(name)
             && !grok_native_task_alias
@@ -417,7 +496,7 @@ fn advertise_as_cursor_mcp(name: &str, grok_build_request: bool) -> bool {
     {
         return true;
     }
-    bare.eq_ignore_ascii_case("Workflow")
+    claude_tool_names_equivalent(bare, "Workflow")
         || bare.eq_ignore_ascii_case("Skill")
         || (!grok_build_request && bare == "Task")
         || bare.starts_with("mcp__")
@@ -1482,10 +1561,13 @@ fn render_block(block: &serde_json::Value) -> Option<String> {
             .get("text")
             .and_then(|t| t.as_str())
             .map(|s| s.to_string()),
-        "thinking" => {
-            let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-            Some(format!("<thinking>\n{text}\n</thinking>"))
-        }
+        // Thinking blocks are an internal Anthropic history representation.
+        // Do not serialize them as literal XML into Cursor's user prompt:
+        // Fable/Grok can treat the markup as ordinary user text and echo it
+        // back to Claude Code. Live reasoning is transported separately via
+        // Cursor's thinking_delta/SSE channel, so historical reasoning is
+        // intentionally omitted here.
+        "thinking" => None,
         "compaction" => {
             let content = block
                 .get("content")
@@ -1582,6 +1664,8 @@ fn render_tool_result_block(block: &serde_json::Value) -> Option<String> {
     let block_type = block.get("type").and_then(|t| t.as_str())?;
     match block_type {
         "text" | "image" | "input_image" | "image_url" | "tool_use" | "tool_result"
+        // Nested historical thinking is filtered by render_block for the same
+        // reason as top-level assistant thinking blocks.
         | "thinking" => render_block(block),
         _ => {
             let type_str = block_type.to_string();
@@ -1965,6 +2049,7 @@ mod tests {
             "LSP",
             "Monitor",
             "StructuredOutput",
+            "TestingPermission",
             "Artifact",
             "CronCreate",
             "CronDelete",
@@ -1994,6 +2079,7 @@ mod tests {
             "SearchMcpRegistry",
             "SuggestConnectors",
             "ListConnectors",
+            "RunWorkflow",
         ];
         let tools: Vec<serde_json::Value> = names
             .iter()
@@ -2068,6 +2154,45 @@ mod tests {
             vec!["Task", "Workflow"],
             "Claude Code Task must be on MCP (gemini has no other subagent tool); AskUserQuestion has a native remap"
         );
+    }
+
+    #[test]
+    fn claude_local_mcp_tools_registers_source_aliases_and_testing_permission() {
+        let names = [
+            "RunWorkflow",
+            "SendUserMessage",
+            "Brief",
+            "ListAgents",
+            "ListPeers",
+            "ListMcpResourcesTool",
+            "ListMcpResources",
+            "ReadMcpResourceTool",
+            "ReadMcpResource",
+            "ReadMcpResourceDirTool",
+            "ReadMcpResourceDir",
+        ];
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "inspect"}],
+            "tools": names.iter().map(|name| serde_json::json!({
+                "name": name,
+                "description": format!("{name} tool"),
+                "input_schema": {"type": "object"}
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let mcp = claude_local_mcp_tools(&req).expect("source aliases must be registered");
+        let registered: BTreeSet<&str> = mcp.tools.iter().map(|tool| tool.name.as_str()).collect();
+        for name in names {
+            assert!(
+                registered.contains(name),
+                "{name} missing from {registered:?}"
+            );
+        }
+        assert!(is_claude_client_only_tool_name("runworkflow"));
+        assert!(claude_tool_names_equivalent("Brief", "SendUserMessage"));
+        assert!(claude_tool_names_equivalent("RunWorkflow", "Workflow"));
+        assert!(!claude_tool_names_equivalent("Brief", "Read"));
     }
 
     #[test]
@@ -3475,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_thinking_blocks() {
+    fn omits_historical_thinking_blocks() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{"role": "assistant", "content": [
@@ -3485,9 +3610,28 @@ mod tests {
         }))
         .unwrap();
         let rendered = render_cursor_prompt(&req);
-        assert!(rendered.contains("<thinking>"));
-        assert!(rendered.contains("let me think..."));
+        assert!(!rendered.contains("<thinking>"));
+        assert!(!rendered.contains("</thinking>"));
+        assert!(!rendered.contains("let me think..."));
         assert!(rendered.contains("done"));
+    }
+
+    #[test]
+    fn omits_thinking_nested_inside_tool_results() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "content": [
+                    {"type": "thinking", "thinking": "private nested reasoning"},
+                    {"type": "text", "text": "visible tool result"}
+                ]}
+            ]}]
+        }))
+        .unwrap();
+        let rendered = render_cursor_prompt(&req);
+        assert!(!rendered.contains("<thinking>"));
+        assert!(!rendered.contains("private nested reasoning"));
+        assert!(rendered.contains("visible tool result"));
     }
 
     #[test]

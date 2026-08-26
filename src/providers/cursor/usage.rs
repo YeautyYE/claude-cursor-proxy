@@ -5,7 +5,9 @@
 //! `x-cursor-client-type`; Sand request routing is handled independently by the
 //! Cursor provider and never by the dashboard poller.
 
-use std::time::{Duration, SystemTime};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -21,6 +23,126 @@ const SAND_USAGE_PATH: &str = "/api/dashboard/get-sand-usage-status";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 const SAND_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENTS_TIMEOUT: Duration = Duration::from_secs(5);
+const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// The dashboard poller runs once per minute. Keep two missed polls worth of
+/// evidence, then stop using it for request classification: a stale 100% meter
+/// must not make a newly reset Sand period look exhausted.
+const SAND_USAGE_EVIDENCE_TTL: Duration = Duration::from_secs(180);
+const SAND_USAGE_EVIDENCE_MAX_ACCOUNTS: usize = 64;
+
+/// Account-scoped dashboard evidence used only to disambiguate Cursor's
+/// otherwise-successful, payload-less Sand `FLAG_END`. Some exhausted Sand
+/// accounts return that frame instead of a typed 429. The bearer itself is
+/// never retained; the map is keyed by a SHA-256 digest.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SandUsageEvidence {
+    pub usage_percent: f64,
+    pub has_available_usage: Option<bool>,
+    pub next_reset: Option<String>,
+    observed_at: Instant,
+}
+
+impl SandUsageEvidence {
+    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+        let reset = self.next_reset.as_deref()?;
+        let reset =
+            time::OffsetDateTime::parse(reset, &time::format_description::well_known::Rfc3339)
+                .ok()?;
+        Some(
+            (reset - time::OffsetDateTime::now_utc())
+                .whole_seconds()
+                .max(1) as u64,
+        )
+    }
+}
+
+static SAND_USAGE_EVIDENCE: LazyLock<Mutex<HashMap<String, SandUsageEvidence>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn sand_usage_account_key(token: &str) -> String {
+    // Keep the usage cache partitioning identical to the policy breaker:
+    // refreshed JWTs for one Cursor account must retain the same dashboard
+    // evidence, while opaque environment tokens still fall back to a digest
+    // of the token itself. The raw bearer is never stored.
+    super::auth::cursor_account_digest(token)
+}
+
+fn store_sand_usage_evidence(auth: &CursorAuth, sand: Option<&Value>) {
+    let account_key = sand_usage_account_key(&auth.access_token);
+    let mut cache = SAND_USAGE_EVIDENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let now = Instant::now();
+    cache.retain(|_, evidence| {
+        now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL
+    });
+    let Some(sand) = sand else {
+        // A transient dashboard failure does not erase a recent successful
+        // poll. Its evidence naturally expires after the short TTL above.
+        return;
+    };
+    let Some(usage_percent) = json_f64(sand.get("usagePercent")) else {
+        cache.remove(&account_key);
+        return;
+    };
+    if cache.len() >= SAND_USAGE_EVIDENCE_MAX_ACCOUNTS && !cache.contains_key(&account_key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, evidence)| evidence.observed_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        account_key,
+        SandUsageEvidence {
+            usage_percent,
+            has_available_usage: sand.get("hasAvailableUsage").and_then(Value::as_bool),
+            next_reset: dashboard_timestamp(sand.get("nextResetTimestampUtc")),
+            observed_at: now,
+        },
+    );
+}
+
+/// Return recent Sand usage evidence only for the exact credential that was
+/// used to open the Run. This prevents a hot account switch from inheriting a
+/// previous login's exhausted meter.
+pub(crate) fn cached_sand_usage_evidence(token: &str) -> Option<SandUsageEvidence> {
+    let account_key = sand_usage_account_key(token);
+    let mut cache = SAND_USAGE_EVIDENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let now = Instant::now();
+    cache.retain(|_, evidence| {
+        now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL
+    });
+    cache.get(&account_key).cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn store_sand_usage_evidence_for_test(
+    token: &str,
+    usage_percent: f64,
+    has_available_usage: Option<bool>,
+    next_reset: Option<&str>,
+) {
+    let auth = CursorAuth {
+        access_token: token.to_string(),
+        refresh_token: None,
+        api_key: None,
+        expires: None,
+        user_id: None,
+        email: None,
+        source: "test".into(),
+    };
+    let sand = serde_json::json!({
+        "usagePercent": usage_percent,
+        "hasAvailableUsage": has_available_usage,
+        "nextResetTimestampUtc": next_reset,
+    });
+    store_sand_usage_evidence(&auth, Some(&sand));
+}
 
 pub fn fetch_account_usage_state() -> AccountUsageState {
     let auth = match load_cursor_auth() {
@@ -47,8 +169,51 @@ pub async fn poll_cursor_account_usage(monitor: crate::monitor::MonitorHandle) {
             Err(_) => AccountUsageState::Failed("usage poller cancelled".into()),
         };
         monitor.set_account_usage(state);
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(USAGE_POLL_INTERVAL).await;
     }
+}
+
+/// Keep the account-scoped Sand meter warm when the proxy runs without the
+/// monitor TUI. Cursor can report an exhausted Sand Run as HTTP 200 followed by
+/// an empty `FLAG_END`; recent dashboard evidence lets the live transport map
+/// that wire shape to a useful 429 instead of a misleading stale-conversation
+/// error. This intentionally calls only the Sand endpoint once per poll rather
+/// than duplicating the monitor's full dashboard sweep.
+pub async fn poll_cursor_sand_usage_evidence() {
+    loop {
+        let _ = tokio::task::spawn_blocking(refresh_sand_usage_evidence).await;
+        tokio::time::sleep(USAGE_POLL_INTERVAL).await;
+    }
+}
+
+fn refresh_sand_usage_evidence() -> anyhow::Result<()> {
+    let auth = match load_cursor_auth() {
+        Ok(Some(auth)) => Some(auth),
+        Ok(None) | Err(_) => load_cursor_desktop_auth().ok().flatten(),
+    };
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    fetch_sand_usage_evidence(&auth)
+}
+
+fn fetch_sand_usage_evidence(auth: &CursorAuth) -> anyhow::Result<()> {
+    let cookie = workos_session_cookie(auth);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(SAND_TIMEOUT)
+        .build()?;
+    fetch_sand_usage_evidence_with(auth, DASHBOARD_ORIGIN, &client, &cookie)
+}
+
+fn fetch_sand_usage_evidence_with(
+    auth: &CursorAuth,
+    origin: &str,
+    client: &reqwest::blocking::Client,
+    cookie: &str,
+) -> anyhow::Result<()> {
+    let sand = dashboard_post(client, origin, SAND_USAGE_PATH, cookie, "{}", SAND_TIMEOUT)?;
+    store_sand_usage_evidence(auth, Some(&sand));
+    Ok(())
 }
 
 pub fn fetch_account_usage(auth: &CursorAuth) -> anyhow::Result<AccountUsageSnapshot> {
@@ -65,6 +230,12 @@ fn fetch_account_usage_with(
     client: &reqwest::blocking::Client,
     cookie: &str,
 ) -> anyhow::Result<AccountUsageSnapshot> {
+    // Fetch and publish the classifier evidence first. The remaining dashboard
+    // endpoints are independent and may each spend their timeout budget; Sand
+    // requests arriving while the TUI snapshot is still loading should not
+    // miss an otherwise available exhausted-meter signal.
+    let sand = dashboard_post(client, origin, SAND_USAGE_PATH, cookie, "{}", SAND_TIMEOUT).ok();
+    store_sand_usage_evidence(auth, sand.as_ref());
     // `usage-summary` is the richest response, but it has not been enabled
     // for every account/dashboard deployment. Keep the independent identity
     // and Sand meters useful when that endpoint is absent.
@@ -88,7 +259,6 @@ fn fetch_account_usage_with(
         EVENTS_TIMEOUT,
     )
     .ok();
-    let sand = dashboard_post(client, origin, SAND_USAGE_PATH, cookie, "{}", SAND_TIMEOUT).ok();
     let summary = match summary_result {
         Ok(summary) => summary,
         Err(_error)
@@ -423,6 +593,8 @@ fn truncate_error(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::providers::cursor::auth::CursorAuth;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     fn auth(user: &str, token: &str) -> CursorAuth {
         CursorAuth {
@@ -498,6 +670,90 @@ mod tests {
         let parsed = parse_account_usage(&auth("user_1", "tok"), &summary, None, Some(&sand));
         assert_eq!(parsed.grok_bot_percent, Some(99.0));
         assert!(parsed.header_line().contains("bot"));
+    }
+
+    #[test]
+    fn sand_usage_evidence_is_scoped_to_the_exact_account_token() {
+        let token_a = format!("usage-evidence-a-{}", uuid::Uuid::new_v4());
+        let token_b = format!("usage-evidence-b-{}", uuid::Uuid::new_v4());
+        store_sand_usage_evidence_for_test(
+            &token_a,
+            100.0,
+            Some(true),
+            Some("2099-09-02T20:12:42Z"),
+        );
+
+        let evidence = cached_sand_usage_evidence(&token_a).expect("account A evidence");
+        assert_eq!(evidence.usage_percent, 100.0);
+        // Cursor currently reports this true even when an exhausted Sand Run
+        // immediately returns an empty END. Classification therefore combines
+        // the meter with observed wire behavior instead of trusting this flag.
+        assert_eq!(evidence.has_available_usage, Some(true));
+        assert!(evidence.retry_after_secs().is_some_and(|secs| secs > 0));
+        assert!(cached_sand_usage_evidence(&token_b).is_none());
+    }
+
+    #[test]
+    fn successful_sand_meter_without_percent_retires_old_evidence() {
+        let token = format!("usage-evidence-retire-{}", uuid::Uuid::new_v4());
+        store_sand_usage_evidence_for_test(&token, 100.0, Some(false), None);
+        assert!(cached_sand_usage_evidence(&token).is_some());
+        store_sand_usage_evidence(
+            &auth("user", &token),
+            Some(&serde_json::json!({"hasAvailableUsage": true})),
+        );
+        assert!(cached_sand_usage_evidence(&token).is_none());
+    }
+
+    #[test]
+    fn sand_only_refresh_hits_one_dashboard_endpoint_and_populates_evidence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n")
+                    && request.ends_with(b"{}")
+                {
+                    break;
+                }
+            }
+            let body = r#"{"usagePercent":100,"hasAvailableUsage":false}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let token = format!("sand-only-refresh-{}", uuid::Uuid::new_v4());
+        let auth = auth("user", &token);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        fetch_sand_usage_evidence_with(&auth, &origin, &client, "cookie=value").unwrap();
+
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /api/dashboard/get-sand-usage-status HTTP/1.1\r\n"),
+            "{request}"
+        );
+        let evidence = cached_sand_usage_evidence(&token).expect("fresh Sand evidence");
+        assert_eq!(evidence.usage_percent, 100.0);
+        assert_eq!(evidence.has_available_usage, Some(false));
     }
 
     #[test]

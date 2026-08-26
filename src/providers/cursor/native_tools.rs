@@ -5,6 +5,7 @@ use crate::providers::cursor::proto::{
     AskQuestionArgs, ExecServerMessage, FetchArgs, PiWriteExecArgs, ShellArgs, ToolCall,
     ToolCallStarted,
 };
+use crate::providers::cursor::request::is_claude_local_mcp_spelling;
 
 const ASK_USER_QUESTION_HEADER_MAX: usize = 12;
 
@@ -129,12 +130,15 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
     if let Some(ref edit) = tc.edit_tool_call {
         let args = edit.args.as_ref()?;
         // Cursor Edit is a full-file overwrite (stream_content), not Claude's
-        // old_string/new_string Edit. Map to Write when content has arrived.
-        let content = args.stream_content.clone().unwrap_or_default();
-        if content.is_empty() {
+        // old_string/new_string Edit. `stream_content` is optional because a
+        // tool_call_started frame can precede the streamed field, but an
+        // explicitly present empty string is a valid full-file truncation.
+        // Distinguish `None` (incomplete stream) from `Some("")` (clear file)
+        // so a legitimate empty overwrite is not silently dropped.
+        let Some(content) = args.stream_content.clone() else {
             // Incomplete stream — do not invent a Read/Write; wait for content.
             return None;
-        }
+        };
         return Some(MappedClaudeTool {
             tool_use_id: call_id,
             name: "Write".into(),
@@ -753,7 +757,12 @@ pub fn advertised_name_fallbacks(mapped_name: &str) -> &'static [&'static str] {
         "TodoWrite" => &["TodoWrite", "todo_write"],
         "TodoRead" => &["TodoRead"],
         "AskUserQuestion" => &["AskUserQuestion", "AskQuestion", "ask_user_question"],
-        "CreatePlan" => &["CreatePlan", "Plan", "EnterPlanMode", "enter_plan_mode"],
+        // Cursor CreatePlan already carries the completed plan body and asks
+        // the client to present it. That is an exit/submit operation, not an
+        // EnterPlanMode transition (whose input is deliberately empty).
+        // Mapping it to EnterPlanMode discarded the plan and could send the
+        // model around the planning loop again.
+        "CreatePlan" => &["CreatePlan", "Plan", "ExitPlanMode", "exit_plan_mode"],
         "Task" => &["Task", "spawn_subagent", "Agent", "task"],
         "TaskOutput"
         | "BashOutput"
@@ -788,7 +797,11 @@ pub fn advertised_name_fallbacks(mapped_name: &str) -> &'static [&'static str] {
             "kill_command_or_subagent",
             "kill_terminal_command",
         ],
-        _ => &[],
+        // Claude-local tools can be surfaced through both MCP and XML paths.
+        // Cursor occasionally returns a runtime alias rather than the exact
+        // spelling from Anthropic's catalog; share Claude Code's explicit
+        // alias families with every advertised-name resolver.
+        _ => crate::providers::cursor::request::claude_tool_aliases(mapped_name),
     }
 }
 
@@ -803,6 +816,14 @@ pub fn adapt_tool_input_for_client(
     // Older Claude clients keep the `mcp_claude-local_` provider prefix in
     // tool_result history. Apply the same schema adapter to that spelling as
     // to the current bare tool name; foreign MCP providers remain untouched.
+    // A provider-qualified foreign MCP name is opaque to this adapter.  Its
+    // leaf may happen to match a Claude/Cursor built-in (for example
+    // `other/read_file` or `plugin/Agent`), but applying the built-in schema
+    // would silently rewrite an unrelated provider's payload.  Only the
+    // explicitly recognized `claude-local` spellings are unwrapped here.
+    if is_foreign_qualified_mcp_name(advertised_name) {
+        return input;
+    }
     let schema_name = crate::providers::cursor::request::strip_mcp_provider_prefix(advertised_name);
     if schema_name == "spawn_subagent" {
         return adapt_native_task_to_spawn_subagent(input);
@@ -988,8 +1009,16 @@ pub fn adapt_tool_input_for_client(
         "TaskStop" | "KillShell" | "KillBash" => {
             normalize_claude_task_stop(obj);
         }
-        "enter_plan_mode" | "EnterPlanMode" => {
+        "enter_plan_mode" | "EnterPlanMode" | "exit_plan_mode" => {
             obj.clear();
+        }
+        "ExitPlanMode" => {
+            // Claude Code 2.1.x accepts an injected `plan` field even though
+            // the public model-facing schema normally asks it to write the
+            // plan file first. Cursor's CreatePlan is inline, so preserve only
+            // that body (plus Claude's optional permission hints) and drop
+            // Cursor UI metadata such as name/overview/todos.
+            retain_object_keys(obj, &["plan", "allowedPrompts"]);
         }
         _ => {}
     }
@@ -1035,6 +1064,20 @@ fn has_nonempty_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str)
     obj.get(key)
         .and_then(|value| value.as_str())
         .is_some_and(|value| !value.is_empty())
+}
+
+fn is_foreign_qualified_mcp_name(name: &str) -> bool {
+    if is_claude_local_mcp_spelling(name) {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        return rest
+            .split_once("__")
+            .is_some_and(|(provider, tool)| !provider.is_empty() && !tool.is_empty());
+    }
+    name.split_once('/')
+        .or_else(|| name.split_once(':'))
+        .is_some_and(|(provider, tool)| !provider.is_empty() && !tool.is_empty())
 }
 
 fn coerce_integer_fields(obj: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
@@ -2142,6 +2185,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_cursor_edit_maps_to_write_that_truncates_file() {
+        let started = ToolCallStarted {
+            call_id: "e3".into(),
+            tool_call: Some(ToolCall {
+                edit_tool_call: Some(crate::providers::cursor::proto::EditToolCall {
+                    args: Some(crate::providers::cursor::proto::EditArgs {
+                        path: "/tmp/empty.txt".into(),
+                        stream_content: Some(String::new()),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let mapped = map_tool_call_started(&started).expect("explicit empty content is complete");
+        assert_eq!(mapped.name, "Write");
+        assert_eq!(mapped.input["file_path"], "/tmp/empty.txt");
+        assert_eq!(mapped.input["content"], "");
+    }
+
+    #[test]
     fn maps_web_fetch_tool_call_tag_37_like_fetch() {
         let started = ToolCallStarted {
             call_id: "wf37".into(),
@@ -2232,6 +2296,30 @@ mod tests {
             assert!(advertised_name_fallbacks(alias).contains(&"kill_command_or_subagent"));
             assert!(advertised_name_fallbacks("kill_command_or_subagent").contains(&alias));
         }
+    }
+
+    #[test]
+    fn claude_client_alias_fallbacks_are_bidirectional() {
+        for (canonical, alias) in [
+            ("Agent", "Task"),
+            ("TaskStop", "KillShell"),
+            ("TaskStop", "KillBash"),
+            ("TaskOutput", "AgentOutputTool"),
+            ("TaskOutput", "BashOutputTool"),
+            ("TaskOutput", "AgentOutput"),
+            ("TaskOutput", "BashOutput"),
+            ("ListAgents", "ListPeers"),
+            ("SendUserMessage", "Brief"),
+            ("ListMcpResourcesTool", "ListMcpResources"),
+            ("ReadMcpResourceTool", "ReadMcpResource"),
+            ("ReadMcpResourceDirTool", "ReadMcpResourceDir"),
+            ("Workflow", "RunWorkflow"),
+        ] {
+            assert!(advertised_name_fallbacks(canonical).contains(&alias));
+            assert!(advertised_name_fallbacks(alias).contains(&canonical));
+        }
+        assert!(advertised_name_fallbacks("runworkflow").contains(&"Workflow"));
+        assert!(advertised_name_fallbacks("brief").contains(&"SendUserMessage"));
     }
 
     #[test]
@@ -2448,6 +2536,30 @@ mod tests {
     }
 
     #[test]
+    fn adapt_foreign_provider_tools_does_not_apply_builtin_leaf_schema() {
+        for name in [
+            "other/Edit",
+            "plugin:Agent",
+            "foreign/read_file",
+            "mcp__other__Edit",
+            "mcp__plugin__Agent",
+            "mcp__foreign__read_file",
+        ] {
+            let input = serde_json::json!({
+                "path": "/tmp/provider-owned",
+                "content": "provider-owned-content",
+                "model": "provider-model",
+                "custom_transport_field": true
+            });
+            assert_eq!(
+                adapt_client_tool_input(name, input.clone()),
+                input,
+                "foreign MCP input for {name} must remain opaque"
+            );
+        }
+    }
+
+    #[test]
     fn adapt_spawn_subagent_renames_resume_and_background() {
         let adapted = adapt_tool_input_for_client(
             "spawn_subagent",
@@ -2605,8 +2717,8 @@ mod tests {
             ("TaskOutput", "get_command_or_subagent_output"),
             ("BashOutput", "get_command_or_subagent_output"),
             ("KillShell", "kill_command_or_subagent"),
-            ("CreatePlan", "enter_plan_mode"),
-            ("CreatePlan", "EnterPlanMode"),
+            ("CreatePlan", "exit_plan_mode"),
+            ("CreatePlan", "ExitPlanMode"),
         ] {
             assert!(
                 advertised_name_fallbacks(mapped).contains(&grok),
@@ -2617,6 +2729,36 @@ mod tests {
             advertised_name_fallbacks("Bash").contains(&"PowerShell"),
             "Cursor Shell must map to Claude Code's Windows-native PowerShell tool"
         );
+    }
+
+    #[test]
+    fn create_plan_submits_instead_of_reentering_plan_mode() {
+        let fallbacks = advertised_name_fallbacks("CreatePlan");
+        assert!(fallbacks.contains(&"ExitPlanMode"));
+        assert!(fallbacks.contains(&"exit_plan_mode"));
+        assert!(!fallbacks.contains(&"EnterPlanMode"));
+        assert!(!fallbacks.contains(&"enter_plan_mode"));
+
+        let claude = adapt_client_tool_input(
+            "ExitPlanMode",
+            serde_json::json!({
+                "name": "implementation",
+                "overview": "ready",
+                "plan": "1. inspect\n2. patch\n3. test",
+                "todos": [{"content": "patch"}],
+                "is_project": true
+            }),
+        );
+        assert_eq!(
+            claude,
+            serde_json::json!({"plan": "1. inspect\n2. patch\n3. test"})
+        );
+
+        let grok = adapt_client_tool_input(
+            "exit_plan_mode",
+            serde_json::json!({"plan": "inline Cursor plan"}),
+        );
+        assert_eq!(grok, serde_json::json!({}));
     }
 
     #[test]

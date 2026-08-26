@@ -13,7 +13,7 @@ use prost::Message;
 use serde_json::json;
 use tokio::sync::Semaphore;
 
-use super::client::CursorError;
+use super::client::{CursorError, retry_after_header};
 use super::connect::encode_connect_frame;
 use super::proto::{AgentClientMessage, BidiRequestId};
 
@@ -127,12 +127,14 @@ impl BidiAppendSession {
         if (200..300).contains(&status) {
             return Ok(());
         }
+        let retry_after = retry_after_header(resp.headers());
         let detail = resp.text().await.unwrap_or_default();
         Err(CursorError::new(
             status,
             format!("BidiAppend failed with HTTP {status}"),
             Some(detail.chars().take(500).collect()),
-        ))
+        )
+        .with_retry_after(retry_after))
     }
 
     pub async fn append_message(&self, message: &AgentClientMessage) -> Result<(), CursorError> {
@@ -293,6 +295,42 @@ mod tests {
             1,
             "an acknowledged-or-ambiguous append failure must never be replayed"
         );
+    }
+
+    #[tokio::test]
+    async fn bidi_append_preserves_upstream_retry_after() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock BidiAppend server");
+        let address = listener.local_addr().expect("mock server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept BidiAppend");
+            let mut request = [0u8; 4096];
+            let read = socket.read(&mut request).await.expect("read request");
+            assert!(read > 0, "mock BidiAppend request must not be empty");
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 12\r\nConnection: close\r\n\r\npolicy limit",
+                )
+                .await
+                .expect("write response");
+        });
+        let session = BidiAppendSession::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "token".into(),
+            "request-id".into(),
+            vec![],
+        );
+
+        let error = session
+            .append_raw(b"\x3a\x00")
+            .await
+            .expect_err("429 append must be surfaced");
+        server.await.expect("mock server");
+        assert_eq!(error.status, 429);
+        assert_eq!(error.retry_after.as_deref(), Some("120"));
+        assert_eq!(error.detail.as_deref(), Some("policy limit"));
     }
 
     #[tokio::test]

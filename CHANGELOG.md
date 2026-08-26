@@ -3,6 +3,66 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.82 (2026-08-27)
+
+- Recognize Cursor's Sand-quota wire sentinel: two consecutive immediate,
+  text/tool-less `FLAG_END` frames with a fresh 100% meter now become a typed
+  HTTP 429 instead of a stale-conversation loop. Speculative Gemini thinking
+  does not mask the signal, and headless `serve --no-monitor` keeps the Sand
+  meter warm with one lightweight dashboard poll per minute.
+- Add an account-and-model scoped circuit breaker for Cursor policy 429s such
+  as `ERROR_PRO_USER_RATE_LIMIT_EXCEEDED`. After the first upstream rejection,
+  fresh requests fail fast with HTTP 429 + `Retry-After` before opening another
+  Run, while accepted tool-result/attach continuations remain resumable and a
+  hot account switch uses an independent breaker key. Breakers are also
+  isolated by Sand/CLI route, survive access-token refreshes for the same
+  account, and coalesce a cold retry wave until the first decisive model event
+  or policy result arrives. The cold gate defaults to 30 seconds (configurable
+  from 25 to 120000 ms); a quiet expiry admits only one additional probe per
+  window instead of releasing the whole wave, covering delayed policy results
+  without turning long model thinking into a retry storm.
+- Emit Cursor/Fable context-compaction summaries as standard Responses
+  assistant `message` / `output_text` lifecycle events. Remove the unsupported
+  `response.compaction.*` events and invalid `compaction` output item so
+  grok-build's strict parser can complete compaction without a retry loop.
+- Promote reasoning-channel summaries to output text for both streaming and
+  non-streaming compaction responses, and keep the isolated live lane across
+  reconnects.
+- Stop historical Anthropic thinking blocks and literal Fable
+  `<thinking>...</thinking>` protocol markup from leaking into Claude Code's
+  visible transcript. Split tags are filtered incrementally, while compaction
+  output deliberately remains plain text.
+- Expand Claude Code 2.1.193+ native/client tool compatibility, including
+  `Workflow`/`RunWorkflow`, `Brief`/`SendUserMessage`, agent/MCP aliases, and
+  explicit empty Cursor Edit payloads mapped to file-truncating `Write` calls.
+  Foreign provider-qualified MCP names remain isolated from Claude-local
+  aliases.
+- Add deterministic live-run concurrency coverage for 64-way identical retry
+  storms, Starting-to-Running-to-Succeeded handoffs, different-operation waits,
+  hidden cancelled terminals, and concurrent headerless fallback sessions.
+  Identical retries attach/replay one accepted Run instead of multiplying
+  `already active` 503 responses.
+- Add MCP/Lobster diagnostics with a narrowly scoped, backed-up repair command.
+  Detect Lobster runtimes that terminate their stdio child after bridge 4405,
+  explicit 4405/4407 takeover evidence, and concurrent-process binding risk.
+- Keep the monitor's `u` account-usage shortcut active while the Sand model
+  editor is open, matching the documented TUI-first workflow.
+- Accept exact model ids from the current account's live Cursor catalog,
+  including newly introduced model families and explicit Agent/Plan/Ask
+  prefixes, while retiring those ids immediately after an account switch.
+- Give Gemini Flash a shorter heartbeat-only progress deadline. A hollow Run
+  that has exposed no text or tools is rotated onto a fresh Cursor conversation
+  and retried inside the same downstream request; Gemini over Sand receives a
+  larger bounded empty-turn recovery budget, while Fable/Grok retain their
+  long-thinking budget.
+- Recover a hollow tool-result continuation even when Cursor omits the next
+  conversation checkpoint. If no new text or tool was exposed, the stale
+  Cursor state is discarded and the same downstream request is retried from
+  the complete Anthropic history, which already contains the finished
+  `tool_result`; confirmed newer checkpoints still use the lighter
+  checkpoint-only continuation. Partial result dispatch or client-visible
+  output remains ambiguity-fenced.
+
 ## v0.1.81 (2026-08-26)
 
 - Route Grok Build and Anthropic context compaction through an isolated,

@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::providers::cursor::request::claude_tool_names_equivalent;
+
 /// An event recovered from a text delta chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecoveredCursorEvent {
@@ -229,19 +231,33 @@ impl CursorToolUseXmlParser {
 
     fn canonicalize_allowed_tool_name(&self, name: &str) -> Option<String> {
         match &self.allowed_tool_names {
-            Some(allowed) => allowed.get(name).cloned().or_else(|| {
-                // Built-in Claude/Cursor tool names are sometimes lower-cased
-                // by XML-oriented models.  Preserve exact matching for MCP
-                // server names, but accept case variants for this bounded
-                // built-in set and emit the client's advertised spelling.
-                if !is_case_insensitive_builtin_tool(name) {
-                    return None;
-                }
-                allowed
-                    .iter()
-                    .find(|advertised| advertised.eq_ignore_ascii_case(name))
-                    .cloned()
-            }),
+            Some(allowed) => allowed
+                .get(name)
+                .cloned()
+                .or_else(|| {
+                    // Prefer the same built-in spelling (case-insensitively)
+                    // when both a canonical name and a historical alias are
+                    // advertised. This prevents a lower-cased `taskoutput`
+                    // from being selected by BTreeSet order as AgentOutput.
+                    if !is_case_insensitive_builtin_tool(name) {
+                        return None;
+                    }
+                    allowed
+                        .iter()
+                        .find(|advertised| advertised.eq_ignore_ascii_case(name))
+                        .cloned()
+                })
+                .or_else(|| {
+                    // Claude Code keeps a handful of source-level aliases across
+                    // releases (for example Workflow/RunWorkflow and
+                    // Brief/SendUserMessage). XML-oriented models may emit the
+                    // other spelling, so resolve only the explicit bounded alias
+                    // families; arbitrary MCP names still require an exact match.
+                    allowed
+                        .iter()
+                        .find(|advertised| claude_tool_names_equivalent(name, advertised))
+                        .cloned()
+                }),
             None => Some(name.to_string()),
         }
     }
@@ -330,6 +346,7 @@ fn is_case_insensitive_builtin_tool(name: &str) -> bool {
         "TaskOutput",
         "Monitor",
         "StructuredOutput",
+        "TestingPermission",
         "Artifact",
         "REPL",
         "RefreshMcpTools",
@@ -346,6 +363,7 @@ fn is_case_insensitive_builtin_tool(name: &str) -> bool {
         "SuggestConnectors",
         "ListConnectors",
         "Workflow",
+        "RunWorkflow",
         "Skill",
     ];
     CLAUDE_LOCAL_CASE_NAMES
@@ -652,6 +670,44 @@ mod tests {
     }
 
     #[test]
+    fn split_tool_xml_preserves_adjacent_unicode_without_leaking_markup() {
+        let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+            Some(["Edit".to_string()].into_iter().collect()),
+            test_id_factory(),
+        );
+        let mut events = parser.push("前缀🙂 <tool_");
+        events.extend(parser.push(concat!(
+            r#"use name="Edit">{"file_path":"a","old_string":"旧","new_string":"新"}"#,
+            "</tool_use> 后缀✅",
+        )));
+        events.extend(parser.flush());
+
+        let visible = events
+            .iter()
+            .filter_map(|event| match event {
+                RecoveredCursorEvent::Text(text) => Some(text.as_str()),
+                RecoveredCursorEvent::ToolUse(_) => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, "前缀🙂  后缀✅");
+        assert!(matches!(
+            events
+                .iter()
+                .find(|event| matches!(event, RecoveredCursorEvent::ToolUse(_))),
+            Some(RecoveredCursorEvent::ToolUse(tool))
+                if tool.name == "Edit"
+                    && tool.input["old_string"] == "旧"
+                    && tool.input["new_string"] == "新"
+        ));
+        assert!(events.iter().all(|event| match event {
+            RecoveredCursorEvent::Text(text) => {
+                !text.contains("<tool_") && !text.contains("</tool_")
+            }
+            RecoveredCursorEvent::ToolUse(_) => true,
+        }));
+    }
+
+    #[test]
     fn recovers_tool_use_without_original_id() {
         let mut parser = CursorToolUseXmlParser::new_with_id_factory(
             Some(["Read".to_string()].into_iter().collect()),
@@ -712,6 +768,10 @@ mod tests {
             ("pushnotification", "PushNotification"),
             ("connectgithub", "ConnectGitHub"),
             ("brief", "Brief"),
+            ("testingpermission", "TestingPermission"),
+            ("runworkflow", "RunWorkflow"),
+            ("listpeers", "ListPeers"),
+            ("readmcpresource", "ReadMcpResource"),
         ] {
             let mut parser = CursorToolUseXmlParser::new_with_id_factory(
                 Some([advertised_name.to_string()].into_iter().collect()),
@@ -724,6 +784,45 @@ mod tests {
                 "{wire_name} should recover as {advertised_name}: {events:?}"
             );
         }
+    }
+
+    #[test]
+    fn canonicalizes_claude_runtime_aliases_to_advertised_spelling() {
+        for (wire_name, advertised_name) in [
+            ("Workflow", "RunWorkflow"),
+            ("RunWorkflow", "Workflow"),
+            ("Brief", "SendUserMessage"),
+            ("SendUserMessage", "Brief"),
+            ("ListPeers", "ListAgents"),
+            ("ListMcpResources", "ListMcpResourcesTool"),
+            ("ReadMcpResource", "ReadMcpResourceTool"),
+            ("ReadMcpResourceDir", "ReadMcpResourceDirTool"),
+        ] {
+            let mut parser = CursorToolUseXmlParser::new_with_id_factory(
+                Some([advertised_name.to_string()].into_iter().collect()),
+                test_id_factory(),
+            );
+            let xml = format!(r#"<tool_use name="{wire_name}">{{}}</tool_use>"#);
+            let events = parser.push(&xml);
+            assert!(
+                matches!(&events[..], [RecoveredCursorEvent::ToolUse(tool)] if tool.name == advertised_name),
+                "{wire_name} should recover as {advertised_name}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalizes_lowercase_to_same_spelling_before_alias_fallback() {
+        let allowed = ["AgentOutput".to_string(), "TaskOutput".to_string()]
+            .into_iter()
+            .collect();
+        let mut parser =
+            CursorToolUseXmlParser::new_with_id_factory(Some(allowed), test_id_factory());
+        let events = parser.push(r#"<tool_use name="taskoutput">{}</tool_use>"#);
+        assert!(matches!(
+            &events[..],
+            [RecoveredCursorEvent::ToolUse(tool)] if tool.name == "TaskOutput"
+        ));
     }
 
     #[test]

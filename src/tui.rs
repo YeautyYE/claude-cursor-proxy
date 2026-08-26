@@ -333,6 +333,15 @@ impl MonitorApp {
                 self.show_sand_settings = false;
                 self.sand_message = None;
             }
+            // Keep the global usage shortcut available while the Sand model
+            // list is open, so users do not have to close the overlay first.
+            KeyCode::Char('u') => {
+                self.detail = Some(DetailView::Usage);
+                self.show_sand_settings = false;
+                self.show_setup = false;
+                self.show_help = false;
+                self.sand_message = None;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.sand_selected = self.sand_selected.saturating_sub(1);
             }
@@ -3271,6 +3280,38 @@ mod tests {
             text.contains("[sand]") || text.contains("[cli]"),
             "Cursor rows must expose the client surface: {text}"
         );
+    }
+
+    #[test]
+    fn usage_shortcut_remains_available_inside_sand_overlay() {
+        let mut app = MonitorApp {
+            listen_url: "http://127.0.0.1:18765".to_string(),
+            setup_text: String::new(),
+            show_setup: true,
+            show_sand_settings: true,
+            show_help: true,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: Some(mpsc::channel().1),
+            sand_models: vec!["claude-fable-5".to_string()],
+            sand_policy: SandRoutingPolicy::empty(),
+            sand_selected: 0,
+            sand_message: Some("previous message".to_string()),
+            sand_input: None,
+        };
+
+        app.handle_sand_key(KeyCode::Char('u'));
+
+        assert!(matches!(app.detail, Some(DetailView::Usage)));
+        assert!(!app.show_sand_settings);
+        assert!(!app.show_setup);
+        assert!(!app.show_help);
+        assert!(app.sand_message.is_none());
     }
 
     fn usage_state_with_sand_percent(percent: f64) -> crate::monitor::AccountUsageState {

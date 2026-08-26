@@ -222,6 +222,7 @@ impl CursorHttpClient {
             .await
             .map_err(|e| CursorError::from_reqwest(e, 30))?;
         let status = resp.status().as_u16();
+        let retry_after = retry_after_header(resp.headers());
         let body = resp
             .text()
             .await
@@ -232,7 +233,8 @@ impl CursorHttpClient {
                 status,
                 format!("GetUsableModels JSON failed with HTTP {status}"),
                 Some(body.chars().take(500).collect()),
-            ));
+            )
+            .with_retry_after(retry_after));
         }
 
         parse_usable_models_json(&body)
@@ -267,6 +269,7 @@ impl CursorHttpClient {
             .await
             .map_err(|e| CursorError::from_reqwest(e, 30))?;
         let status = resp.status().as_u16();
+        let retry_after = retry_after_header(resp.headers());
         let body = resp
             .bytes()
             .await
@@ -277,7 +280,8 @@ impl CursorHttpClient {
                 status,
                 format!("GetUsableModels proto failed with HTTP {status}"),
                 Some(String::from_utf8_lossy(&body).chars().take(500).collect()),
-            ));
+            )
+            .with_retry_after(retry_after));
         }
 
         decode_usable_models_proto(&body)
@@ -563,6 +567,7 @@ impl CursorHttpClient {
 
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
+        let retry_after = retry_after_header(&headers);
         let error_detail = resp
             .headers()
             .get("grpc-message")
@@ -891,11 +896,10 @@ impl CursorHttpClient {
                     String::from_utf8(body_bytes.to_vec()).ok()
                 }
             });
-            return Err(CursorError::new(
-                status,
-                format!("Cursor upstream HTTP {status}"),
-                detail,
-            ));
+            return Err(
+                CursorError::new(status, format!("Cursor upstream HTTP {status}"), detail)
+                    .with_retry_after(retry_after),
+            );
         }
 
         if !buffered_finish_accepts_incomplete(finish_reason, saw_end, saw_turn_ended, saw_text) {
@@ -1630,6 +1634,14 @@ impl CursorError {
         }
     }
 
+    /// Preserve an upstream HTTP `Retry-After` value all the way to the
+    /// downstream response. The raw header may be either delta-seconds or an
+    /// HTTP date, so do not normalize it at the transport boundary.
+    pub(crate) fn with_retry_after(mut self, retry_after: Option<String>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
     /// Text live SSE and retry gates can classify. Direct HTTP errors keep
     /// the status in `message` ("Cursor upstream HTTP 403") and the policy
     /// body in `detail`; both must reach grok-build.
@@ -1673,6 +1685,15 @@ impl CursorError {
     }
 }
 
+pub(crate) fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 impl std::fmt::Display for CursorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Cursor error {}: {}", self.status, self.message)
@@ -1684,6 +1705,19 @@ impl std::error::Error for CursorError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_header_preserves_the_upstream_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("120"),
+        );
+        assert_eq!(retry_after_header(&headers).as_deref(), Some("120"));
+
+        headers.remove(reqwest::header::RETRY_AFTER);
+        assert_eq!(retry_after_header(&headers), None);
+    }
 
     #[test]
     fn client_message_includes_http_status_and_body_detail() {

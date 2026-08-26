@@ -184,24 +184,39 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             model_id: "claude-opus-4-8-high".to_string(),
             mode: CursorAgentMode::Agent,
         }),
-        // Pass through full Cursor catalog ids (claude-fable-5-thinking-high, …).
-        other
+        other => {
+            // GetUsableModels is the authority for account-specific catalog
+            // ids. Preserve the exact upstream spelling so newly introduced
+            // model families work from the TUI and `/v1/models` without a
+            // proxy release, while an account switch immediately retires the
+            // previous account's ids through the scoped cache below.
+            if let Some(model_id) = current_account_live_catalog_model(other) {
+                return Ok(CursorModelResolution {
+                    model_id,
+                    mode: CursorAgentMode::Agent,
+                });
+            }
+
+            // Keep known catalog families usable before the live catalog has
+            // been fetched (startup/offline fallback).
             if other.starts_with("claude-")
                 || other.starts_with("gpt-")
                 || other.starts_with("composer-")
                 || other.starts_with("gemini-")
                 || other.starts_with("cursor-grok-")
                 || other.starts_with("kimi-")
-                || other.starts_with("glm-") =>
-        {
-            Ok(CursorModelResolution {
-                model_id: other.to_string(),
-                mode: CursorAgentMode::Agent,
-            })
+                || other.starts_with("glm-")
+            {
+                return Ok(CursorModelResolution {
+                    model_id: other.to_string(),
+                    mode: CursorAgentMode::Agent,
+                });
+            }
+
+            Err(format!(
+                "unknown cursor model: {model}. Use cursor:<id> with a current CLI catalog id (e.g. cursor:claude-fable-5-thinking-max, cursor:composer-2.5)"
+            ))
         }
-        _ => Err(format!(
-            "unknown cursor model: {model}. Use cursor:<id> with a CLI catalog id (e.g. cursor:claude-fable-5-thinking-max, cursor:composer-2.5)"
-        )),
     }
 }
 
@@ -364,8 +379,8 @@ pub fn requested_model_parameters(
 }
 
 /// Process-wide live catalog from `GetUsableModels` (filled by the HTTP client).
-/// Merged into [`cursor_supported_models`] for listing only — does not affect
-/// [`resolve_cursor_model`].
+/// Merged into [`cursor_supported_models`] for listing and used by
+/// [`resolve_cursor_model`] to validate exact account-specific catalog ids.
 ///
 /// The cache is account-scoped. Cursor account switches happen in a separate
 /// CLI process while `serve` remains alive; a process-wide, unkeyed catalog
@@ -487,6 +502,26 @@ pub fn cached_live_usable_models() -> Option<Vec<String>> {
     (snapshot.fetched_at.elapsed() < LIVE_CATALOG_TTL).then(|| snapshot.models.clone())
 }
 
+/// Resolve one exact id only from the catalog belonging to the currently
+/// observed account. The legacy unkeyed cache is deliberately excluded: it
+/// predates hot account switching and is useful for listing tests, but is not
+/// strong enough evidence to authorize an otherwise unknown wire id.
+fn current_account_live_catalog_model(model: &str) -> Option<String> {
+    let guard = live_catalog_cache().lock().ok()?;
+    let active_account_key = guard.active_account_key.as_deref()?;
+    let snapshot = guard.snapshot.as_ref()?;
+    if snapshot.account_key != active_account_key
+        || snapshot.fetched_at.elapsed() >= LIVE_CATALOG_TTL
+    {
+        return None;
+    }
+    snapshot
+        .models
+        .iter()
+        .find(|id| id.as_str() == model)
+        .cloned()
+}
+
 /// Return a cached catalog only when it was fetched with the current account.
 /// A token rotation for the same account may cause one extra refresh, which is
 /// preferable to presenting another account's model entitlements.
@@ -513,7 +548,8 @@ fn account_catalog_key(token: &str) -> String {
 /// Build the list of supported Cursor model names.
 ///
 /// Includes legacy aliases plus any still-fresh live catalog ids from
-/// GetUsableModels. Resolution via [`resolve_cursor_model`] is unchanged.
+/// GetUsableModels. Exact ids from the current account's snapshot are also
+/// accepted by [`resolve_cursor_model`].
 pub fn cursor_supported_models() -> Vec<String> {
     let mut out: Vec<String> = CURSOR_LEGACY_MODELS
         .iter()
@@ -870,6 +906,63 @@ mod tests {
             Some(vec!["gemini-b".into()])
         );
         assert_eq!(cached_live_usable_models(), Some(vec!["gemini-b".into()]));
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn current_account_live_catalog_ids_resolve_exactly_with_all_modes() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        let generation = observe_live_usable_models_account("account-a-token");
+        store_live_usable_models_for_account_at_generation(
+            "account-a-token",
+            generation,
+            vec!["frontier-account-model".into()],
+        );
+
+        for (requested, expected_mode) in [
+            ("frontier-account-model", CursorAgentMode::Agent),
+            ("cursor:frontier-account-model", CursorAgentMode::Agent),
+            (
+                "cursor-agent:frontier-account-model",
+                CursorAgentMode::Agent,
+            ),
+            ("cursor-plan:frontier-account-model", CursorAgentMode::Plan),
+            ("cursor-ask:frontier-account-model", CursorAgentMode::Ask),
+        ] {
+            let resolved = resolve_cursor_model(requested).unwrap();
+            assert_eq!(resolved.model_id, "frontier-account-model");
+            assert_eq!(resolved.mode, expected_mode);
+        }
+
+        assert!(
+            resolve_cursor_model("Frontier-Account-Model").is_err(),
+            "live catalog ids must retain Cursor's exact case-sensitive spelling"
+        );
+
+        observe_live_usable_models_account("account-b-token");
+        assert!(
+            resolve_cursor_model("frontier-account-model").is_err(),
+            "switching accounts must immediately retire account A's dynamic ids"
+        );
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn legacy_unkeyed_catalog_does_not_authorize_unknown_model_ids() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        store_live_usable_models(vec!["legacy-frontier-model".into()]);
+        assert!(
+            cursor_supported_models().contains(&"legacy-frontier-model".to_string()),
+            "the legacy helper remains available to listing-only callers"
+        );
+        assert!(
+            resolve_cursor_model("legacy-frontier-model").is_err(),
+            "an unkeyed catalog must not authorize an otherwise unknown wire id"
+        );
         clear_live_usable_models_account();
     }
 

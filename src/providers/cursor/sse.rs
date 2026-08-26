@@ -29,6 +29,44 @@ pub const EVENT_ERROR: &str = "error";
 const USAGE_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const USAGE_PROGRESS_MIN_OUTPUT_DELTA: u64 = 8;
 
+// Some Fable runs serialize one leading private-reasoning block through the
+// text field as the exact protocol wrapper `<thinking>...</thinking>`.  Treat
+// only that narrow shape as protocol.  Searching for tags throughout an answer
+// corrupts ordinary XML/code examples, and accepting aliases, attributes, or
+// case variants creates the same ambiguity.  Non-Fable models bypass this
+// classifier entirely.
+const FABLE_THINKING_OPEN: &str = "<thinking>";
+const FABLE_THINKING_CLOSE: &str = "</thinking>";
+const FABLE_THINKING_LEADING_WS_MAX_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeadingThinkingArtifactState {
+    /// Model/operation is not eligible for protocol-artifact recognition.
+    Disabled,
+    /// No visible output has been committed; inspect only the leading bytes.
+    Candidate,
+    /// The exact leading opening wrapper was confirmed.
+    Body,
+    /// The response was classified as ordinary text, or the one artifact ended.
+    Passthrough,
+}
+
+fn fable_protocol_artifact_candidate(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("fable")
+}
+
+/// Bytes at the end of `value` that may be the beginning of `marker`.
+/// `marker` is ASCII, so a positive result is always a UTF-8 boundary.
+fn trailing_marker_prefix_len(value: &str, marker: &str) -> usize {
+    let value = value.as_bytes();
+    let marker = marker.as_bytes();
+    let max = value.len().min(marker.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|&len| value.ends_with(&marker[..len]))
+        .unwrap_or(0)
+}
+
 /// Frame upstream Cursor response bytes into Anthropic SSE event bytes.
 ///
 /// Produces the standard message lifecycle:
@@ -59,6 +97,30 @@ pub fn frame_cursor_stream_with_allowed(
     model: &str,
     allowed_tool_names: Option<&BTreeSet<String>>,
 ) -> Vec<u8> {
+    frame_cursor_stream_with_allowed_mode(upstream, message_id, model, allowed_tool_names, false)
+}
+
+/// Frame a Cursor compaction response as Anthropic SSE.
+///
+/// Grok Build's Responses compaction collector only accepts output text. Real
+/// `text_delta` content is authoritative; reasoning is promoted only when the
+/// compaction stream ends without any text summary.
+pub fn frame_cursor_stream_compaction(
+    upstream: &CursorUpstreamResponse,
+    message_id: &str,
+    model: &str,
+) -> Vec<u8> {
+    let empty = BTreeSet::new();
+    frame_cursor_stream_with_allowed_mode(upstream, message_id, model, Some(&empty), true)
+}
+
+fn frame_cursor_stream_with_allowed_mode(
+    upstream: &CursorUpstreamResponse,
+    message_id: &str,
+    model: &str,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    compaction_mode: bool,
+) -> Vec<u8> {
     let events = match decode_upstream_response(&upstream.body) {
         Ok(e) => e,
         Err(e) => {
@@ -67,13 +129,15 @@ pub fn frame_cursor_stream_with_allowed(
     };
 
     let mut sse = Vec::new();
-    let mut framer = CursorSseFramer::new(&mut sse, message_id, model);
+    let mut framer = if compaction_mode {
+        CursorSseFramer::new_compaction(&mut sse, message_id, model)
+    } else {
+        CursorSseFramer::new(&mut sse, message_id, model)
+    };
 
     for event in &events {
         match event {
-            CursorStreamEvent::ThinkingDelta { text } => {
-                framer.emit_thinking_delta(text);
-            }
+            CursorStreamEvent::ThinkingDelta { text } => framer.emit_thinking_delta(text),
             CursorStreamEvent::TextDelta { text } => {
                 framer.emit_text_delta(text);
             }
@@ -224,6 +288,7 @@ pub struct CursorSseFramer<'a> {
 #[derive(Debug)]
 struct CursorSseState {
     started: bool,
+    compaction_mode: bool,
     thinking_open: bool,
     text_open: bool,
     next_index: i32,
@@ -244,6 +309,15 @@ struct CursorSseState {
     /// Mid-stream usage `message_delta` is withheld until the first text delta
     /// so Claude Code's thinking OTPS meter can keep counting `thinking_delta`.
     seen_text_delta: bool,
+    /// Classifier for Fable's one known leading text-channel protocol artifact.
+    leading_thinking_artifact: LeadingThinkingArtifactState,
+    /// Small split-marker buffer, or the currently unflushed artifact body.
+    leading_thinking_buffer: String,
+    /// Compaction may put its summary in reasoning, but a later real text delta
+    /// is authoritative. Hold reasoning until end so mixed streams never expose
+    /// private reasoning concatenated with the actual summary.
+    compaction_thinking_fallback: String,
+    compaction_seen_text: bool,
     finalized: bool,
 }
 
@@ -251,6 +325,7 @@ impl Default for CursorSseState {
     fn default() -> Self {
         Self {
             started: false,
+            compaction_mode: false,
             thinking_open: false,
             text_open: false,
             next_index: 0,
@@ -267,6 +342,10 @@ impl Default for CursorSseState {
             last_progress_cache_write: 0,
             last_progress_at: None,
             seen_text_delta: false,
+            leading_thinking_artifact: LeadingThinkingArtifactState::Disabled,
+            leading_thinking_buffer: String::new(),
+            compaction_thinking_fallback: String::new(),
+            compaction_seen_text: false,
             finalized: false,
         }
     }
@@ -279,6 +358,25 @@ impl<'a> CursorSseFramer<'a> {
             message_id,
             model,
             state: CursorSseState {
+                thinking_index: -1,
+                text_index: -1,
+                leading_thinking_artifact: if fable_protocol_artifact_candidate(model) {
+                    LeadingThinkingArtifactState::Candidate
+                } else {
+                    LeadingThinkingArtifactState::Disabled
+                },
+                ..CursorSseState::default()
+            },
+        }
+    }
+
+    fn new_compaction(output: &'a mut Vec<u8>, message_id: &'a str, model: &'a str) -> Self {
+        Self {
+            output,
+            message_id,
+            model,
+            state: CursorSseState {
+                compaction_mode: true,
                 thinking_index: -1,
                 text_index: -1,
                 ..CursorSseState::default()
@@ -419,11 +517,18 @@ impl<'a> CursorSseFramer<'a> {
     }
 
     pub fn close_open_blocks(&mut self) {
+        self.flush_deferred_text();
         self.close_thinking();
         self.close_text();
     }
 
     pub fn emit_thinking_delta(&mut self, text: &str) {
+        if self.state.compaction_mode {
+            if !self.state.compaction_seen_text && !self.state.finalized {
+                self.state.compaction_thinking_fallback.push_str(text);
+            }
+            return;
+        }
         if !self.open_thinking() {
             return;
         }
@@ -441,6 +546,37 @@ impl<'a> CursorSseFramer<'a> {
     }
 
     pub fn emit_text_delta(&mut self, text: &str) {
+        if self.state.compaction_mode {
+            if text.is_empty() || self.state.finalized {
+                return;
+            }
+            if !self.state.compaction_seen_text {
+                self.state.compaction_seen_text = true;
+                self.state.compaction_thinking_fallback.clear();
+            }
+            self.emit_text_delta_raw(text);
+            return;
+        }
+        if text.is_empty() || self.state.finalized {
+            return;
+        }
+        match self.state.leading_thinking_artifact {
+            LeadingThinkingArtifactState::Candidate | LeadingThinkingArtifactState::Body => {
+                self.state.leading_thinking_buffer.push_str(text);
+                self.drain_leading_thinking_artifact(false);
+            }
+            LeadingThinkingArtifactState::Disabled | LeadingThinkingArtifactState::Passthrough => {
+                self.emit_text_delta_raw(text)
+            }
+        }
+    }
+
+    /// Emit text after the literal-thinking protocol filter has classified the
+    /// chunk as ordinary visible output.
+    fn emit_text_delta_raw(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         if !self.open_text() {
             return;
         }
@@ -455,6 +591,105 @@ impl<'a> CursorSseFramer<'a> {
             text,
         );
         self.maybe_emit_usage_progress(false);
+    }
+
+    /// Flush deferred protocol classification or the compaction reasoning
+    /// fallback before the content blocks close.
+    fn flush_deferred_text(&mut self) {
+        if self.state.compaction_mode {
+            if !self.state.compaction_seen_text
+                && !self.state.compaction_thinking_fallback.is_empty()
+            {
+                let fallback = std::mem::take(&mut self.state.compaction_thinking_fallback);
+                self.emit_text_delta_raw(&fallback);
+            } else {
+                self.state.compaction_thinking_fallback.clear();
+            }
+            return;
+        }
+        self.drain_leading_thinking_artifact(true);
+    }
+
+    /// Recognize only an exact, leading Fable `<thinking>...</thinking>` block.
+    /// Once ordinary text is observed (or the one block closes), all remaining
+    /// bytes are passed through verbatim, including later XML examples.
+    fn drain_leading_thinking_artifact(&mut self, flush: bool) {
+        loop {
+            match self.state.leading_thinking_artifact {
+                LeadingThinkingArtifactState::Disabled
+                | LeadingThinkingArtifactState::Passthrough => {
+                    if !self.state.leading_thinking_buffer.is_empty() {
+                        let visible = std::mem::take(&mut self.state.leading_thinking_buffer);
+                        self.emit_text_delta_raw(&visible);
+                    }
+                    return;
+                }
+                LeadingThinkingArtifactState::Candidate => {
+                    if self.state.leading_thinking_buffer.is_empty() {
+                        return;
+                    }
+                    let whitespace_len = self
+                        .state
+                        .leading_thinking_buffer
+                        .char_indices()
+                        .find_map(|(at, ch)| (!ch.is_ascii_whitespace()).then_some(at))
+                        .unwrap_or(self.state.leading_thinking_buffer.len());
+                    if whitespace_len > FABLE_THINKING_LEADING_WS_MAX_BYTES {
+                        self.state.leading_thinking_artifact =
+                            LeadingThinkingArtifactState::Passthrough;
+                        continue;
+                    }
+                    let candidate = &self.state.leading_thinking_buffer[whitespace_len..];
+                    if candidate.starts_with(FABLE_THINKING_OPEN) {
+                        self.state
+                            .leading_thinking_buffer
+                            .drain(..whitespace_len + FABLE_THINKING_OPEN.len());
+                        self.state.leading_thinking_artifact = LeadingThinkingArtifactState::Body;
+                        continue;
+                    }
+                    if !flush && FABLE_THINKING_OPEN.starts_with(candidate) {
+                        return;
+                    }
+                    self.state.leading_thinking_artifact =
+                        LeadingThinkingArtifactState::Passthrough;
+                }
+                LeadingThinkingArtifactState::Body => {
+                    if let Some(close_at) = self
+                        .state
+                        .leading_thinking_buffer
+                        .find(FABLE_THINKING_CLOSE)
+                    {
+                        if close_at > 0 {
+                            let reasoning =
+                                self.state.leading_thinking_buffer[..close_at].to_owned();
+                            self.emit_thinking_delta(&reasoning);
+                        }
+                        self.state
+                            .leading_thinking_buffer
+                            .drain(..close_at + FABLE_THINKING_CLOSE.len());
+                        self.state.leading_thinking_artifact =
+                            LeadingThinkingArtifactState::Passthrough;
+                        continue;
+                    }
+                    if flush {
+                        let reasoning = std::mem::take(&mut self.state.leading_thinking_buffer);
+                        self.emit_thinking_delta(&reasoning);
+                        return;
+                    }
+                    let keep = trailing_marker_prefix_len(
+                        &self.state.leading_thinking_buffer,
+                        FABLE_THINKING_CLOSE,
+                    );
+                    let emit_len = self.state.leading_thinking_buffer.len() - keep;
+                    if emit_len > 0 {
+                        let reasoning = self.state.leading_thinking_buffer[..emit_len].to_owned();
+                        self.state.leading_thinking_buffer.drain(..emit_len);
+                        self.emit_thinking_delta(&reasoning);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Accumulate a rough Out floor from streamed text/thinking. Merged with
@@ -732,11 +967,33 @@ pub struct CursorSseEncoder {
 
 impl CursorSseEncoder {
     pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        Self {
+            output: Vec::new(),
+            message_id: message_id.into(),
+            model: model.clone(),
+            state: CursorSseState {
+                thinking_index: -1,
+                text_index: -1,
+                leading_thinking_artifact: if fable_protocol_artifact_candidate(&model) {
+                    LeadingThinkingArtifactState::Candidate
+                } else {
+                    LeadingThinkingArtifactState::Disabled
+                },
+                ..CursorSseState::default()
+            },
+        }
+    }
+
+    /// Construct an encoder for a Responses context-compaction operation.
+    /// Actual text wins; a reasoning-only stream is surfaced as text at end.
+    pub fn new_compaction(message_id: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             output: Vec::new(),
             message_id: message_id.into(),
             model: model.into(),
             state: CursorSseState {
+                compaction_mode: true,
                 thinking_index: -1,
                 text_index: -1,
                 ..CursorSseState::default()
@@ -1126,6 +1383,233 @@ mod tests {
                 .and_then(|t| t.as_str())
                 == Some("text")
         }));
+    }
+
+    #[test]
+    fn compaction_sse_promotes_thinking_to_output_text() {
+        let mut body = test_frames::thinking_frame("summary from reasoning");
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+
+        let sse = frame_cursor_stream_compaction(&upstream, "msg_compact", "claude-fable-5");
+        let events = parse_sse_events(&String::from_utf8_lossy(&sse));
+        assert!(
+            events.iter().any(|(_, data)| {
+                data.get("delta")
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(|value| value.as_str())
+                    == Some("text_delta")
+                    && data["delta"]["text"] == "summary from reasoning"
+            }),
+            "compaction summaries must be visible as text deltas: {events:?}"
+        );
+        assert!(
+            events.iter().all(|(_, data)| {
+                data.get("delta").and_then(|delta| delta.get("type"))
+                    != Some(&serde_json::json!("thinking_delta"))
+            }),
+            "compaction output must not be exposed on the thinking channel: {events:?}"
+        );
+    }
+
+    #[test]
+    fn buffered_compaction_sse_prefers_real_text_over_reasoning() {
+        let mut body = test_frames::thinking_frame("private reasoning");
+        body.extend_from_slice(&test_frames::text_frame("actual summary"));
+        body.extend_from_slice(&test_frames::thinking_frame("later private reasoning"));
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+
+        let sse = frame_cursor_stream_compaction(&upstream, "msg_compact_mixed", "grok-build");
+        let wire = String::from_utf8_lossy(&sse);
+        assert_eq!(rendered_channels(&sse).0, "actual summary");
+        assert!(!wire.contains("private reasoning"), "{wire}");
+    }
+
+    fn rendered_channels(bytes: &[u8]) -> (String, String) {
+        let wire = String::from_utf8_lossy(bytes);
+        let events = parse_sse_events(&wire);
+        let visible = events
+            .iter()
+            .filter_map(|(_, data)| {
+                (data["delta"]["type"] == "text_delta")
+                    .then(|| data["delta"]["text"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let reasoning = events
+            .iter()
+            .filter_map(|(_, data)| {
+                (data["delta"]["type"] == "thinking_delta")
+                    .then(|| data["delta"]["thinking"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        (visible, reasoning)
+    }
+
+    #[test]
+    fn compaction_encoder_uses_thinking_only_as_end_of_stream_fallback() {
+        let mut encoder = CursorSseEncoder::new_compaction("msg_compact_encoder", "claude-fable-5");
+        encoder.begin();
+        let _ = encoder.take_bytes();
+        encoder.push_event(&CursorStreamEvent::ThinkingDelta {
+            text: "summary from reasoning".into(),
+        });
+        assert!(
+            encoder.take_bytes().is_empty(),
+            "reasoning must remain retractable until real text or stream end"
+        );
+        encoder.push_event(&CursorStreamEvent::End);
+        let bytes = encoder.take_bytes();
+        assert_eq!(
+            rendered_channels(&bytes),
+            ("summary from reasoning".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn compaction_real_text_replaces_buffered_reasoning_in_mixed_stream() {
+        let mut encoder = CursorSseEncoder::new_compaction("msg_compact_mixed", "claude-fable-5");
+        encoder.push_event(&CursorStreamEvent::ThinkingDelta {
+            text: "private chain of thought".into(),
+        });
+        assert!(encoder.take_bytes().is_empty());
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "actual ".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::ThinkingDelta {
+            text: "later private reasoning".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "summary".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::End);
+
+        let bytes = encoder.take_bytes();
+        let wire = String::from_utf8_lossy(&bytes);
+        assert!(!wire.contains("private chain of thought"), "{wire}");
+        assert!(!wire.contains("later private reasoning"), "{wire}");
+        assert_eq!(
+            rendered_channels(&bytes),
+            ("actual summary".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn compaction_real_text_preserves_literal_xml() {
+        let mut encoder = CursorSseEncoder::new_compaction("msg_compact_xml", "claude-fable-5");
+        encoder.push_event(&CursorStreamEvent::ThinkingDelta {
+            text: "discard me".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "<thinking>quoted markup</thinking>".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::End);
+        assert_eq!(
+            rendered_channels(&encoder.take_bytes()).0,
+            "<thinking>quoted markup</thinking>"
+        );
+    }
+
+    #[test]
+    fn fable_filters_only_one_exact_leading_split_protocol_block() {
+        let mut encoder = CursorSseEncoder::new("msg_leading_artifact", "claude-fable-5");
+        for text in [
+            " \n<thin",
+            "king>private ",
+            "reasoning</think",
+            "ing>\nanswer <thinking>visible example</thinking>",
+        ] {
+            encoder.push_event(&CursorStreamEvent::TextDelta { text: text.into() });
+        }
+        encoder.push_event(&CursorStreamEvent::End);
+
+        assert_eq!(
+            rendered_channels(&encoder.take_bytes()),
+            (
+                "\nanswer <thinking>visible example</thinking>".into(),
+                "private reasoning".into(),
+            )
+        );
+    }
+
+    #[test]
+    fn fable_reasoning_only_protocol_block_does_not_leak_xml() {
+        let mut encoder = CursorSseEncoder::new("msg_artifact_only", "claude-fable-5");
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "<thinking>private only</thinking>".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::End);
+        assert_eq!(
+            rendered_channels(&encoder.take_bytes()),
+            ("".into(), "private only".into())
+        );
+    }
+
+    #[test]
+    fn fable_preserves_embedded_and_code_fenced_xml_examples() {
+        for (id, text) in [
+            ("embedded", "visible <thinking>quoted</thinking> tail"),
+            ("fenced", "```xml\n<thinking>quoted</thinking>\n```"),
+        ] {
+            let mut encoder = CursorSseEncoder::new(id, "claude-fable-5");
+            encoder.push_event(&CursorStreamEvent::TextDelta { text: text.into() });
+            encoder.push_event(&CursorStreamEvent::End);
+            assert_eq!(rendered_channels(&encoder.take_bytes()).0, text, "{id}");
+        }
+    }
+
+    #[test]
+    fn non_fable_preserves_even_exact_leading_thinking_xml() {
+        let text = "<thinking>ordinary Gemini XML</thinking>";
+        let mut encoder = CursorSseEncoder::new("msg_gemini_xml", "gemini-3.6-flash");
+        encoder.push_event(&CursorStreamEvent::TextDelta { text: text.into() });
+        encoder.push_event(&CursorStreamEvent::End);
+        assert_eq!(rendered_channels(&encoder.take_bytes()).0, text);
+    }
+
+    #[test]
+    fn fable_preserves_lookalike_or_incomplete_thinking_markup() {
+        for (id, text) in [
+            ("case", "<THINKING>quoted</THINKING>"),
+            ("alias", "<think>quoted</think>"),
+            ("attribute", "<thinking kind=\"example\">quoted</thinking>"),
+            ("partial", "<thi"),
+        ] {
+            let mut encoder = CursorSseEncoder::new(id, "claude-fable-5");
+            encoder.push_event(&CursorStreamEvent::TextDelta { text: text.into() });
+            encoder.push_event(&CursorStreamEvent::End);
+            assert_eq!(rendered_channels(&encoder.take_bytes()).0, text, "{id}");
+        }
+    }
+
+    #[test]
+    fn confirmed_fable_protocol_body_streams_with_bounded_marker_tail() {
+        let mut encoder = CursorSseEncoder::new("msg_artifact_bounded", "claude-fable-5");
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "<thinking>".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "private".repeat(20_000),
+        });
+        assert!(encoder.state.leading_thinking_buffer.len() < FABLE_THINKING_CLOSE.len());
+        let partial = encoder.take_bytes();
+        assert!(rendered_channels(&partial).1.contains("private"));
+
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "</thinking>done".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::End);
+        assert_eq!(rendered_channels(&encoder.take_bytes()).0, "done");
     }
 
     #[test]

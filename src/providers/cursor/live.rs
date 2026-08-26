@@ -24,7 +24,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
-    encode_client_heartbeat_frame,
+    encode_client_heartbeat_frame, retry_after_header,
 };
 use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
@@ -52,10 +52,10 @@ use super::proto::{
     SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
 };
 use super::request::{
-    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, cursor_mcp_wire_name,
-    is_claude_local_mcp_spelling, is_claude_local_tool_name, is_grok_build_subagent_lifecycle_tool,
-    is_xml_client_only_native_tool_name, normalize_grok_build_lifecycle_name,
-    strip_mcp_provider_prefix,
+    CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, claude_tool_names_equivalent,
+    cursor_mcp_wire_name, is_claude_local_mcp_spelling, is_claude_local_tool_name,
+    is_grok_build_subagent_lifecycle_tool, is_xml_client_only_native_tool_name,
+    normalize_grok_build_lifecycle_name, strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
 use super::sse::{
@@ -74,14 +74,21 @@ fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorEr
     if is_pre_connect_failure(&error) {
         return error;
     }
+    let CursorError {
+        status,
+        message,
+        detail,
+        retry_after,
+    } = error;
     CursorError::new(
-        error.status,
+        status,
         format!(
             "Cursor BidiAppend {operation} failed; acceptance is ambiguous: {}",
-            error.message
+            message
         ),
-        error.detail,
+        detail,
     )
+    .with_retry_after(retry_after)
 }
 
 impl ClientOutbound {
@@ -2463,6 +2470,16 @@ impl LiveRunRegistry {
             // ambiguous, so they fall through to the remove-and-deliver arm:
             // slot freed immediately, verbatim message delivered once.
             if terminal_error_clears_live_slot(&error) {
+                // The registry and durable ledger describe the same active
+                // operation.  A retryable terminal outcome proves this owner
+                // reached a safe boundary, so release the durable marker
+                // while still holding the registry lock, then free the slot.
+                // This ordering closes the tiny race where a same-session
+                // retry could observe an empty registry and hit the old
+                // Dispatched marker before it was cleared. Leaving that
+                // marker behind turns an in-request fresh-history retry into a
+                // permanent ambiguous-operation rejection.
+                clear_durable_operation(&key, sealed_fingerprint, &owner_token);
                 runs.remove_key(&key);
                 return LiveRunProbe::Free;
             }
@@ -2477,6 +2494,7 @@ impl LiveRunRegistry {
                 drop(runs);
                 persist_ambiguous_operation(&key, sealed_fingerprint, &owner_token, &error);
             } else {
+                clear_durable_operation(&key, sealed_fingerprint, &owner_token);
                 runs.remove_key(&key);
             }
             return LiveRunProbe::TerminalError(error);
@@ -2986,10 +3004,49 @@ impl CursorHttpClient {
         mcp_tools: Option<super::proto::McpTools>,
         request_context: super::proto::RequestContext,
         original_request_id: Option<&str>,
+        cancel: Option<watch::Receiver<bool>>,
+        upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
+        pre_admission: Option<LiveGenerationPermit>,
+        client_type_override: Option<&str>,
+    ) -> Result<LiveRunStart, CursorError> {
+        self.start_live_agent_with_identity_guarded_profile_mode(
+            token,
+            prompt,
+            model,
+            images,
+            custom_system_prompt,
+            identity,
+            allowed_tool_names,
+            mcp_tools,
+            request_context,
+            original_request_id,
+            cancel,
+            upstream_open_guard,
+            pre_admission,
+            client_type_override,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_live_agent_with_identity_guarded_profile_mode(
+        &self,
+        token: &str,
+        prompt: &str,
+        model: &str,
+        images: &[CursorSelectedImage],
+        custom_system_prompt: Option<&str>,
+        identity: LiveRunIdentity<'_>,
+        allowed_tool_names: Option<BTreeSet<String>>,
+        mcp_tools: Option<super::proto::McpTools>,
+        request_context: super::proto::RequestContext,
+        original_request_id: Option<&str>,
         mut cancel: Option<watch::Receiver<bool>>,
         upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
         pre_admission: Option<LiveGenerationPermit>,
         client_type_override: Option<&str>,
+        compaction_mode: bool,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -3155,6 +3212,7 @@ impl CursorHttpClient {
             h2_epoch: (!force_http1).then(process_h2_circuit_epoch),
             http1_rejected: false,
             mcp_tools: mcp_tools.clone(),
+            compaction_mode,
             opening_checkpoint: opening_live_checkpoint(&continuation.conversation_state),
             recovery: LiveRecoveryEpisode::default(),
             breakers: TransportBreakers::default(),
@@ -3385,12 +3443,12 @@ impl CursorHttpClient {
             .map_err(|e| CursorError::from_reqwest(e, self.timeout_secs))?;
         let status = response.status().as_u16();
         if status >= 400 {
+            let retry_after = retry_after_header(response.headers());
             let detail = response.text().await.ok();
-            return Err(CursorError::new(
-                status,
-                format!("Cursor RunSSE HTTP {status}"),
-                detail,
-            ));
+            return Err(
+                CursorError::new(status, format!("Cursor RunSSE HTTP {status}"), detail)
+                    .with_retry_after(retry_after),
+            );
         }
 
         let append = BidiAppendSession::new_with_original(
@@ -3496,12 +3554,12 @@ impl CursorHttpClient {
         let response = send_result.map_err(|e| CursorError::from_reqwest(e, self.timeout_secs))?;
         let status = response.status().as_u16();
         if status >= 400 {
+            let retry_after = retry_after_header(response.headers());
             let detail = response.text().await.ok();
-            return Err(CursorError::new(
-                status,
-                format!("Cursor upstream HTTP {status}"),
-                detail,
-            ));
+            return Err(
+                CursorError::new(status, format!("Cursor upstream HTTP {status}"), detail)
+                    .with_retry_after(retry_after),
+            );
         }
         Ok((ClientOutbound::Bidi(request_tx), response))
     }
@@ -3691,6 +3749,8 @@ struct LiveReconnectContext {
     /// Clash/Surge 464/421 while on HTTP/1. Do not oscillate back to H1.
     http1_rejected: bool,
     mcp_tools: Option<super::proto::McpTools>,
+    /// Preserve the compaction wire mode across ResumeAction reconnects.
+    compaction_mode: bool,
     opening_checkpoint: Option<Vec<u8>>,
     recovery: LiveRecoveryEpisode,
     breakers: TransportBreakers,
@@ -4041,15 +4101,56 @@ async fn with_live_open_timeout<T>(
     }
 }
 
-fn live_heartbeat_thinking_budget(stream_idle: Duration) -> Duration {
-    let minimum_secs = stream_idle.as_secs().saturating_mul(2).max(1);
+fn is_gemini_flash_model(model_id: &str) -> bool {
+    let lower = model_id.trim().to_ascii_lowercase();
+    lower.starts_with("gemini-") && lower.contains("flash")
+}
+
+fn parse_positive_u64(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn live_heartbeat_thinking_budget_from(
+    model_id: &str,
+    stream_idle: Duration,
+    gemini_flash_raw: Option<&str>,
+    global_raw: Option<&str>,
+) -> Duration {
+    let gemini_flash = is_gemini_flash_model(model_id);
+    let minimum_secs = if gemini_flash {
+        stream_idle.as_secs().max(1)
+    } else {
+        stream_idle.as_secs().saturating_mul(2).max(1)
+    };
     let maximum_secs = 1800.max(minimum_secs);
+    let configured = if gemini_flash {
+        parse_positive_u64(gemini_flash_raw).or_else(|| parse_positive_u64(global_raw))
+    } else {
+        parse_positive_u64(global_raw)
+    };
+    // Fable and Grok can legitimately emit only transport heartbeats for many
+    // minutes. Gemini Flash is expected to make progress quickly; retaining a
+    // hollow Flash Run for the general 20-minute budget looks like a hung
+    // request. Its shorter default safely rotates only before client-visible
+    // text/tools, and the late-retry pump keeps that recovery inside the same
+    // downstream request.
+    let default_secs = if gemini_flash { 180 } else { 1200 };
     Duration::from_secs(
-        // Long-thinking models can legitimately emit only transport
-        // heartbeats for many minutes. Keep the recovery window below the
-        // 30-minute segment hard deadline, while avoiding a premature
-        // "no useful progress" terminal error at the former 10-minute mark.
-        env_u64("CCP_CURSOR_HEARTBEAT_PROGRESS_SECS", 1200).clamp(minimum_secs, maximum_secs),
+        configured
+            .unwrap_or(default_secs)
+            .clamp(minimum_secs, maximum_secs),
+    )
+}
+
+fn live_heartbeat_thinking_budget(model_id: &str, stream_idle: Duration) -> Duration {
+    let gemini_flash = std::env::var("CCP_CURSOR_GEMINI_FLASH_PROGRESS_SECS").ok();
+    let global = std::env::var("CCP_CURSOR_HEARTBEAT_PROGRESS_SECS").ok();
+    live_heartbeat_thinking_budget_from(
+        model_id,
+        stream_idle,
+        gemini_flash.as_deref(),
+        global.as_deref(),
     )
 }
 
@@ -5089,8 +5190,31 @@ fn hollow_resume_terminal_message(
         {
             return format!("{EMPTY_TURN_RETRY_NOTE} ({EMPTY_TURN_CHECKPOINT_RETRY_NOTE})");
         }
-        // Results may already have crossed the upstream boundary. Without a
-        // post-submit checkpoint, neither resetting nor replaying is safe.
+        // Tool results in this segment came from the current Anthropic
+        // request, whose fresh-run prompt contains the completed tool_use /
+        // tool_result history.  If Cursor stays hollow and omits a newer
+        // checkpoint, rotate to that replay-safe representation instead of
+        // sealing a same-fingerprint Ambiguous tombstone.  Client-visible
+        // output or an exposed/pending tool still remains fail-closed below.
+        if !saw_text && pending_empty {
+            super::conversation::reset(session_id);
+            *latest_checkpoint = None;
+            kv_blobs.clear();
+            crate::logging::create_logger("cursor").warn(
+                "live_conversation_reset",
+                Some(serde_json::Map::from_iter([
+                    (
+                        "reason".into(),
+                        serde_json::json!("unconfirmed_post_tool_hollow"),
+                    ),
+                    (
+                        "recovery".into(),
+                        serde_json::json!("fresh_anthropic_history"),
+                    ),
+                ])),
+            );
+            return format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})");
+        }
         return fallback.into();
     }
     // A hollow ResumeAction that never exposed assistant text or tools can be
@@ -5210,11 +5334,18 @@ fn annotate_live_cursor_error(session_id: &str, err: CursorError) -> CursorError
         return err;
     }
     super::conversation::reset(session_id);
+    let CursorError {
+        status,
+        message,
+        detail,
+        retry_after,
+    } = err;
     CursorError::new(
-        err.status,
-        format!("{} ({CONVERSATION_RESET_RETRY_NOTE})", err.message),
-        err.detail,
+        status,
+        format!("{message} ({CONVERSATION_RESET_RETRY_NOTE})"),
+        detail,
     )
+    .with_retry_after(retry_after)
 }
 
 /// An Ambiguous tombstone with an unknown fingerprint (`0`) fail-closes every
@@ -5697,14 +5828,21 @@ fn partial_tool_result_send_error(
     sent_frames: usize,
     total_frames: usize,
 ) -> CursorError {
+    let CursorError {
+        status,
+        message,
+        detail,
+        retry_after,
+    } = error;
     CursorError::new(
-        error.status,
+        status,
         format!(
             "Cursor tool-result batch partially sent ({sent_frames}/{total_frames}); acceptance is ambiguous: {}",
-            error.message
+            message
         ),
-        error.detail,
+        detail,
     )
+    .with_retry_after(retry_after)
 }
 
 /// Semantic Cursor errors (400/401/403/429) must not be retried on another
@@ -6627,10 +6765,164 @@ impl PostToolCheckpointEvidence {
 struct LiveTurnCtx<'a> {
     session_id: &'a str,
     user_prompt: &'a str,
+    /// Compaction has a distinct downstream contract: reasoning text is
+    /// promoted to output text so a Responses collector can build a summary.
+    compaction_mode: bool,
     post_tool_checkpoint: &'a mut PostToolCheckpointEvidence,
     request_context: &'a RequestContext,
     decode_failures: &'a mut u32,
     coalescer: &'a mut LiveDeltaCoalescer,
+    sand_empty_end: Option<SandEmptyEndContext<'a>>,
+}
+
+/// Request identity needed to distinguish Cursor's Sand quota sentinel from a
+/// transient empty turn. The token is borrowed from `LiveReconnectContext` and
+/// is used only to query account-scoped, hashed dashboard evidence.
+#[derive(Debug, Clone, Copy)]
+struct SandEmptyEndContext<'a> {
+    token: &'a str,
+    model_id: &'a str,
+    client_type: &'a str,
+    fresh_run: bool,
+    opened_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SandEmptyEndSequence {
+    count: u8,
+    last_seen: Instant,
+}
+
+const SAND_EMPTY_END_IMMEDIATE_MAX: Duration = Duration::from_secs(15);
+const SAND_EMPTY_END_SEQUENCE_WINDOW: Duration = Duration::from_secs(60);
+const SAND_EMPTY_END_SEQUENCE_MAX_KEYS: usize = 1024;
+
+static SAND_EMPTY_END_SEQUENCES: LazyLock<Mutex<HashMap<String, SandEmptyEndSequence>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn sand_empty_end_sequence_key(context: SandEmptyEndContext<'_>) -> String {
+    format!(
+        "{}:{}:{}",
+        context.client_type.trim().to_ascii_lowercase(),
+        context.model_id.trim().to_ascii_lowercase(),
+        super::auth::cursor_account_digest(context.token),
+    )
+}
+
+fn clear_sand_empty_end_sequence(context: SandEmptyEndContext<'_>) {
+    if !context.client_type.trim().eq_ignore_ascii_case("sand") {
+        return;
+    }
+    SAND_EMPTY_END_SEQUENCES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&sand_empty_end_sequence_key(context));
+}
+
+/// Cursor can encode an exhausted Sand allowance as HTTP 200 followed by an
+/// empty `FLAG_END`. One such frame remains retryable because it can also be a
+/// transient upstream anomaly. Two consecutive immediate fresh-run frames,
+/// combined with a fresh 100% dashboard meter for the same account, are the
+/// typed policy signal that Cursor omitted.
+fn classify_sand_quota_empty_end(
+    context: Option<SandEmptyEndContext<'_>>,
+    saw_text: bool,
+    reason: &str,
+) -> Option<String> {
+    let context = context?;
+    if !context.client_type.trim().eq_ignore_ascii_case("sand") {
+        return None;
+    }
+    if saw_text
+        || reason != "flag_end"
+        || !context.fresh_run
+        || context.opened_at.elapsed() > SAND_EMPTY_END_IMMEDIATE_MAX
+    {
+        clear_sand_empty_end_sequence(context);
+        return None;
+    }
+    let Some(evidence) = super::usage::cached_sand_usage_evidence(context.token) else {
+        clear_sand_empty_end_sequence(context);
+        return None;
+    };
+    if evidence.usage_percent < 99.999 {
+        clear_sand_empty_end_sequence(context);
+        return None;
+    }
+
+    let key = sand_empty_end_sequence_key(context);
+    let now = Instant::now();
+    let count = {
+        let mut sequences = SAND_EMPTY_END_SEQUENCES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        sequences.retain(|_, sequence| {
+            now.saturating_duration_since(sequence.last_seen) < SAND_EMPTY_END_SEQUENCE_WINDOW
+        });
+        if sequences.len() >= SAND_EMPTY_END_SEQUENCE_MAX_KEYS && !sequences.contains_key(&key) {
+            if let Some(oldest) = sequences
+                .iter()
+                .min_by_key(|(_, sequence)| sequence.last_seen)
+                .map(|(key, _)| key.clone())
+            {
+                sequences.remove(&oldest);
+            }
+        }
+        let sequence = sequences.entry(key).or_insert(SandEmptyEndSequence {
+            count: 0,
+            last_seen: now,
+        });
+        if now.saturating_duration_since(sequence.last_seen) >= SAND_EMPTY_END_SEQUENCE_WINDOW {
+            sequence.count = 0;
+        }
+        sequence.count = sequence.count.saturating_add(1);
+        sequence.last_seen = now;
+        sequence.count
+    };
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("model".into(), serde_json::json!(context.model_id));
+    fields.insert("clientType".into(), serde_json::json!(context.client_type));
+    fields.insert("emptyEnds".into(), serde_json::json!(count));
+    fields.insert(
+        "sandUsagePercent".into(),
+        serde_json::json!(evidence.usage_percent),
+    );
+    fields.insert(
+        "hasAvailableUsage".into(),
+        serde_json::json!(evidence.has_available_usage),
+    );
+    crate::logging::create_logger("cursor").warn("sand_empty_end_observed", Some(fields));
+
+    if count < 2 {
+        return None;
+    }
+
+    // The process-local policy breaker deliberately caps long dashboard reset
+    // windows. Include a bounded hint that it can turn into Retry-After while
+    // preserving the actual reset timestamp in the diagnostic.
+    let retry_after = evidence.retry_after_secs().unwrap_or(600).clamp(5, 600);
+    let reset = evidence
+        .next_reset
+        .as_deref()
+        .map(|value| format!("; dashboard reset {value}"))
+        .unwrap_or_default();
+    Some(format!(
+        "Connect error 429: ERROR_SAND_USER_RATE_LIMIT_EXCEEDED: Sand usage meter is {:.2}% and Cursor returned two consecutive empty END frames for {}; retry after {retry_after} seconds{reset}. [resource_exhausted]",
+        evidence.usage_percent, context.model_id
+    ))
+}
+
+fn clear_sand_empty_end_sequence_on_progress(
+    context: SandEmptyEndContext<'_>,
+    saw_text_before: bool,
+    saw_text_after: bool,
+    pending_was_empty: bool,
+    pending_is_empty: bool,
+) {
+    if (!saw_text_before && saw_text_after) || (pending_was_empty && !pending_is_empty) {
+        clear_sand_empty_end_sequence(context);
+    }
 }
 
 fn release_generation_permit_between_segments(
@@ -6682,6 +6974,7 @@ async fn drive_live_run(
     let mut useful = false;
     let mut logical_tools_waiting = LogicalToolTracker::default();
     let mut last_progress = Instant::now();
+    let initial_opened_at = last_progress;
     let mut last_liveness = last_progress;
     let mut resume_grace_until: Option<Instant> = None;
     let mut xml_parser = CursorToolUseXmlParser::new(allowed_tool_names.clone());
@@ -6723,7 +7016,7 @@ async fn drive_live_run(
     // still bounds a stream with no model progress. setup_idle is only for a
     // stream with no frames.
     let stream_idle = Duration::from_secs(env_u64("CCP_CURSOR_IDLE_SECS", 120));
-    let heartbeat_progress_idle = live_heartbeat_thinking_budget(stream_idle);
+    let heartbeat_progress_idle = live_heartbeat_thinking_budget(&reconnect.model_id, stream_idle);
     // Live path always waits for Cursor `turn_ended` (or hard timeout). The old
     // 8s complete_idle for tool-less runs truncated Fable quiet thinking.
     let wait_for_turn_ended = true;
@@ -6773,11 +7066,21 @@ async fn drive_live_run(
                 let mut turn = LiveTurnCtx {
                     session_id: &session_id,
                     user_prompt: &user_prompt,
+                    compaction_mode: reconnect.compaction_mode,
                     post_tool_checkpoint: &mut post_tool_checkpoint,
                     request_context: &request_context,
                     decode_failures: &mut decode_failures,
                     coalescer: &mut coalescer,
+                    sand_empty_end: Some(SandEmptyEndContext {
+                        token: &reconnect.token,
+                        model_id: &reconnect.model_id,
+                        client_type: &reconnect.identity.client_type,
+                        fresh_run: segment_count == 1,
+                        opened_at: initial_opened_at,
+                    }),
                 };
+                let saw_text_before = saw_text;
+                let pending_was_empty = pending.is_empty();
                 let frame_kept_running = process_live_frame(
                     frame,
                     &outbound,
@@ -6799,6 +7102,23 @@ async fn drive_live_run(
                     Some(&mut turn),
                 )
                 .await;
+                // Thinking/metadata is speculative and can precede Sand's
+                // payload-less quota END, so it must not clear the consecutive
+                // empty-END evidence. Real text or a queued tool proves that
+                // the model produced client-actionable progress.
+                clear_sand_empty_end_sequence_on_progress(
+                    SandEmptyEndContext {
+                        token: &reconnect.token,
+                        model_id: &reconnect.model_id,
+                        client_type: &reconnect.identity.client_type,
+                        fresh_run: segment_count == 1,
+                        opened_at: initial_opened_at,
+                    },
+                    saw_text_before,
+                    saw_text,
+                    pending_was_empty,
+                    pending.is_empty(),
+                );
                 if !frame_kept_running {
                     let missing_terminal = terminal_error
                         .lock()
@@ -8293,6 +8613,7 @@ async fn process_live_frame(
             turn_ctx.as_ref().map(|ctx| ctx.session_id),
             latest_checkpoint,
             kv_blobs,
+            turn_ctx.as_ref().and_then(|ctx| ctx.sand_empty_end),
             "flag_end",
         )
         .await
@@ -8600,6 +8921,7 @@ async fn process_interaction_update(
     task_nest_depth: u8,
 ) -> bool {
     let defer_client_only_exposure = turn_ctx.is_some();
+    let compaction_mode = turn_ctx.as_ref().is_some_and(|ctx| ctx.compaction_mode);
     if let Some(partial) = update.partial_tool_call {
         logical_tools_waiting.remember_partial_args(
             &partial.call_id,
@@ -8809,17 +9131,20 @@ async fn process_interaction_update(
     {
         *useful = true;
         *last_progress = Instant::now();
-        if !emit_live_delta(
-            sink,
-            deferred,
-            replay,
+        let event = if compaction_mode {
+            // Compaction summaries are delivered on Cursor's reasoning channel
+            // but are client-visible output for this operation. Mark the turn
+            // as text-bearing so turn_ended does not enter empty-turn recovery.
+            *saw_text = true;
+            CursorStreamEvent::TextDelta {
+                text: thinking.text,
+            }
+        } else {
             CursorStreamEvent::ThinkingDelta {
                 text: thinking.text,
-            },
-            turn_ctx.as_deref_mut(),
-        )
-        .await
-        {
+            }
+        };
+        if !emit_live_delta(sink, deferred, replay, event, turn_ctx.as_deref_mut()).await {
             return false;
         }
     }
@@ -8832,49 +9157,74 @@ async fn process_interaction_update(
     {
         *useful = true;
         *last_progress = Instant::now();
-        let recovered = xml_parser.push(&text.text);
-        for evt in recovered {
-            match evt {
-                RecoveredCursorEvent::Text(t) if !t.is_empty() => {
-                    *saw_text = true;
-                    if !emit_live_delta(
-                        sink,
-                        deferred,
-                        replay,
-                        CursorStreamEvent::TextDelta { text: t },
-                        turn_ctx.as_deref_mut(),
-                    )
-                    .await
-                    {
-                        return false;
-                    }
-                }
-                RecoveredCursorEvent::Text(_) => {}
-                RecoveredCursorEvent::ToolUse(tool_use) => {
-                    // Claude-local tools (Workflow/Skill/…) appear as XML in
-                    // Fable text when advertised via `<tools>`. Native
-                    // Read/Bash still come through ExecServerMessage.
-                    if let Some(emit_name) = xml_client_only_anthropic_name(
-                        &tool_use.name,
-                        &tool_use.input,
-                        allowed_tool_names,
-                    ) {
-                        let mut exec = client_only_pending_exec(&tool_use);
-                        exec.claude_name = emit_name.clone();
-                        exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
-                        // Direct frame tests expose immediately. The live
-                        // driver defers until turn_ended/END/EOF so a trailing
-                        // END error cannot be bypassed by closing the sink.
-                        pending.queue(exec, Duration::ZERO);
-                        if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut())
-                            .await
+        if compaction_mode {
+            // Compaction summaries are plain model output. Do not run the
+            // normal XML tool-use parser: a summary can contain angle-bracket
+            // examples and must remain visible as output text.
+            *saw_text = true;
+            if !emit_live_delta(
+                sink,
+                deferred,
+                replay,
+                CursorStreamEvent::TextDelta { text: text.text },
+                turn_ctx.as_deref_mut(),
+            )
+            .await
+            {
+                return false;
+            }
+        } else {
+            let recovered = xml_parser.push(&text.text);
+            for evt in recovered {
+                match evt {
+                    RecoveredCursorEvent::Text(t) if !t.is_empty() => {
+                        *saw_text = true;
+                        if !emit_live_delta(
+                            sink,
+                            deferred,
+                            replay,
+                            CursorStreamEvent::TextDelta { text: t },
+                            turn_ctx.as_deref_mut(),
+                        )
+                        .await
                         {
                             return false;
                         }
-                        if !defer_client_only_exposure
-                            && !expose_collected_tools(pending, pending_shared, sink, replay).await
-                        {
-                            return false;
+                    }
+                    RecoveredCursorEvent::Text(_) => {}
+                    RecoveredCursorEvent::ToolUse(tool_use) => {
+                        // Claude-local tools (Workflow/Skill/…) appear as XML in
+                        // Fable text when advertised via `<tools>`. Native
+                        // Read/Bash still come through ExecServerMessage.
+                        if let Some(emit_name) = xml_client_only_anthropic_name(
+                            &tool_use.name,
+                            &tool_use.input,
+                            allowed_tool_names,
+                        ) {
+                            let mut exec = client_only_pending_exec(&tool_use);
+                            exec.claude_name = emit_name.clone();
+                            exec.claude_input =
+                                adapt_client_tool_input(&emit_name, exec.claude_input);
+                            // Direct frame tests expose immediately. The live
+                            // driver defers until turn_ended/END/EOF so a trailing
+                            // END error cannot be bypassed by closing the sink.
+                            pending.queue(exec, Duration::ZERO);
+                            if !flush_turn_coalescer(
+                                sink,
+                                deferred,
+                                replay,
+                                turn_ctx.as_deref_mut(),
+                            )
+                            .await
+                            {
+                                return false;
+                            }
+                            if !defer_client_only_exposure
+                                && !expose_collected_tools(pending, pending_shared, sink, replay)
+                                    .await
+                            {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -8974,6 +9324,7 @@ async fn process_interaction_update(
             turn_ctx.as_ref().map(|ctx| ctx.session_id),
             latest_checkpoint,
             kv_blobs,
+            turn_ctx.as_ref().and_then(|ctx| ctx.sand_empty_end),
             "turn_ended",
         )
         .await
@@ -9036,6 +9387,7 @@ async fn recover_empty_turn_if_needed(
     session_id: Option<&str>,
     latest_checkpoint: &mut Option<Vec<u8>>,
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    sand_empty_end: Option<SandEmptyEndContext<'_>>,
     reason: &str,
 ) -> bool {
     if *saw_text || sink.is_none() {
@@ -9049,9 +9401,34 @@ async fn recover_empty_turn_if_needed(
             crate::logging::create_logger("cursor").warn("empty_turn_retry", Some(fields));
             format!("{EMPTY_TURN_RETRY_NOTE} ({EMPTY_TURN_CHECKPOINT_RETRY_NOTE})")
         } else {
-            "Cursor produced an empty turn after tool results without a newer checkpoint; \
-             acceptance is ambiguous"
-                .to_string()
+            // Cursor does not emit a checkpoint on every accepted tool-result
+            // continuation.  Treating that normal response shape as an
+            // ambiguous operation permanently wedges Claude Code: the same
+            // fingerprint is held by the 409 tombstone and every retry is
+            // rejected.  The original Anthropic request (kept by the caller
+            // for tool-result-only turns) contains the completed tool_result,
+            // so a fresh Cursor conversation can replay the history without
+            // dispatching the tool a second time.  Reset the opaque Cursor
+            // state before returning a retryable marker; the late-retry pump
+            // then starts that fresh-history attempt inside the same client
+            // request, while the next client retry also sees a free slot.
+            if let Some(session_id) = session_id {
+                super::conversation::reset(session_id);
+                *latest_checkpoint = None;
+                kv_blobs.clear();
+            }
+            let mut fields = serde_json::Map::new();
+            fields.insert("reason".into(), serde_json::json!(reason));
+            fields.insert(
+                "recovery".into(),
+                serde_json::json!("fresh_history_after_unconfirmed_tool_continuation"),
+            );
+            fields.insert(
+                "checkpoint_confirmed".into(),
+                serde_json::json!(post_tool_checkpoint_confirmed),
+            );
+            crate::logging::create_logger("cursor").warn("empty_turn_retry", Some(fields));
+            format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})")
         };
         report_terminal_error(sink, terminal_error, message).await;
         return false;
@@ -9079,6 +9456,10 @@ async fn recover_empty_turn_if_needed(
         crate::logging::create_logger("cursor").info("empty_turn_workflow", Some(fields));
         return expose_collected_tools(pending, pending_shared, sink, replay).await;
     }
+    // `useful` includes speculative thinking/partial-call metadata. Those
+    // frames are transport progress, not client-visible completion, so use
+    // the text-bearing bit for Sand's empty-END quota discriminator.
+    let quota_error = classify_sand_quota_empty_end(sand_empty_end, *saw_text, reason);
     // Never turn a transport/upstream anomaly into assistant-authored text:
     // clients treat any TextDelta + End as success and will not retry.
     {
@@ -9107,9 +9488,10 @@ async fn recover_empty_turn_if_needed(
                 serde_json::json!("empty_turn"),
             )])),
         );
-        format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})")
+        quota_error
+            .unwrap_or_else(|| format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})"))
     } else {
-        EMPTY_TURN_RETRY_NOTE.to_string()
+        quota_error.unwrap_or_else(|| EMPTY_TURN_RETRY_NOTE.to_string())
     };
     report_terminal_error(sink, terminal_error, message).await;
     false
@@ -9405,7 +9787,39 @@ fn xml_client_only_anthropic_name(
         if !allowed.contains(mapped_name) {
             return None;
         }
-        return valid_xml_native_tool_input(mapped_name, input).then(|| mapped_name.to_string());
+        // Normalize known aliases below, but reject malformed selector types
+        // before normalization. Claude Code's current contract uses a
+        // non-empty string `cell_id`; the legacy `cell_number` selector is a
+        // non-negative integer. In particular, a numeric `cell_id` must not
+        // be silently converted into a different field and exposed as a
+        // seemingly valid NotebookEdit call.
+        if mapped_name == "NotebookEdit" {
+            if input
+                .get("cell_id")
+                .is_some_and(|value| value.as_str().is_none_or(|value| value.trim().is_empty()))
+            {
+                return None;
+            }
+            if input.get("cell_number").is_some_and(|value| {
+                !(value.as_u64().is_some()
+                    || value.as_i64().is_some_and(|value| value >= 0)
+                    || value.as_f64().is_some_and(|value| {
+                        value.is_finite() && value >= 0.0 && value.fract() == 0.0
+                    }))
+            }) {
+                return None;
+            }
+        }
+        // XML-oriented models frequently use Cursor-ish aliases (`path`,
+        // `oldText`, `newText`, `source`, numeric cell selectors). Validate
+        // the exact payload that will be handed to Claude Code rather than
+        // rejecting those aliases before the shared adapter gets a chance to
+        // canonicalize them.
+        let normalized =
+            adapt_client_tool_input(mapped_name, serde_json::Value::Object(input.clone()));
+        let normalized = normalized.as_object()?;
+        return valid_xml_native_tool_input(mapped_name, normalized)
+            .then(|| mapped_name.to_string());
     }
     client_only_anthropic_name(mapped_name, "", allowed)
 }
@@ -9515,6 +9929,46 @@ fn client_only_anthropic_name(
     if stripped.is_empty() {
         return None;
     }
+    // Every client-owned tool registered by this proxy uses the synthetic
+    // `claude-local` provider.  A different non-empty provider id is therefore
+    // a foreign namespace and must never satisfy a bare Claude built-in or one
+    // of its aliases merely because the leaf matches.  Preserve only an
+    // exact provider-aware name that the downstream advertised; this keeps
+    // ordinary foreign MCP tools routable without letting `other + Workflow`
+    // become the local Workflow implementation. Cursor normally sends
+    // provider and tool as separate protobuf fields, so reconstruct the common
+    // Anthropic `mcp__provider__tool` spelling when the wire name is bare.
+    if !provider_identifier.is_empty() && provider_identifier != CLAUDE_LOCAL_MCP_PROVIDER {
+        let set = allowed.filter(|set| !set.is_empty())?;
+        if let Some(embedded_provider) = qualified_mcp_provider(mapped_name) {
+            if embedded_provider != provider_identifier {
+                return None;
+            }
+            return set
+                .iter()
+                .find(|candidate| {
+                    qualified_mcp_provider(candidate) == Some(provider_identifier)
+                        && (candidate.as_str() == mapped_name
+                            || cursor_mcp_wire_name(candidate) == mapped_name)
+                })
+                .cloned();
+        }
+
+        // A bare wire tool name is meaningful only together with its protobuf
+        // provider field. Never compare it directly with the allow-list: that
+        // would let `provider=other, tool=Workflow` invoke the local Workflow.
+        let reconstructed = format!("mcp__{provider_identifier}__{mapped_name}");
+        let reconstructed_wire = cursor_mcp_wire_name(&reconstructed);
+        return set
+            .iter()
+            .find(|candidate| {
+                qualified_mcp_provider(candidate) == Some(provider_identifier)
+                    && (candidate.as_str() == reconstructed
+                        || cursor_mcp_wire_name(candidate) == reconstructed
+                        || cursor_mcp_wire_name(candidate) == reconstructed_wire)
+            })
+            .cloned();
+    }
     if normalize_grok_build_lifecycle_name(mapped_name).is_some()
         || normalize_grok_build_lifecycle_name(stripped).is_some()
     {
@@ -9561,6 +10015,20 @@ fn client_only_anthropic_name(
         }
         return None;
     }
+    // A provider-qualified name from a foreign MCP server must not be
+    // reduced to a Claude-local leaf (for example `other/Workflow` ->
+    // `Workflow`). Keep exact/wire matches available for ordinary foreign
+    // tools, but stop before the Claude alias and prefix-stripping paths.
+    if is_foreign_qualified_mcp_name(mapped_name) {
+        let set = allowed.filter(|set| !set.is_empty())?;
+        if set.contains(mapped_name) {
+            return Some(mapped_name.to_string());
+        }
+        return set
+            .iter()
+            .find(|candidate| cursor_mcp_wire_name(candidate) == mapped_name)
+            .cloned();
+    }
     let local = is_claude_local_tool_name(stripped)
         || (stripped != mapped_name && is_claude_local_tool_name(mapped_name));
     if !local {
@@ -9583,7 +10051,66 @@ fn client_only_anthropic_name(
     set.get(stripped)
         .or_else(|| set.get(mapped_name))
         .cloned()
+        .or_else(|| advertised_claude_alias_name(stripped, set))
         .or_else(|| advertised_workflow_or_skill_name(set, stripped, provider_identifier))
+}
+
+/// Resolve one of Claude Code's source-level aliases against the exact names
+/// advertised by the client. Cursor's MCP catalog may emit either spelling
+/// (and may qualify it with `claude-local/` or `mcp_claude-local_`); preserve
+/// the client's spelling in the resulting Anthropic `tool_use` block.
+fn advertised_claude_alias_name(mapped_name: &str, allowed: &BTreeSet<String>) -> Option<String> {
+    // Prefer a case-insensitive exact leaf first when both canonical and alias
+    // spellings are present. This keeps `brief` -> `Brief` deterministic while
+    // still allowing `RunWorkflow` -> `Workflow`.
+    if let Some(hit) = allowed.iter().find(|candidate| {
+        !is_foreign_qualified_mcp_name(candidate) && {
+            let leaf = strip_mcp_provider_prefix(candidate);
+            leaf.eq_ignore_ascii_case(mapped_name)
+                && claude_tool_names_equivalent(mapped_name, leaf)
+        }
+    }) {
+        return Some(hit.clone());
+    }
+    allowed
+        .iter()
+        .find(|candidate| {
+            !is_foreign_qualified_mcp_name(candidate)
+                && claude_tool_names_equivalent(mapped_name, strip_mcp_provider_prefix(candidate))
+        })
+        .cloned()
+}
+
+fn is_foreign_qualified_mcp_name(name: &str) -> bool {
+    if is_claude_local_mcp_spelling(name) {
+        return false;
+    }
+    // `strip_mcp_provider_prefix` intentionally only unwraps the synthetic
+    // claude-local namespace. Recognize the generic qualified forms here so a
+    // foreign `mcp__provider__tool` entry cannot fall through to Claude alias
+    // matching. Bare tool names containing `__` remain unqualified unless the
+    // canonical MCP marker is present.
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        return rest
+            .split_once("__")
+            .is_some_and(|(provider, tool)| !provider.is_empty() && !tool.is_empty());
+    }
+    name.split_once('/')
+        .or_else(|| name.split_once(':'))
+        .is_some_and(|(provider, tool)| !provider.is_empty() && !tool.is_empty())
+}
+
+fn qualified_mcp_provider(name: &str) -> Option<&str> {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        return rest
+            .split_once("__")
+            .filter(|(provider, tool)| !provider.is_empty() && !tool.is_empty())
+            .map(|(provider, _)| provider);
+    }
+    name.split_once('/')
+        .or_else(|| name.split_once(':'))
+        .filter(|(provider, tool)| !provider.is_empty() && !tool.is_empty())
+        .map(|(provider, _)| provider)
 }
 
 fn advertised_workflow_or_skill_name(
@@ -9598,7 +10125,10 @@ fn advertised_workflow_or_skill_name(
         return None;
     }
     set.iter()
-        .find(|advertised| strip_mcp_provider_prefix(advertised).eq_ignore_ascii_case(name))
+        .find(|advertised| {
+            !is_foreign_qualified_mcp_name(advertised)
+                && strip_mcp_provider_prefix(advertised).eq_ignore_ascii_case(name)
+        })
         .cloned()
 }
 
@@ -10161,7 +10691,9 @@ fn resolve_advertised_name(
     {
         return Some(name);
     }
-    // MCP tools: match exact name, or any advertised tool ending with __{tool}.
+    // MCP tools are provider-qualified identities.  Match the exact/wire name;
+    // a leaf-only suffix fallback would let `mcp__one__search` resolve to
+    // `mcp__two__search` when providers expose the same tool name.
     if mapped_name.starts_with("mcp__") || mapped_name.contains("__") {
         if let Some(hit) = allowed
             .iter()
@@ -10170,13 +10702,6 @@ fn resolve_advertised_name(
             return Some(hit.clone());
         }
         if let Some(hit) = allowed.iter().find(|n| *n == mapped_name) {
-            return Some(hit.clone());
-        }
-        let suffix = mapped_name.rsplit("__").next().unwrap_or(mapped_name);
-        if let Some(hit) = allowed
-            .iter()
-            .find(|n| *n == mapped_name || n.ends_with(&format!("__{suffix}")))
-        {
             return Some(hit.clone());
         }
     }
@@ -10546,6 +11071,7 @@ pub fn live_sse_response(
     model: String,
     estimated_input_tokens: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    compaction_mode: bool,
 ) -> Response {
     struct State {
         events: mpsc::Receiver<LiveEventResult>,
@@ -10563,7 +11089,11 @@ pub fn live_sse_response(
         next_ping_at: tokio::time::Instant,
     }
 
-    let mut encoder = CursorSseEncoder::new(message_id, model);
+    let mut encoder = if compaction_mode {
+        CursorSseEncoder::new_compaction(message_id, model)
+    } else {
+        CursorSseEncoder::new(message_id, model)
+    };
     encoder.seed_estimated_input_tokens(estimated_input_tokens);
     if let Some((ref handle, ref req_id)) = monitor {
         let (input_tokens, output_tokens) = encoder.current_usage();
@@ -10801,7 +11331,16 @@ mod tests {
         RequestContextEnv, TextDelta, TurnEnded,
     };
     use super::*;
+    use base64::Engine as _;
     use prost::Message;
+
+    fn sand_test_jwt(subject: &str, expires: u64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"sub": subject, "exp": expires}).to_string());
+        format!("{header}.{payload}.sig")
+    }
 
     fn pending_exec(id: u32, tool_use_id: &str) -> PendingCursorExec {
         PendingCursorExec {
@@ -10837,6 +11376,7 @@ mod tests {
             h2_epoch: Some(0),
             http1_rejected: false,
             mcp_tools: None,
+            compaction_mode: false,
             opening_checkpoint: None,
             recovery: LiveRecoveryEpisode::default(),
             breakers: TransportBreakers::default(),
@@ -11664,7 +12204,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn probation_expiry_after_tool_results_without_new_checkpoint_stays_ambiguous() {
+    async fn probation_expiry_after_tool_results_without_new_checkpoint_replays_fresh_history() {
         let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
         super::super::conversation::reset_for_test();
         let session_id = "sess-probation-after-tool-results";
@@ -11725,21 +12265,17 @@ mod tests {
             .expect("probation expiry must store a terminal outcome")
             .message
             .clone();
-        assert!(
-            terminal_error_is_ambiguous_accept(&message),
-            "a pre-tool checkpoint cannot prove Cursor accepted the tool results: {message}"
-        );
+        assert!(live_error_is_empty_turn_retry(&message), "{message}");
+        assert!(message.contains(CONVERSATION_RESET_RETRY_NOTE), "{message}");
+        assert!(!terminal_error_is_ambiguous_accept(&message), "{message}");
         assert_eq!(
             crate::retry::classify_proxy_error_status(502, &message),
-            409
+            502
         );
-        let retained = super::super::conversation::continuation_for(Some(session_id));
-        assert_eq!(retained.conversation_id, original);
-        assert!(retained.has_checkpoint);
-        assert_eq!(
-            retained.pre_fetched_blobs,
-            blobs.into_iter().collect::<Vec<_>>()
-        );
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
     }
 
     #[test]
@@ -13202,6 +13738,53 @@ mod tests {
     }
 
     #[test]
+    fn gemini_flash_hollow_runs_rotate_before_long_thinking_models() {
+        let idle = Duration::from_secs(120);
+        assert_eq!(
+            live_heartbeat_thinking_budget_from("gemini-3.6-flash-high", idle, None, None,),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            live_heartbeat_thinking_budget_from("claude-fable-5-thinking-max", idle, None, None,),
+            Duration::from_secs(1200)
+        );
+        assert_eq!(
+            live_heartbeat_thinking_budget_from("cursor-grok-4.6-xhigh-fast", idle, None, None,),
+            Duration::from_secs(1200)
+        );
+    }
+
+    #[test]
+    fn gemini_flash_progress_budget_has_specific_and_global_overrides() {
+        let idle = Duration::from_secs(120);
+        assert_eq!(
+            live_heartbeat_thinking_budget_from(
+                "gemini-3.6-flash-high",
+                idle,
+                Some("300"),
+                Some("900"),
+            ),
+            Duration::from_secs(300),
+            "the model-specific override wins"
+        );
+        assert_eq!(
+            live_heartbeat_thinking_budget_from(
+                "gemini-3.6-flash-high",
+                idle,
+                Some("invalid"),
+                Some("900"),
+            ),
+            Duration::from_secs(900),
+            "an invalid specific value falls back to the global override"
+        );
+        assert_eq!(
+            live_heartbeat_thinking_budget_from("gemini-3.6-flash-high", idle, Some("30"), None,),
+            idle,
+            "the budget never drops below the transport idle window"
+        );
+    }
+
+    #[test]
     fn live_heartbeats_block_idle_reconnect() {
         let setup = Duration::from_secs(45);
         let idle = Duration::from_secs(120);
@@ -13564,10 +14147,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id,
             user_prompt: "continue",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
         let frame = ConnectFrame {
             flags: FLAG_END,
@@ -13684,6 +14269,48 @@ mod tests {
                 LiveRunProbe::Free
             ),
             "the next grok turn must not replay a consumed 429 as 502"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn retryable_terminal_error_clears_durable_marker_before_same_operation_retry() {
+        let _ledger = super::super::operation_ledger::OPERATION_LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _registry = lock_live_registry_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = super::super::operation_ledger::test_operation_dir_guard(dir.path());
+        let session = format!("empty-turn-ledger-release-{}", uuid::Uuid::new_v4());
+        let key = live_run_key(&session, None);
+        let fingerprint = 0x7a11;
+        LiveRunRegistry::clear();
+        let handle = durable_running_handle(&session, "empty-turn-ledger-run", fingerprint);
+        store_terminal_error(
+            &handle.terminal_error,
+            "Cursor upstream finished this turn without text or tool calls; retry this turn (stale Cursor conversation reset; retry this message to continue)",
+        );
+        handle.completed.store(true, Ordering::Release);
+
+        assert!(matches!(
+            LiveRunRegistry::probe_run(&session, None),
+            LiveRunProbe::Free
+        ));
+        // The in-memory slot and durable operation marker must transition
+        // together.  A same-fingerprint fresh-history retry should be able to
+        // claim immediately rather than seeing the old Dispatched marker as
+        // an ambiguous 409/503 tombstone.
+        assert_eq!(
+            super::super::operation_ledger::admit(&key, fingerprint),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        assert_eq!(
+            super::super::operation_ledger::claim(&key, fingerprint, "retry-owner"),
+            super::super::operation_ledger::OperationAdmission::Allowed
+        );
+        assert!(
+            super::super::operation_ledger::clear_if_owner(&key, fingerprint, "retry-owner")
+                .unwrap()
         );
         LiveRunRegistry::clear();
     }
@@ -16774,6 +17401,12 @@ mod tests {
             resolve_advertised_name(&wire, Some(&allowed)).as_deref(),
             Some(original.as_str())
         );
+
+        let other_provider = BTreeSet::from(["mcp__provider_b__search".to_string()]);
+        assert!(
+            resolve_advertised_name("mcp__provider_a__search", Some(&other_provider)).is_none(),
+            "native name restoration must not cross MCP provider namespaces"
+        );
     }
 
     #[test]
@@ -17378,6 +18011,93 @@ mod tests {
     }
 
     #[test]
+    fn client_only_anthropic_name_resolves_claude_source_aliases() {
+        for (mapped, advertised) in [
+            ("Brief", "SendUserMessage"),
+            ("SendUserMessage", "Brief"),
+            ("ListPeers", "ListAgents"),
+            ("ListAgents", "ListPeers"),
+            ("ListMcpResources", "ListMcpResourcesTool"),
+            ("ReadMcpResource", "ReadMcpResourceTool"),
+            ("ReadMcpResourceDir", "ReadMcpResourceDirTool"),
+            ("RunWorkflow", "Workflow"),
+            ("Workflow", "RunWorkflow"),
+            ("BashOutput", "TaskOutput"),
+            ("AgentOutputTool", "TaskOutput"),
+            ("KillBash", "TaskStop"),
+        ] {
+            let allowed = BTreeSet::from([advertised.to_string()]);
+            assert_eq!(
+                client_only_anthropic_name(mapped, "claude-local", Some(&allowed)).as_deref(),
+                Some(advertised),
+                "{mapped} must resolve to the client's advertised alias {advertised}"
+            );
+        }
+        let allowed = BTreeSet::from(["SendUserMessage".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("mcp_claude-local_brief", "claude-local", Some(&allowed))
+                .as_deref(),
+            Some("SendUserMessage"),
+            "qualified lowercase alias should preserve the advertised spelling"
+        );
+    }
+
+    #[test]
+    fn client_only_anthropic_name_does_not_cross_foreign_provider_aliases() {
+        let bare = BTreeSet::from(["Workflow".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("other/Workflow", "other", Some(&bare)),
+            None,
+            "foreign qualified Workflow must not be reduced to Claude-local Workflow"
+        );
+
+        let exact = BTreeSet::from(["other/Workflow".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("other/Workflow", "other", Some(&exact)).as_deref(),
+            Some("other/Workflow"),
+            "an explicitly advertised foreign name remains callable by exact match"
+        );
+
+        let foreign = BTreeSet::from(["other/Workflow".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("Workflow", "", Some(&foreign)),
+            None,
+            "a foreign qualified catalog entry must not satisfy a bare Claude alias"
+        );
+
+        let local = BTreeSet::from(["Workflow".to_string(), "RunWorkflow".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("Workflow", "other", Some(&local)),
+            None,
+            "a foreign provider id on a bare Workflow must not enter claude-local"
+        );
+        assert_eq!(
+            client_only_anthropic_name("mcp_claude-local_Workflow", "other", Some(&local)),
+            None,
+            "a foreign provider id must not bless a claude-local-qualified alias"
+        );
+        let foreign_exact = BTreeSet::from(["other/Workflow".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("other/Workflow", "other", Some(&foreign_exact)).as_deref(),
+            Some("other/Workflow"),
+            "explicitly advertised foreign names remain exact-only"
+        );
+
+        let separated = BTreeSet::from(["mcp__other__search".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("search", "other", Some(&separated)).as_deref(),
+            Some("mcp__other__search"),
+            "separate provider/tool wire fields must reconstruct the exact advertised MCP name"
+        );
+        let same_leaf_different_provider = BTreeSet::from(["mcp__provider_b__search".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("search", "provider_a", Some(&same_leaf_different_provider)),
+            None,
+            "provider-aware reconstruction must never match a same-leaf MCP tool from another provider"
+        );
+    }
+
+    #[test]
     fn xml_native_edit_requires_advertised_complete_schema() {
         let allowed = BTreeSet::from(["Edit".to_string()]);
         let valid = serde_json::json!({
@@ -17404,6 +18124,30 @@ mod tests {
             xml_client_only_anthropic_name("Edit", valid.as_object().unwrap(), None),
             None,
             "XML native tools require an exact downstream allow-list entry"
+        );
+
+        let aliased = serde_json::json!({
+            "path": "/tmp/example.rs",
+            "oldText": "before",
+            "newText": "after",
+            "replaceAll": false,
+            "transport_metadata": "drop me"
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name("Edit", aliased.as_object().unwrap(), Some(&allowed))
+                .as_deref(),
+            Some("Edit"),
+            "XML Edit aliases must be normalized before schema validation"
+        );
+        let adapted = adapt_client_tool_input("Edit", aliased);
+        assert_eq!(
+            adapted,
+            serde_json::json!({
+                "file_path": "/tmp/example.rs",
+                "old_string": "before",
+                "new_string": "after",
+                "replace_all": false
+            })
         );
     }
 
@@ -17433,6 +18177,23 @@ mod tests {
                 Some(&allowed)
             ),
             None
+        );
+
+        let aliased = serde_json::json!({
+            "path": "/tmp/example.rs",
+            "edits": [
+                {"oldText": "one", "newText": "two"},
+                {"old_text": "three", "new_text": "four", "replaceAll": true}
+            ]
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name(
+                "MultiEdit",
+                aliased.as_object().unwrap(),
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("MultiEdit")
         );
     }
 
@@ -17481,6 +18242,22 @@ mod tests {
                 Some(&allowed)
             ),
             None
+        );
+
+        let aliased = serde_json::json!({
+            "path": "/tmp/example.ipynb",
+            "cell_number": 3,
+            "source": "print(3)",
+            "edit_mode": "replace"
+        });
+        assert_eq!(
+            xml_client_only_anthropic_name(
+                "NotebookEdit",
+                aliased.as_object().unwrap(),
+                Some(&allowed)
+            )
+            .as_deref(),
+            Some("NotebookEdit")
         );
     }
 
@@ -17858,10 +18635,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-mcp-task",
             user_prompt: "spawn a subagent",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
         let (cont, event, pending) = drive_native_task_frame(
             mcp_task_started_frame("mcp-task-2"),
@@ -18712,17 +19491,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_plan_started_exposes_enter_plan_mode_for_claude_code() {
-        let allowed = BTreeSet::from(["EnterPlanMode".to_string()]);
+    async fn create_plan_started_exposes_exit_plan_mode_for_claude_code() {
+        let allowed = BTreeSet::from(["EnterPlanMode".to_string(), "ExitPlanMode".to_string()]);
         let (cont, event, _) =
             drive_native_task_frame(create_plan_started_frame(), Some(&allowed), None).await;
-        assert!(!cont, "CreatePlan must map to Claude Code EnterPlanMode");
+        assert!(!cont, "CreatePlan must map to Claude Code ExitPlanMode");
         match event.expect("NativeToolBatch") {
             Ok(LiveRunEvent::NativeToolBatch(tools)) => {
-                assert_eq!(tools[0].name, "EnterPlanMode");
-                assert_eq!(tools[0].input, serde_json::json!({}));
+                assert_eq!(tools[0].name, "ExitPlanMode");
+                assert_eq!(tools[0].input, serde_json::json!({"plan": "step 1"}));
             }
-            other => panic!("expected EnterPlanMode, got {other:?}"),
+            other => panic!("expected ExitPlanMode, got {other:?}"),
         }
     }
 
@@ -18746,17 +19525,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_plan_started_exposes_enter_plan_mode() {
-        let allowed = BTreeSet::from(["enter_plan_mode".to_string()]);
+    async fn create_plan_started_exposes_exit_plan_mode() {
+        let allowed = BTreeSet::from(["enter_plan_mode".to_string(), "exit_plan_mode".to_string()]);
         let (cont, event, _) =
             drive_native_task_frame(create_plan_started_frame(), Some(&allowed), None).await;
         assert!(!cont, "CreatePlan must not stay on Cursor plan UI");
         match event.expect("NativeToolBatch") {
             Ok(LiveRunEvent::NativeToolBatch(tools)) => {
-                assert_eq!(tools[0].name, "enter_plan_mode");
+                assert_eq!(tools[0].name, "exit_plan_mode");
                 assert_eq!(tools[0].input, serde_json::json!({}));
             }
-            other => panic!("expected enter_plan_mode, got {other:?}"),
+            other => panic!("expected exit_plan_mode, got {other:?}"),
         }
     }
 
@@ -18770,10 +19549,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-ws",
             user_prompt: "search",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
         let (cont, event, _) = drive_native_task_frame(
             web_search_started_frame("rust async"),
@@ -18864,10 +19645,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-wrap",
             user_prompt: "fan-out",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
         let (request_tx, _request_rx) = mpsc::channel(4);
         let outbound = ClientOutbound::Bidi(request_tx);
@@ -19299,7 +20082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_plan_query_exposes_enter_plan_mode() {
+    async fn create_plan_query_exposes_exit_plan_mode() {
         use super::super::connect::encode_connect_frame;
         use super::super::proto::{
             AgentServerMessage, CreatePlanArgs, CreatePlanRequestQuery, InteractionQuery,
@@ -19329,16 +20112,16 @@ mod tests {
         let framed = encode_connect_frame(full, 0);
         let mut decoder = super::super::connect::ConnectFrameDecoder::new();
         let frame = decoder.push(&framed).unwrap().into_iter().next().unwrap();
-        let allowed = BTreeSet::from(["enter_plan_mode".to_string()]);
+        let allowed = BTreeSet::from(["enter_plan_mode".to_string(), "exit_plan_mode".to_string()]);
         let (cont, event, reply) = drive_live_frame_io(frame, Some(&allowed)).await;
         assert!(!cont, "CreatePlan query must not stay on Cursor plan UI");
         assert!(reply.is_none(), "must not auto-succeed Cursor CreatePlan");
         match event.expect("NativeToolBatch") {
             Ok(LiveRunEvent::NativeToolBatch(tools)) => {
-                assert_eq!(tools[0].name, "enter_plan_mode");
+                assert_eq!(tools[0].name, "exit_plan_mode");
                 assert_eq!(tools[0].input, serde_json::json!({}));
             }
-            other => panic!("expected enter_plan_mode, got {other:?}"),
+            other => panic!("expected exit_plan_mode, got {other:?}"),
         }
     }
 
@@ -19417,10 +20200,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-task",
             user_prompt: "spawn a child",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
         let (cont, event, _) =
             drive_native_task_frame(frame, Some(&allowed), Some(&mut turn)).await;
@@ -20154,10 +20939,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-sib",
             user_prompt: "spawn two",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
 
         let (request_tx, _request_rx) = mpsc::channel(4);
@@ -20260,10 +21047,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-xml-spawn",
             user_prompt: "spawn 64",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
 
         let (request_tx, _request_rx) = mpsc::channel(4);
@@ -20618,10 +21407,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-test",
             user_prompt: prompt,
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
 
         let cont = process_live_frame(
@@ -20706,10 +21497,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id,
             user_prompt: "用 workflow 按原 nonce 一次扇出 64 人",
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
 
         let cont = process_live_frame(
@@ -20802,6 +21595,7 @@ mod tests {
                 Some(session_id),
                 &mut latest_checkpoint,
                 &mut kv_blobs,
+                None,
                 "turn_ended",
             )
             .await
@@ -20830,7 +21624,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_continue_without_post_tool_confirmation_fails_closed() {
+    #[allow(clippy::await_holding_lock)]
+    async fn checkpoint_continue_without_post_tool_confirmation_replays_fresh_history() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-unconfirmed-checkpoint";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        super::super::conversation::merge_blobs(
+            session_id,
+            &HashMap::from([(vec![0xaa], vec![0xbb])]),
+        );
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let mut sink = Some(event_tx);
         let mut pending = PendingExecState::default();
@@ -20840,7 +21645,7 @@ mod tests {
         let mut useful = false;
         let checkpoint = vec![0x08, 0x01];
         let mut latest_checkpoint = Some(checkpoint.clone());
-        let mut kv_blobs = HashMap::new();
+        let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
         let mut segment_replay = SegmentReplayLog::default();
 
         assert!(
@@ -20855,9 +21660,10 @@ mod tests {
                 None,
                 EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT,
                 false,
-                Some("sess-unconfirmed-checkpoint"),
+                Some(session_id),
                 &mut latest_checkpoint,
                 &mut kv_blobs,
+                None,
                 "turn_ended",
             )
             .await
@@ -20866,11 +21672,19 @@ mod tests {
         let error = event_rx
             .recv()
             .await
-            .expect("fail-closed checkpoint error")
+            .expect("fresh-history retry error")
             .expect_err("an unconfirmed post-tool checkpoint must not succeed");
-        assert!(terminal_error_is_ambiguous_accept(&error), "{error}");
-        assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 409);
-        assert_eq!(latest_checkpoint, Some(checkpoint));
+        assert!(live_error_is_empty_turn_retry(&error), "{error}");
+        assert!(error.contains(CONVERSATION_RESET_RETRY_NOTE), "{error}");
+        assert!(!live_error_needs_checkpoint_continue(&error), "{error}");
+        assert!(!terminal_error_is_ambiguous_accept(&error), "{error}");
+        assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 502);
+        assert_eq!(latest_checkpoint, None);
+        assert!(kv_blobs.is_empty());
+        let recovered = super::super::conversation::continuation_for(Some(session_id));
+        assert_ne!(recovered.conversation_id, original);
+        assert!(!recovered.has_checkpoint);
+        assert!(recovered.pre_fetched_blobs.is_empty());
     }
 
     async fn run_post_tool_checkpoint_scenario(
@@ -21067,12 +21881,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_checkpoint_before_tool_result_submit_is_absorbed_into_baseline() {
+    async fn queued_checkpoint_before_tool_result_submit_uses_fresh_history_retry() {
         let message = run_post_tool_checkpoint_scenario(true, false, false).await;
-        assert!(
-            terminal_error_is_ambiguous_accept(&message),
-            "a pre-submit checkpoint must not later look like post-tool proof: {message}"
-        );
+        assert!(live_error_is_empty_turn_retry(&message), "{message}");
+        assert!(message.contains(CONVERSATION_RESET_RETRY_NOTE), "{message}");
+        assert!(!live_error_needs_checkpoint_continue(&message), "{message}");
+        assert!(!terminal_error_is_ambiguous_accept(&message), "{message}");
     }
 
     #[tokio::test]
@@ -21086,12 +21900,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_queued_while_tool_result_send_is_blocked_is_not_commit_proof() {
+    async fn checkpoint_queued_while_tool_result_send_is_blocked_replays_fresh_history() {
         let message = run_post_tool_checkpoint_scenario(false, false, true).await;
-        assert!(
-            terminal_error_is_ambiguous_accept(&message),
-            "a checkpoint that predates the send boundary must not make the batch retryable: {message}"
-        );
+        assert!(live_error_is_empty_turn_retry(&message), "{message}");
+        assert!(message.contains(CONVERSATION_RESET_RETRY_NOTE), "{message}");
+        assert!(!live_error_needs_checkpoint_continue(&message), "{message}");
+        assert!(!terminal_error_is_ambiguous_accept(&message), "{message}");
     }
 
     #[test]
@@ -21168,6 +21982,333 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sand_quota_clean_end_needs_fresh_meter_and_two_consecutive_observations() {
+        let token = format!("sand-empty-quota-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(
+            &token,
+            100.0,
+            Some(true),
+            Some("2099-09-02T20:12:42Z"),
+        );
+        let context = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.1-pro",
+            client_type: "sand",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+
+        assert!(
+            classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none(),
+            "one clean END remains eligible for the bounded fresh-conversation retry"
+        );
+        let error = classify_sand_quota_empty_end(Some(context), false, "flag_end")
+            .expect("the second quota-evidenced clean END must become a typed policy limit");
+        assert!(error.contains("ERROR_SAND_USER_RATE_LIMIT_EXCEEDED"));
+        assert!(crate::retry::is_policy_rate_limit(&error));
+        assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 429);
+        assert!(!live_error_is_same_request_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn thinking_then_flag_end_does_not_mask_sand_quota_sequence() {
+        let token = format!("sand-thinking-quota-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
+        let session_id = format!("sand-thinking-session-{}", uuid::Uuid::new_v4());
+
+        for attempt in 0..2 {
+            let mut decoder = ConnectFrameDecoder::new();
+            let thinking_frame = decoder
+                .push(super::super::test_frames::thinking_frame(
+                    "speculative reasoning",
+                ))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let end_frame = ConnectFrame {
+                flags: FLAG_END,
+                payload: Bytes::new(),
+            };
+            let context = SandEmptyEndContext {
+                token: &token,
+                model_id: "gemini-3.6-flash-high",
+                client_type: "sand",
+                fresh_run: true,
+                opened_at: Instant::now(),
+            };
+            let (request_tx, _request_rx) = mpsc::channel(2);
+            let outbound = ClientOutbound::Bidi(request_tx);
+            let (event_tx, mut event_rx) = mpsc::channel(4);
+            let mut sink = Some(event_tx);
+            let mut deferred = VecDeque::new();
+            let mut replay = SegmentReplayLog::default();
+            let mut pending = PendingExecState::default();
+            let pending_shared = Arc::new(Mutex::new(Vec::new()));
+            let terminal_error = Arc::new(Mutex::new(None));
+            let mut saw_text = false;
+            let mut useful = false;
+            let mut logical = LogicalToolTracker::default();
+            let mut last_progress = Instant::now();
+            let mut latest_checkpoint = None;
+            let mut kv_blobs = HashMap::new();
+            let mut xml_parser = CursorToolUseXmlParser::new(None);
+            let request_context = RequestContext::default();
+            let mut decode_failures = 0;
+            let mut coalescer = LiveDeltaCoalescer::default();
+            let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
+
+            let saw_text_before = saw_text;
+            let pending_was_empty = pending.is_empty();
+            {
+                let mut turn = LiveTurnCtx {
+                    session_id: &session_id,
+                    user_prompt: "ordinary prompt",
+                    compaction_mode: false,
+                    post_tool_checkpoint: &mut post_tool_checkpoint,
+                    request_context: &request_context,
+                    decode_failures: &mut decode_failures,
+                    coalescer: &mut coalescer,
+                    sand_empty_end: Some(context),
+                };
+                assert!(
+                    process_live_frame(
+                        thinking_frame,
+                        &outbound,
+                        &mut sink,
+                        &mut deferred,
+                        &mut replay,
+                        &mut pending,
+                        &pending_shared,
+                        &mut kv_blobs,
+                        &mut latest_checkpoint,
+                        &terminal_error,
+                        None,
+                        &mut saw_text,
+                        &mut useful,
+                        &mut logical,
+                        &mut last_progress,
+                        Duration::from_millis(25),
+                        &mut xml_parser,
+                        Some(&mut turn),
+                    )
+                    .await
+                );
+            }
+            assert!(useful, "thinking is transport progress");
+            assert!(!saw_text, "thinking is not client-visible answer text");
+            clear_sand_empty_end_sequence_on_progress(
+                context,
+                saw_text_before,
+                saw_text,
+                pending_was_empty,
+                pending.is_empty(),
+            );
+
+            {
+                let mut turn = LiveTurnCtx {
+                    session_id: &session_id,
+                    user_prompt: "ordinary prompt",
+                    compaction_mode: false,
+                    post_tool_checkpoint: &mut post_tool_checkpoint,
+                    request_context: &request_context,
+                    decode_failures: &mut decode_failures,
+                    coalescer: &mut coalescer,
+                    sand_empty_end: Some(context),
+                };
+                assert!(
+                    !process_live_frame(
+                        end_frame,
+                        &outbound,
+                        &mut sink,
+                        &mut deferred,
+                        &mut replay,
+                        &mut pending,
+                        &pending_shared,
+                        &mut kv_blobs,
+                        &mut latest_checkpoint,
+                        &terminal_error,
+                        None,
+                        &mut saw_text,
+                        &mut useful,
+                        &mut logical,
+                        &mut last_progress,
+                        Duration::from_millis(25),
+                        &mut xml_parser,
+                        Some(&mut turn),
+                    )
+                    .await
+                );
+            }
+
+            assert!(matches!(
+                event_rx.recv().await,
+                Some(Ok(LiveRunEvent::Cursor(
+                    CursorStreamEvent::ThinkingDelta { .. }
+                )))
+            ));
+            let error = event_rx.recv().await.unwrap().unwrap_err();
+            if attempt == 0 {
+                assert!(live_error_is_empty_turn_retry(&error), "{error}");
+            } else {
+                assert!(
+                    error.contains("ERROR_SAND_USER_RATE_LIMIT_EXCEEDED"),
+                    "{error}"
+                );
+                assert!(crate::retry::is_policy_rate_limit(&error));
+            }
+        }
+    }
+
+    #[test]
+    fn nonqualifying_sand_end_breaks_the_consecutive_quota_sequence() {
+        let token = format!("sand-nonqualifying-quota-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
+        let context = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.6-flash-high",
+            client_type: "sand",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        assert!(
+            classify_sand_quota_empty_end(Some(context), false, "turn_ended").is_none(),
+            "a different terminal shape breaks the consecutive clean-END sequence"
+        );
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_some());
+
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 99.0, Some(true), None);
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
+        assert!(
+            classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none(),
+            "an under-quota observation must retire the prior sequence"
+        );
+
+        let continuation = SandEmptyEndContext {
+            fresh_run: false,
+            ..context
+        };
+        assert!(classify_sand_quota_empty_end(Some(continuation), false, "flag_end").is_none());
+        assert!(
+            classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none(),
+            "a continuation observation must retire the prior fresh-run sequence"
+        );
+    }
+
+    #[test]
+    fn sand_empty_end_classifier_does_not_cross_route_quota_or_account_boundaries() {
+        let under_token = format!("sand-empty-under-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(
+            &under_token,
+            99.0,
+            Some(true),
+            None,
+        );
+        let under = SandEmptyEndContext {
+            token: &under_token,
+            model_id: "gemini-3.6-flash-high",
+            client_type: "sand",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+        assert!(classify_sand_quota_empty_end(Some(under), false, "flag_end").is_none());
+        assert!(classify_sand_quota_empty_end(Some(under), false, "flag_end").is_none());
+
+        let full_token = format!("sand-empty-full-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(
+            &full_token,
+            100.0,
+            Some(false),
+            None,
+        );
+        let cli = SandEmptyEndContext {
+            token: &full_token,
+            model_id: "gemini-3.6-flash-high",
+            client_type: "cli",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+        assert!(classify_sand_quota_empty_end(Some(cli), false, "flag_end").is_none());
+        assert!(classify_sand_quota_empty_end(Some(cli), false, "flag_end").is_none());
+
+        let continuation = SandEmptyEndContext {
+            client_type: "sand",
+            fresh_run: false,
+            ..cli
+        };
+        assert!(
+            classify_sand_quota_empty_end(Some(continuation), false, "flag_end").is_none(),
+            "tool-result continuations keep their checkpoint-safe empty-turn path"
+        );
+
+        let switched_token = format!("sand-empty-switched-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(
+            &switched_token,
+            100.0,
+            Some(false),
+            None,
+        );
+        let switched = SandEmptyEndContext {
+            token: &switched_token,
+            client_type: "sand",
+            fresh_run: true,
+            ..cli
+        };
+        assert!(
+            classify_sand_quota_empty_end(Some(switched), false, "flag_end").is_none(),
+            "a hot account switch must start a new evidence sequence"
+        );
+    }
+
+    #[test]
+    fn sand_empty_end_sequence_survives_same_account_jwt_refresh() {
+        let first_token = sand_test_jwt("sand-refresh-account", 4_102_444_800);
+        let refreshed_token = sand_test_jwt("sand-refresh-account", 4_102_444_900);
+        super::super::usage::store_sand_usage_evidence_for_test(
+            &first_token,
+            100.0,
+            Some(false),
+            None,
+        );
+        let first = SandEmptyEndContext {
+            token: &first_token,
+            model_id: "gemini-3.6-flash-high",
+            client_type: "sand",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+        let refreshed = SandEmptyEndContext {
+            token: &refreshed_token,
+            ..first
+        };
+
+        assert!(classify_sand_quota_empty_end(Some(first), false, "flag_end").is_none());
+        let error = classify_sand_quota_empty_end(Some(refreshed), false, "flag_end")
+            .expect("a JWT refresh for the same account must retain quota evidence");
+        assert!(error.contains("ERROR_SAND_USER_RATE_LIMIT_EXCEEDED"));
+    }
+
+    #[test]
+    fn healthy_sand_progress_breaks_the_empty_end_sequence() {
+        let token = format!("sand-empty-progress-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
+        let context = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.1-pro",
+            client_type: "sand",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        clear_sand_empty_end_sequence(context);
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_some());
+    }
+
     #[tokio::test]
     async fn empty_turn_with_workflow_advertised_requires_explicit_invocation() {
         let (event_tx, mut event_rx) = mpsc::channel(4);
@@ -21196,6 +22337,7 @@ mod tests {
             None,
             &mut latest_checkpoint,
             &mut kv_blobs,
+            None,
             "test",
         )
         .await;
@@ -21572,10 +22714,12 @@ mod tests {
         let mut turn = LiveTurnCtx {
             session_id: "sess-test",
             user_prompt: prompt,
+            compaction_mode: false,
             post_tool_checkpoint: &mut post_tool_checkpoint,
             request_context: &request_context,
             decode_failures: &mut decode_failures,
             coalescer: &mut coalescer,
+            sand_empty_end: None,
         };
         let frame = ConnectFrame {
             flags: super::super::connect::FLAG_GZIP,
@@ -23173,6 +24317,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simultaneous_identical_retry_storm_all_replays_the_prefix() {
+        // A client can fan out many retries after every attempt receives the
+        // same transient 503. They all identify the same logical operation,
+        // so none may start another upstream Run or bounce as busy. Each
+        // waiter gets the recorded prefix; the last attach becomes the sole
+        // live sink for subsequent deltas.
+        const RETRIES: usize = 64;
+        let mut harness = spawn_attach_replay_driver("attach-retry-storm");
+        send_text_delta(&harness.upstream_tx, "stable prefix").await;
+        let first = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("initial prefix flushed")
+            .expect("initial stream open")
+            .expect("initial prefix is not an error");
+        assert!(matches!(
+            first,
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { ref text })
+                if text == "stable prefix"
+        ));
+
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..RETRIES {
+            let command_tx = harness.command_tx.clone();
+            waiters.spawn(async move { attach_replay(&command_tx, 7).await });
+        }
+
+        let mut attached = Vec::with_capacity(RETRIES);
+        while let Some(result) = waiters.join_next().await {
+            attached.push(
+                result
+                    .expect("attach task")
+                    .expect("same-fingerprint retry must attach without a 503"),
+            );
+        }
+        assert_eq!(attached.len(), RETRIES);
+        for events in &mut attached {
+            let replayed = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("replayed prefix arrives")
+                .expect("attached stream contains the prefix")
+                .expect("replayed prefix is not an error");
+            assert!(matches!(
+                replayed,
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { ref text })
+                    if text == "stable prefix"
+            ));
+        }
+
+        send_text_delta(&harness.upstream_tx, "one live continuation").await;
+        let mut live_continuations = 0;
+        for events in &mut attached {
+            match tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("superseded attach closes or receives the continuation")
+            {
+                Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })))
+                    if text == "one live continuation" =>
+                {
+                    live_continuations += 1;
+                }
+                None => {}
+                other => panic!("unexpected post-attach event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            live_continuations, 1,
+            "exactly one retry may own the live continuation after the retry storm"
+        );
+        assert!(
+            !harness.completed.load(Ordering::Acquire),
+            "all retries must remain attached to one upstream generation"
+        );
+
+        harness
+            .command_tx
+            .send(RunCommand::Cancel { ack: None })
+            .await
+            .expect("cancel retry-storm driver");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !harness.completed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry-storm driver terminates");
+    }
+
+    #[tokio::test]
     async fn attach_replay_reproduces_exposed_native_tool_batch() {
         // Segment already closed by a NativeToolBatch handoff (the exact state
         // from the grok-build 503 storms: run Running, waiting on tool
@@ -23340,6 +24572,163 @@ mod tests {
             LiveRunRegistry::try_claim_run_for_operation(session, None, 8)
         else {
             panic!("a new operation must release the replay tombstone and reserve");
+        };
+        reservation.release();
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn starting_running_succeeded_race_replays_to_identical_waiter() {
+        // Reproduce the narrow admission race behind the post-/compact 503
+        // storm: the retry observes Starting, while the original open becomes
+        // Running and completes before the next registry poll. The terminal
+        // replay must survive both transitions.
+        let _registry = lock_live_registry_for_test();
+        let session = format!("starting-running-success-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "cursor-grok-4.6-xhigh-fast",
+                "stream": true,
+                "messages": [{"role": "user", "content": "same compact retry"}]
+            }))
+            .unwrap();
+        let fingerprint =
+            live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+        let mut reservation = LiveRunRegistry::reserve(&session).expect("Starting reservation");
+        reservation.set_operation_fingerprint(fingerprint);
+
+        let transition = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let handle = dummy_handle("fast-terminal-generation");
+            handle.set_request_fingerprint(fingerprint);
+            reservation
+                .insert(Arc::clone(&handle))
+                .expect("Starting becomes Running");
+            LiveRunRegistry::seal_success_if(
+                &session,
+                "fast-terminal-generation",
+                Some(Arc::new(vec![
+                    LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                        text: "compacted".into(),
+                    }),
+                    LiveRunEvent::Cursor(CursorStreamEvent::End),
+                ])),
+            );
+            handle.completed.store(true, Ordering::Release);
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_starting_running_success".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, transition);
+
+        let super::super::LiveResumeOutcome::Resumed(mut events) = outcome else {
+            panic!("identical waiter must receive the Succeeded replay across the race");
+        };
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })))
+                if text == "compacted"
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+        ));
+        assert!(events.recv().await.is_none());
+        LiveRunRegistry::clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn different_fingerprint_waiter_claims_slot_after_old_run_succeeds() {
+        // A genuinely new turn must wait while the old connected generation
+        // is healthy, then atomically claim the slot when that exact Run seals
+        // success. It must not inherit an "already active" 503 from the
+        // Running -> Succeeded handoff.
+        let _registry = lock_live_registry_for_test();
+        let session = format!("different-fingerprint-wait-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "cursor-grok-4.6-xhigh-fast",
+                "stream": true,
+                "messages": [{"role": "user", "content": "the next independent turn"}]
+            }))
+            .unwrap();
+        let next_fingerprint =
+            live_request_fingerprint(&serde_json::to_vec(&body.messages).unwrap_or_default());
+        let (old, _command_rx_guard) = connected_dummy_handle("old-connected-generation");
+        old.set_request_fingerprint(next_fingerprint ^ u64::MAX);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve old generation")
+            .insert(Arc::clone(&old))
+            .expect("insert old generation");
+
+        let complete_old = async {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            LiveRunRegistry::seal_success_if(&session, "old-connected-generation", None);
+            old.completed.store(true, Ordering::Release);
+        };
+        let wait = super::super::await_live_run_resume(
+            &session,
+            None,
+            &body,
+            "msg_next_turn".into(),
+            "cursor-grok-4.6-xhigh-fast".into(),
+            1,
+            None,
+            true,
+        );
+        let (outcome, ()) = tokio::join!(wait, complete_old);
+
+        let super::super::LiveResumeOutcome::Free(Some(reservation)) = outcome else {
+            panic!("new operation must atomically reserve after the old Run succeeds");
+        };
+        assert!(LiveRunRegistry::is_starting_run(&session, None));
+        reservation.release();
+        assert!(!LiveRunRegistry::is_occupied_run(&session, None));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn hidden_cancelled_terminal_generation_unblocks_identical_retry() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("hidden-terminal-retry-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (handle, _command_rx_guard) = connected_dummy_handle("hidden-terminal-generation");
+        handle.set_request_fingerprint(91);
+        handle.cancel_requested.store(true, Ordering::Release);
+        store_terminal_error(&handle.terminal_error, "Cursor live run cancelled");
+        handle.completed.store(true, Ordering::Release);
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve hidden generation")
+            .insert(Arc::clone(&handle))
+            .expect("insert hidden terminal generation");
+
+        assert!(
+            LiveRunRegistry::get_run(&session, None).is_none(),
+            "cancelled terminal handles are intentionally hidden from attach"
+        );
+        assert!(matches!(
+            LiveRunRegistry::probe_run(&session, None),
+            LiveRunProbe::Free
+        ));
+        assert!(
+            LiveRunRegistry::running_generation(&session, None).is_none(),
+            "probing a definitive cancellation must remove the hidden generation"
+        );
+        let LiveSlotClaim::Reserved(reservation) =
+            LiveRunRegistry::try_claim_run_for_operation(&session, None, 91)
+        else {
+            panic!("identical retry must be admitted after definitive cancellation");
         };
         reservation.release();
         LiveRunRegistry::clear();

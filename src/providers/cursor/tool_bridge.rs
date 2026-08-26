@@ -16,7 +16,10 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::native_tools::{
     adapt_tool_input_for_client, advertised_name_fallbacks, json_u64, shell_single_quote,
 };
-use crate::providers::cursor::request::{cursor_mcp_wire_name, is_model_visible_tool_definition};
+use crate::providers::cursor::request::{
+    claude_tool_names_equivalent, cursor_mcp_wire_name, is_claude_local_mcp_spelling,
+    is_model_visible_tool_definition, strip_mcp_provider_prefix,
+};
 use crate::providers::cursor::response::CursorStreamEvent;
 use crate::providers::cursor::sse::CursorSseFramer;
 use crate::providers::cursor::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
@@ -1343,6 +1346,64 @@ pub(crate) fn resolve_advertised_name(
             return Some((*cand).to_string());
         }
     }
+    // Claude Code's bundled runtime exposes a small, explicit alias table
+    // (for example `Brief`/`SendUserMessage`, `Workflow`/`RunWorkflow`).
+    // Resolve only those names against the client's allow-list and preserve
+    // the exact spelling the client advertised. Do not case-fold arbitrary
+    // MCP names: two unrelated providers may legitimately differ only by
+    // case.
+    if let Some(hit) = allowed.iter().find(|candidate| {
+        candidate.eq_ignore_ascii_case(mapped_name)
+            && claude_tool_names_equivalent(mapped_name, candidate)
+    }) {
+        return Some(hit.clone());
+    }
+    if let Some(hit) = allowed
+        .iter()
+        .find(|candidate| claude_tool_names_equivalent(mapped_name, candidate))
+    {
+        return Some(hit.clone());
+    }
+    // Older Claude clients can retain a `claude-local` provider prefix in
+    // tool history. Compare aliases using the bare leaf, but only for the
+    // explicitly recognized provider-qualified forms.
+    if is_claude_local_mcp_spelling(mapped_name)
+        || allowed
+            .iter()
+            .any(|candidate| is_claude_local_mcp_spelling(candidate))
+    {
+        let leaf = strip_mcp_provider_prefix(mapped_name);
+        if let Some(hit) = allowed.iter().find(|candidate| {
+            is_claude_local_mcp_spelling(candidate)
+                && strip_mcp_provider_prefix(candidate).eq_ignore_ascii_case(leaf)
+                && claude_tool_names_equivalent(leaf, strip_mcp_provider_prefix(candidate))
+        }) {
+            return Some(hit.clone());
+        }
+        if let Some(hit) = allowed.iter().find(|candidate| {
+            is_claude_local_mcp_spelling(candidate)
+                && claude_tool_names_equivalent(leaf, strip_mcp_provider_prefix(candidate))
+        }) {
+            return Some(hit.clone());
+        }
+        // The mapped event may be qualified while the client advertised the
+        // bare name (or vice versa). Compare both leaves in that case.
+        if is_claude_local_mcp_spelling(mapped_name)
+            && let Some(hit) = allowed.iter().find(|candidate| {
+                candidate.eq_ignore_ascii_case(leaf)
+                    && claude_tool_names_equivalent(leaf, candidate)
+            })
+        {
+            return Some(hit.clone());
+        }
+        if is_claude_local_mcp_spelling(mapped_name)
+            && let Some(hit) = allowed
+                .iter()
+                .find(|candidate| claude_tool_names_equivalent(leaf, candidate))
+        {
+            return Some(hit.clone());
+        }
+    }
     if mapped_name.contains("__") {
         if let Some(hit) = allowed
             .iter()
@@ -1351,10 +1412,6 @@ pub(crate) fn resolve_advertised_name(
             return Some(hit.clone());
         }
         if let Some(hit) = allowed.iter().find(|n| n.as_str() == mapped_name) {
-            return Some(hit.clone());
-        }
-        let suffix = mapped_name.rsplit("__").next().unwrap_or(mapped_name);
-        if let Some(hit) = allowed.iter().find(|n| n.ends_with(&format!("__{suffix}"))) {
             return Some(hit.clone());
         }
     }
@@ -2497,6 +2554,68 @@ mod tests {
                 "recovered XML aliases should remain callable"
             );
         }
+    }
+
+    #[test]
+    fn claude_alias_resolution_uses_the_advertised_spelling() {
+        let cases = [
+            ("RunWorkflow", "Workflow"),
+            ("Brief", "SendUserMessage"),
+            ("ListMcpResources", "ListMcpResourcesTool"),
+            ("ReadMcpResource", "ReadMcpResourceTool"),
+            ("ReadMcpResourceDir", "ReadMcpResourceDirTool"),
+            ("ListPeers", "ListAgents"),
+            ("KillBash", "TaskStop"),
+            ("AgentOutputTool", "TaskOutput"),
+        ];
+        for (mapped, advertised) in cases {
+            let allowed: BTreeSet<String> = [advertised.to_string()].into_iter().collect();
+            assert_eq!(
+                resolve_advertised_name(mapped, Some(&allowed)).as_deref(),
+                Some(advertised),
+                "{mapped} should resolve to the exact advertised spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_alias_resolution_handles_qualified_local_names() {
+        let allowed: BTreeSet<String> = ["Workflow".into()].into_iter().collect();
+        assert_eq!(
+            resolve_advertised_name("mcp_claude-local_RunWorkflow", Some(&allowed)).as_deref(),
+            Some("Workflow")
+        );
+
+        let qualified: BTreeSet<String> =
+            ["mcp_claude-local_Workflow".into()].into_iter().collect();
+        assert_eq!(
+            resolve_advertised_name("RunWorkflow", Some(&qualified)).as_deref(),
+            Some("mcp_claude-local_Workflow")
+        );
+    }
+
+    #[test]
+    fn claude_alias_resolution_prefers_same_spelling_before_alias() {
+        let allowed: BTreeSet<String> = ["RunWorkflow".into(), "Workflow".into()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            resolve_advertised_name("workflow", Some(&allowed)).as_deref(),
+            Some("Workflow")
+        );
+    }
+
+    #[test]
+    fn arbitrary_mcp_names_remain_exact_only() {
+        let allowed: BTreeSet<String> = ["mcp__plugin__CustomTool".into()].into_iter().collect();
+        assert!(resolve_advertised_name("mcp__plugin__customtool", Some(&allowed)).is_none());
+        assert!(resolve_advertised_name("CustomTool", Some(&allowed)).is_none());
+
+        let same_leaf: BTreeSet<String> = ["mcp__provider_b__search".into()].into_iter().collect();
+        assert!(
+            resolve_advertised_name("mcp__provider_a__search", Some(&same_leaf)).is_none(),
+            "MCP tools with the same leaf must remain isolated by provider"
+        );
     }
 
     #[test]

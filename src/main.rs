@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_cursor_proxy::{
-    config, logging,
+    config, logging, mcp_doctor,
     monitor::MonitorHandle,
     paths, providers,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
@@ -41,6 +41,12 @@ enum Commands {
     Models {
         #[arg(long)]
         full: bool,
+    },
+    /// Inspect Claude Code MCP/Lobster state and optionally repair a disabled entry.
+    #[command(name = "mcp-doctor")]
+    McpDoctor {
+        #[command(flatten)]
+        options: mcp_doctor::McpDoctorOptions,
     },
     Codex {
         #[command(subcommand)]
@@ -101,6 +107,9 @@ fn main() -> Result<()> {
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
+                    runtime.spawn(async {
+                        providers::cursor::usage::poll_cursor_sand_usage_evidence().await;
+                    });
                     spawn_cursor_catalog_warmup(&runtime);
                     runtime
                         .block_on(server::serve(ServerConfig {
@@ -162,6 +171,10 @@ fn main() -> Result<()> {
         }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
+            Ok(())
+        }
+        Commands::McpDoctor { options } => {
+            println!("{}", mcp_doctor::run_and_render(&options)?);
             Ok(())
         }
         Commands::Codex { command } => run_provider_cli("codex", command),
@@ -339,6 +352,28 @@ mod tests {
         let cli = Cli::try_parse_from(["claude-cursor-proxy", "demo"]).unwrap();
 
         assert!(matches!(cli.command, Some(Commands::Demo)));
+    }
+
+    #[test]
+    fn mcp_doctor_command_parses_options() {
+        let cli = Cli::try_parse_from([
+            "claude-cursor-proxy",
+            "mcp-doctor",
+            "--cwd",
+            "/tmp/project",
+            "--repair",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::McpDoctor { options }) => {
+                assert_eq!(options.cwd, Some(std::path::PathBuf::from("/tmp/project")));
+                assert!(options.repair);
+                assert!(options.json);
+            }
+            other => panic!("expected mcp-doctor command, got {other:?}"),
+        }
     }
 
     #[test]

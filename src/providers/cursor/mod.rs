@@ -35,8 +35,8 @@ use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::cursor::auth::{
-    clear_cursor_auth, expired_auth_message, force_refresh_cursor_auth, load_cursor_auth,
-    missing_auth_message, run_cursor_login,
+    clear_cursor_auth, cursor_account_digest, expired_auth_message, force_refresh_cursor_auth,
+    load_cursor_auth, missing_auth_message, run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::exec_results::PendingCursorExec;
@@ -63,8 +63,9 @@ use crate::providers::cursor::request::{
     render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
-    AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_with_allowed,
-    decode_upstream_response, estimate_rendered_prompt_tokens, estimate_request_input_tokens,
+    AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_compaction,
+    decode_cursor_upstream_with_allowed, decode_upstream_response, estimate_rendered_prompt_tokens,
+    estimate_request_input_tokens,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
@@ -80,6 +81,505 @@ use crate::providers::cursor::tool_bridge::{
 // bounding TLS handshakes. Tune with CCP_CURSOR_H2_SHARDS.
 const CURSOR_HTTP_SHARDS_DEFAULT: usize = 16;
 const CURSOR_HTTP_SHARDS_MAX: usize = 64;
+
+/// Bound the process-local policy breaker so a long-lived proxy cannot retain
+/// one entry forever for every historical model/account combination. Expired
+/// entries are swept on every read/write; this cap covers a burst of account
+/// rotations before the sweep gets a chance to run.
+const POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES: usize = 1024;
+/// A cold account/model key is single-flighted long enough to cover Cursor's
+/// delayed policy decisions. Production traces put the median policy 429 near
+/// 6s and have observed it after 16s; the former 1.5s window released most
+/// retry waves before the decisive error arrived. A useful model/tool/End
+/// event still marks the key healthy immediately, so healthy traffic normally
+/// pays only the first Run's time-to-first-useful-event rather than this cap.
+const POLICY_RATE_LIMIT_PROBE_WINDOW_DEFAULT_MS: u64 = 30_000;
+const POLICY_RATE_LIMIT_PROBE_WINDOW_MIN_MS: u64 = 25;
+const POLICY_RATE_LIMIT_PROBE_WINDOW_MAX_MS: u64 = 120_000;
+
+// Cursor account/model policy 429s are deterministic for the current login.
+// Without a local breaker, a Claude Code retry wave can open hundreds of
+// identical Runs before the first response reaches the client; each rejected
+// start then consumes a connection and turns into a visible 503/429 storm.
+// Keep the breaker keyed by a stable one-way account digest and request-scoped
+// client route. Access-token refreshes retain the cooldown, while a hot account
+// switch or Sand/CLI route switch remains immediately eligible.
+#[derive(Clone, Debug)]
+struct PolicyRateLimitState {
+    until: Instant,
+    retry_after_secs: u64,
+    message: String,
+}
+
+static POLICY_RATE_LIMIT_BREAKER: LazyLock<Mutex<HashMap<String, PolicyRateLimitState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cold/half-open account+model keys use bounded single-flight. This closes
+/// the gap where a large retry wave could pass an empty breaker: actual output
+/// releases the wave, while a quiet key ramps by only one probe per window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyRateLimitProbeState {
+    Unknown,
+    Probing { lease: u64, started: Instant },
+    Healthy,
+}
+
+#[derive(Debug)]
+struct PolicyRateLimitProbeGateState {
+    /// Incremented whenever a policy result opens the breaker. Probes from a
+    /// previous epoch may finish later, but must not mark a post-cooldown key
+    /// healthy and bypass its next half-open probe.
+    epoch: u64,
+    phase: PolicyRateLimitProbeState,
+}
+
+#[derive(Debug)]
+struct PolicyRateLimitProbeGate {
+    state: Mutex<PolicyRateLimitProbeGateState>,
+    changed: tokio::sync::Notify,
+}
+
+impl PolicyRateLimitProbeGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PolicyRateLimitProbeGateState {
+                epoch: 0,
+                phase: PolicyRateLimitProbeState::Unknown,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn reset_after_policy_limit(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.epoch = state.epoch.wrapping_add(1);
+        state.phase = PolicyRateLimitProbeState::Unknown;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+}
+
+static POLICY_RATE_LIMIT_PROBE_GATES: LazyLock<
+    Mutex<HashMap<String, Arc<PolicyRateLimitProbeGate>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static POLICY_RATE_LIMIT_PROBE_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+struct PolicyRateLimitProbeLease {
+    gate: Arc<PolicyRateLimitProbeGate>,
+    epoch: u64,
+    lease: u64,
+    active: bool,
+}
+
+impl PolicyRateLimitProbeLease {
+    fn mark_healthy(mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // A quiet key may have admitted a newer bounded probe by the time an
+        // older Run emits its first useful event. Same-epoch evidence can
+        // release the whole wave. A probe predating a policy result cannot:
+        // after cooldown it must leave the key half-open for a fresh probe.
+        if state.epoch == self.epoch {
+            state.phase = PolicyRateLimitProbeState::Healthy;
+        }
+        self.active = false;
+        drop(state);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+impl Drop for PolicyRateLimitProbeLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.epoch == self.epoch
+            && matches!(
+                state.phase,
+                PolicyRateLimitProbeState::Probing { lease, .. } if lease == self.lease
+            )
+        {
+            state.phase = PolicyRateLimitProbeState::Unknown;
+        }
+        drop(state);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+#[derive(Debug)]
+enum PolicyRateLimitAdmission {
+    KnownHealthy,
+    Probe(PolicyRateLimitProbeLease),
+}
+
+impl PolicyRateLimitAdmission {
+    fn mark_healthy(self) {
+        if let Self::Probe(lease) = self {
+            lease.mark_healthy();
+        }
+    }
+
+    fn into_probe(self) -> Option<PolicyRateLimitProbeLease> {
+        match self {
+            Self::KnownHealthy => None,
+            Self::Probe(lease) => Some(lease),
+        }
+    }
+
+    /// Publish the breaker before releasing a cold-probe lease. Reversing
+    /// this order briefly changes the gate to Unknown and wakes a waiter that
+    /// can dispatch another upstream Run before the policy 429 is visible.
+    fn mark_policy_limited(
+        self,
+        model: &str,
+        client_type: &str,
+        token: &str,
+        message: &str,
+        retry_after: Option<&str>,
+    ) {
+        note_policy_rate_limit(model, client_type, token, message, retry_after);
+        drop(self);
+    }
+}
+
+fn policy_rate_limit_key(model: &str, client_type: &str, token: &str) -> String {
+    let resolved_model = resolve_cursor_model(model)
+        .map(|resolved| resolved.model_id)
+        .unwrap_or_else(|_| model.trim().to_ascii_lowercase());
+    let route = match client_type.trim().to_ascii_lowercase() {
+        route if !route.is_empty() => route,
+        _ => "cli".to_string(),
+    };
+    format!("{route}:{resolved_model}:{}", cursor_account_digest(token))
+}
+
+fn policy_rate_limit_probe_gate(key: &str) -> Arc<PolicyRateLimitProbeGate> {
+    let mut gates = POLICY_RATE_LIMIT_PROBE_GATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(gate) = gates.get(key) {
+        return Arc::clone(gate);
+    }
+    if gates.len() >= POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES {
+        let removable = gates
+            .iter()
+            .find_map(|(key, gate)| (Arc::strong_count(gate) == 1).then(|| key.clone()));
+        if let Some(removable) = removable {
+            gates.remove(&removable);
+        }
+    }
+    let gate = Arc::new(PolicyRateLimitProbeGate::new());
+    gates.insert(key.to_string(), Arc::clone(&gate));
+    gate
+}
+
+fn policy_rate_limit_probe_window() -> Duration {
+    Duration::from_millis(
+        std::env::var("CCP_CURSOR_POLICY_429_PROBE_WINDOW_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(POLICY_RATE_LIMIT_PROBE_WINDOW_DEFAULT_MS)
+            .clamp(
+                POLICY_RATE_LIMIT_PROBE_WINDOW_MIN_MS,
+                POLICY_RATE_LIMIT_PROBE_WINDOW_MAX_MS,
+            ),
+    )
+}
+
+async fn policy_rate_limit_admit_fresh_open(
+    model: &str,
+    client_type: &str,
+    token: &str,
+) -> Result<PolicyRateLimitAdmission, CursorError> {
+    policy_rate_limit_admit_fresh_open_with_window(
+        model,
+        client_type,
+        token,
+        policy_rate_limit_probe_window(),
+    )
+    .await
+}
+
+async fn policy_rate_limit_admit_fresh_open_with_window(
+    model: &str,
+    client_type: &str,
+    token: &str,
+    probe_window: Duration,
+) -> Result<PolicyRateLimitAdmission, CursorError> {
+    let key = policy_rate_limit_key(model, client_type, token);
+    let gate = policy_rate_limit_probe_gate(&key);
+    loop {
+        policy_rate_limit_preflight(model, client_type, token)?;
+        enum ProbeDecision {
+            Healthy,
+            Acquire { epoch: u64, lease: u64 },
+            Wait(Duration),
+        }
+        let decision = {
+            let mut state = gate
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match state.phase {
+                PolicyRateLimitProbeState::Healthy => ProbeDecision::Healthy,
+                PolicyRateLimitProbeState::Unknown => {
+                    let lease = POLICY_RATE_LIMIT_PROBE_SEQUENCE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    state.phase = PolicyRateLimitProbeState::Probing {
+                        lease,
+                        started: Instant::now(),
+                    };
+                    ProbeDecision::Acquire {
+                        epoch: state.epoch,
+                        lease,
+                    }
+                }
+                PolicyRateLimitProbeState::Probing { started, .. } => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= probe_window {
+                        // The current probe remained quiet for one window. Do
+                        // not call the key healthy and release the whole retry
+                        // wave: delayed policy decisions have arrived well
+                        // after 30s. Admit exactly one additional probe and
+                        // rotate the lease; older probes keep observing their
+                        // Runs and may still prove health or open the breaker.
+                        let lease = POLICY_RATE_LIMIT_PROBE_SEQUENCE
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        state.phase = PolicyRateLimitProbeState::Probing {
+                            lease,
+                            started: Instant::now(),
+                        };
+                        ProbeDecision::Acquire {
+                            epoch: state.epoch,
+                            lease,
+                        }
+                    } else {
+                        ProbeDecision::Wait(probe_window - elapsed)
+                    }
+                }
+            }
+        };
+        match decision {
+            ProbeDecision::Healthy => {
+                // Close the small race with a policy result published between
+                // the first breaker read and the gate-state read.
+                policy_rate_limit_preflight(model, client_type, token)?;
+                return Ok(PolicyRateLimitAdmission::KnownHealthy);
+            }
+            ProbeDecision::Acquire { epoch, lease } => {
+                // A concurrent policy result may have won immediately after
+                // the first read. Do not let this newly acquired lease pass it.
+                if let Err(error) = policy_rate_limit_preflight(model, client_type, token) {
+                    drop(PolicyRateLimitProbeLease {
+                        gate: Arc::clone(&gate),
+                        epoch,
+                        lease,
+                        active: true,
+                    });
+                    return Err(error);
+                }
+                return Ok(PolicyRateLimitAdmission::Probe(PolicyRateLimitProbeLease {
+                    gate: Arc::clone(&gate),
+                    epoch,
+                    lease,
+                    active: true,
+                }));
+            }
+            ProbeDecision::Wait(remaining) => {
+                // Result publication wakes the coalesced wave. Short sleeps
+                // let one waiter rotate the probe at the window boundary;
+                // every other waiter observes that new lease and remains
+                // queued instead of fanning out.
+                tokio::select! {
+                    _ = gate.changed.notified() => {}
+                    _ = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
+                }
+            }
+        }
+    }
+}
+
+fn retry_after_delta_secs(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(seconds);
+    }
+    let deadline =
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc2822).ok()?;
+    Some(
+        (deadline - time::OffsetDateTime::now_utc())
+            .whole_seconds()
+            .max(0) as u64,
+    )
+}
+
+fn policy_rate_limit_cooldown_secs(message: &str, retry_after: Option<&str>) -> u64 {
+    // Cursor usually omits Retry-After from Connect END frames. Accept a
+    // small set of human-readable hints when present, otherwise use a short
+    // local cooldown that smooths retries without making account changes feel
+    // sticky. The value is deliberately bounded so a stale error cannot brick
+    // a model for hours.
+    let lower = message.to_ascii_lowercase();
+    let message_hint = ["retry after", "try again in", "wait "]
+        .iter()
+        .find_map(|marker| {
+            let start = lower.find(marker)? + marker.len();
+            let tail = lower[start..].trim_start_matches(|ch: char| !ch.is_ascii_digit());
+            let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            let amount = digits.parse::<u64>().ok()?;
+            let unit = tail[digits.len()..].trim_start();
+            Some(if unit.starts_with("minute") {
+                amount.saturating_mul(60)
+            } else {
+                amount
+            })
+        });
+    retry_after
+        .and_then(retry_after_delta_secs)
+        .or(message_hint)
+        .or_else(|| {
+            std::env::var("CCP_CURSOR_POLICY_429_COOLDOWN_SECS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(30)
+        .clamp(5, 600)
+}
+
+fn note_policy_rate_limit(
+    model: &str,
+    client_type: &str,
+    token: &str,
+    message: &str,
+    retry_after: Option<&str>,
+) {
+    if !crate::retry::is_policy_rate_limit(message) {
+        return;
+    }
+    let retry_after_secs = policy_rate_limit_cooldown_secs(message, retry_after);
+    let key = policy_rate_limit_key(model, client_type, token);
+    let now = Instant::now();
+    let state = PolicyRateLimitState {
+        until: now + Duration::from_secs(retry_after_secs),
+        retry_after_secs,
+        message: message.to_string(),
+    };
+    {
+        let mut breaker = POLICY_RATE_LIMIT_BREAKER
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Prune all expired keys, not only the key being opened. Account
+        // switches can otherwise leave a stale digest per model in memory for
+        // the lifetime of the process.
+        breaker.retain(|_, previous| previous.until > now);
+        if let Some(previous) = breaker.get_mut(&key) {
+            // Extend an existing window, never shorten it during a burst.
+            if state.until > previous.until {
+                *previous = state;
+            }
+        } else {
+            if breaker.len() >= POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES {
+                // Remove the entry with the nearest expiry first. This keeps
+                // the longest-lived cooldowns while making room for the
+                // current account/model that just produced a policy error.
+                let oldest = breaker
+                    .iter()
+                    .min_by_key(|(_, previous)| previous.until)
+                    .map(|(key, _)| key.clone());
+                if let Some(oldest) = oldest {
+                    breaker.remove(&oldest);
+                }
+            }
+            breaker.insert(key, state);
+        }
+    }
+    if let Some(gate) = POLICY_RATE_LIMIT_PROBE_GATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&policy_rate_limit_key(model, client_type, token))
+        .cloned()
+    {
+        gate.reset_after_policy_limit();
+    }
+    create_logger("cursor").warn(
+        "policy_rate_limit_breaker_open",
+        Some(serde_json::Map::from_iter([
+            ("model".into(), serde_json::json!(model)),
+            ("clientType".into(), serde_json::json!(client_type)),
+            ("retryAfterSecs".into(), serde_json::json!(retry_after_secs)),
+        ])),
+    );
+}
+
+fn policy_rate_limit_breaker_state(
+    model: &str,
+    client_type: &str,
+    token: &str,
+) -> Option<PolicyRateLimitState> {
+    let key = policy_rate_limit_key(model, client_type, token);
+    let mut breaker = POLICY_RATE_LIMIT_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let now = Instant::now();
+    // Keep the map bounded even when no new policy errors arrive. A read is
+    // the hot path for retries, so doing this under the same short mutex lock
+    // avoids a background task and keeps account-switch cleanup deterministic.
+    breaker.retain(|_, state| state.until > now);
+    let mut state = breaker.get(&key).cloned();
+    if let Some(state) = state.as_mut() {
+        state.retry_after_secs = state.until.saturating_duration_since(now).as_secs().max(1);
+    }
+    state
+}
+
+fn policy_rate_limit_breaker_error(model: &str, state: &PolicyRateLimitState) -> CursorError {
+    let mut error = CursorError::new(
+        429,
+        format!(
+            "{} (local rate-limit cooldown for {model}; retry after {}s)",
+            state.message, state.retry_after_secs
+        ),
+        None,
+    );
+    error.retry_after = Some(state.retry_after_secs.to_string());
+    error
+}
+
+fn policy_rate_limit_preflight(
+    model: &str,
+    client_type: &str,
+    token: &str,
+) -> Result<(), CursorError> {
+    match policy_rate_limit_breaker_state(model, client_type, token) {
+        Some(state) => Err(policy_rate_limit_breaker_error(model, &state)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+fn reset_policy_rate_limit_breaker_for_test() {
+    POLICY_RATE_LIMIT_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+    POLICY_RATE_LIMIT_PROBE_GATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+}
 
 struct SharedCursorHttpClients {
     base_url: String,
@@ -141,6 +641,8 @@ fn shared_cursor_http_client(conversation_key: Option<&str>) -> CursorHttpClient
 const MAX_SESSION_USAGE: usize = 10_000;
 const LIVE_USAGE_TAP_CAP: usize = 512;
 const LIVE_EMPTY_TURN_MAX_RETRIES: u32 = 1;
+const LIVE_SAND_GEMINI_EMPTY_TURN_MAX_RETRIES: u32 = 3;
+const LIVE_EMPTY_TURN_MAX_RETRIES_LIMIT: u32 = 8;
 const LIVE_EMPTY_TURN_EPISODE_MS: u64 = 300_000;
 const CURSOR_RESOURCE_RETRIES_DEFAULT: u32 = 6;
 const CURSOR_RESOURCE_RETRIES_MAX: u32 = 12;
@@ -165,8 +667,21 @@ impl Default for LiveLateRetryPolicy {
 }
 
 impl LiveLateRetryPolicy {
-    fn from_env() -> Self {
+    fn for_request_with_override(
+        model: &str,
+        client_type: &str,
+        empty_turn_max_retries: Option<&str>,
+    ) -> Self {
+        let request_default = if is_sand_gemini_request(model, client_type) {
+            LIVE_SAND_GEMINI_EMPTY_TURN_MAX_RETRIES
+        } else {
+            LIVE_EMPTY_TURN_MAX_RETRIES
+        };
         Self {
+            empty_turn_max_retries: empty_turn_max_retries
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
+                .map(|value| value.min(LIVE_EMPTY_TURN_MAX_RETRIES_LIMIT))
+                .unwrap_or(request_default),
             empty_turn_episode: Duration::from_millis(
                 env_u64_millis(
                     "CCP_CURSOR_EMPTY_TURN_EPISODE_MS",
@@ -176,6 +691,42 @@ impl LiveLateRetryPolicy {
             ),
             ..Self::default()
         }
+    }
+
+    fn for_request(model: &str, client_type: &str) -> Self {
+        Self::for_request_with_override(
+            model,
+            client_type,
+            std::env::var("CCP_CURSOR_EMPTY_TURN_MAX_RETRIES")
+                .ok()
+                .as_deref(),
+        )
+    }
+}
+
+fn is_sand_gemini_request(model: &str, client_type: &str) -> bool {
+    if !client_type.trim().eq_ignore_ascii_case("sand") {
+        return false;
+    }
+    resolve_cursor_model(model)
+        .map(|resolved| resolved.model_id.to_ascii_lowercase())
+        .unwrap_or_else(|_| model.trim().to_ascii_lowercase())
+        .starts_with("gemini-")
+}
+
+#[derive(Debug, Clone)]
+struct LiveLateRetryContext {
+    model: String,
+    client_type: String,
+    effective_token: Arc<Mutex<String>>,
+}
+
+impl LiveLateRetryContext {
+    fn effective_token(&self) -> String {
+        self.effective_token
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 }
 
@@ -341,6 +892,7 @@ fn live_sse_recording_usage(
     wire_model: String,
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    compaction_mode: bool,
 ) -> Response {
     live_sse_response(
         tap_session_usage(session_id.to_string(), events),
@@ -348,21 +900,36 @@ fn live_sse_recording_usage(
         wire_model,
         estimated_input,
         monitor,
+        compaction_mode,
     )
 }
 
 enum LiveStartPeek {
     Retryable(String),
-    Ready(mpsc::Receiver<LiveEventResult>),
+    Ready {
+        events: mpsc::Receiver<LiveEventResult>,
+        /// The peek observed client-committing model output/tool completion.
+        /// Session/usage/thinking metadata is deliberately not health proof:
+        /// Cursor can emit it immediately before a delayed policy 429.
+        observed_healthy_event: bool,
+    },
 }
 
 #[derive(Clone)]
 struct LiveRetryStart {
     client: CursorHttpClient,
-    token: String,
+    /// The bearer actually used by the current generation. A start can refresh
+    /// or hot-switch accounts internally; subsequent empty-turn/transport
+    /// retries and policy attribution must continue with that effective token.
+    effective_token: Arc<Mutex<String>>,
     user_text: String,
     model: String,
+    /// Images appropriate for the currently persisted Cursor continuation.
+    /// With a checkpoint this is limited to the current user turn.
     images: Vec<CursorSelectedImage>,
+    /// Full-history images retained for the one recovery path that clears the
+    /// Cursor conversation and replays the original Anthropic history.
+    reset_retry_images: Vec<CursorSelectedImage>,
     custom_system: Option<String>,
     session_id: String,
     agent_id: Option<String>,
@@ -381,6 +948,9 @@ struct LiveRetryStart {
     /// Captured when the logical request starts; retries must keep the same
     /// client identity even if the live routing config is edited meanwhile.
     client_type: String,
+    /// Context compaction uses output-text framing even when Cursor emits
+    /// reasoning deltas. Keep this bit stable across transport retries.
+    compaction_mode: bool,
 }
 
 fn live_retry_user_text<'a>(original: &'a str, error: &str) -> &'a str {
@@ -391,7 +961,54 @@ fn live_retry_user_text<'a>(original: &'a str, error: &str) -> &'a str {
     }
 }
 
+fn prepare_live_retry_conversation(session_id: &str, error: &str) -> bool {
+    if live_error_is_empty_turn_retry(error)
+        && !live_error_needs_checkpoint_continue(error)
+        // `recover_empty_turn_if_needed` already reset this conversation when
+        // it appended the stale-reset note. Avoid replacing it a second time,
+        // which would unnecessarily discard a just-created binding.
+        && !error.contains("stale Cursor conversation reset")
+    {
+        conversation::reset(session_id);
+        true
+    } else {
+        false
+    }
+}
+
+fn live_retry_conversation_key(session_id: &str, agent_id: Option<&str>) -> String {
+    live_run_key_for(LiveRunIdentity {
+        session_id,
+        agent_id,
+        parent_agent_id: None,
+    })
+}
+
+fn live_retry_needs_fresh_history(error: &str) -> bool {
+    live_error_is_empty_turn_retry(error) && !live_error_needs_checkpoint_continue(error)
+}
+
+fn live_request_image_sets(
+    body: &MessagesRequest,
+    has_checkpoint: bool,
+) -> (Vec<CursorSelectedImage>, Vec<CursorSelectedImage>) {
+    let images = request::cursor_selected_images_for_continuation(body, has_checkpoint);
+    let reset_retry_images = if has_checkpoint {
+        request::cursor_selected_images_for_continuation(body, false)
+    } else {
+        images.clone()
+    };
+    (images, reset_retry_images)
+}
+
 impl LiveRetryStart {
+    fn effective_token(&self) -> String {
+        self.effective_token
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
     fn retry_user_text(&self, error: &str) -> &str {
         live_retry_user_text(&self.user_text, error)
     }
@@ -408,7 +1025,20 @@ impl LiveRetryStart {
         &self,
         error: &str,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
-        self.start_with_user_text(self.retry_user_text(error), None)
+        // Ordinary hollow turns are safe to replay because no client-visible
+        // text/tool committed. Fence every retry onto a fresh Cursor
+        // conversation even if an unusual upstream termination path failed to
+        // perform the driver's normal empty-turn reset. A post-tool checkpoint
+        // continuation is different: clearing it could replay completed tools.
+        let conversation_key =
+            live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+        prepare_live_retry_conversation(&conversation_key, error);
+        let images = if live_retry_needs_fresh_history(error) {
+            &self.reset_retry_images
+        } else {
+            &self.images
+        };
+        self.start_with_user_text_and_images(self.retry_user_text(error), images, None)
             .await
     }
 
@@ -417,12 +1047,26 @@ impl LiveRetryStart {
         user_text: &str,
         reservation: Option<LiveRunReservation>,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        self.start_with_user_text_and_images(user_text, &self.images, reservation)
+            .await
+    }
+
+    async fn start_with_user_text_and_images(
+        &self,
+        user_text: &str,
+        images: &[CursorSelectedImage],
+        reservation: Option<LiveRunReservation>,
+    ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        // Do not preflight before registry reconciliation: this path also
+        // serves identical attach/replay and late tool-result retries, which
+        // create no new upstream load. The start loop checks the breaker after
+        // it has a reservation and immediately before the first Cursor open.
         start_live_events_with_retries_with_client_type(
             self.client.clone(),
-            self.token.clone(),
+            self.effective_token(),
             user_text,
             &self.model,
-            &self.images,
+            images,
             self.custom_system.as_deref(),
             LiveRunIdentity {
                 session_id: &self.session_id,
@@ -437,6 +1081,8 @@ impl LiveRetryStart {
             self.has_refresh,
             &self.client_type,
             self.unbounded_conflict_wait,
+            self.compaction_mode,
+            Some(Arc::clone(&self.effective_token)),
         )
         .await
     }
@@ -710,6 +1356,8 @@ async fn start_live_events_with_retries(
         has_refresh,
         &client_type,
         false,
+        false,
+        None,
     )
     .await
 }
@@ -731,7 +1379,15 @@ async fn start_live_events_with_retries_with_client_type(
     has_refresh: bool,
     client_type: &str,
     unbounded_conflict_wait: bool,
+    compaction_mode: bool,
+    effective_token: Option<Arc<Mutex<String>>>,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+    let publish_effective_token = |token: &str| {
+        if let Some(shared) = effective_token.as_ref() {
+            *shared.lock().unwrap_or_else(|poison| poison.into_inner()) = token.to_string();
+        }
+    };
+    publish_effective_token(&token);
     let operation_conflict_deadline = live_conflict_wait_deadline(unbounded_conflict_wait);
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
@@ -1059,9 +1715,25 @@ async fn start_live_events_with_retries_with_client_type(
             }
         }
 
+        // A request may have waited behind another generation while a policy
+        // 429 arrived and opened the account/model breaker. Re-check directly
+        // before the first Cursor operation so queued callers do not dispatch
+        // into the same deterministic limit. This is intentionally after the
+        // session claim but before `start_live_agent...`; releasing here is a
+        // definitive pre-acceptance path and does not leave a 503 tombstone.
+        let mut probe_admission = Some(
+            match policy_rate_limit_admit_fresh_open(model, client_type, &token).await {
+                Ok(admission) => admission,
+                Err(error) => {
+                    reservation.release();
+                    return Err(error);
+                }
+            },
+        );
+
         let upstream_open_guard = reservation.upstream_open_guard();
         let start = match client
-            .start_live_agent_with_identity_guarded_profile(
+            .start_live_agent_with_identity_guarded_profile_mode(
                 &token,
                 user_text,
                 model,
@@ -1076,16 +1748,34 @@ async fn start_live_events_with_retries_with_client_type(
                 Some(Arc::clone(&upstream_open_guard)),
                 Some(admission),
                 Some(client_type),
+                compaction_mode,
             )
             .await
         {
             Ok(start) => Ok(start),
             Err(error) if error.status == 401 && has_refresh => {
+                // Release this attempt's probe while refreshing. JWT rotation
+                // for the same subject intentionally resolves to the same
+                // stable account key; a genuine account switch resolves to a
+                // different key.
+                drop(probe_admission.take());
                 match force_refresh_cursor_auth_async(token.clone()).await {
                     Ok(Some(refreshed)) => {
                         token = refreshed.access_token;
+                        publish_effective_token(&token);
+                        probe_admission = Some(
+                            match policy_rate_limit_admit_fresh_open(model, client_type, &token)
+                                .await
+                            {
+                                Ok(admission) => admission,
+                                Err(policy_error) => {
+                                    reservation.release();
+                                    return Err(policy_error);
+                                }
+                            },
+                        );
                         client
-                            .start_live_agent_with_identity_guarded_profile(
+                            .start_live_agent_with_identity_guarded_profile_mode(
                                 &token,
                                 user_text,
                                 model,
@@ -1100,6 +1790,7 @@ async fn start_live_events_with_retries_with_client_type(
                                 Some(upstream_open_guard),
                                 None,
                                 Some(client_type),
+                                compaction_mode,
                             )
                             .await
                     }
@@ -1113,15 +1804,56 @@ async fn start_live_events_with_retries_with_client_type(
             Ok(start) => {
                 start.handle.set_request_fingerprint(operation_fingerprint);
                 if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
+                    drop(probe_admission.take());
                     let _ = orphaned.cancel_and_wait().await;
                     break;
                 }
                 match peek_live_start_for_stale_reset(start.events).await {
-                    LiveStartPeek::Ready(events) => return Ok(events),
+                    LiveStartPeek::Ready {
+                        events,
+                        observed_healthy_event,
+                    } => {
+                        let admission = probe_admission
+                            .take()
+                            .expect("policy admission remains owned by the live start");
+                        if observed_healthy_event {
+                            // Client-committing model output/tool completion
+                            // proves this key is not in an immediate
+                            // deterministic policy shed.
+                            // Subsequent starts need no cold-probe serialization
+                            // until a policy error resets the gate.
+                            admission.mark_healthy();
+                            return Ok(events);
+                        }
+                        // The short stale-conversation peek is a downstream
+                        // latency optimization, not evidence that Cursor
+                        // accepted the model. Keep a cold probe single-flight
+                        // after that timeout and classify its eventual first
+                        // event before releasing the account/model gate.
+                        if let Some(lease) = admission.into_probe() {
+                            return Ok(hold_policy_probe_until_decisive_event(
+                                events,
+                                lease,
+                                model.to_string(),
+                                client_type.to_string(),
+                                token.clone(),
+                            ));
+                        }
+                        return Ok(events);
+                    }
                     LiveStartPeek::Retryable(error) => {
+                        let policy_limited = crate::retry::is_policy_rate_limit(&error);
+                        if policy_limited {
+                            probe_admission
+                                .take()
+                                .expect("policy admission remains owned by the live start")
+                                .mark_policy_limited(model, client_type, &token, &error, None);
+                        } else {
+                            drop(probe_admission.take());
+                        }
                         let _ = start.handle.cancel_and_wait().await;
                         let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
-                        if crate::retry::is_policy_rate_limit(&error) {
+                        if policy_limited {
                             // Account-bound 429: same-login retries cannot
                             // succeed. Fail over to newly stored credentials
                             // after a hot account switch, else pass through.
@@ -1129,12 +1861,17 @@ async fn start_live_events_with_retries_with_client_type(
                                 && let Some(replacement) = account_switch_replacement_token(&token)
                             {
                                 token = replacement;
+                                publish_effective_token(&token);
                                 account_swaps += 1;
                                 transient_retries = 0;
                                 continue;
                             }
                             let status = crate::retry::classify_proxy_error_status(502, &error);
-                            return Err(CursorError::new(status, error, None));
+                            let mut surfaced = CursorError::new(status, error, None);
+                            surfaced.retry_after =
+                                policy_rate_limit_breaker_state(model, client_type, &token)
+                                    .map(|state| state.retry_after_secs.to_string());
+                            return Err(surfaced);
                         }
                         if transient_retries >= cursor_transient_retry_limit(&error) {
                             return Err(CursorError::internal(error));
@@ -1149,12 +1886,27 @@ async fn start_live_events_with_retries_with_client_type(
             Err(error) => {
                 let policy_limited = crate::retry::is_policy_rate_limit(&error.client_message())
                     || crate::retry::is_policy_rate_limit(&error.message);
+                if policy_limited {
+                    probe_admission
+                        .take()
+                        .expect("policy admission remains owned by the live start")
+                        .mark_policy_limited(
+                            model,
+                            client_type,
+                            &token,
+                            &error.client_message(),
+                            error.retry_after.as_deref(),
+                        );
+                } else {
+                    drop(probe_admission.take());
+                }
                 if policy_limited
                     && account_swaps < MAX_ACCOUNT_FAILOVER_SWAPS
                     && let Some(replacement) = account_switch_replacement_token(&token)
                 {
                     reservation.release();
                     token = replacement;
+                    publish_effective_token(&token);
                     account_swaps += 1;
                     transient_retries = 0;
                     continue;
@@ -1177,7 +1929,12 @@ async fn start_live_events_with_retries_with_client_type(
                 } else {
                     reservation.release();
                 }
-                return Err(exhausted_live_start_error(error, transient_retries));
+                let mut error = exhausted_live_start_error(error, transient_retries);
+                if policy_limited && error.retry_after.is_none() {
+                    error.retry_after = policy_rate_limit_breaker_state(model, client_type, &token)
+                        .map(|state| state.retry_after_secs.to_string());
+                }
+                return Err(error);
             }
         }
     }
@@ -1192,6 +1949,7 @@ fn spawn_streaming_live_sse(
     user_text: String,
     model: String,
     images: Vec<CursorSelectedImage>,
+    reset_retry_images: Vec<CursorSelectedImage>,
     custom_system: Option<String>,
     sid: String,
     agent_id: Option<String>,
@@ -1203,6 +1961,7 @@ fn spawn_streaming_live_sse(
     initial_reservation: Option<LiveRunReservation>,
     has_refresh: bool,
     unbounded_conflict_wait: bool,
+    compaction_mode: bool,
     client_type: String,
     message_id: String,
     wire_model: String,
@@ -1213,10 +1972,11 @@ fn spawn_streaming_live_sse(
     let rx = spawn_live_events_with_late_retries(
         LiveRetryStart {
             client,
-            token,
+            effective_token: Arc::new(Mutex::new(token)),
             user_text,
             model,
             images,
+            reset_retry_images,
             custom_system,
             session_id: sid,
             agent_id,
@@ -1231,6 +1991,7 @@ fn spawn_streaming_live_sse(
             // continuations keep the bounded, generation-specific handoff
             // semantics even though their SSE lifecycle is already open.
             unbounded_conflict_wait,
+            compaction_mode,
         },
         initial_reservation,
         None,
@@ -1242,16 +2003,22 @@ fn spawn_streaming_live_sse(
         wire_model,
         estimated_input,
         monitor,
+        compaction_mode,
     )
 }
 
 /// Wait briefly for the first live event before committing Anthropic SSE.
 /// A missing-conversation reset on that first event can start a fresh Run
 /// on this same request; grok-build will not retry the 502 itself.
-async fn peek_live_start_for_stale_reset(
-    mut events: mpsc::Receiver<LiveEventResult>,
-) -> LiveStartPeek {
+async fn peek_live_start_for_stale_reset(events: mpsc::Receiver<LiveEventResult>) -> LiveStartPeek {
     let wait = Duration::from_millis(env_u64_millis("CCP_CURSOR_STALE_CONV_PEEK_MS", 2_000));
+    peek_live_start_for_stale_reset_with_wait(events, wait).await
+}
+
+async fn peek_live_start_for_stale_reset_with_wait(
+    mut events: mpsc::Receiver<LiveEventResult>,
+    wait: Duration,
+) -> LiveStartPeek {
     match tokio::time::timeout(wait, events.recv()).await {
         // Policy 429s are routed as Retryable so the start loop can fail over
         // to newly stored credentials after a hot account switch; without a
@@ -1263,9 +2030,72 @@ async fn peek_live_start_for_stale_reset(
         {
             LiveStartPeek::Retryable(error)
         }
-        Ok(Some(first)) => LiveStartPeek::Ready(prepend_live_event(first, events)),
-        Ok(None) | Err(_) => LiveStartPeek::Ready(events),
+        Ok(Some(first)) => LiveStartPeek::Ready {
+            observed_healthy_event: first.as_ref().is_ok_and(live_event_commits_client_output),
+            events: prepend_live_event(first, events),
+        },
+        Ok(None) => LiveStartPeek::Ready {
+            events,
+            observed_healthy_event: false,
+        },
+        Err(_) => LiveStartPeek::Ready {
+            events,
+            observed_healthy_event: false,
+        },
     }
+}
+
+/// Keep a cold account/model policy probe owned after the short live-start
+/// peek expires. A late policy 429 opens the breaker before any waiting
+/// session can dispatch; a decisive model event marks the key healthy.
+///
+/// The task deliberately keeps observing the upstream even if the original
+/// downstream receiver is dropped. Otherwise a client disconnect during the
+/// quiet start window could release the only probe while its accepted Cursor
+/// Run was still capable of returning the decisive policy result.
+fn hold_policy_probe_until_decisive_event(
+    mut events: mpsc::Receiver<LiveEventResult>,
+    lease: PolicyRateLimitProbeLease,
+    model: String,
+    client_type: String,
+    token: String,
+) -> mpsc::Receiver<LiveEventResult> {
+    let (tx, rx) = mpsc::channel(512);
+    tokio::spawn(async move {
+        let mut lease = Some(lease);
+        let mut forwarding = true;
+        while let Some(item) = events.recv().await {
+            if lease.is_some() {
+                match &item {
+                    Ok(event) if live_event_commits_client_output(event) => {
+                        lease
+                            .take()
+                            .expect("policy probe lease is present")
+                            .mark_healthy();
+                    }
+                    Err(error) if crate::retry::is_policy_rate_limit(error) => {
+                        note_policy_rate_limit(&model, &client_type, &token, error, None);
+                        drop(lease.take());
+                    }
+                    Err(_) => drop(lease.take()),
+                    Ok(_) => {
+                        // Session/usage/thinking metadata is not proof that
+                        // Cursor admitted the requested model. Keep the probe
+                        // owned until text, a tool, End, or an error arrives.
+                    }
+                }
+            }
+
+            if forwarding && tx.send(item).await.is_err() {
+                forwarding = false;
+            }
+            if !forwarding && lease.is_none() {
+                return;
+            }
+        }
+        drop(lease.take());
+    });
+    rx
 }
 
 fn prepend_live_event(
@@ -1290,6 +2120,7 @@ fn prepend_live_event(
 enum LivePumpOutcome {
     Done,
     Retry(String),
+    PolicyLimited(String),
     ClientGone,
 }
 
@@ -1312,6 +2143,9 @@ fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
 
 fn classify_live_pump_item(committed: bool, item: &LiveEventResult) -> LivePumpAction {
     match item {
+        Err(error) if !committed && crate::retry::is_policy_rate_limit(error) => {
+            LivePumpAction::PolicyLimit
+        }
         Err(error) if live_error_is_empty_turn_retry(error) => LivePumpAction::Retry,
         Err(error) if !committed && live_error_is_same_request_retryable(error) => {
             LivePumpAction::Retry
@@ -1328,6 +2162,7 @@ enum LivePumpAction {
     Buffer,
     Forward,
     Retry,
+    PolicyLimit,
 }
 
 async fn pump_live_events_until_commit_or_retry(
@@ -1343,6 +2178,12 @@ async fn pump_live_events_until_commit_or_retry(
                     continue;
                 };
                 return LivePumpOutcome::Retry(error);
+            }
+            LivePumpAction::PolicyLimit => {
+                let Err(error) = item else {
+                    continue;
+                };
+                return LivePumpOutcome::PolicyLimited(error);
             }
             LivePumpAction::Buffer => buffered.push(item),
             LivePumpAction::Forward => {
@@ -1404,13 +2245,37 @@ fn live_late_retry_limit(error: &str, policy: LiveLateRetryPolicy) -> u32 {
     }
 }
 
+#[cfg(test)]
 async fn forward_live_events_with_retries<F, Fut>(
+    tx: &mpsc::Sender<LiveEventResult>,
+    events: mpsc::Receiver<LiveEventResult>,
+    session_id: &str,
+    agent_id: Option<&str>,
+    restart: F,
+    policy: LiveLateRetryPolicy,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<mpsc::Receiver<LiveEventResult>, CursorError>>,
+{
+    let context = LiveLateRetryContext {
+        model: "unknown".into(),
+        client_type: "unknown".into(),
+        effective_token: Arc::new(Mutex::new(String::new())),
+    };
+    forward_live_events_with_retries_context(
+        tx, events, session_id, agent_id, restart, policy, &context,
+    )
+    .await;
+}
+
+async fn forward_live_events_with_retries_context<F, Fut>(
     tx: &mpsc::Sender<LiveEventResult>,
     mut events: mpsc::Receiver<LiveEventResult>,
     session_id: &str,
     agent_id: Option<&str>,
     mut restart: F,
     policy: LiveLateRetryPolicy,
+    context: &LiveLateRetryContext,
 ) where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<mpsc::Receiver<LiveEventResult>, CursorError>>,
@@ -1467,6 +2332,24 @@ async fn forward_live_events_with_retries<F, Fut>(
                 };
                 let retry_limit = live_late_retry_limit(&error, policy);
                 if retry_index >= retry_limit {
+                    create_logger("cursor").warn(
+                        "live_retry_exhausted",
+                        Some(serde_json::Map::from_iter([
+                            ("attempt".into(), serde_json::json!(retry_index + 1)),
+                            ("maxRetries".into(), serde_json::json!(retry_limit)),
+                            ("model".into(), serde_json::json!(&context.model)),
+                            ("clientType".into(), serde_json::json!(&context.client_type)),
+                            ("sessionId".into(), serde_json::json!(session_id)),
+                            (
+                                "recovery".into(),
+                                serde_json::json!(if empty_turn {
+                                    "empty_turn_exhausted"
+                                } else {
+                                    "transient_exhausted"
+                                }),
+                            ),
+                        ])),
+                    );
                     let _ = tx.send(Err(error)).await;
                     return;
                 }
@@ -1549,6 +2432,26 @@ async fn forward_live_events_with_retries<F, Fut>(
                 } else {
                     transient_retries += 1;
                 }
+                create_logger("cursor").warn(
+                    "live_internal_retry",
+                    Some(serde_json::Map::from_iter([
+                        ("attempt".into(), serde_json::json!(retry_index + 1)),
+                        ("maxRetries".into(), serde_json::json!(retry_limit)),
+                        ("model".into(), serde_json::json!(&context.model)),
+                        ("clientType".into(), serde_json::json!(&context.client_type)),
+                        ("sessionId".into(), serde_json::json!(session_id)),
+                        (
+                            "recovery".into(),
+                            serde_json::json!(if live_error_needs_checkpoint_continue(&error) {
+                                "checkpoint_continue"
+                            } else if empty_turn {
+                                "fresh_conversation"
+                            } else {
+                                "same_request"
+                            }),
+                        ),
+                    ])),
+                );
                 let start = restart(error);
                 tokio::pin!(start);
                 events = match tokio::select! {
@@ -1582,6 +2485,25 @@ async fn forward_live_events_with_retries<F, Fut>(
                 // that newly accepted generation.
                 expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
             }
+            LivePumpOutcome::PolicyLimited(error) => {
+                // A Sand clean-END may be reclassified by the live driver once
+                // dashboard quota evidence is available. Treat it exactly like
+                // an explicit Connect policy 429: open the account/model
+                // breaker and surface one terminal event, rather than burning
+                // the hollow-turn retry budget and creating another Run wave.
+                let token = context.effective_token();
+                if !token.is_empty() {
+                    note_policy_rate_limit(
+                        &context.model,
+                        &context.client_type,
+                        &token,
+                        &error,
+                        None,
+                    );
+                }
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
             LivePumpOutcome::Done => return,
         }
     }
@@ -1596,6 +2518,13 @@ fn spawn_live_events_with_late_retries(
     let session_id = start.session_id.clone();
     let agent_id = start.agent_id.clone();
     tokio::spawn(async move {
+        let retry_context = LiveLateRetryContext {
+            model: start.model.clone(),
+            client_type: start.client_type.clone(),
+            effective_token: Arc::clone(&start.effective_token),
+        };
+        let retry_policy =
+            LiveLateRetryPolicy::for_request(&retry_context.model, &retry_context.client_type);
         let events = match initial_events {
             Some(events) => events,
             None => {
@@ -1620,7 +2549,7 @@ fn spawn_live_events_with_late_retries(
             }
         };
         let retry_start = start.clone();
-        forward_live_events_with_retries(
+        forward_live_events_with_retries_context(
             &tx,
             events,
             &session_id,
@@ -1629,13 +2558,15 @@ fn spawn_live_events_with_late_retries(
                 let retry_start = retry_start.clone();
                 async move { retry_start.start_after_error(&error).await }
             },
-            LiveLateRetryPolicy::from_env(),
+            retry_policy,
+            &retry_context,
         )
         .await;
     });
     rx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_downstream_response(
     want_stream: bool,
     session_id: &str,
@@ -1644,6 +2575,7 @@ async fn live_downstream_response(
     wire_model: String,
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    compaction_mode: bool,
 ) -> Response {
     if want_stream {
         live_sse_recording_usage(
@@ -1653,6 +2585,7 @@ async fn live_downstream_response(
             wire_model,
             estimated_input,
             monitor,
+            compaction_mode,
         )
     } else {
         live_json_recording_usage(
@@ -1662,6 +2595,7 @@ async fn live_downstream_response(
             wire_model,
             estimated_input,
             monitor,
+            compaction_mode,
         )
         .await
     }
@@ -1672,8 +2606,9 @@ async fn collect_live_events_to_json(
     message_id: &str,
     model: &str,
     estimated_input: u64,
+    compaction_mode: bool,
 ) -> Result<serde_json::Value, String> {
-    let mut acc = AnthropicJsonAcc::new(estimated_input);
+    let mut acc = AnthropicJsonAcc::new_mode(estimated_input, compaction_mode);
     let mut saw_end = false;
     let mut tool_handoff = false;
     while let Some(item) = events.recv().await {
@@ -1712,12 +2647,14 @@ async fn live_json_recording_usage(
     wire_model: String,
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    compaction_mode: bool,
 ) -> Response {
     match collect_live_events_to_json(
         tap_session_usage(session_id.to_string(), events),
         &message_id,
         &wire_model,
         estimated_input,
+        compaction_mode,
     )
     .await
     {
@@ -2491,6 +3428,32 @@ fn request_has_current_tool_result(body: &MessagesRequest) -> bool {
     })
 }
 
+/// An open account/model breaker blocks only work that could create a new
+/// Cursor Run. Matching tool-result continuations and identical retries can
+/// still attach to a Run that is already accepted upstream; rejecting those
+/// here would strand native tools or turn a recoverable dropped SSE into a
+/// new client retry storm without reducing Cursor load.
+fn policy_preflight_can_attach_existing_run(body: &MessagesRequest, ctx: &RequestContext) -> bool {
+    if request_has_current_tool_result(body) {
+        // Route tool results through the registry first. A matching accepted
+        // Run can resume even while its account/model breaker is open; a stale
+        // result is rejected by the registry, and every true fresh start still
+        // hits the final pre-open breaker below.
+        return true;
+    }
+    let Some(session_id) = ctx.session_id.as_deref().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    let fingerprint = live_request_fingerprint(&live_operation_fingerprint_payload(
+        body,
+        ctx.client_request_id.as_deref(),
+    ));
+    let agent_id = claude_agent_id(ctx);
+    LiveRunRegistry::get_run(session_id, agent_id)
+        .is_some_and(|run| run.request_fingerprint() == fingerprint)
+        || LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint).is_some()
+}
+
 #[cfg(test)]
 fn live_current_batch_is_unrelated(body: &MessagesRequest, pending: &[PendingCursorExec]) -> bool {
     if pending.is_empty() {
@@ -2590,13 +3553,55 @@ impl Provider for CursorProvider {
             );
         }
 
+        // Read auth before the live-slot/SSE path so an account/model policy
+        // breaker can return a real HTTP 429. If this check runs after
+        // `live_sse_response`, Claude Code sees HTTP 200 plus an error event
+        // and immediately fans out another retry wave.
+        let mut auth = match load_cursor_auth() {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    missing_auth_message(),
+                );
+            }
+            Err(err) => {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    format!("Cursor auth failed: {err}"),
+                );
+            }
+        };
+
+        // Near expiry: refresh first. A rotated token represents a fresh
+        // account credential and must not inherit the old token's breaker.
+        if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
+            match force_refresh_cursor_auth_async(auth.access_token.clone()).await {
+                Ok(Some(refreshed)) => auth = refreshed,
+                Ok(None) | Err(_) => {
+                    return json_error(
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        expired_auth_message(&auth),
+                    );
+                }
+            }
+        }
+        let has_tool_results = request_has_current_tool_result(&body);
+        if !policy_preflight_can_attach_existing_run(&body, &ctx)
+            && let Err(error) = policy_rate_limit_preflight(model, &client_type, &auth.access_token)
+        {
+            return map_cursor_error_to_response(&error);
+        }
+
         // True Cursor BiDi continuation: the preceding Anthropic response ended
         // at tool_use, but the upstream AgentService/Run stream is still alive.
         // Route the matching tool_result back onto that exact request stream
         // instead of replaying the whole conversation as a fresh Cursor run.
         let mut preclaimed_live_reservation = None;
         let mut resumed_live_events = None;
-        let has_tool_results = request_has_current_tool_result(&body);
         let defer_fresh_stream = defer_fresh_stream_admission(
             want_stream,
             ctx.hold_http_until_live_open,
@@ -2827,42 +3832,6 @@ impl Provider for CursorProvider {
             BridgeRegistry::remove(&bridge_key);
         }
 
-        // INVARIANT: auth is re-read from the store on every request — never
-        // cache it process-wide. `cursor auth login` in another terminal hot
-        // swaps the account for new requests while in-flight runs keep the
-        // token copy they captured at start.
-        let mut auth = match load_cursor_auth() {
-            Ok(Some(auth)) => auth,
-            Ok(None) => {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication_error",
-                    missing_auth_message(),
-                );
-            }
-            Err(err) => {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication_error",
-                    format!("Cursor auth failed: {err}"),
-                );
-            }
-        };
-
-        // Near expiry: force-refresh when possible instead of hard-failing re-login.
-        if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
-            match force_refresh_cursor_auth_async(auth.access_token.clone()).await {
-                Ok(Some(refreshed)) => auth = refreshed,
-                Ok(None) | Err(_) => {
-                    return json_error(
-                        StatusCode::UNAUTHORIZED,
-                        "authentication_error",
-                        expired_auth_message(&auth),
-                    );
-                }
-            }
-        }
-
         // Hosted search/fetch run after Cursor auth so a logged-out proxy is
         // not an open SSRF/search endpoint. Incoming Anthropic tokens are still
         // unused; the gate is the stored Cursor login on this host.
@@ -2886,6 +3855,21 @@ impl Provider for CursorProvider {
         }
         if let Some(resp) = maybe_handle_hosted_web_fetch(&body, &message_id, &wire_model).await {
             return resp;
+        }
+
+        // The registry work above may wait for a previous generation to
+        // finish. Re-check before constructing any fresh live/buffered Run so
+        // a policy 429 observed during that handoff is still surfaced as a
+        // real HTTP 429. A resumed/attached stream is already accepted work
+        // and deliberately bypasses this new-dispatch guard.
+        if resumed_live_events.is_none()
+            && !policy_preflight_can_attach_existing_run(&body, &ctx)
+            && let Err(error) = policy_rate_limit_preflight(model, &client_type, &auth.access_token)
+        {
+            if let Some(reservation) = preclaimed_live_reservation.take() {
+                reservation.release();
+            }
+            return map_cursor_error_to_response(&error);
         }
 
         // Compaction uses the original session with its synthetic agent lane;
@@ -2912,28 +3896,50 @@ impl Provider for CursorProvider {
                 ])),
             );
         }
-        let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
+        // A compaction turn is a summary-only operation. Do not expose native
+        // tool bridge state or MCP catalogs to it: a tool call here would make
+        // the Responses collector wait for output text and report an empty
+        // summary, then retry the same compaction forever.
+        let bridge_eligible = !xai_compact && can_bridge_cursor_native_tools(&body, session_id);
+        let request_allowed_tools = if xai_compact {
+            Some(BTreeSet::new())
+        } else {
+            advertised_tool_names(&body)
+        };
+        let request_mcp_tools = if xai_compact {
+            None
+        } else {
+            claude_local_mcp_tools(&body)
+        };
         let bridge_key = bridge_registry_key(&ctx);
         let continuation_key = session_id
             .filter(|s| !s.is_empty())
             .map(|sid| live_run_key_for(live_run_identity(sid, &ctx)));
         let continuation = continuation_for_request(session_id, &ctx);
+        let tool_result_only_turn = latest_user_is_only_tool_results(&body);
         let client_only_continuation =
-            request_has_client_only_tool_results(&body) || latest_user_is_only_tool_results(&body);
+            request_has_client_only_tool_results(&body) || tool_result_only_turn;
         let parts = render_cursor_prompt_parts_with(
             &body,
             CursorPromptOptions {
                 // Native BiDi tools don't need Anthropic schemas in user text;
                 // Claude-local tools (Workflow/Skill/mcp__) are still forwarded.
-                omit_tools: bridge_eligible || continuation.has_checkpoint,
+                omit_tools: xai_compact || bridge_eligible || continuation.has_checkpoint,
                 // ClientOnly (Workflow/Skill) results arrive after BiDi teardown.
                 // delta_only would skip tool_result-only messages and replay the
                 // original user text against a stale/zombie MCP checkpoint.
-                delta_only: continuation.has_checkpoint && !client_only_continuation,
+                delta_only: !xai_compact
+                    && continuation.has_checkpoint
+                    && !client_only_continuation,
             },
         );
-        let images =
-            request::cursor_selected_images_for_continuation(&body, continuation.has_checkpoint);
+        // Normal checkpoint-backed starts send only images from the current
+        // user turn. A tool-result-only request additionally retains historical
+        // image bytes for the specific recovery that clears the conversation
+        // and replays full Anthropic history; confirmed-checkpoint nudges and
+        // ordinary transport retries must not re-submit old screenshots.
+        let (images, reset_retry_images) =
+            live_request_image_sets(&body, continuation.has_checkpoint);
         if !images.is_empty() {
             create_logger("cursor").info(
                 "selected_images",
@@ -2965,16 +3971,17 @@ impl Provider for CursorProvider {
                 .map(|handle| (handle, ctx.req_id.clone()));
             let retry_start = LiveRetryStart {
                 client: client.clone(),
-                token,
+                effective_token: Arc::new(Mutex::new(token)),
                 user_text: user_text.to_string(),
                 model: model.to_string(),
                 images,
+                reset_retry_images,
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
                 parent_agent_id: identity.parent_agent_id.map(str::to_string),
-                allowed: advertised_tool_names(&body),
-                mcp_tools: claude_local_mcp_tools(&body),
+                allowed: request_allowed_tools.clone(),
+                mcp_tools: request_mcp_tools.clone(),
                 request_context: cursor_request_context(&body),
                 fingerprint: live_operation_fingerprint_payload(
                     &body,
@@ -2983,6 +3990,7 @@ impl Provider for CursorProvider {
                 has_refresh: auth.refresh_token.is_some(),
                 client_type: client_type.clone(),
                 unbounded_conflict_wait: false,
+                compaction_mode: xai_compact,
             };
             let events = spawn_live_events_with_late_retries(retry_start, None, Some(events));
             return live_downstream_response(
@@ -2993,6 +4001,7 @@ impl Provider for CursorProvider {
                 wire_model,
                 estimated_input,
                 monitor,
+                xai_compact,
             )
             .await;
         }
@@ -3025,8 +4034,8 @@ impl Provider for CursorProvider {
             let sid = session_id.expect("live eligibility requires session id");
             let identity = live_run_identity(sid, &ctx);
             log_live_start_claude_headers(&ctx, sid);
-            let allowed = advertised_tool_names(&body);
-            let mcp_tools = claude_local_mcp_tools(&body);
+            let allowed = request_allowed_tools.clone();
+            let mcp_tools = request_mcp_tools.clone();
             let estimated_input = estimate_rendered_prompt_tokens(&parts);
             let monitor = ctx
                 .monitor
@@ -3052,6 +4061,7 @@ impl Provider for CursorProvider {
                     user_text.to_string(),
                     model.to_string(),
                     images,
+                    reset_retry_images,
                     custom_system.map(str::to_string),
                     sid.to_string(),
                     identity.agent_id.map(str::to_string),
@@ -3063,6 +4073,7 @@ impl Provider for CursorProvider {
                     initial_reservation,
                     has_refresh,
                     defer_fresh_stream,
+                    xai_compact,
                     client_type.clone(),
                     message_id,
                     wire_model,
@@ -3072,10 +4083,11 @@ impl Provider for CursorProvider {
             }
             let retry_start = LiveRetryStart {
                 client: client.clone(),
-                token,
+                effective_token: Arc::new(Mutex::new(token)),
                 user_text: user_text.to_string(),
                 model: model.to_string(),
                 images,
+                reset_retry_images,
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -3087,6 +4099,7 @@ impl Provider for CursorProvider {
                 has_refresh,
                 client_type: client_type.clone(),
                 unbounded_conflict_wait: false,
+                compaction_mode: xai_compact,
             };
             match retry_start.start(initial_reservation).await {
                 Ok(events) => {
@@ -3100,6 +4113,7 @@ impl Provider for CursorProvider {
                         wire_model,
                         estimated_input,
                         monitor,
+                        xai_compact,
                     )
                     .await;
                 }
@@ -3110,6 +4124,14 @@ impl Provider for CursorProvider {
         let mut transport_retries = 0_u32;
         let mut refreshed_once = false;
         let upstream = loop {
+            // The buffered fallback can also wait behind auth/session work;
+            // honor a breaker opened in that interval before dispatching, and
+            // single-flight a cold account/model key just like the live path.
+            let probe_admission =
+                match policy_rate_limit_admit_fresh_open(model, &client_type, &token).await {
+                    Ok(admission) => admission,
+                    Err(error) => return map_cursor_error_to_response(&error),
+                };
             match client
                 .run_agent_with_session_profile(
                     &token,
@@ -3124,8 +4146,12 @@ impl Provider for CursorProvider {
                 )
                 .await
             {
-                Ok(r) => break r,
+                Ok(r) => {
+                    probe_admission.mark_healthy();
+                    break r;
+                }
                 Err(e) if e.status == 401 && !refreshed_once && auth.refresh_token.is_some() => {
+                    drop(probe_admission);
                     match force_refresh_cursor_auth_async(token.clone()).await {
                         Ok(Some(refreshed)) => {
                             token = refreshed.access_token;
@@ -3139,6 +4165,7 @@ impl Provider for CursorProvider {
                     if transport_retries < cursor_transient_retry_limit(&e.client_message())
                         && cursor_start_error_is_same_request_retryable(&e) =>
                 {
+                    drop(probe_admission);
                     crate::retry::sleep(same_request_retry_wait_ms(
                         transport_retries,
                         &e.client_message(),
@@ -3147,10 +4174,26 @@ impl Provider for CursorProvider {
                     transport_retries += 1;
                 }
                 Err(e) => {
-                    return map_cursor_error_to_response(&exhausted_live_start_error(
-                        e,
-                        transport_retries,
-                    ));
+                    let policy_limited = crate::retry::is_policy_rate_limit(&e.client_message())
+                        || crate::retry::is_policy_rate_limit(&e.message);
+                    if policy_limited {
+                        probe_admission.mark_policy_limited(
+                            model,
+                            &client_type,
+                            &token,
+                            &e.client_message(),
+                            e.retry_after.as_deref(),
+                        );
+                    } else {
+                        drop(probe_admission);
+                    }
+                    let mut error = exhausted_live_start_error(e, transport_retries);
+                    if policy_limited && error.retry_after.is_none() {
+                        error.retry_after =
+                            policy_rate_limit_breaker_state(model, &client_type, &token)
+                                .map(|state| state.retry_after_secs.to_string());
+                    }
+                    return map_cursor_error_to_response(&error);
                 }
             }
         };
@@ -3203,13 +4246,17 @@ impl Provider for CursorProvider {
                 // advertised tool set too. Native Cursor exec events are
                 // ignored when the request advertises no tools, preventing
                 // synthetic tool_use blocks from leaking into plain chats.
-                let allowed = advertised_tool_names(&body).unwrap_or_default();
-                let sse_bytes = sse::frame_cursor_stream_with_allowed(
-                    &upstream,
-                    &message_id,
-                    &wire_model,
-                    Some(&allowed),
-                );
+                let allowed = request_allowed_tools.clone().unwrap_or_default();
+                let sse_bytes = if xai_compact {
+                    sse::frame_cursor_stream_compaction(&upstream, &message_id, &wire_model)
+                } else {
+                    sse::frame_cursor_stream_with_allowed(
+                        &upstream,
+                        &message_id,
+                        &wire_model,
+                        Some(&allowed),
+                    )
+                };
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
                     remember_input_tokens(session_id, input_tokens);
@@ -3232,13 +4279,18 @@ impl Provider for CursorProvider {
                 (headers, sse_bytes).into_response()
             }
         } else {
-            let allowed = advertised_tool_names(&body).unwrap_or_default();
-            match decode_cursor_upstream_with_allowed(
-                &upstream,
-                &message_id,
-                &wire_model,
-                Some(&allowed),
-            ) {
+            let allowed = request_allowed_tools.clone().unwrap_or_default();
+            let decoded = if xai_compact {
+                decode_cursor_upstream_compaction(&upstream, &message_id, &wire_model)
+            } else {
+                decode_cursor_upstream_with_allowed(
+                    &upstream,
+                    &message_id,
+                    &wire_model,
+                    Some(&allowed),
+                )
+            };
+            match decoded {
                 Ok(json) => {
                     let input_tokens = json.pointer("/usage/input_tokens").and_then(|v| v.as_u64());
                     remember_input_tokens(session_id, input_tokens);
@@ -3491,6 +4543,8 @@ mod tests {
     use super::*;
     use crate::providers::cursor::live::live_error_allows_fresh_conversation;
 
+    static POLICY_RATE_LIMIT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     #[test]
     fn xai_compact_request_ids_are_detected_without_matching_other_operations() {
         assert!(is_xai_compact_request(Some("xai-compact-123")));
@@ -3528,6 +4582,479 @@ mod tests {
             claude_code: crate::provider::ClaudeCodeAgentHeaders::default(),
             hold_http_until_live_open: false,
         }
+    }
+
+    fn policy_test_context(session_id: Option<&str>) -> RequestContext {
+        RequestContext {
+            req_id: "policy-test-req".into(),
+            client_request_id: None,
+            session_id: session_id.map(str::to_owned),
+            session_seq: None,
+            provider: "cursor".into(),
+            traffic: None,
+            monitor: None,
+            claude_code: crate::provider::ClaudeCodeAgentHeaders::default(),
+            hold_http_until_live_open: false,
+        }
+    }
+
+    #[test]
+    fn policy_breaker_is_scoped_by_model_account_and_client_route() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let message = "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded";
+        note_policy_rate_limit("gemini-3.6-flash-high", "sand", "token-a", message, None);
+
+        let blocked = policy_rate_limit_preflight("gemini-3.6-flash-high", "sand", "token-a")
+            .expect_err("the same model/account/route must observe the local cooldown");
+        assert_eq!(blocked.status, 429);
+        assert!(blocked.retry_after.is_some());
+        assert!(policy_rate_limit_preflight("gemini-3.1-pro", "sand", "token-a").is_ok());
+        assert!(policy_rate_limit_preflight("gemini-3.6-flash-high", "sand", "token-b").is_ok());
+        assert!(
+            policy_rate_limit_preflight("gemini-3.6-flash-high", "cli", "token-a").is_ok(),
+            "a Sand allowance limit must not block the CLI route"
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn policy_breaker_concurrent_preflights_remain_model_account_and_route_isolated() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        note_policy_rate_limit(
+            "gemini-3.6-flash-high",
+            "sand",
+            "token-a",
+            "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED",
+            Some("90"),
+        );
+
+        std::thread::scope(|scope| {
+            let mut checks = Vec::new();
+            for index in 0..64 {
+                checks.push(scope.spawn(move || {
+                    match index % 4 {
+                        0 => {
+                            policy_rate_limit_preflight("gemini-3.6-flash-high", "sand", "token-a")
+                                .is_err()
+                        }
+                        1 => {
+                            policy_rate_limit_preflight("gemini-3.1-pro", "sand", "token-a").is_ok()
+                        }
+                        2 => {
+                            policy_rate_limit_preflight("gemini-3.6-flash-high", "sand", "token-b")
+                                .is_ok()
+                        }
+                        _ => policy_rate_limit_preflight("gemini-3.6-flash-high", "cli", "token-a")
+                            .is_ok(),
+                    }
+                }));
+            }
+            for check in checks {
+                assert!(check.join().expect("policy preflight worker"));
+            }
+        });
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn policy_breaker_single_flights_a_thousand_waiters_until_delayed_429() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        // Preserve the production 5s-policy / 30s-window ratio while keeping
+        // this regression sub-second through the injectable window.
+        let probe_window = Duration::from_millis(600);
+        let owner = policy_rate_limit_admit_fresh_open_with_window(
+            "gemini-3.6-flash-high",
+            "sand",
+            "first-wave-token",
+            probe_window,
+        )
+        .await
+        .expect("the first request owns the cold probe");
+        assert!(matches!(owner, PolicyRateLimitAdmission::Probe(_)));
+
+        const REQUESTS: usize = 1_000;
+        let barrier = Arc::new(tokio::sync::Barrier::new(REQUESTS + 1));
+        let unexpected_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut wave = tokio::task::JoinSet::new();
+        for _ in 0..REQUESTS {
+            let barrier = Arc::clone(&barrier);
+            let unexpected_probes = Arc::clone(&unexpected_probes);
+            wave.spawn(async move {
+                barrier.wait().await;
+                match policy_rate_limit_admit_fresh_open_with_window(
+                    "gemini-3.6-flash-high",
+                    "sand",
+                    "first-wave-token",
+                    probe_window,
+                )
+                .await
+                {
+                    Ok(PolicyRateLimitAdmission::Probe(lease)) => {
+                        unexpected_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        drop(lease);
+                        None
+                    }
+                    Ok(PolicyRateLimitAdmission::KnownHealthy) => None,
+                    Err(error) => error.retry_after,
+                }
+            });
+        }
+        barrier.wait().await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            unexpected_probes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a policy result delayed by the equivalent of 5s must still precede fanout"
+        );
+        owner.mark_policy_limited(
+            "gemini-3.6-flash-high",
+            "sand",
+            "first-wave-token",
+            "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded",
+            Some("120"),
+        );
+        // Exercise the former note-after-drop race: every awakened waiter must
+        // see the breaker even when it is scheduled immediately after release.
+        tokio::task::yield_now().await;
+
+        let mut blocked = 0;
+        while let Some(result) = wave.join_next().await {
+            let retry_after = result.expect("policy first-wave worker");
+            if let Some(retry_after) = retry_after {
+                let retry_after = retry_after.parse::<u64>().expect("numeric Retry-After");
+                assert!((1..=120).contains(&retry_after));
+                blocked += 1;
+            }
+        }
+        assert_eq!(
+            unexpected_probes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "only the original cold probe may reach Cursor before its delayed 429"
+        );
+        assert_eq!(blocked, REQUESTS);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn policy_probe_quiet_window_ramps_only_one_of_a_thousand_waiters() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let probe_window = Duration::from_millis(500);
+        let owner = policy_rate_limit_admit_fresh_open_with_window(
+            "cursor-grok-4.6-xhigh-fast",
+            "cli",
+            "healthy-fanout-token",
+            probe_window,
+        )
+        .await
+        .expect("the first start owns the coalescing probe");
+        assert!(matches!(owner, PolicyRateLimitAdmission::Probe(_)));
+
+        const WAITERS: usize = 1_000;
+        let barrier = Arc::new(tokio::sync::Barrier::new(WAITERS + 1));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let healthy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut fanout = tokio::task::JoinSet::new();
+        for _ in 0..WAITERS {
+            let barrier = Arc::clone(&barrier);
+            let probes = Arc::clone(&probes);
+            let healthy = Arc::clone(&healthy);
+            fanout.spawn(async move {
+                barrier.wait().await;
+                match policy_rate_limit_admit_fresh_open_with_window(
+                    "cursor-grok-4.6-xhigh-fast",
+                    "cli",
+                    "healthy-fanout-token",
+                    probe_window,
+                )
+                .await
+                {
+                    Ok(PolicyRateLimitAdmission::Probe(lease)) => {
+                        probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                        drop(lease);
+                    }
+                    Ok(PolicyRateLimitAdmission::KnownHealthy) => {
+                        healthy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    }
+                    Err(error) => panic!("quiet fanout was rejected: {error}"),
+                }
+            });
+        }
+        barrier.wait().await;
+
+        // Once the first quiet window expires, exactly one waiter becomes a
+        // second probe. It holds that rotated lease so the remaining 999 stay
+        // coalesced until another full window or a decisive event.
+        tokio::time::timeout(Duration::from_millis(800), async {
+            loop {
+                if probes.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("one bounded ramp probe must be admitted after the quiet window");
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(healthy.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        drop(owner);
+        fanout.abort_all();
+        while fanout.join_next().await.is_some() {}
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn policy_probe_waits_for_a_decisive_result_after_live_peek_timeout() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let admission = policy_rate_limit_admit_fresh_open(
+            "gemini-3.6-flash-high",
+            "sand",
+            "late-policy-token",
+        )
+        .await
+        .expect("the first request owns the cold probe");
+        let lease = admission.into_probe().expect("cold admission is a probe");
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let LiveStartPeek::Ready {
+            events,
+            observed_healthy_event,
+        } = peek_live_start_for_stale_reset_with_wait(upstream_rx, Duration::from_millis(1)).await
+        else {
+            panic!("a quiet live start must remain attached after the short peek");
+        };
+        assert!(
+            !observed_healthy_event,
+            "a local peek timeout is not upstream health evidence"
+        );
+        let mut held = hold_policy_probe_until_decisive_event(
+            events,
+            lease,
+            "gemini-3.6-flash-high".into(),
+            "sand".into(),
+            "late-policy-token".into(),
+        );
+
+        let waiter = tokio::spawn(async {
+            policy_rate_limit_admit_fresh_open("gemini-3.6-flash-high", "sand", "late-policy-token")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the second session must not dispatch while the first probe is quiet"
+        );
+
+        upstream_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::Session {
+                session_id: "metadata-only".into(),
+            })))
+            .await
+            .expect("deliver non-decisive metadata");
+        assert!(matches!(
+            held.recv().await,
+            Some(Ok(LiveRunEvent::Cursor(CursorStreamEvent::Session { .. })))
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !waiter.is_finished(),
+            "session metadata must not be mistaken for model admission"
+        );
+
+        // Continue observing even if the original downstream receiver is
+        // dropped; a late policy result still has to open the breaker.
+        drop(held);
+
+        let policy_error =
+            "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded";
+        upstream_tx
+            .send(Err(policy_error.into()))
+            .await
+            .expect("deliver the delayed policy result");
+
+        let blocked = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter observes the opened breaker")
+            .expect("policy waiter task")
+            .expect_err("the delayed first policy result blocks the waiting session");
+        assert_eq!(blocked.status, 429);
+        assert!(blocked.retry_after.is_some());
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn policy_breaker_key_uses_the_resolved_model_id() {
+        assert_eq!(
+            policy_rate_limit_key("cursor", "cli", "token-a"),
+            policy_rate_limit_key("composer-2.5", "cli", "token-a")
+        );
+        assert_ne!(
+            policy_rate_limit_key("cursor", "sand", "token-a"),
+            policy_rate_limit_key("cursor", "cli", "token-a"),
+            "Sand and CLI policy state must remain independent"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stale_pre_limit_probe_cannot_mark_post_cooldown_epoch_healthy() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let stale = policy_rate_limit_admit_fresh_open_with_window(
+            "gemini-3.6-flash-high",
+            "sand",
+            "epoch-token",
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("the pre-limit request owns a probe");
+        assert!(matches!(stale, PolicyRateLimitAdmission::Probe(_)));
+
+        note_policy_rate_limit(
+            "gemini-3.6-flash-high",
+            "sand",
+            "epoch-token",
+            "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded",
+            Some("30"),
+        );
+        // Simulate cooldown expiry without a wall-clock sleep. The stale Run
+        // then reports useful output, but its older epoch must not turn the
+        // newly half-open gate Healthy.
+        POLICY_RATE_LIMIT_BREAKER
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        stale.mark_healthy();
+
+        let after_cooldown = policy_rate_limit_admit_fresh_open_with_window(
+            "gemini-3.6-flash-high",
+            "sand",
+            "epoch-token",
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("the post-cooldown request is admitted as half-open");
+        assert!(
+            matches!(after_cooldown, PolicyRateLimitAdmission::Probe(_)),
+            "stale pre-limit health evidence must not skip the fresh half-open probe"
+        );
+        drop(after_cooldown);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn policy_cooldown_parses_retry_hints_and_bounds_values() {
+        assert_eq!(
+            policy_rate_limit_cooldown_secs("retry after 2 minutes", None),
+            120
+        );
+        assert_eq!(
+            policy_rate_limit_cooldown_secs("try again in 3 seconds", None),
+            5
+        );
+        assert_eq!(
+            policy_rate_limit_cooldown_secs("wait 9999 seconds", None),
+            600
+        );
+        assert_eq!(policy_rate_limit_cooldown_secs("quota", Some("120")), 120);
+        assert_eq!(
+            policy_rate_limit_cooldown_secs("retry after 2 minutes", Some("9")),
+            9,
+            "the upstream HTTP header takes priority over body prose"
+        );
+        assert!(
+            retry_after_delta_secs("Wed, 21 Oct 2037 07:28:00 GMT").is_some(),
+            "HTTP-date Retry-After must be accepted"
+        );
+    }
+
+    #[test]
+    fn policy_preflight_keeps_tool_result_continuations_attachable() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.6-flash-high",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "done"
+            }]}]
+        }))
+        .unwrap();
+        assert!(policy_preflight_can_attach_existing_run(
+            &body,
+            &policy_test_context(Some("policy-tool-session")),
+        ));
+    }
+
+    #[test]
+    fn policy_breaker_map_prunes_expired_entries_and_stays_bounded() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let now = Instant::now();
+        {
+            let mut breaker = POLICY_RATE_LIMIT_BREAKER
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            breaker.insert(
+                "expired".into(),
+                PolicyRateLimitState {
+                    until: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+                    retry_after_secs: 1,
+                    message: "expired".into(),
+                },
+            );
+            for index in 0..POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES {
+                breaker.insert(
+                    format!("seed-{index}"),
+                    PolicyRateLimitState {
+                        until: now + Duration::from_secs(60 + index as u64),
+                        retry_after_secs: 60,
+                        message: "seed".into(),
+                    },
+                );
+            }
+        }
+        note_policy_rate_limit(
+            "gemini-3.6-flash-high",
+            "sand",
+            "fresh-token",
+            "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: retry after 30 seconds",
+            None,
+        );
+        let breaker = POLICY_RATE_LIMIT_BREAKER
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(breaker.len() <= POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES);
+        assert!(!breaker.contains_key("expired"));
+        drop(breaker);
+        reset_policy_rate_limit_breaker_for_test();
     }
 
     #[test]
@@ -4178,10 +5705,54 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         tx.send(Err(error.into())).await.unwrap();
         drop(tx);
-        let LiveStartPeek::Ready(mut events) = peek_live_start_for_stale_reset(rx).await else {
+        let LiveStartPeek::Ready { mut events, .. } = peek_live_start_for_stale_reset(rx).await
+        else {
             panic!("empty turns must not consume the generic start retry budget");
         };
         assert_eq!(events.recv().await.unwrap().unwrap_err(), error);
+    }
+
+    #[tokio::test]
+    async fn peek_metadata_and_thinking_are_not_policy_health_evidence() {
+        for event in [
+            LiveRunEvent::Cursor(CursorStreamEvent::Session {
+                session_id: "metadata-only".into(),
+            }),
+            LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                text: "speculative reasoning".into(),
+            }),
+        ] {
+            let (tx, rx) = mpsc::channel(2);
+            tx.send(Ok(event)).await.unwrap();
+            drop(tx);
+            let LiveStartPeek::Ready {
+                observed_healthy_event,
+                ..
+            } = peek_live_start_for_stale_reset(rx).await
+            else {
+                panic!("metadata must stay on the attached live stream");
+            };
+            assert!(
+                !observed_healthy_event,
+                "metadata/thinking must not release a cold policy probe"
+            );
+        }
+
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "accepted".into(),
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+        let LiveStartPeek::Ready {
+            observed_healthy_event,
+            ..
+        } = peek_live_start_for_stale_reset(rx).await
+        else {
+            panic!("model output must stay on the attached live stream");
+        };
+        assert!(observed_healthy_event, "model text is health evidence");
     }
 
     #[test]
@@ -4201,6 +5772,151 @@ mod tests {
             ),
             crate::retry::MAX_RATE_LIMIT_RETRIES
         );
+    }
+
+    #[test]
+    fn sand_gemini_gets_a_larger_bounded_empty_turn_budget() {
+        assert_eq!(
+            LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "sand", None,)
+                .empty_turn_max_retries,
+            3
+        );
+        assert_eq!(
+            LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "cli", None,)
+                .empty_turn_max_retries,
+            1
+        );
+        assert_eq!(
+            LiveLateRetryPolicy::for_request_with_override("claude-fable-5", "sand", None,)
+                .empty_turn_max_retries,
+            1
+        );
+        assert_eq!(
+            LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "sand", Some("99"),)
+                .empty_turn_max_retries,
+            LIVE_EMPTY_TURN_MAX_RETRIES_LIMIT,
+            "operator overrides stay bounded"
+        );
+    }
+
+    #[test]
+    fn empty_turn_retry_resets_only_replay_safe_conversations() {
+        let _guard = conversation::STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        conversation::reset_for_test();
+        let session = "sand-gemini-fresh-conversation-retry";
+        let original = conversation::get_or_create(session).conversation_id;
+        assert!(!prepare_live_retry_conversation(
+            session,
+            "Cursor upstream finished this turn without text or tool calls; retry this turn \
+             (stale Cursor conversation reset; retry this message to continue)"
+        ));
+        let replacement = conversation::get_or_create(session).conversation_id;
+        assert_eq!(original, replacement);
+
+        assert!(prepare_live_retry_conversation(
+            session,
+            "Cursor upstream finished this turn without text or tool calls; retry this turn"
+        ));
+        let replacement = conversation::get_or_create(session).conversation_id;
+        assert_ne!(original, replacement);
+
+        assert!(!prepare_live_retry_conversation(
+            session,
+            "Cursor upstream finished this turn without text or tool calls; retry this turn \
+             (completed tool results retained in Cursor checkpoint; continue without replaying tools)"
+        ));
+        assert_eq!(
+            replacement,
+            conversation::get_or_create(session).conversation_id,
+            "checkpoint continuation must not replay completed tools on a new conversation"
+        );
+        conversation::reset_for_test();
+    }
+
+    #[test]
+    fn nested_empty_turn_retry_resets_only_the_composite_agent_conversation() {
+        let _guard = conversation::STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        conversation::reset_for_test();
+        let session = "nested-empty-turn-session";
+        let agent = "agent-child";
+        let parent_key = live_retry_conversation_key(session, None);
+        let nested_key = live_retry_conversation_key(session, Some(agent));
+        assert_ne!(parent_key, nested_key);
+        assert_eq!(
+            nested_key,
+            live_run_key_for(LiveRunIdentity {
+                session_id: session,
+                agent_id: Some(agent),
+                parent_agent_id: Some("parent-agent"),
+            })
+        );
+        let parent_before = conversation::get_or_create(&parent_key).conversation_id;
+        let nested_before = conversation::get_or_create(&nested_key).conversation_id;
+        conversation::save_checkpoint(&nested_key, vec![1, 2, 3]);
+
+        assert!(prepare_live_retry_conversation(
+            &nested_key,
+            "Cursor upstream finished this turn without text or tool calls; retry this turn"
+        ));
+        assert_eq!(
+            conversation::get_or_create(&parent_key).conversation_id,
+            parent_before,
+            "a nested retry must not reset its parent lane"
+        );
+        let nested_after = conversation::continuation_for(Some(&nested_key));
+        assert_ne!(nested_after.conversation_id, Some(nested_before));
+        assert!(!nested_after.has_checkpoint);
+        conversation::reset_for_test();
+    }
+
+    #[test]
+    fn tool_result_reset_retry_alone_retains_full_history_images() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "inspect this screenshot"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "T0xESU1H"
+                    }}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/tmp/a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "read-1", "content": "done"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(latest_user_is_only_tool_results(&body));
+        let (checkpoint_images, reset_images) = live_request_image_sets(&body, true);
+        assert!(
+            checkpoint_images.is_empty(),
+            "normal BiDi/checkpoint retries must not resubmit an old screenshot"
+        );
+        assert_eq!(
+            reset_images
+                .iter()
+                .map(|image| image.data.as_str())
+                .collect::<Vec<_>>(),
+            ["T0xESU1H"]
+        );
+        assert!(live_retry_needs_fresh_history(
+            "Cursor upstream finished this turn without text or tool calls; retry this turn \
+             (stale Cursor conversation reset; retry this message to continue)"
+        ));
+        assert!(!live_retry_needs_fresh_history(
+            "Cursor upstream finished this turn without text or tool calls; retry this turn \
+             (completed tool results retained in Cursor checkpoint; continue without replaying tools)"
+        ));
+        assert!(!live_retry_needs_fresh_history(
+            "Connect error 502: transient transport failure"
+        ));
     }
 
     #[test]
@@ -4516,6 +6232,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sand_gemini_empty_turn_recovers_on_its_fourth_upstream_attempt() {
+        let error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
+                     (stale Cursor conversation reset; retry this message to continue)";
+        let (first_tx, first_rx) = mpsc::channel(1);
+        first_tx.send(Err(error.into())).await.unwrap();
+        drop(first_tx);
+
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-sand-gemini-empty-fourth-success",
+            None,
+            move |_| {
+                let attempt = restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let (retry_tx, retry_rx) = mpsc::channel(2);
+                if attempt < 3 {
+                    retry_tx.try_send(Err(error.into())).unwrap();
+                } else {
+                    retry_tx
+                        .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                            text: "recovered after transient Sand hollow turns".into(),
+                        })))
+                        .unwrap();
+                    retry_tx
+                        .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+                        .unwrap();
+                }
+                drop(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "sand", None),
+        )
+        .await;
+
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let mut text = String::new();
+        while let Ok(item) = out_rx.try_recv() {
+            match item {
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text: delta })) => {
+                    text.push_str(&delta);
+                }
+                Err(error) => panic!("internal retry leaked to downstream: {error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "recovered after transient Sand hollow turns");
+    }
+
+    #[tokio::test]
     async fn missing_conversation_retains_the_transport_retry_budget() {
         let error = "Connect error 502: Conversation data missing \
                      (stale Cursor conversation reset; retry this message to continue)";
@@ -4600,14 +6368,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_or_billing_live_error_is_forwarded() {
+    async fn committed_or_policy_live_error_is_not_retried() {
         let billing = "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice — pay your invoice in Stripe [resource_exhausted]";
         let empty_turn =
             "Cursor upstream finished this turn without text or tool calls; retry this turn";
         let step_failure = "Cursor error 502: Failed to run step, exceeded max retries [internal]";
         assert_eq!(
             classify_live_pump_item(false, &Err(billing.into())),
-            LivePumpAction::Forward
+            LivePumpAction::PolicyLimit,
+            "pre-output policy failures must open the local breaker, not restart upstream"
         );
         assert_eq!(
             classify_live_pump_item(
@@ -4930,7 +6699,8 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
-        let LiveStartPeek::Ready(mut events) = peek_live_start_for_stale_reset(rx).await else {
+        let LiveStartPeek::Ready { mut events, .. } = peek_live_start_for_stale_reset(rx).await
+        else {
             panic!("a useful first event must keep the original live run");
         };
         let Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) =
@@ -5174,7 +6944,7 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        let json = collect_live_events_to_json(rx, "msg_live", "claude-fable-5", 3)
+        let json = collect_live_events_to_json(rx, "msg_live", "claude-fable-5", 3, false)
             .await
             .unwrap();
         assert_eq!(json["content"][0]["text"], "hi");
@@ -5185,7 +6955,7 @@ mod tests {
     async fn collect_live_events_to_json_empty_is_error() {
         let (tx, rx) = mpsc::channel::<LiveEventResult>(1);
         drop(tx);
-        let err = collect_live_events_to_json(rx, "msg_empty", "claude-fable-5", 1)
+        let err = collect_live_events_to_json(rx, "msg_empty", "claude-fable-5", 1, false)
             .await
             .unwrap_err();
         assert!(err.contains("no useful progress"), "{err}");
@@ -5200,7 +6970,7 @@ mod tests {
         .await
         .unwrap();
         drop(tx);
-        let err = collect_live_events_to_json(rx, "msg_trunc", "claude-fable-5", 3)
+        let err = collect_live_events_to_json(rx, "msg_trunc", "claude-fable-5", 3, false)
             .await
             .unwrap_err();
         assert!(err.contains("without turn_ended"), "{err}");

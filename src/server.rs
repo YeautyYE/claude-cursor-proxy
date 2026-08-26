@@ -1811,7 +1811,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
     use serde_json::json;
-    use std::sync::Mutex;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
 
@@ -2021,6 +2022,51 @@ mod tests {
         let a = derive_fallback_session_id(&first);
         let b = derive_fallback_session_id(&continued);
         assert_eq!(a, b, "later turns must keep the same live BiDi session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_headerless_retries_share_one_fallback_session() {
+        // Missing X-Claude-Code-Session-Id used to fall through to unrelated
+        // per-request identities. Concurrent retries of one logical turn then
+        // bypassed the live registry fence and opened duplicate Cursor Runs.
+        const RETRIES: usize = 64;
+        let body = Arc::new(fallback_body(
+            "fallback-retry-user",
+            "/tmp/fallback-retry-project",
+            "same logical first turn",
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(RETRIES));
+        let mut retries = tokio::task::JoinSet::new();
+        for _ in 0..RETRIES {
+            let body = Arc::clone(&body);
+            let barrier = Arc::clone(&barrier);
+            retries.spawn(async move {
+                barrier.wait().await;
+                resolve_session_id(None, &body).session_id
+            });
+        }
+
+        let mut sessions = HashSet::new();
+        while let Some(result) = retries.join_next().await {
+            sessions.insert(result.expect("fallback resolver task"));
+        }
+        assert_eq!(
+            sessions.len(),
+            1,
+            "identical headerless retries must converge on one registry key"
+        );
+        let session = sessions.into_iter().next().expect("derived session");
+        assert!(session.starts_with("ccp-fb-"));
+
+        let distinct = derive_fallback_session_id(&fallback_body(
+            "fallback-retry-user",
+            "/tmp/fallback-retry-project",
+            "a genuinely different first turn",
+        ));
+        assert_ne!(
+            session, distinct,
+            "independent headerless conversations must not wait on each other's live Run"
+        );
     }
 
     #[test]

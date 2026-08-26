@@ -2845,6 +2845,32 @@ fn bridge_shell_stream_result_has_correct_shape() {
 // from starving later streams.
 #[tokio::test]
 async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
+    // The live admission gate is process-global and intentionally reads its
+    // configuration once. Other integration tests can initialize it first,
+    // so run this configuration-sensitive contract in an exact-filter child
+    // process where the 32-slot fixture is installed before any live request.
+    const CHILD_MARKER: &str = "CCP_CURSOR_LIVE_CONCURRENCY_TEST_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve cursor_native test binary"),
+        )
+        .args([
+            "--exact",
+            "cursor_live_generations_admit_normal_fanout_across_h2_shards",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .output()
+        .expect("spawn isolated live-concurrency contract");
+        assert!(
+            output.status.success(),
+            "isolated live-concurrency contract failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     use axum::{
         Router, body::Body, extract::ConnectInfo, http::Request, response::Response, routing::post,
     };
@@ -2889,9 +2915,8 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
         encode_connect_frame(payload, 0)
     }
 
-    fn successful_turn_bytes() -> Bytes {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&server_frame(AgentServerMessage {
+    fn useful_text_bytes() -> Bytes {
+        server_frame(AgentServerMessage {
             conversation_checkpoint_update: None,
             interaction_update: Some(InteractionUpdate {
                 heartbeat: None,
@@ -2908,7 +2933,11 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             kv_server_message: None,
             interaction_query: None,
             exec_server_message: None,
-        }));
+        })
+    }
+
+    fn successful_turn_end_bytes() -> Bytes {
+        let mut bytes = Vec::new();
         bytes.extend_from_slice(&server_frame(AgentServerMessage {
             conversation_checkpoint_update: None,
             interaction_update: Some(InteractionUpdate {
@@ -2996,14 +3025,24 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
                 // remaining Runs never reach this handler.
                 tokio::spawn(async move {
                     let mut body = request.into_body().into_data_stream();
-                    while body.next().await.is_some() {}
+                    // A reset Connect stream may surface one terminal body
+                    // error. Stop there: treating `Some(Err(_))` as progress
+                    // spins forever on some h2 versions and can wedge the
+                    // entire integration suite at 100% CPU.
+                    while let Some(Ok(_)) = body.next().await {}
                 });
                 let body_held = Arc::clone(&held);
-                let response_stream = futures_util::stream::once(async move {
-                    let _ = release_rx.await;
-                    body_held.active.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, Infallible>(successful_turn_bytes())
-                });
+                // Publish one useful event immediately. That proves this cold
+                // account/model key healthy and releases the policy-429 probe
+                // gate, while the held terminal frame keeps every admitted
+                // generation active for the fanout/admission assertions.
+                let response_stream =
+                    futures_util::stream::once(async { Ok::<_, Infallible>(useful_text_bytes()) })
+                        .chain(futures_util::stream::once(async move {
+                            let _ = release_rx.await;
+                            body_held.active.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<_, Infallible>(successful_turn_end_bytes())
+                        }));
                 Response::builder()
                     .status(200)
                     .header(
@@ -3053,7 +3092,9 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let client = reqwest::Client::new();
+    // Keep the loopback fixture out of macOS system HTTP proxies (for example
+    // Surge), which can serialize or buffer the 32 streaming requests.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let mut requests = Vec::new();
     const REQUESTS: usize = 32;
     for index in 0..REQUESTS {

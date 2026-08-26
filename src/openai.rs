@@ -684,22 +684,11 @@ impl AnthropicToResponses {
                         let Some(text) = delta.get("content").and_then(Value::as_str) else {
                             return Vec::new();
                         };
-                        self.compaction_text.push_str(text);
-                        if let Some(item_id) = self.compaction_item_id.as_deref()
-                            && let Some(item) = self.output_items.iter_mut().find(|item| {
-                                item.get("id").and_then(Value::as_str) == Some(item_id)
-                            })
-                        {
-                            item["content"] = json!(self.compaction_text.clone());
-                        }
-                        let item_id = self.compaction_item_id.clone().unwrap_or_default();
-                        let output_index = self.compaction_output_index.unwrap_or(0);
-                        self.emit(json!({
-                            "type": "response.compaction.delta",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "delta": text
-                        }))
+                        // xAI's Responses decoder does not define a
+                        // `response.compaction.*` stream event. Compaction
+                        // summaries are represented as ordinary assistant
+                        // output text so strict clients can decode them.
+                        self.compaction_text_delta(text)
                     }
                     Some("text_delta") => {
                         self.text_delta(delta.get("text").and_then(Value::as_str))
@@ -742,28 +731,41 @@ impl AnthropicToResponses {
                 let block = value.get("content_block").cloned().unwrap_or(Value::Null);
                 if block.get("type").and_then(Value::as_str) == Some("compaction") {
                     let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let item_id = format!("cmp_{}_{}", self.id, index);
+                    let item_id = format!("msg_cmp_{}_{}", self.id, index);
                     let output_index = self.allocate_output_index();
                     self.compaction_item_id = Some(item_id.clone());
                     self.compaction_output_index = Some(output_index);
                     self.compaction_active_index = Some(index);
-                    self.compaction_text = block
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    self.compaction_text.clear();
                     let item = json!({
-                        "type": "compaction",
+                        "type": "message",
                         "id": item_id,
+                        "role": "assistant",
                         "status": "in_progress",
-                        "content": self.compaction_text
+                        "content": []
                     });
                     self.output_items.push(item.clone());
-                    self.emit(json!({
+                    let mut out = self.emit(json!({
                         "type": "response.output_item.added",
                         "output_index": output_index,
                         "item": item
-                    }))
+                    }));
+                    out.extend(self.emit(json!({
+                        "type": "response.content_part.added",
+                        "item_id": self.compaction_item_id.clone().unwrap_or_default(),
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                            "logprobs": []
+                        }
+                    })));
+                    if let Some(content) = block.get("content").and_then(Value::as_str) {
+                        out.extend(self.compaction_text_delta(content));
+                    }
+                    out
                 } else if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     self.tool_index += 1;
                     let call_id = block
@@ -814,20 +816,7 @@ impl AnthropicToResponses {
                     .unwrap_or(usize::MAX as u64) as usize;
                 if self.compaction_active_index == Some(index) {
                     self.compaction_active_index = None;
-                    let item_id = self.compaction_item_id.clone().unwrap_or_default();
-                    let output_index = self.compaction_output_index.unwrap_or(0);
-                    if let Some(item) = self.output_items.iter_mut().find(|item| {
-                        item.get("id").and_then(Value::as_str) == Some(item_id.as_str())
-                    }) {
-                        item["status"] = json!("completed");
-                        item["content"] = json!(self.compaction_text.clone());
-                    }
-                    self.emit(json!({
-                        "type": "response.compaction.done",
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content": self.compaction_text
-                    }))
+                    self.close_compaction_item()
                 } else {
                     Vec::new()
                 }
@@ -916,6 +905,98 @@ impl AnthropicToResponses {
         !self.text.is_empty() || !self.output_items.is_empty() || !self.reasoning_text.is_empty()
     }
 
+    fn compaction_text_delta(&mut self, text: &str) -> Vec<u8> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let Some(item_id) = self.compaction_item_id.clone() else {
+            // A well-formed Anthropic stream starts a compaction block before
+            // sending its deltas. Drop an orphan delta rather than emitting a
+            // Responses event with an empty item id that strict clients reject.
+            return Vec::new();
+        };
+        self.compaction_text.push_str(text);
+        if let Some(item) = self
+            .output_items
+            .iter_mut()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+        {
+            item["content"] = json!([{
+                "type": "output_text",
+                "text": self.compaction_text.clone(),
+                "annotations": [],
+                "logprobs": []
+            }]);
+        }
+        self.emit(json!({
+            "type": "response.output_text.delta",
+            "item_id": item_id,
+            "output_index": self.compaction_output_index.unwrap_or(0),
+            "content_index": 0,
+            "delta": text,
+            "logprobs": []
+        }))
+    }
+
+    fn close_compaction_item(&mut self) -> Vec<u8> {
+        let Some(item_id) = self.compaction_item_id.clone() else {
+            return Vec::new();
+        };
+        let output_index = self.compaction_output_index.unwrap_or(0);
+        let text = self.compaction_text.clone();
+        let mut item = self
+            .output_items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+            .cloned();
+        let Some(mut item) = item.take() else {
+            return Vec::new();
+        };
+        if item.get("status").and_then(Value::as_str) == Some("completed") {
+            return Vec::new();
+        }
+        item["status"] = json!("completed");
+        item["content"] = json!([{
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+            "logprobs": []
+        }]);
+        if let Some(stored) = self
+            .output_items
+            .iter_mut()
+            .find(|stored| stored.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+        {
+            *stored = item.clone();
+        }
+        let mut out = self.emit(json!({
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": text,
+            "logprobs": []
+        }));
+        out.extend(self.emit(json!({
+            "type": "response.content_part.done",
+            "item_id": self.compaction_item_id.clone().unwrap_or_default(),
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": self.compaction_text,
+                "annotations": [],
+                "logprobs": []
+            }
+        })));
+        out.extend(self.emit(json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item
+        })));
+        out
+    }
+
     fn completed(&mut self) -> Vec<u8> {
         if self.finished || self.failed {
             return Vec::new();
@@ -989,6 +1070,10 @@ impl AnthropicToResponses {
         }
         for (index, mut item) in self.output_items.clone().into_iter().enumerate() {
             if item.get("status").and_then(Value::as_str) == Some("completed") {
+                continue;
+            }
+            if item.get("id").and_then(Value::as_str) == self.compaction_item_id.as_deref() {
+                out.extend(self.close_compaction_item());
                 continue;
             }
             let output_index = if item.get("type").and_then(Value::as_str) == Some("function_call")
@@ -1407,8 +1492,86 @@ mod tests {
             "claude-fable-5[1m]",
         );
         assert_eq!(response["status"], "completed");
-        assert_eq!(response["output"][0]["type"], "compaction");
-        assert_eq!(response["output"][0]["content"], "summary");
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(response["output"][0]["role"], "assistant");
+        assert_eq!(response["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(response["output"][0]["content"][0]["text"], "summary");
+        assert!(response["output"][0].get("encrypted_content").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_responses_compaction_uses_standard_output_text_lifecycle() {
+        let mut translator =
+            AnthropicToResponses::new("resp_compact_stream".into(), "claude-fable-5".into());
+        let input = encode_sse_event(
+            Some("message_start"),
+            r#"{"type":"message_start","message":{"model":"claude-fable-5"}}"#,
+        );
+        let mut bytes = translator.push(&input);
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_start"),
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":""}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"summary"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_stop"),
+            r#"{"type":"content_block_stop","index":0}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_stop"),
+            r#"{"type":"message_stop"}"#,
+        )));
+        let events = parse_sse_events(&bytes);
+        let types: Vec<String> = events
+            .iter()
+            .filter_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "response.created".to_string(),
+                "response.output_item.added".to_string(),
+                "response.content_part.added".to_string(),
+                "response.output_text.delta".to_string(),
+                "response.output_text.done".to_string(),
+                "response.content_part.done".to_string(),
+                "response.output_item.done".to_string(),
+                "response.completed".to_string()
+            ]
+        );
+        assert!(
+            !bytes
+                .windows("response.compaction.".len())
+                .any(|window| window == b"response.compaction."),
+            "Grok's Responses schema has no compaction stream events: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let completed = events
+            .iter()
+            .find_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .filter(|value| {
+                        value.get("type").and_then(Value::as_str) == Some("response.completed")
+                    })
+            })
+            .expect("response.completed event");
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["text"],
+            "summary"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ grok-build  ──Responses / Messages ──►        │
                                               └── Grok
 ```
 
-[Quick start](#quick-start) · [Models](#models) · [Sand mode](#sand-mode) · [Features](#features) · [Config](#configuration) · [Limitations](#limitations)
+[Quick start](#quick-start) · [Models](#models) · [Sand mode](#sand-mode) · [Features](#features) · [Config](#configuration) · [MCP troubleshooting](#mcp-troubleshooting) · [Limitations](#limitations)
 
 ---
 
@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.81 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.82 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -226,6 +226,19 @@ needed.
 The policy applies only to requests resolved to the Cursor provider; Codex,
 Kimi, and Grok routes are unchanged.
 
+> **Recommended: configure Sand from the monitor TUI.** Keep one `serve`
+> process running and use the shortcuts below; this avoids hand-editing
+> configuration files and makes the active request type visible immediately.
+
+| Key | Action |
+| --- | --- |
+| `s` | Open **Sand Models** and select the model list |
+| `j` / `k` | Move through models |
+| `Space` / `Enter` | Toggle the selected model between `[sand]` and `[cli]` |
+| `a` | Add a model id manually (for example `claude-fable-5`) |
+| `u` | Open the account-usage view |
+| `Esc` / `s` | Close the Sand editor |
+
 ### Fast setup
 
 ```bash
@@ -235,7 +248,8 @@ claude-cursor-proxy serve              # keep the monitor TUI open
 
 In the monitor TUI, press `s` to open **Sand Models**. Use `j`/`k` to select a
 model, `Space` or `Enter` to toggle it, and `a` to enter an exact Cursor
-catalog id. The list is marked `[sand]` or `[cli]`; changes apply to new
+catalog id such as `claude-fable-5`. From the model list, press `u` to inspect
+account usage. The list is marked `[sand]` or `[cli]`; changes apply to new
 requests and are written atomically to `config.json`. The TUI requires a
 terminal; `serve --no-monitor` keeps the proxy running without it.
 
@@ -247,7 +261,9 @@ usual `claude-fable-5[1m]`, `fable[1m]`, and `cursor:` forms.
 
 This TUI flow is the recommended way to manage Sand routing. You do not need
 to edit a file or launch another binary; the running `serve` process picks up
-the saved policy for the next request.
+the saved policy for the next request. Environment variables and
+`config.json` are fallback interfaces for automation, not the normal setup
+path.
 
 ### Use the selected model
 
@@ -256,8 +272,8 @@ After enabling a model with `s`, point Claude Code at that model:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
 export ANTHROPIC_AUTH_TOKEN=unused
-export ANTHROPIC_MODEL="cursor:claude-fable-5"
-export ANTHROPIC_SMALL_FAST_MODEL="cursor:claude-fable-5"
+export ANTHROPIC_MODEL="claude-fable-5"
+export ANTHROPIC_SMALL_FAST_MODEL="claude-fable-5"
 claude
 ```
 
@@ -268,8 +284,9 @@ override the TUI policy:
 export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 ```
 
-For another account-enabled Cursor catalog id, press `a` in the TUI and enter
-it directly; for example, `gemini-3.1-pro`.
+To add an exact Cursor catalog id that is not in the current list, press `a`
+inside **Sand Models** and enter it directly; for example,
+`claude-fable-5`.
 
 `CCP_CURSOR_SAND_MODELS` is a comma-separated list and supports `*` and `?`.
 Model matching is case-insensitive and normalizes `[1m]` plus
@@ -299,7 +316,9 @@ totals, and the Sand/Grok Bot period meter when the account provides it. Press
 `u` for the multi-line usage view, including the Sand period and recent usage
 events. `cursor auth status` shows the active login. On macOS, the monitor can
 fall back to Cursor Desktop's read-only `state.vscdb`; missing dashboard fields
-are omitted rather than invented.
+are omitted rather than invented. In headless `serve --no-monitor`, a lightweight
+poller requests only the Sand meter once per minute so an exhausted Sand turn
+can still be reported as HTTP 429; usage display remains a TUI feature.
 
 ```bash
 claude-cursor-proxy cursor auth status
@@ -320,6 +339,11 @@ claude-cursor-proxy cursor auth status
 ---
 
 ## Configuration
+
+For interactive Sand routing and usage inspection, prefer the monitor TUI:
+`s` selects Sand models, `a` adds an exact model id, and `u` opens account
+usage. The file and environment settings below are primarily for headless or
+automated deployments.
 
 Precedence: **env > `config.json` > defaults**.
 
@@ -344,23 +368,27 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | on | Disable with `0` / `false` |
 | `CCP_CURSOR_EMBED_SYSTEM` | off | Forward Anthropic `system` into Cursor user text (can trigger Fable injection loops) |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | off | Dump **all** tool schemas (large); BiDi already keeps Claude-local tools (`Workflow`/`Skill`/…) |
-| `CCP_CURSOR_LIVE_CONCURRENCY` | `32` | Fair cap for bulk (`cursor-grok-*`) generation starts (1–128) |
-| `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `8` | Protected start capacity for non-Grok models (Gemini/Claude/… subagents); interactive starts may also borrow idle bulk slots, but bulk never borrows the reserve (0–32) |
-| `CCP_CURSOR_LIVE_QUEUE_SECS` | `15` | Maximum local admission wait before retryable HTTP 503 (1–300s) |
+| `CCP_CURSOR_LIVE_CONCURRENCY` | `1024` | Fair cap for bulk (`cursor-grok-*`) generation starts (1–8192) |
+| `CCP_CURSOR_LIVE_RUNS` | `4096` | Process-wide cap for live requests holding a Run slot (1–16384); generation-start capacity is controlled separately by `CCP_CURSOR_LIVE_CONCURRENCY` |
+| `CCP_CURSOR_LIVE_INTERACTIVE_RESERVE` | `128` | Protected start capacity for non-Grok models (Gemini/Claude/… subagents); interactive starts may also borrow idle bulk slots, but bulk never borrows the reserve (0–1024) |
+| `CCP_CURSOR_LIVE_QUEUE_SECS` | `30` | Maximum local admission wait before retryable HTTP 503 (1–300s) |
 | `CCP_CURSOR_LIVE_ATTACH_WAIT_MS` | `15000` | Same-operation attach handoff wait before local busy is returned (500–60000ms) |
 | `CCP_CURSOR_LIVE_RESUME_ATTACH_WAIT_MS` | `4000` | Pre-response same-operation attach wait (500–5000ms); kept below the Claude Code stream watchdog |
 | `CCP_CURSOR_LIVE_CONFLICT_WAIT_MS` | `180000` | Wait for a different operation to observe the current session Run advance (500–600000ms) |
 | `CCP_CURSOR_LIVE_RESUME_WAIT_MS` | `5000` | Pre-response tool-result handoff wait; kept below the client stream watchdog (500–5000ms) |
 | `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | Pre-response nested-agent handoff wait (500–5000ms) |
 | `CCP_CURSOR_RESOURCE_RETRIES` | `6` | Same-request retries for transient Cursor `ERROR_RESOURCE_EXHAUSTED` responses (1–12); billing/quota/capacity policy 429s are never hidden-retried |
+| `CCP_CURSOR_POLICY_429_COOLDOWN_SECS` | `30` | Local cooldown after an account/model/Sand-or-CLI policy 429; fresh requests on that exact route fail fast with HTTP 429 + `Retry-After` (5–600s) |
+| `CCP_CURSOR_POLICY_429_PROBE_WINDOW_MS` | `30000` | Cold account/model/route single-flight window: useful output releases the wave immediately; a quiet expiry admits only one additional probe rather than fanning out all retries (25–120000ms) |
 | `CCP_CURSOR_STEP_FAILURE_RETRIES` | `4` | Same-request retries for pre-output Cursor `Failed to run step, exceeded max retries` failures (1–8); post-output failures are forwarded |
-| `CCP_CURSOR_LIVE_RESUME_RESERVE` | `4` | Additional capacity reserved for paused Runs that need to submit tool results (0–16) |
+| `CCP_CURSOR_LIVE_RESUME_RESERVE` | `64` | Additional capacity reserved for paused Runs that need to submit tool results (0–512) |
 | `CCP_CURSOR_OPERATION_LEDGER` | off | Opt-in durable operation ledger (crash-safe replay refusal). Stays off by default until completion is gated on downstream delivery, so dropped responses cannot permanently refuse client retries |
 | `CCP_CURSOR_LIVE_TIMEOUT_SECS` | `1800` | Active model-generation budget for each live segment (max 3600s; paused while downstream tools run) |
 | `CCP_CURSOR_TOOL_TTL_SECS` | same as live timeout | Maximum wait after a tool batch reaches the downstream client; an admitted result is allowed to finish dispatch |
-| `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `600` | Maximum heartbeat-only thinking period without model progress |
+| `CCP_CURSOR_HEARTBEAT_PROGRESS_SECS` | `1200` | Maximum heartbeat-only thinking period without model progress |
+| `CCP_CURSOR_GEMINI_FLASH_PROGRESS_SECS` | `180` | Gemini Flash heartbeat-only progress deadline; a hollow pre-output run is rotated and retried inside the same client request instead of appearing stuck |
 | `CCP_CURSOR_H2_SHARDS` | `16` | Stable H2 client pools used to isolate concurrent conversations (1–64) |
-| `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `4` | Process-wide cap for simultaneous ResumeAction replacement opens (1–16) |
+| `CCP_CURSOR_LIVE_RECOVERY_OPENS` | `16` | Process-wide cap for simultaneous ResumeAction replacement opens (1–128) |
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `5` | SSE heartbeat interval (message_delta + ping; keep below Claude Code's 10s stream watchdog) |
 | `CCP_CURSOR_NO_PROXY` | off | Skip HTTP(S)_PROXY for Cursor API (`1` / `true`) |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | unset | Debug |
@@ -384,7 +412,7 @@ These are Claude Code knobs (not proxy config). Useful when `/deep-research` or 
   "bindAddress": "127.0.0.1",
   "port": 18765,
   "cursor": {
-    "sandModels": ["claude-fable-5", "cursor:gpt-5.5"]
+    "sandModels": ["claude-fable-5"]
   },
   "log": { "stderr": false, "verbose": false }
 }
@@ -393,6 +421,67 @@ These are Claude Code knobs (not proxy config). Useful when `/deep-research` or 
 This is the shape written by the TUI; manual editing is mainly useful for
 automation. See [Sand mode](#sand-mode) for the complete routing, TUI, model
 discovery, and usage guide.
+
+---
+
+## MCP troubleshooting
+
+If Claude Code repeatedly prints
+`MCP server 'plugin:lobster-channel:lobster-channel' not connected`, the
+message is produced by Claude Code's local hook dispatcher when its Lobster
+client is missing or stale. It happens before an HTTP request reaches this
+proxy, so proxy stream retries do not repair the local MCP registry.
+
+One confirmed cause is Lobster `1.23.0`'s local lifecycle: Claude Code can
+start one plugin process per session while the processes share a bridge
+binding. When a newer process takes over, the bridge closes the older one with
+code `4405` (`session superseded`), and that runtime calls `process.exit(1)`.
+The older Claude session then keeps a disconnected MCP registry entry and can
+print the error on every hook. Competing pairing processes can similarly cause
+`4407` handshake takeovers. This is a local Lobster/session-lifecycle problem,
+not a Cursor inference-stream retry failure.
+
+Use this order:
+
+1. Keep the existing `serve` process. Use the monitor TUI first: press `s` to
+   inspect or toggle Sand models and `u` to inspect account usage. A second
+   Sand binary is not needed.
+2. Inspect the selected project:
+
+   ```bash
+   claude-cursor-proxy mcp-doctor --cwd "$PWD"
+   claude-cursor-proxy mcp-doctor --cwd "$PWD" --json
+   ```
+
+   The doctor scans installed `dist/server.js` files for the exit-prone 4405
+   branch, reports explicit 4405/4407 log events, and warns when multiple
+   Lobster processes can compete for the shared binding. If it reports an
+   exit-prone runtime, update Lobster to a build that keeps a superseded
+   process dormant instead of terminating the stdio MCP child.
+
+3. If the report lists Lobster under `disabledMcpServers`, run
+   `claude-cursor-proxy mcp-doctor --cwd "$PWD" --repair`. The repair makes a
+   timestamped backup and removes only Lobster entries. Start a new Claude Code
+   session after the repair.
+4. For an existing session, try
+   `/mcp reconnect plugin:lobster-channel:lobster-channel`. If the session
+   still reports `not connected` after a 4405 exit, start a new session after
+   updating Lobster; reconnecting the registry cannot revive a child process
+   that already exited. This does not require restarting the proxy.
+5. Batch commands such as `claude --bare --tools "" -p ...` should use a
+   dedicated Claude config directory, so global Lobster hooks are not loaded
+   into a process with no matching MCP client:
+
+   ```bash
+   BATCH_CONFIG="$(mktemp -d)"
+   CLAUDE_CONFIG_DIR="$BATCH_CONFIG" claude --bare --tools "" -p "$PROMPT"
+   ```
+
+   Put only the settings needed by the batch in that directory; do not copy
+   the global plugin/hooks tree. The doctor follows Claude Code's path rules:
+   default `~/.claude.json`, or
+   `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is non-empty. A legacy
+   `.config.json` is used only when the canonical file is absent.
 
 ---
 
@@ -419,15 +508,16 @@ discovery, and usage guide.
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |
 | grok-build `Conflict (409) - error sending request` / `live open timed out after 20s`, or Claude Code `Agent type 'gemini-3.6-flash-high' not found` | Update to ≥0.1.57 and restart serve. Proven pre-connect misses may switch transport; response-less sends are never replayed. Agent/Task model slugs remap to `general-purpose`. |
 | grok-build dumps raw `<tool_use>` / `<parameter>` XML, or `Cursor auth failed: /usr/bin/security: Too many open files` | Update to ≥0.1.51 and restart serve. Named-parameter XML is recovered as tools; XML `spawn_subagent` waits for turn end; serve raises the macOS 256-file limit. |
-| grok-build ends with `Cursor finished this turn without text or tool calls`, or reports that `workflow` was intercepted/renamed | Update to ≥0.1.61 and restart serve. Live heartbeats no longer abort valid thinking at 240s, while a heartbeat-only run with no model progress is bounded to 10 minutes. A truly empty Cursor turn still retries instead of becoming successful assistant text; malformed control XML is quarantined; exact workflow/skill casing is preserved. |
-| grok-build/Grok 4.6 fan-out shows many failed subagents, repeats completed tools, stalls without tokens, or reports `rate_limit_error: Cursor live generation concurrency saturated` | Update to ≥0.1.60 and restart serve. Normal 32-way fan-out is admitted, four extra slots are reserved for tool-result resumes, overflow queues fairly then returns retryable 503, conversations span four H2 pools, and replacement opens are bounded. Start a fresh Grok session after upgrading. |
+| grok-build ends with `Cursor finished this turn without text or tool calls`, or reports that `workflow` was intercepted/renamed | Update to the current release and restart serve. Live heartbeats no longer abort valid thinking at 240s, while a heartbeat-only run with no model progress is bounded to 20 minutes by default. A truly empty Cursor turn still retries instead of becoming successful assistant text; malformed control XML is quarantined; exact workflow/skill casing is preserved. |
+| grok-build/Grok 4.6 fan-out shows many failed subagents, repeats completed tools, stalls without tokens, or reports `rate_limit_error: Cursor live generation concurrency saturated` | Update to the current release and restart serve. Current defaults admit 1024 bulk starts, protect another 128 interactive starts and 64 tool-result resumes, queue overflow fairly for up to 30 seconds, spread conversations across 16 H2 pools, and bound replacement opens to 16. Start a fresh Grok session after upgrading. |
 | grok-build `Conflict (409) - Cursor live open timed out after 20s` then many `A Cursor live run is already active`, or requests stay streaming at 0 B/s | Update to ≥0.1.65 and restart serve. H2 first-open waits 90s; after one timeout the H2 circuit uses HTTP/1 for 30s, then half-opens with one read-only model-catalog probe. A still-connected duplicate is HTTP 503 + `Retry-After`; an identical retry whose original consumer is gone attaches to the in-flight run and replays the segment, and a retry of an already-completed turn receives the retained original response. Genuinely ambiguous acceptance remains fail-closed as 409. Start a fresh Grok session after upgrading. |
-| grok-build `Conflict (409) - Cursor resume produced no progress before the recovery deadline` after tool results | Update to ≥0.1.60 and restart serve. The proxy retries without replaying tools only if Cursor emitted a newer checkpoint after receiving those results and no new text/tools reached the client. Without that proof, 409 is intentional because automatic replay could duplicate execution. |
+| `Cursor produced an empty turn after tool results without a newer checkpoint`, or grok-build `Conflict (409) - Cursor resume produced no progress` after tool results | Update to ≥0.1.82 and restart serve. A newer post-result checkpoint is continued directly. If Cursor omits it and no text/new tool reached the client, the proxy clears the stale Cursor state and internally retries the same downstream request from the complete Anthropic history, which already contains the finished `tool_result`. Partial result dispatch or client-visible partial output still remains ambiguity-fenced. |
 | grok-build reports `Cursor tool result wait expired`, or a heartbeat stall first appears as 502 and then 409 | Update to ≥0.1.62 and restart serve. Tool time starts when Grok receives the batch and no longer consumes the next model segment's budget; an already-admitted tool result wins the TTL boundary. Unresolved heartbeat completion is reported as 409 immediately because replay could duplicate the Run. |
 | Claude Code Bash widget titles a giant `python3 -c` script | Update to ≥0.1.48 and restart serve. Cursor Shell has no description; the proxy now fills a short one-line title. |
 | 45s 502 `idle timeout` / `0 response bytes` | Update to ≥0.1.39 and restart serve. Still set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`. Clash/Surge TUN: DIRECT `*.cursor.sh`. Optional: `CCP_CURSOR_HTTP1=1` |
 | `Stream idle timeout - no chunks received`, especially on the first turn or before a background tool result resumes | Update to the current release and restart serve. `/v1/messages` commits the Anthropic SSE lifecycle before Cursor live open, so the client receives bytes immediately and emits a watchdog-safe `message_delta` + `ping` heartbeat every 5s by default. Pre-output Cursor open/step failures stay inside the bounded retry loop; `/v1/responses` intentionally keeps held-HTTP mapping for `response.failed`. |
-| grok-build context compaction reports `idle timeout after 45s with no useful progress` / `0 response bytes` | Update to ≥0.1.81 and restart serve. `xai-compact-*` and `compact_20260112` requests use a stable isolated Cursor live lane, so Connect heartbeats and reconnects stay active instead of entering the buffered 45-second setup watchdog. |
+| Gemini/Fable returns `ERROR_PRO_USER_RATE_LIMIT_EXCEEDED` repeatedly, or Sand says `finished this turn without text or tool calls` on every resend | Update to ≥0.1.82 and restart serve. Explicit policy errors and Sand's 100%-meter empty-END sentinel become HTTP 429 with `Retry-After`; a short cold-key gate stops the first retry wave before it opens many identical Runs. Cooldowns are isolated by stable account, resolved model, and Sand/CLI route, while native tool-result continuations and accepted attaches keep their resume path. |
+| grok-build context compaction reports `idle timeout after 45s with no useful progress` / `0 response bytes`, or the response parser rejects compaction events | Update to ≥0.1.82 and restart serve. `xai-compact-*` and `compact_20260112` requests use a stable isolated Cursor live lane, and summaries are emitted as standard Responses assistant/output-text events accepted by Grok Build. |
 | Claude Code shows `Cursor live run cancelled`, or Grok 4.6 repeatedly reports `A Cursor live run is already active` after `/compact` | Update to ≥0.1.77 and restart serve. Replacement reservations keep both the old operation fingerprint and its durable Run owner through cancellation teardown; a dropped handoff now seals the existing ledger marker as a scoped ambiguous operation instead of leaving `Dispatched` state that blocks every later turn. Completed runs are replayed after an attach race and resolved pre-output cancellation is retried inside the same SSE request. |
 | 502 `Image not found [internal]` on a text-only turn | Update to ≥0.1.40 and restart serve, then retry the same message once (the poisoned conversation checkpoint is cleared on that error). A new Claude Code session also works. |
 | 502 `Conversation data missing` / `missing blobs` and the session cannot recover | Update to ≥0.1.45 and restart serve, then retry the same message. The failed turn now resets the unrecoverable Cursor conversation binding; the first retry replays full history in a fresh Cursor conversation without requiring a new Claude Code chat. |

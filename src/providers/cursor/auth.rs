@@ -792,6 +792,44 @@ fn token_expiry_ms(token: &str) -> Option<u64> {
         .map(|exp| exp * 1000)
 }
 
+/// Stable, one-way identity for account-scoped runtime state.
+///
+/// Cursor rotates access JWTs for the same login. Keying cooldowns by the raw
+/// bearer would therefore forget an active account limit after every refresh.
+/// Prefer the stable JWT subject, then email for older tokens, and retain a
+/// token-digest fallback for opaque credentials. Domain separators prevent the
+/// same bytes in two different identity classes from colliding semantically.
+pub(crate) fn cursor_account_digest(token: &str) -> String {
+    let claims = parse_jwt_claims(token);
+    let subject = claims
+        .as_ref()
+        .and_then(|claims| claims.get("sub"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let email = claims
+        .as_ref()
+        .and_then(|claims| claims.get("email"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+
+    let mut digest = Sha256::new();
+    digest.update(b"claude-cursor-proxy:cursor-account:v1\0");
+    if let Some(subject) = subject {
+        digest.update(b"sub\0");
+        digest.update(subject.as_bytes());
+    } else if let Some(email) = email {
+        digest.update(b"email\0");
+        digest.update(email.as_bytes());
+    } else {
+        digest.update(b"token\0");
+        digest.update(token.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn parse_jwt_claims(token: &str) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
@@ -913,6 +951,31 @@ mod tests {
         assert_eq!(auth.user_id.as_deref(), Some("user_1"));
         assert_eq!(auth.email.as_deref(), Some("me@example.com"));
         assert_eq!(auth.expires, Some(4_102_444_800_000));
+    }
+
+    #[test]
+    fn account_digest_survives_jwt_rotation_and_isolates_accounts() {
+        let first = test_jwt(4_102_444_800, Some("user_1"), Some("old@example.com"));
+        let rotated = test_jwt(4_102_444_900, Some("user_1"), Some("new@example.com"));
+        let other = test_jwt(4_102_444_900, Some("user_2"), Some("old@example.com"));
+
+        assert_eq!(
+            cursor_account_digest(&first),
+            cursor_account_digest(&rotated),
+            "a refreshed JWT for the same subject must retain account cooldowns"
+        );
+        assert_ne!(cursor_account_digest(&first), cursor_account_digest(&other));
+    }
+
+    #[test]
+    fn account_digest_uses_normalized_email_then_opaque_token_fallback() {
+        let upper = test_jwt(4_102_444_800, None, Some(" Person@Example.COM "));
+        let lower = test_jwt(4_102_444_900, None, Some("person@example.com"));
+        assert_eq!(cursor_account_digest(&upper), cursor_account_digest(&lower));
+        assert_ne!(
+            cursor_account_digest("opaque-token-a"),
+            cursor_account_digest("opaque-token-b")
+        );
     }
 
     #[test]

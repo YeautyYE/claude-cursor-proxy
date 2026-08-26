@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod fdlimit;
 pub mod logging;
+pub mod mcp_doctor;
 pub mod media;
 pub mod monitor;
 pub mod openai;
