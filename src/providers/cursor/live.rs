@@ -24657,7 +24657,7 @@ mod tests {
             "the second late exec consumes the second promotion"
         );
         waiting.mark_pi_edit_acknowledged("src/parallel.rs", std::slice::from_ref(&replacement));
-        assert!(waiting.promoted_pi_edit_counts.get(&key).is_none());
+        assert!(!waiting.promoted_pi_edit_counts.contains_key(&key));
         assert!(waiting.promoted_pi_edit_keys.is_empty());
         assert_eq!(
             waiting.resolve_pi_edit_fallback(&second_exec),
