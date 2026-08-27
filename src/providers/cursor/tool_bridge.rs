@@ -2557,6 +2557,45 @@ mod tests {
     }
 
     #[test]
+    fn pi_edit_resolves_to_modern_text_editor_when_only_modern_name_is_advertised() {
+        let allowed: BTreeSet<String> = ["str_replace_based_edit_tool".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            resolve_advertised_name("Edit", Some(&allowed)).as_deref(),
+            Some("str_replace_based_edit_tool"),
+            "Pi Edit must follow Claude Code 2.1.193's exact text-editor name"
+        );
+        // All historical spellings should resolve in the same direction when
+        // an upstream Cursor frame says StrReplace/Edit interchangeably.
+        for mapped in ["Edit", "StrReplace", "StrReplaceTool", "str_replace_editor"] {
+            assert_eq!(
+                resolve_advertised_name(mapped, Some(&allowed)).as_deref(),
+                Some("str_replace_based_edit_tool"),
+                "{mapped} should resolve to the modern advertised editor"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_text_editor_name_wins_over_legacy_edit_alias_when_both_are_advertised() {
+        let allowed: BTreeSet<String> = [
+            "Edit".to_string(),
+            "str_replace_based_edit_tool".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        // A 2.1.193 request may carry a stale legacy Edit entry from an MCP
+        // extension alongside the Anthropic-defined editor. Prefer the exact
+        // modern editor for a Pi Edit event; emitting Edit makes Claude Code
+        // print “Edit unavailable, use StrReplace” and abandons the call.
+        assert_eq!(
+            resolve_advertised_name("Edit", Some(&allowed)).as_deref(),
+            Some("str_replace_based_edit_tool")
+        );
+    }
+
+    #[test]
     fn claude_alias_resolution_uses_the_advertised_spelling() {
         let cases = [
             ("RunWorkflow", "Workflow"),
