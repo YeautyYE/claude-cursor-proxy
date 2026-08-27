@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.82 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.83 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -500,9 +500,10 @@ Use this order:
 | Auth / 401 | `claude-cursor-proxy cursor auth login` |
 | Background 400 | Set `ANTHROPIC_SMALL_FAST_MODEL` to a known full model id |
 | Duplicated tools | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` |
+| Claude Code prints `Edit` unavailable / switches to `StrReplace`, or an edit call loops | Update to ≥0.1.83 and restart `serve`. Claude Code 2.1.193's `text_editor_20250728` / `str_replace_based_edit_tool` pair is preserved end-to-end; Cursor PiEdit replacements are normalized and returned with the matching native result. |
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
-| Image attachment immediately fails with 502 `Image not found [internal]` | Update to a build that encodes inline `SelectedImage.data` as protobuf field 8 bytes. Field 1 is a Cursor blob id in current CLI builds. |
+| Image attachment immediately fails with 502 `Image not found [internal]` | Update to ≥0.1.83 and restart `serve`. The proxy keeps the original inline bytes, rotates the selected-image id once, and retries on a fresh Cursor conversation; a persistent upstream error is then surfaced instead of opening an unbounded retry loop. |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
 | grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.57 and restart serve. Response-less live opens fail closed as HTTP 409; local open-slot saturation is jittered HTTP 503. |
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |

@@ -1321,6 +1321,7 @@ fn build_request_context_reply(frame: &ConnectFrame) -> Result<Option<Bytes>, Cu
             }),
             shell_stream: None,
             pi_write_result: None,
+            pi_edit_result: None,
         }),
         kv_client_message: None,
         exec_client_control_message: None,
@@ -1766,6 +1767,49 @@ mod tests {
                 .windows(5)
                 .any(|window| window == [0x42, 0x03, 0, 0, 0]),
             "inline image bytes must be encoded as length-delimited protobuf field 8: {encoded:?}"
+        );
+    }
+
+    #[test]
+    fn refreshed_image_retry_reencodes_same_bytes_with_new_asset_identity() {
+        use crate::providers::cursor::request::refresh_image_uuids;
+
+        let resolved = crate::providers::cursor::model::resolve_cursor_model("claude-fable-5")
+            .expect("resolve model");
+        let original = CursorSelectedImage {
+            // A tiny valid PNG prefix is enough to exercise the exact inline
+            // data path; the builder decodes the canonical base64 verbatim.
+            data: "iVBORw0KGgo=".into(),
+            uuid: "stale-image-id".into(),
+            path: String::new(),
+            mime_type: "image/png".into(),
+        };
+        let retry = refresh_image_uuids(std::slice::from_ref(&original));
+        let first = build_run_request("inspect", &resolved, &[original], "req-first", None);
+        let second = build_run_request("inspect", &resolved, &retry, "req-retry", None);
+        let first_image = &first
+            .action
+            .as_ref()
+            .and_then(|action| action.user_message_action.as_ref())
+            .and_then(|action| action.user_message.as_ref())
+            .and_then(|message| message.selected_context.as_ref())
+            .expect("first selected context")
+            .selected_images[0];
+        let second_image = &second
+            .action
+            .as_ref()
+            .and_then(|action| action.user_message_action.as_ref())
+            .and_then(|action| action.user_message.as_ref())
+            .and_then(|message| message.selected_context.as_ref())
+            .expect("retry selected context")
+            .selected_images[0];
+        assert_eq!(first_image.data, second_image.data);
+        assert_eq!(first_image.mime_type, second_image.mime_type);
+        assert!(first_image.path.is_empty() && second_image.path.is_empty());
+        assert_ne!(first_image.uuid, second_image.uuid);
+        assert_eq!(
+            second_image.data,
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
         );
     }
 

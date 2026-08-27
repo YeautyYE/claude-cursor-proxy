@@ -1450,6 +1450,7 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                 request_context_args: None,
                 shell_stream_args: None,
                 pi_write_args: None,
+                pi_edit_args: None,
             }),
         })
     }
@@ -2019,6 +2020,7 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
                 request_context_args: None,
                 shell_stream_args: None,
                 pi_write_args: None,
+                pi_edit_args: None,
             }),
             kv_server_message: None,
             interaction_query: None,

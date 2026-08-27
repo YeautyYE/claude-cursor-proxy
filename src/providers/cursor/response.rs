@@ -5,6 +5,7 @@ use crate::providers::cursor::client::{
 use crate::providers::cursor::connect::{ConnectEndError, FLAG_END, parse_connect_error};
 use crate::providers::cursor::native_tools::adapt_tool_input_for_client;
 use crate::providers::cursor::proto::AgentServerMessage;
+use crate::providers::cursor::request::preferred_text_editor_name;
 use crate::providers::cursor::tool_bridge::resolve_advertised_name;
 use std::collections::BTreeSet;
 
@@ -72,6 +73,25 @@ impl std::error::Error for CursorDecodeError {}
 /// Returns both the events and the final usage for the response, since the
 /// upstream may send multiple update frames.
 pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, CursorDecodeError> {
+    decode_upstream_response_with_allowed_inner(body, None)
+}
+
+/// Decode a buffered Cursor response while retaining the downstream tool
+/// catalog.  The modern Claude text editor accepts one `str_replace` per
+/// tool_use, whereas Cursor's PiEdit exec can contain an array of
+/// replacements.  Knowing the allow-list at decode time lets us expand that
+/// *native* PiEdit event without weakening the generic/XML `MultiEdit` gate.
+pub(crate) fn decode_upstream_response_with_allowed(
+    body: &[u8],
+    allowed_tool_names: Option<&BTreeSet<String>>,
+) -> Result<Vec<CursorStreamEvent>, CursorDecodeError> {
+    decode_upstream_response_with_allowed_inner(body, allowed_tool_names)
+}
+
+fn decode_upstream_response_with_allowed_inner(
+    body: &[u8],
+    allowed_tool_names: Option<&BTreeSet<String>>,
+) -> Result<Vec<CursorStreamEvent>, CursorDecodeError> {
     let frames =
         decode_upstream_frames(body).map_err(|e| CursorDecodeError::Decode(e.to_string()))?;
     let mut events = Vec::new();
@@ -93,7 +113,7 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
             Err(_) => continue,
         };
 
-        events_from_message(&msg, &mut events);
+        events_from_message_with_allowed(&msg, &mut events, allowed_tool_names);
     }
 
     Ok(events)
@@ -301,7 +321,10 @@ fn decode_cursor_upstream_with_allowed_mode(
     allowed_tool_names: Option<&BTreeSet<String>>,
     compaction_mode: bool,
 ) -> Result<serde_json::Value, CursorDecodeError> {
-    let events = decode_upstream_response(&upstream.body)?;
+    let events = match allowed_tool_names {
+        Some(allowed) => decode_upstream_response_with_allowed(&upstream.body, Some(allowed))?,
+        None => decode_upstream_response(&upstream.body)?,
+    };
 
     let mut text_content = String::new();
     let mut compaction_thinking_fallback = String::new();
@@ -415,7 +438,11 @@ fn estimate_input_tokens(_content: &str) -> u64 {
     (_content.len() / 4) as u64
 }
 
-fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEvent>) {
+fn events_from_message_with_allowed(
+    msg: &AgentServerMessage,
+    events: &mut Vec<CursorStreamEvent>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+) {
     if let Some(ref exec) = msg.exec_server_message {
         if let Some(ref sid) = exec.exec_id
             && !sid.is_empty()
@@ -425,14 +452,46 @@ fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEv
             });
         }
         // BiDi exec tool requests (not request_context) → Claude tool_use.
-        if exec.request_context_args.is_none()
-            && let Some(mapped) = super::native_tools::map_exec_server_message(exec)
-        {
-            events.push(CursorStreamEvent::NativeTool {
-                tool_use_id: mapped.tool_use_id,
-                name: mapped.name,
-                input: mapped.input,
-            });
+        if exec.request_context_args.is_none() {
+            // Cursor PiEdit is the one native operation whose payload shape
+            // cannot be represented by Claude Code 2.1+'s modern editor in a
+            // single tool_use: `edits` is an array upstream, while the
+            // `str_replace` command carries exactly one pair. Expand only
+            // field-47 PiEdit here; generic/XML MultiEdit remains governed by
+            // the normal exact allow-list resolver.
+            if let (Some(args), Some(modern)) = (
+                exec.pi_edit_args.as_ref(),
+                allowed_tool_names.and_then(preferred_text_editor_name),
+            ) {
+                let base_id = exec
+                    .exec_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("exec_{}", exec.id));
+                for (index, edit) in args.edits.iter().enumerate() {
+                    let tool_use_id = if index == 0 {
+                        base_id.clone()
+                    } else {
+                        format!("{base_id}__part_{}", index + 1)
+                    };
+                    events.push(CursorStreamEvent::NativeTool {
+                        tool_use_id,
+                        name: modern.clone(),
+                        input: serde_json::json!({
+                            "command": "str_replace",
+                            "path": args.path,
+                            "old_str": edit.old_text,
+                            "new_str": edit.new_text,
+                        }),
+                    });
+                }
+            } else if let Some(mapped) = super::native_tools::map_exec_server_message(exec) {
+                events.push(CursorStreamEvent::NativeTool {
+                    tool_use_id: mapped.tool_use_id,
+                    name: mapped.name,
+                    input: mapped.input,
+                });
+            }
         }
     }
 
@@ -592,6 +651,7 @@ mod tests {
                 request_context_args: None,
                 shell_stream_args: None,
                 pi_write_args: None,
+                pi_edit_args: None,
             }),
         };
         let mut payload = Vec::new();
@@ -770,6 +830,7 @@ mod tests {
                 request_context_args: None,
                 shell_stream_args: None,
                 pi_write_args: None,
+                pi_edit_args: None,
             }),
         };
         let mut payload = Vec::new();
@@ -809,6 +870,67 @@ mod tests {
             with_tool["content"][0]["input"]["file_path"],
             "/tmp/example.txt"
         );
+    }
+
+    #[test]
+    fn buffered_pi_edit_expands_each_replacement_for_modern_editor() {
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: Some(ExecServerMessage {
+                id: 17,
+                exec_id: Some("pi-buffered-17".into()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: None,
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
+                pi_write_args: None,
+                pi_edit_args: Some(PiEditExecArgs {
+                    path: "/tmp/example.rs".into(),
+                    edits: vec![
+                        PiEditReplacement {
+                            old_text: "one".into(),
+                            new_text: "1".into(),
+                        },
+                        PiEditReplacement {
+                            old_text: "two".into(),
+                            new_text: "2".into(),
+                        },
+                    ],
+                }),
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let body = encode_connect_frame(&payload, 0).to_vec();
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+        let json = decode_cursor_upstream_with_allowed(
+            &upstream,
+            "msg_pi_buffered",
+            "claude-fable-5",
+            Some(&allowed),
+        )
+        .unwrap();
+        assert_eq!(json["stop_reason"], "tool_use");
+        let content = json["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["name"], "str_replace_based_edit_tool");
+        assert_eq!(content[0]["id"], "pi-buffered-17");
+        assert_eq!(content[0]["input"]["command"], "str_replace");
+        assert_eq!(content[0]["input"]["old_str"], "one");
+        assert_eq!(content[1]["id"], "pi-buffered-17__part_2");
+        assert_eq!(content[1]["input"]["new_str"], "2");
     }
 
     #[test]

@@ -25,6 +25,7 @@ use axum::Json;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -39,6 +40,7 @@ use crate::providers::cursor::auth::{
     load_cursor_auth, missing_auth_message, run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
+use crate::providers::cursor::connect::cursor_connect_error_is_missing_image;
 use crate::providers::cursor::exec_results::PendingCursorExec;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
@@ -58,14 +60,14 @@ use crate::providers::cursor::live::{
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
     CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, current_user_blocks,
-    cursor_request_context, latest_user_is_only_tool_results,
+    cursor_request_context, latest_user_is_only_tool_results, refresh_image_uuids,
     reject_orphaned_native_results_when_live_slot_is_free, render_cursor_prompt,
     render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_compaction,
-    decode_cursor_upstream_with_allowed, decode_upstream_response, estimate_rendered_prompt_tokens,
-    estimate_request_input_tokens,
+    decode_cursor_upstream_with_allowed, decode_upstream_response_with_allowed,
+    estimate_rendered_prompt_tokens, estimate_request_input_tokens,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
@@ -930,6 +932,10 @@ struct LiveRetryStart {
     /// Full-history images retained for the one recovery path that clears the
     /// Cursor conversation and replays the original Anthropic history.
     reset_retry_images: Vec<CursorSelectedImage>,
+    /// Shared one-shot fence for stale selected-image recovery. It spans the
+    /// initial open, late stream pump, and any internal restart so one request
+    /// cannot create an unbounded fresh-UUID wave.
+    image_recovery_attempted: Arc<AtomicBool>,
     custom_system: Option<String>,
     session_id: String,
     agent_id: Option<String>,
@@ -1001,6 +1007,20 @@ fn live_request_image_sets(
     (images, reset_retry_images)
 }
 
+/// Match image lookup failures across the structured Cursor error fields.
+/// Connect END errors often put the useful text in `detail`, while HTTP/SSE
+/// failures expose it through `client_message`; checking all three keeps the
+/// one-shot re-upload recovery consistent for live and buffered paths.
+fn cursor_error_is_missing_image(error: &CursorError) -> bool {
+    let client_message = error.client_message();
+    cursor_connect_error_is_missing_image(&client_message)
+        || cursor_connect_error_is_missing_image(&error.message)
+        || error
+            .detail
+            .as_deref()
+            .is_some_and(cursor_connect_error_is_missing_image)
+}
+
 impl LiveRetryStart {
     fn effective_token(&self) -> String {
         self.effective_token
@@ -1032,14 +1052,44 @@ impl LiveRetryStart {
         // continuation is different: clearing it could replay completed tools.
         let conversation_key =
             live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
-        prepare_live_retry_conversation(&conversation_key, error);
-        let images = if live_retry_needs_fresh_history(error) {
-            &self.reset_retry_images
+        if cursor_connect_error_is_missing_image(error) {
+            // The same request can encounter the stale asset during the
+            // initial open *and* again when a late stream pump is restarted.
+            // Share one atomic fence across both paths so a persistent
+            // upstream Image-not-found response cannot create a fresh UUID /
+            // conversation wave on every retry.
+            if self
+                .image_recovery_attempted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(CursorError::new(502, error, None));
+            }
+            // A stale selected-image id can survive checkpoint clearing in the
+            // upstream asset index. Rotate the binding and replay the original
+            // Anthropic bytes with fresh UUIDs for one bounded recovery.
+            conversation::reset(&conversation_key);
+            let images = refresh_image_uuids(&self.reset_retry_images);
+            create_logger("cursor").warn(
+                "image_checkpoint_recovery",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(&self.session_id)),
+                    ("imageCount".into(), serde_json::json!(images.len())),
+                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                ])),
+            );
+            self.start_with_user_text_and_images(&self.user_text, &images, None)
+                .await
         } else {
-            &self.images
-        };
-        self.start_with_user_text_and_images(self.retry_user_text(error), images, None)
-            .await
+            prepare_live_retry_conversation(&conversation_key, error);
+            let images = if live_retry_needs_fresh_history(error) {
+                &self.reset_retry_images
+            } else {
+                &self.images
+            };
+            self.start_with_user_text_and_images(self.retry_user_text(error), images, None)
+                .await
+        }
     }
 
     async fn start_with_user_text(
@@ -1067,6 +1117,12 @@ impl LiveRetryStart {
             user_text,
             &self.model,
             images,
+            // Keep the full-history slice available to the initial-open
+            // recovery path.  A checkpoint-backed tool-result continuation
+            // intentionally has an empty `images` slice, but a stale Cursor
+            // image error still needs the original bytes to rebuild a fresh
+            // conversation.
+            Some(&self.reset_retry_images),
             self.custom_system.as_deref(),
             LiveRunIdentity {
                 session_id: &self.session_id,
@@ -1083,15 +1139,28 @@ impl LiveRetryStart {
             self.unbounded_conflict_wait,
             self.compaction_mode,
             Some(Arc::clone(&self.effective_token)),
+            Some(Arc::clone(&self.image_recovery_attempted)),
         )
         .await
     }
 }
 
-/// Streaming Anthropic clients see "Waiting for response" until SSE starts.
-/// `/v1/responses` must wait for live open so a 20s timeout can still be JSON 409.
-fn commit_streaming_live_sse_before_start_live(want_stream: bool, hold_http: bool) -> bool {
-    want_stream && !hold_http
+/// Decide whether a streaming request should receive its SSE envelope before
+/// live admission finishes.
+///
+/// The Responses adapter historically held HTTP headers for every request so
+/// a pre-output Cursor error could be returned as JSON.  Holding a *fresh*
+/// stream, however, routes it through the nested-resume probe and produces a
+/// local 503 after `LIVE_NESTED_WAIT_DEFAULT_MS` whenever another generation
+/// owns the session.  Fresh streams now get the envelope immediately (the
+/// adapter still peeks the translated SSE for pre-output 4xx classification);
+/// tool-result/non-streaming requests retain the held status path.
+fn commit_streaming_live_sse_before_start_live(
+    want_stream: bool,
+    hold_http: bool,
+    defer_fresh_stream: bool,
+) -> bool {
+    want_stream && (!hold_http || defer_fresh_stream)
 }
 
 const LIVE_RUN_BUSY_MESSAGE: &str =
@@ -1171,6 +1240,20 @@ fn defer_fresh_stream_admission(
     has_tool_results: bool,
 ) -> bool {
     want_stream && !hold_http_until_live_open && !has_tool_results
+}
+
+/// A fresh streamed turn must not be sent through the nested-resume probe.
+///
+/// `/v1/responses` deliberately keeps its HTTP status uncommitted until the
+/// live run opens (`hold_http_until_live_open = true`) so a pre-output Cursor
+/// error can be returned as JSON.  That flag used to make Responses requests
+/// take the 1.5s nested-resume waiter, which then surfaced a local 503 for a
+/// perfectly healthy *different* generation.  The normal start path already
+/// has generation-bound conflict/replacement handling; let both streaming
+/// surfaces use it.  Tool-result continuations remain on the bounded resume
+/// path because their payload must be matched to the exact pending batch.
+fn fresh_stream_can_skip_resume_probe(want_stream: bool, has_tool_results: bool) -> bool {
+    want_stream && !has_tool_results
 }
 
 fn live_probe_cursor_error(message: String) -> CursorError {
@@ -1346,6 +1429,7 @@ async fn start_live_events_with_retries(
         user_text,
         model,
         images,
+        None,
         custom_system,
         identity,
         allowed,
@@ -1358,6 +1442,7 @@ async fn start_live_events_with_retries(
         false,
         false,
         None,
+        None,
     )
     .await
 }
@@ -1369,6 +1454,7 @@ async fn start_live_events_with_retries_with_client_type(
     user_text: &str,
     model: &str,
     images: &[CursorSelectedImage],
+    reset_retry_images: Option<&[CursorSelectedImage]>,
     custom_system: Option<&str>,
     identity: LiveRunIdentity<'_>,
     allowed: Option<BTreeSet<String>>,
@@ -1381,6 +1467,7 @@ async fn start_live_events_with_retries_with_client_type(
     unbounded_conflict_wait: bool,
     compaction_mode: bool,
     effective_token: Option<Arc<Mutex<String>>>,
+    image_recovery_attempted: Option<Arc<AtomicBool>>,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
     let publish_effective_token = |token: &str| {
         if let Some(shared) = effective_token.as_ref() {
@@ -1392,6 +1479,18 @@ async fn start_live_events_with_retries_with_client_type(
     let original_request_id = uuid::Uuid::new_v4().to_string();
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
+    let image_recovery_attempted =
+        image_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    // Normally the original request slice is reused across transport retries.
+    // A stale Cursor asset requires a new UUID and a fresh conversation; keep
+    // that replacement owned by this start loop so both initial-open and
+    // Connect END errors share the same bounded recovery state.
+    let mut image_retry_images: Option<Vec<CursorSelectedImage>> = None;
+    // `images` is normally the current checkpoint delta.  On a stale-image
+    // response the conversation is reset and the original Anthropic history
+    // must be replayed; callers that have no separate history slice (the
+    // compatibility wrapper) simply use the current slice for both roles.
+    let reset_retry_images = reset_retry_images.unwrap_or(images);
     let mut account_swaps = 0_u32;
     loop {
         // Local admission strictly precedes the session-slot claim. A start
@@ -1732,12 +1831,13 @@ async fn start_live_events_with_retries_with_client_type(
         );
 
         let upstream_open_guard = reservation.upstream_open_guard();
+        let attempt_images = image_retry_images.as_deref().unwrap_or(images);
         let start = match client
             .start_live_agent_with_identity_guarded_profile_mode(
                 &token,
                 user_text,
                 model,
-                images,
+                attempt_images,
                 custom_system,
                 identity,
                 allowed.clone(),
@@ -1779,7 +1879,7 @@ async fn start_live_events_with_retries_with_client_type(
                                 &token,
                                 user_text,
                                 model,
-                                images,
+                                attempt_images,
                                 custom_system,
                                 identity,
                                 allowed.clone(),
@@ -1842,6 +1942,7 @@ async fn start_live_events_with_retries_with_client_type(
                         return Ok(events);
                     }
                     LiveStartPeek::Retryable(error) => {
+                        let image_error = cursor_connect_error_is_missing_image(&error);
                         let policy_limited = crate::retry::is_policy_rate_limit(&error);
                         if policy_limited {
                             probe_admission
@@ -1853,6 +1954,32 @@ async fn start_live_events_with_retries_with_client_type(
                         }
                         let _ = start.handle.cancel_and_wait().await;
                         let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
+                        if image_error {
+                            if image_recovery_attempted
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                return Err(CursorError::new(502, error, None));
+                            }
+                            let key =
+                                live_retry_conversation_key(identity.session_id, identity.agent_id);
+                            conversation::reset(&key);
+                            image_retry_images = Some(refresh_image_uuids(reset_retry_images));
+                            create_logger("cursor").warn(
+                                "image_start_recovery",
+                                Some(serde_json::Map::from_iter([
+                                    ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                    (
+                                        "imageCount".into(),
+                                        serde_json::json!(
+                                            image_retry_images.as_ref().map_or(0, Vec::len)
+                                        ),
+                                    ),
+                                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                ])),
+                            );
+                            continue;
+                        }
                         if policy_limited {
                             // Account-bound 429: same-login retries cannot
                             // succeed. Fail over to newly stored credentials
@@ -1884,6 +2011,35 @@ async fn start_live_events_with_retries_with_client_type(
                 }
             }
             Err(error) => {
+                let image_error = cursor_connect_error_is_missing_image(&error.client_message())
+                    || cursor_connect_error_is_missing_image(&error.message)
+                    || error
+                        .detail
+                        .as_deref()
+                        .is_some_and(cursor_connect_error_is_missing_image);
+                if image_error
+                    && image_recovery_attempted
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    drop(probe_admission.take());
+                    reservation.release();
+                    let key = live_retry_conversation_key(identity.session_id, identity.agent_id);
+                    conversation::reset(&key);
+                    image_retry_images = Some(refresh_image_uuids(reset_retry_images));
+                    create_logger("cursor").warn(
+                        "image_start_recovery",
+                        Some(serde_json::Map::from_iter([
+                            ("sessionId".into(), serde_json::json!(identity.session_id)),
+                            (
+                                "imageCount".into(),
+                                serde_json::json!(image_retry_images.as_ref().map_or(0, Vec::len)),
+                            ),
+                            ("recovery".into(), serde_json::json!("fresh_conversation")),
+                        ])),
+                    );
+                    continue;
+                }
                 let policy_limited = crate::retry::is_policy_rate_limit(&error.client_message())
                     || crate::retry::is_policy_rate_limit(&error.message);
                 if policy_limited {
@@ -1911,8 +2067,8 @@ async fn start_live_events_with_retries_with_client_type(
                     transient_retries = 0;
                     continue;
                 }
-                let retryable = transient_retries
-                    < cursor_transient_retry_limit(&error.client_message())
+                let retryable = !image_error
+                    && transient_retries < cursor_transient_retry_limit(&error.client_message())
                     && cursor_start_error_is_same_request_retryable(&error);
                 if retryable {
                     reservation.release();
@@ -1977,6 +2133,7 @@ fn spawn_streaming_live_sse(
             model,
             images,
             reset_retry_images,
+            image_recovery_attempted: Arc::new(AtomicBool::new(false)),
             custom_system,
             session_id: sid,
             agent_id,
@@ -2142,6 +2299,17 @@ fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
 }
 
 fn classify_live_pump_item(committed: bool, item: &LiveEventResult) -> LivePumpAction {
+    // Cursor asset lookup failures are recoverable before any client-visible
+    // output: rotate the conversation and resend the original inline bytes.
+    // Keep this ahead of generic 502 classification, which intentionally
+    // excludes image errors so stale assets do not loop indefinitely.
+    if let Err(error) = item
+        && !committed
+        && !crate::retry::is_policy_rate_limit(error)
+        && cursor_connect_error_is_missing_image(error)
+    {
+        return LivePumpAction::Retry;
+    }
     match item {
         Err(error) if !committed && crate::retry::is_policy_rate_limit(error) => {
             LivePumpAction::PolicyLimit
@@ -2283,6 +2451,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
     let episode_started = tokio::time::Instant::now();
     let mut transient_retries = 0_u32;
     let mut empty_turn_retries = 0_u32;
+    let mut image_retries = 0_u32;
     let mut empty_turn_deadline = None;
     let mut last_empty_turn_error = None::<String>;
     // Event receivers do not carry their owning Run id. Capture the current
@@ -2325,12 +2494,23 @@ async fn forward_live_events_with_retries_context<F, Fut>(
             }
             LivePumpOutcome::Retry(error) => {
                 let empty_turn = live_error_is_empty_turn_retry(&error);
+                let image_error = cursor_connect_error_is_missing_image(&error);
                 let retry_index = if empty_turn {
                     empty_turn_retries
+                } else if image_error {
+                    image_retries
                 } else {
                     transient_retries
                 };
-                let retry_limit = live_late_retry_limit(&error, policy);
+                // Re-upload a stale inline image at most once.  A second
+                // Image-not-found response is generally an upstream asset
+                // outage and should reach the client instead of generating a
+                // fresh-conversation storm.
+                let retry_limit = if image_error {
+                    1
+                } else {
+                    live_late_retry_limit(&error, policy)
+                };
                 if retry_index >= retry_limit {
                     create_logger("cursor").warn(
                         "live_retry_exhausted",
@@ -2429,6 +2609,8 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                 }
                 if empty_turn {
                     empty_turn_retries += 1;
+                } else if image_error {
+                    image_retries += 1;
                 } else {
                     transient_retries += 1;
                 }
@@ -2444,6 +2626,8 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                             "recovery".into(),
                             serde_json::json!(if live_error_needs_checkpoint_continue(&error) {
                                 "checkpoint_continue"
+                            } else if image_error {
+                                "image_fresh_conversation"
                             } else if empty_turn {
                                 "fresh_conversation"
                             } else {
@@ -3607,6 +3791,13 @@ impl Provider for CursorProvider {
             ctx.hold_http_until_live_open,
             has_tool_results,
         );
+        // Responses callers set `hold_http_until_live_open` so pre-output
+        // policy errors can be translated to JSON.  That must not force a
+        // fresh turn through the nested-resume waiter: once the streaming
+        // envelope is committed, the normal generation claim path can wait
+        // behind the prior turn and emit heartbeats.  Only a current
+        // tool_result needs the exact bounded resume probe.
+        let skip_resume_probe = fresh_stream_can_skip_resume_probe(want_stream, has_tool_results);
         if !xai_compact && let Some(session_id) = ctx.session_id.as_deref() {
             let agent_id = claude_agent_id(&ctx);
             let fingerprint_payload =
@@ -3672,7 +3863,7 @@ impl Provider for CursorProvider {
                             );
                         }
                     }
-                    LiveRunProbe::Occupied if defer_fresh_stream => {
+                    LiveRunProbe::Occupied if defer_fresh_stream || skip_resume_probe => {
                         // Do not hold the HTTP handler in the pre-response
                         // resume waiter for a fresh streaming turn. The
                         // downstream SSE starts now (and emits heartbeats),
@@ -3976,6 +4167,7 @@ impl Provider for CursorProvider {
                 model: model.to_string(),
                 images,
                 reset_retry_images,
+                image_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4054,6 +4246,7 @@ impl Provider for CursorProvider {
             if commit_streaming_live_sse_before_start_live(
                 want_stream,
                 ctx.hold_http_until_live_open,
+                defer_fresh_stream || skip_resume_probe,
             ) {
                 return spawn_streaming_live_sse(
                     client.clone(),
@@ -4072,7 +4265,7 @@ impl Provider for CursorProvider {
                     fingerprint,
                     initial_reservation,
                     has_refresh,
-                    defer_fresh_stream,
+                    defer_fresh_stream || skip_resume_probe,
                     xai_compact,
                     client_type.clone(),
                     message_id,
@@ -4088,6 +4281,7 @@ impl Provider for CursorProvider {
                 model: model.to_string(),
                 images,
                 reset_retry_images,
+                image_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4123,6 +4317,12 @@ impl Provider for CursorProvider {
 
         let mut transport_retries = 0_u32;
         let mut refreshed_once = false;
+        let mut image_recovery_attempted = false;
+        // Keep the current continuation delta untouched for ordinary
+        // transport retries.  A stale selected-image id is different: after
+        // one bounded conversation reset, replay the original history with
+        // fresh UUID metadata so Cursor receives the inline bytes again.
+        let mut request_images = images.clone();
         let upstream = loop {
             // The buffered fallback can also wait behind auth/session work;
             // honor a breaker opened in that interval before dispatching, and
@@ -4137,7 +4337,7 @@ impl Provider for CursorProvider {
                     &token,
                     user_text,
                     model,
-                    &images,
+                    &request_images,
                     custom_system,
                     CursorRunOptions {
                         session_id: continuation_key.as_deref(),
@@ -4160,6 +4360,34 @@ impl Provider for CursorProvider {
                         }
                         _ => return map_cursor_error_to_response(&e),
                     }
+                }
+                Err(e) if cursor_error_is_missing_image(&e) && !image_recovery_attempted => {
+                    drop(probe_admission);
+                    image_recovery_attempted = true;
+                    if let Some(key) = continuation_key.as_deref() {
+                        conversation::reset(key);
+                    }
+                    request_images = refresh_image_uuids(&reset_retry_images);
+                    create_logger("cursor").warn(
+                        "image_buffered_recovery",
+                        Some(serde_json::Map::from_iter([
+                            (
+                                "sessionId".into(),
+                                serde_json::json!(session_id.unwrap_or_default()),
+                            ),
+                            ("imageCount".into(), serde_json::json!(request_images.len())),
+                            ("recovery".into(), serde_json::json!("fresh_conversation")),
+                        ])),
+                    );
+                    continue;
+                }
+                // A second missing-image response means the bounded
+                // re-upload did not repair the upstream asset lookup. Surface
+                // it directly instead of feeding it into the generic
+                // transport retry budget.
+                Err(e) if cursor_error_is_missing_image(&e) => {
+                    drop(probe_admission);
+                    return map_cursor_error_to_response(&e);
                 }
                 Err(e)
                     if transport_retries < cursor_transient_retry_limit(&e.client_message())
@@ -4200,12 +4428,19 @@ impl Provider for CursorProvider {
 
         if want_stream {
             if bridge_eligible {
-                let events = match decode_upstream_response(&upstream.body) {
-                    Ok(e) => e,
-                    Err(e) => return map_cursor_decode_error_to_response(&e),
-                };
-
+                // The buffered bridge must apply the same downstream tool
+                // allow-list while decoding that the live/SSE paths use.
+                // Without this, a multi-replacement PiEdit is first mapped to
+                // the legacy `MultiEdit` shape; the bridge then cannot resolve
+                // it to Claude Code 2.1+'s single-operation text editor and
+                // silently drops the edit.
                 let allowed = advertised_tool_names(&body);
+                let events =
+                    match decode_upstream_response_with_allowed(&upstream.body, allowed.as_ref()) {
+                        Ok(e) => e,
+                        Err(e) => return map_cursor_decode_error_to_response(&e),
+                    };
+
                 // Anthropic surface must echo the wire id (`claude-fable-5[1m]`),
                 // not the suffix-stripped request model — Claude Code / ccstatusline
                 // derive the 1M window from `[1m]` when the proxy host is not
@@ -5611,7 +5846,7 @@ mod tests {
             ),
             "geo blocks must fail closed, not retry as a 502"
         );
-        assert!(!live_error_is_same_request_retryable(
+        assert!(live_error_is_same_request_retryable(
             "Connect error 502: Image not found [internal]"
         ));
         assert!(!live_error_is_same_request_retryable(
@@ -5917,6 +6152,27 @@ mod tests {
         assert!(!live_retry_needs_fresh_history(
             "Connect error 502: transient transport failure"
         ));
+    }
+
+    #[test]
+    fn image_recovery_helper_preserves_detail_and_history_payload() {
+        let error = CursorError::new(
+            502,
+            "Cursor upstream connect failed",
+            Some("Image not found [internal]".into()),
+        );
+        assert!(cursor_error_is_missing_image(&error));
+
+        let images = vec![CursorSelectedImage {
+            data: "T0xESU1H".into(),
+            uuid: "stale-image-id".into(),
+            path: String::new(),
+            mime_type: "image/png".into(),
+        }];
+        let refreshed = refresh_image_uuids(&images);
+        assert_eq!(refreshed[0].data, images[0].data);
+        assert_eq!(refreshed[0].mime_type, images[0].mime_type);
+        assert_ne!(refreshed[0].uuid, images[0].uuid);
     }
 
     #[test]
@@ -6610,16 +6866,20 @@ mod tests {
     #[test]
     fn streaming_live_commits_sse_before_start_live() {
         assert!(
-            commit_streaming_live_sse_before_start_live(true, false),
+            commit_streaming_live_sse_before_start_live(true, false, true),
             "Claude Code must get message_start before start_live / peek / retry"
         );
         assert!(
-            !commit_streaming_live_sse_before_start_live(true, true),
-            "/v1/responses must wait for live open so 409 is JSON, not grok 500"
+            commit_streaming_live_sse_before_start_live(true, true, true),
+            "/v1/responses fresh streams must emit heartbeats while waiting behind a live run"
         );
         assert!(
-            !commit_streaming_live_sse_before_start_live(false, false),
+            !commit_streaming_live_sse_before_start_live(false, false, false),
             "non-streaming JSON collection still waits for the live run"
+        );
+        assert!(
+            !commit_streaming_live_sse_before_start_live(true, true, false),
+            "Responses tool-result continuations retain JSON-before-open semantics"
         );
     }
 

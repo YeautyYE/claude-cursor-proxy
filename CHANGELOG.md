@@ -3,6 +3,26 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.83 (2026-08-28)
+
+- Fix Claude Code 2.1.193 text-editor dispatch. Cursor PiEdit events now
+  resolve to the exact advertised `text_editor_20250728` /
+  `str_replace_based_edit_tool` handler, so Claude Code no longer falls back
+  from `Edit` to `StrReplace` or prints an unavailable-tool message.
+- Normalize modern editor commands and aliases (`view`, `create`,
+  `str_replace`, and `insert`) while rejecting unsupported rename/delete
+  shapes. Multi-replacement PiEdit calls are expanded into ordered sibling
+  `str_replace` blocks without losing the native Cursor result envelope.
+- Keep the same editor allow-list and schema across live BiDi, buffered SSE,
+  non-streaming, XML recovery, and tool-result continuation paths. Late or
+  replayed PiEdit markers are deduplicated, and malformed editor payloads no
+  longer become phantom waits or leaked XML transcript text.
+- Add PiEdit protobuf result encoding and legacy bridge coverage, including
+  reconnect, split-chunk, mixed-batch, and modern/legacy catalog regressions.
+- Bound stale-image recovery to one fresh-UUID replay per request and retain
+  the original inline image bytes, preventing repeated `Image not found`
+  retry waves while preserving normal text/tool turns.
+
 ## v0.1.82 (2026-08-27)
 
 - Recognize Cursor's Sand-quota wire sentinel: two consecutive immediate,

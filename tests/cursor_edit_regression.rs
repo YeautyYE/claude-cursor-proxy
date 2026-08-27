@@ -105,6 +105,18 @@ fn claude_20250728_editor_is_registered_with_exact_wire_name() {
         text_editor_command_enum(editor.input_schema.as_ref().unwrap()),
         ["view", "create", "str_replace", "insert"]
     );
+    let root = match editor.input_schema.as_ref().unwrap().kind.as_ref() {
+        Some(prost_types::value::Kind::StructValue(root)) => root,
+        other => panic!("text editor schema must be a struct Value: {other:?}"),
+    };
+    let properties = match root.fields.get("properties").and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::StructValue(properties)) => properties,
+        other => panic!("text editor schema properties must be a struct Value: {other:?}"),
+    };
+    assert!(
+        !properties.fields.contains_key("new_path"),
+        "20250728 editor has no rename/new_path input"
+    );
     assert!(!editor.description.contains("delete"));
     assert!(!editor.description.contains("rename"));
 }
@@ -240,6 +252,62 @@ fn modern_editor_commands_preserve_their_operation_specific_fields() {
 }
 
 #[test]
+fn modern_editor_drops_legacy_rename_fields_and_does_not_infer_view() {
+    // `rename`/`new_path` are not part of text_editor_20250728. Keep an
+    // unsupported command invalid so the bridge validator can discard it;
+    // never turn it into a `view` call by guessing from the remaining path.
+    let renamed = adapt_tool_input_for_client(
+        "str_replace_based_edit_tool",
+        serde_json::json!({
+            "command": "rename",
+            "path": "old.txt",
+            "new_path": "new.txt",
+            "destination": "new.txt",
+            "to": "new.txt",
+            "provider_identifier": "claude-local"
+        }),
+    );
+    assert_eq!(
+        renamed,
+        serde_json::json!({"command": "rename", "path": "old.txt"})
+    );
+
+    let path_only = adapt_tool_input_for_client(
+        "str_replace_based_edit_tool",
+        serde_json::json!({
+            "path": "old.txt",
+            "new_path": "new.txt"
+        }),
+    );
+    assert_eq!(path_only, serde_json::json!({"path": "old.txt"}));
+}
+
+#[test]
+fn modern_editor_preserves_empty_old_str_for_insert_semantics() {
+    // Claude's editor implementation intentionally accepts an empty old_str
+    // (it inserts new_str at the beginning); do not treat an empty string as
+    // a missing field while normalizing Cursor PiEdit payloads.
+    let normalized = adapt_tool_input_for_client(
+        "str_replace_based_edit_tool",
+        serde_json::json!({
+            "command": "str_replace",
+            "path": "src/lib.rs",
+            "old_str": "",
+            "new_str": "header\\n"
+        }),
+    );
+    assert_eq!(
+        normalized,
+        serde_json::json!({
+            "command": "str_replace",
+            "path": "src/lib.rs",
+            "old_str": "",
+            "new_str": "header\\n"
+        })
+    );
+}
+
+#[test]
 fn xml_edit_alias_is_canonicalized_to_advertised_modern_name() {
     let allowed: BTreeSet<String> = ["str_replace_based_edit_tool".to_string()]
         .into_iter()
@@ -263,6 +331,44 @@ fn xml_edit_alias_is_canonicalized_to_advertised_modern_name() {
     assert_eq!(normalized["path"], "src/lib.rs");
     assert_eq!(normalized["old_str"], "x");
     assert_eq!(normalized["new_str"], "y");
+}
+
+#[test]
+fn xml_edit_prefers_modern_handler_when_legacy_edit_is_also_advertised() {
+    // This is the exact failure shape seen by Claude Code: the upstream
+    // Cursor event is labelled `Edit`, while the client advertises the
+    // Anthropic-defined 20250728 handler.  Emitting the legacy name makes the
+    // CLI print "Edit unavailable" and switch to StrReplace; the proxy must
+    // resolve the event to the exact modern name instead.
+    let allowed: BTreeSet<String> = [
+        "Edit".to_string(),
+        "str_replace_based_edit_tool".to_string(),
+    ]
+    .into_iter()
+    .collect();
+    let mut parser =
+        CursorToolUseXmlParser::new_with_id_factory(Some(allowed), || "edit-call-both".to_string());
+    let events = parser.push(
+        r#"<tool_use name="Edit">{"file_path":"src/lib.rs","old_string":"a","new_string":"b"}</tool_use>"#,
+    );
+    let tool = events
+        .into_iter()
+        .find_map(|event| match event {
+            RecoveredCursorEvent::ToolUse(tool) => Some(tool),
+            RecoveredCursorEvent::Text(_) => None,
+        })
+        .expect("Edit event should be recovered");
+    assert_eq!(tool.name, "str_replace_based_edit_tool");
+    let input = adapt_tool_input_for_client(&tool.name, serde_json::Value::Object(tool.input));
+    assert_eq!(
+        input,
+        serde_json::json!({
+            "command": "str_replace",
+            "path": "src/lib.rs",
+            "old_str": "a",
+            "new_str": "b"
+        })
+    );
 }
 
 #[test]

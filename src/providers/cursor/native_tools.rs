@@ -2,10 +2,10 @@
 //! onto Claude Code Anthropic tool_use shapes.
 
 use crate::providers::cursor::proto::{
-    AskQuestionArgs, ExecServerMessage, FetchArgs, PiWriteExecArgs, ShellArgs, ToolCall,
-    ToolCallStarted,
+    AskQuestionArgs, ExecServerMessage, FetchArgs, PiEditExecArgs, PiWriteExecArgs, ShellArgs,
+    ToolCall, ToolCallStarted,
 };
-use crate::providers::cursor::request::is_claude_local_mcp_spelling;
+use crate::providers::cursor::request::{is_claude_local_mcp_spelling, is_text_editor_tool_name};
 
 const ASK_USER_QUESTION_HEADER_MAX: usize = 12;
 
@@ -73,6 +73,9 @@ pub fn map_exec_server_message(exec: &ExecServerMessage) -> Option<MappedClaudeT
                 "content": args.file_text,
             }),
         });
+    }
+    if let Some(ref args) = exec.pi_edit_args {
+        return map_pi_edit_args(args, id);
     }
     if let Some(ref args) = exec.pi_write_args {
         return Some(map_pi_write_args(args, id));
@@ -157,6 +160,16 @@ fn map_tool_call(tc: &ToolCall, call_id: String) -> Option<MappedClaudeTool> {
             },
             call_id,
         ));
+    }
+    if let Some(ref edit) = tc.pi_edit_tool_call {
+        let args = edit.args.as_ref()?;
+        return map_pi_edit_args(
+            &PiEditExecArgs {
+                path: args.path.clone(),
+                edits: args.edits.clone(),
+            },
+            call_id,
+        );
     }
     if let Some(ref grep) = tc.grep_tool_call {
         let args = grep.args.as_ref()?;
@@ -470,6 +483,50 @@ fn map_pi_write_args(args: &PiWriteExecArgs, tool_use_id: String) -> MappedClaud
     }
 }
 
+/// Map Cursor's modern Pi string-replacement edit into Claude Code's native
+/// Edit/MultiEdit contract.  A single replacement uses `Edit`; preserving a
+/// multi-replacement call as `MultiEdit` avoids dropping atomic edits or
+/// forcing the model to issue several independent tool calls.
+fn map_pi_edit_args(args: &PiEditExecArgs, tool_use_id: String) -> Option<MappedClaudeTool> {
+    if args.path.trim().is_empty() || args.edits.is_empty() {
+        // Empty Pi edits/path values are incomplete or invalid stream
+        // markers. Returning no tool prevents a fabricated editor call with
+        // missing replacement data (an empty old/new string itself remains a
+        // valid insertion/deletion and is intentionally preserved).
+        return None;
+    }
+    if args.edits.len() == 1 {
+        let edit = &args.edits[0];
+        return Some(MappedClaudeTool {
+            tool_use_id,
+            name: "Edit".into(),
+            input: serde_json::json!({
+                "file_path": args.path,
+                "old_string": edit.old_text,
+                "new_string": edit.new_text,
+            }),
+        });
+    }
+    let edits: Vec<serde_json::Value> = args
+        .edits
+        .iter()
+        .map(|edit| {
+            serde_json::json!({
+                "old_string": edit.old_text,
+                "new_string": edit.new_text,
+            })
+        })
+        .collect();
+    Some(MappedClaudeTool {
+        tool_use_id,
+        name: "MultiEdit".into(),
+        input: serde_json::json!({
+            "file_path": args.path,
+            "edits": edits,
+        }),
+    })
+}
+
 fn map_fetch_args(args: &FetchArgs, call_id: String) -> Option<MappedClaudeTool> {
     Some(MappedClaudeTool {
         tool_use_id: if args.tool_call_id.is_empty() {
@@ -742,6 +799,27 @@ pub fn advertised_name_fallbacks(mapped_name: &str) -> &'static [&'static str] {
         "Write" | "write" | "write_file" | "WriteFile" => {
             &["Write", "write", "write_file", "WriteFile"]
         }
+        // PiEdit's canonical mapping is Claude `Edit`; when the client only
+        // advertises Anthropic's schema-less editor, resolve to that exact
+        // name instead of dropping the call as "not advertised".
+        "Edit"
+        | "edit"
+        | "StrReplace"
+        | "StrReplaceTool"
+        | "str_replace_based_edit_tool"
+        | "str_replace_editor" => &[
+            "Edit",
+            "str_replace_based_edit_tool",
+            "StrReplace",
+            "StrReplaceTool",
+            "str_replace_editor",
+        ],
+        // `MultiEdit` has a distinct array payload.  Do not alias it to the
+        // single-operation schema-less editor here: doing so would discard
+        // the `edits` array (or expose only a fabricated `view` call).  Native
+        // PiEdit multi-replacements are expanded explicitly in the live path;
+        // an XML MultiEdit call requires the legacy handler to be advertised.
+        "MultiEdit" => &["MultiEdit"],
         "Grep" => &["Grep", "grep", "Search"],
         "Glob" => &["Glob", "glob", "Find", "list_dir"],
         "LS" | "Ls" => &[
@@ -931,6 +1009,9 @@ pub fn adapt_tool_input_for_client(
             obj.remove("file_text");
             obj.remove("contents");
         }
+        name if is_text_editor_tool_name(name) => {
+            normalize_text_editor_input(obj);
+        }
         "grep" => {
             coerce_integer_fields(obj, &["head_limit", "-B", "-A", "-C"]);
             if let Some(flag) = obj.remove("case_insensitive") {
@@ -1036,6 +1117,77 @@ pub fn adapt_client_tool_input(
     } else {
         adapt_tool_input_for_client(advertised_name, input)
     }
+}
+
+/// Normalize an Anthropic text-editor invocation for Claude Code's local
+/// handler. The 20250728 contract is schema-less at the API boundary but uses
+/// a fixed command/field vocabulary. Cursor/Grok may send Claude Edit aliases;
+/// canonicalize those aliases and drop transport metadata before exposing the
+/// client-only tool.
+fn normalize_text_editor_input(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    copy_alias_if_missing(obj, "path", &["file_path", "target_file"]);
+    copy_alias_if_missing(obj, "old_str", &["old_string", "oldText", "old_text"]);
+    copy_alias_if_missing(
+        obj,
+        "new_str",
+        &["new_string", "newText", "new_text", "content"],
+    );
+    copy_alias_if_missing(obj, "file_text", &["contents", "file_content"]);
+    copy_alias_if_missing(obj, "insert_text", &["text"]);
+    copy_alias_if_missing(obj, "insert_line", &["line", "line_number"]);
+    copy_alias_if_missing(obj, "view_range", &["range"]);
+    copy_alias_if_missing(obj, "max_characters", &["maxChars", "max_chars"]);
+
+    // Normalize common command spellings. PiEdit → text-editor fallback has
+    // no command field, so infer it from the operation-specific arguments.
+    if let Some(command) = obj.get("command").and_then(|value| value.as_str()) {
+        let normalized = match command {
+            "strReplace" | "replace" | "replace_string" => Some("str_replace"),
+            "new" | "write" | "overwrite" => Some("create"),
+            _ => None,
+        };
+        if let Some(normalized) = normalized {
+            obj.insert(
+                "command".into(),
+                serde_json::Value::String(normalized.into()),
+            );
+        }
+    }
+    if !obj.contains_key("command") {
+        // Infer a command only when an operation-specific field is present.
+        // A path-only (or path + unknown `new_path`) payload is incomplete;
+        // defaulting it to `view` would turn an unsupported rename/malformed
+        // call into a seemingly valid editor invocation. The XML bridge's
+        // schema validator will then discard the incomplete call instead of
+        // handing Claude Code a misleading tool_use.
+        let command = if obj.contains_key("old_str") || obj.contains_key("new_str") {
+            Some("str_replace")
+        } else if obj.contains_key("file_text") {
+            Some("create")
+        } else if obj.contains_key("insert_text") || obj.contains_key("insert_line") {
+            Some("insert")
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            obj.insert("command".into(), serde_json::Value::String(command.into()));
+        }
+    }
+
+    retain_object_keys(
+        obj,
+        &[
+            "command",
+            "path",
+            "old_str",
+            "new_str",
+            "file_text",
+            "insert_line",
+            "insert_text",
+            "view_range",
+            "max_characters",
+        ],
+    );
 }
 
 pub fn glob_pattern_is_directory_listing(input: &serde_json::Value) -> bool {
@@ -2141,6 +2293,94 @@ mod tests {
         assert_eq!(mapped.name, "Write");
         assert_eq!(mapped.input["file_path"], "/tmp/pi.txt");
         assert_eq!(mapped.input["content"], "hello");
+    }
+
+    #[test]
+    fn maps_pi_edit_exec_single_replacement_to_edit() {
+        let exec = ExecServerMessage {
+            id: 11,
+            exec_id: Some("pi-exec-edit".into()),
+            pi_edit_args: Some(crate::providers::cursor::proto::PiEditExecArgs {
+                path: "/tmp/pi.rs".into(),
+                edits: vec![crate::providers::cursor::proto::PiEditReplacement {
+                    old_text: "before".into(),
+                    new_text: "after".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let mapped = map_exec_server_message(&exec).expect("Pi edit must map");
+        assert_eq!(mapped.name, "Edit");
+        assert_eq!(mapped.tool_use_id, "pi-exec-edit");
+        assert_eq!(mapped.input["file_path"], "/tmp/pi.rs");
+        assert_eq!(mapped.input["old_string"], "before");
+        assert_eq!(mapped.input["new_string"], "after");
+        assert!(mapped.input.get("edits").is_none());
+    }
+
+    #[test]
+    fn maps_pi_edit_exec_multiple_replacements_to_multi_edit() {
+        let exec = ExecServerMessage {
+            id: 12,
+            exec_id: Some("pi-exec-multi".into()),
+            pi_edit_args: Some(crate::providers::cursor::proto::PiEditExecArgs {
+                path: "/tmp/pi.rs".into(),
+                edits: vec![
+                    crate::providers::cursor::proto::PiEditReplacement {
+                        old_text: "one".into(),
+                        new_text: "1".into(),
+                    },
+                    crate::providers::cursor::proto::PiEditReplacement {
+                        old_text: "two".into(),
+                        new_text: "2".into(),
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let mapped = map_exec_server_message(&exec).expect("Pi multi-edit must map");
+        assert_eq!(mapped.name, "MultiEdit");
+        assert_eq!(mapped.input["file_path"], "/tmp/pi.rs");
+        assert_eq!(mapped.input["edits"][0]["old_string"], "one");
+        assert_eq!(mapped.input["edits"][1]["new_string"], "2");
+    }
+
+    #[test]
+    fn maps_pi_edit_tool_call_field_63() {
+        let started = ToolCallStarted {
+            call_id: "pi-tool-edit".into(),
+            tool_call: Some(ToolCall {
+                pi_edit_tool_call: Some(crate::providers::cursor::proto::PiEditToolCall {
+                    args: Some(crate::providers::cursor::proto::PiEditToolArgs {
+                        path: "/tmp/pi.txt".into(),
+                        edits: vec![crate::providers::cursor::proto::PiEditReplacement {
+                            old_text: "x".into(),
+                            new_text: "y".into(),
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            model_call_id: String::new(),
+        };
+        let mapped = map_tool_call_started(&started).expect("Pi edit tool must map");
+        assert_eq!(mapped.name, "Edit");
+        assert_eq!(mapped.input["file_path"], "/tmp/pi.txt");
+        assert_eq!(mapped.input["old_string"], "x");
+    }
+
+    #[test]
+    fn empty_pi_edit_does_not_create_tool_call() {
+        let exec = ExecServerMessage {
+            id: 13,
+            pi_edit_args: Some(crate::providers::cursor::proto::PiEditExecArgs {
+                path: "/tmp/empty".into(),
+                edits: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(map_exec_server_message(&exec).is_none());
     }
 
     #[test]

@@ -104,6 +104,13 @@ const CURSOR_NATIVE_TOOL_NAMES: &[&str] = &[
     "Write",
     "write_file",
     "WriteFile",
+    // Cursor's Pi string-replacement editor is advertised as `StrReplace`
+    // (field-63/field-47 in the Agent protocol).  It is a Cursor-native
+    // capability, not a Claude-local MCP tool.  Keeping it in this list is
+    // important: otherwise the same operation is registered a second time
+    // through `claude-local`, and the model can receive an `Edit` fallback
+    // even though the client only knows `StrReplace`.
+    "StrReplace",
     "Grep",
     "Search",
     "Glob",
@@ -215,9 +222,83 @@ const CLAUDE_CLIENT_ONLY_TOOL_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn is_claude_client_only_tool_name(name: &str) -> bool {
+    // A bare Cursor-native `StrReplace` must never be put on the
+    // client-only/MCP route.  Qualified `claude-local/StrReplace` spellings
+    // remain client-owned and are handled by the provider-aware resolver.
+    if is_cursor_native_tool_name(name) {
+        return false;
+    }
     CLAUDE_CLIENT_ONLY_TOOL_NAMES
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        || is_text_editor_tool_name(name)
+}
+
+/// Anthropic's schema-less text editor names.  Claude Code 2.1.x advertises
+/// the versioned pair `text_editor_20250728` / `str_replace_based_edit_tool`;
+/// older clients used `str_replace_editor`, while a few Cursor/Grok bridges
+/// expose the short `StrReplace` spelling.  Keep this list deliberately
+/// explicit so a foreign MCP tool cannot become a local editor by fuzzy
+/// matching.
+pub(crate) fn is_text_editor_tool_name(name: &str) -> bool {
+    let leaf = if is_claude_local_mcp_spelling(name) {
+        strip_mcp_provider_prefix(name)
+    } else {
+        name
+    };
+    [
+        "str_replace_based_edit_tool",
+        "str_replace_editor",
+        "StrReplace",
+        "StrReplaceTool",
+    ]
+    .iter()
+    .any(|candidate| candidate.eq_ignore_ascii_case(leaf))
+}
+
+/// Pick the most capable text-editor spelling from an advertised tool set.
+///
+/// Claude Code 2.1.193's canonical pair is
+/// `text_editor_20250728`/`str_replace_based_edit_tool`.  A request can still
+/// contain a stale legacy `Edit` entry (or an older `str_replace_editor`), so
+/// callers resolving a Cursor PiEdit event must prefer the canonical spelling
+/// whenever it is present.  Return the exact spelling from the allow-list so
+/// Anthropic's tool-result ids continue to match the client's catalog.
+pub(crate) fn preferred_text_editor_name(
+    allowed: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    const PREFERRED: &[&str] = &[
+        "str_replace_based_edit_tool",
+        "StrReplace",
+        "StrReplaceTool",
+        "str_replace_editor",
+    ];
+    // Prefer an exact/bare spelling first.  This is what Claude Code sends in
+    // its `tools` array and avoids needlessly exposing the synthetic provider
+    // prefix in the downstream `tool_use.name`.
+    PREFERRED
+        .iter()
+        .find_map(|candidate| {
+            allowed
+                .iter()
+                .find(|advertised| advertised.eq_ignore_ascii_case(candidate))
+                .cloned()
+        })
+        // Older clients can retain a `claude-local` provider qualification in
+        // their tool catalog/history.  Match only that explicit namespace;
+        // `mcp__other__StrReplace` must never become a local editor by leaf
+        // matching.
+        .or_else(|| {
+            PREFERRED.iter().find_map(|candidate| {
+                allowed
+                    .iter()
+                    .find(|advertised| {
+                        is_claude_local_mcp_spelling(advertised)
+                            && strip_mcp_provider_prefix(advertised).eq_ignore_ascii_case(candidate)
+                    })
+                    .cloned()
+            })
+        })
 }
 
 /// Names that Claude Code's bundled runtime treats as aliases of one tool.
@@ -243,6 +324,17 @@ pub(crate) fn claude_tool_aliases(name: &str) -> &'static [&'static str] {
         &["ReadMcpResourceTool", "ReadMcpResource"],
         &["ReadMcpResourceDirTool", "ReadMcpResourceDir"],
         &["Workflow", "RunWorkflow"],
+        // Cursor calls Claude Code's text editor `StrReplace`; Claude Code's
+        // Anthropic-defined name is `str_replace_based_edit_tool`.  These are
+        // the same client-side operation, while `Edit` is the legacy Claude
+        // tool shape used by PiEdit native events.
+        &[
+            "Edit",
+            "str_replace_based_edit_tool",
+            "str_replace_editor",
+            "StrReplace",
+            "StrReplaceTool",
+        ],
     ];
     GROUPS
         .iter()
@@ -330,7 +422,7 @@ pub(crate) fn is_claude_local_tool_name(name: &str) -> bool {
 /// as ClientOnly only after the live driver validates their Claude schema and
 /// allow-list entry.
 pub(crate) fn is_xml_client_only_native_tool_name(name: &str) -> bool {
-    matches!(name, "Edit" | "MultiEdit" | "NotebookEdit")
+    matches!(name, "Edit" | "MultiEdit" | "NotebookEdit") || is_text_editor_tool_name(name)
 }
 
 /// Classify tool results that require a fresh Anthropic continuation rather
@@ -463,6 +555,15 @@ fn advertise_as_cursor_mcp(name: &str, grok_build_request: bool) -> bool {
         return true;
     }
     let bare = strip_mcp_provider_prefix(name);
+    // Bare Cursor-native tools (including the Pi `StrReplace` editor) are
+    // already part of Cursor's native catalog.  Registering them again as a
+    // Claude-local MCP tool creates two identities for one operation and can
+    // make a PiEdit event resolve to the legacy `Edit` label.  A qualified
+    // `claude-local/...` spelling is intentionally left eligible below: it is
+    // an explicit client-local alias, not the native bare tool.
+    if name == bare && is_cursor_native_tool_name(name) {
+        return false;
+    }
     // Claude Code's Agent is fulfilled by Cursor's native Task event. A bare
     // Agent entry in mcp_tools would create a second subagent route; qualified
     // `claude-local/Agent` spellings remain eligible for explicit MCP calls.
@@ -593,6 +694,37 @@ fn mcp_input_schema_value(tool: &serde_json::Value) -> prost_types::Value {
     }
 }
 
+/// Anthropic-defined text editors intentionally omit `input_schema` from the
+/// Messages request. Cursor's MCP catalog still requires a structured value;
+/// provide the documented command vocabulary so function-calling models can
+/// select and populate the client-side editor reliably.
+fn text_editor_mcp_schema_value() -> prost_types::Value {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            // Claude Code 2.1.193's `text_editor_20250728` contract has
+            // exactly four operations.  `delete`/`rename` belonged to an
+            // earlier internal memory-tool shape; advertising them here
+            // makes the model emit calls that the local handler rejects.
+            "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert"]},
+            "path": {"type": "string"},
+            "old_str": {"type": "string"},
+            "new_str": {"type": "string"},
+            "file_text": {"type": "string"},
+            "view_range": {"type": "array", "items": {"type": "integer"}},
+            "max_characters": {"type": "integer"},
+            "insert_line": {"type": "integer"},
+            "insert_text": {"type": "string"}
+        },
+        "required": ["command", "path"]
+    });
+    prost_types::Value {
+        kind: Some(prost_types::value::Kind::StructValue(
+            json_to_prost_struct(&schema).expect("text editor schema object"),
+        )),
+    }
+}
+
 /// Cursor may qualify MCP names as `provider/tool`, `provider:tool`,
 /// `mcp__provider__tool`, or `mcp_provider_tool` (`claude-local/Workflow`,
 /// `mcp_claude-local_Workflow`). Anthropic / grok-build `tools[].name` is the
@@ -670,20 +802,30 @@ pub fn claude_local_mcp_tools(req: &MessagesRequest) -> Option<super::proto::Mcp
             // function-calling models (gemini) hallucinated names like
             // "asr-review-workflow". The generous ceiling only guards against
             // pathological megabyte descriptions.
-            let description = tool
+            let mut description = tool
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .chars()
                 .take(16_384)
                 .collect::<String>();
+            if is_text_editor_tool_name(&name) && description.trim().is_empty() {
+                description = "Client-side text editor. Use command=view, create, str_replace, or insert with the documented path fields.".into();
+            }
             let wire_name = cursor_mcp_wire_name(&name);
+            let input_schema = if is_text_editor_tool_name(&name)
+                && tool.get("input_schema").is_none()
+            {
+                text_editor_mcp_schema_value()
+            } else {
+                mcp_input_schema_value(tool)
+            };
             Some(super::proto::McpTool {
                 tool_name: wire_name.clone(),
                 provider_identifier: CLAUDE_LOCAL_MCP_PROVIDER.to_string(),
                 name: wire_name,
                 description,
-                input_schema: Some(mcp_input_schema_value(tool)),
+                input_schema: Some(input_schema),
             })
         })
         .collect();
@@ -1509,6 +1651,25 @@ fn current_turn_user_messages(req: &MessagesRequest) -> Vec<&crate::anthropic::s
 /// reuse a stale asset entry when the same bytes are pasted again.
 fn fresh_image_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Re-issue inline image metadata for a fresh Cursor conversation.
+///
+/// Cursor treats the UUID on an inline `SelectedImage` as the identity of the
+/// uploaded asset.  A failed continuation can leave that identity pointing at
+/// an expired/stale entry even though the original bytes are still available
+/// in the Anthropic request.  Keep the payload and MIME/path untouched while
+/// assigning a new CLI-style UUID for the one bounded recovery attempt.
+pub(crate) fn refresh_image_uuids(images: &[CursorSelectedImage]) -> Vec<CursorSelectedImage> {
+    images
+        .iter()
+        .map(|image| CursorSelectedImage {
+            data: image.data.clone(),
+            uuid: fresh_image_uuid(),
+            path: image.path.clone(),
+            mime_type: image.mime_type.clone(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3565,6 +3726,62 @@ mod tests {
         assert_ne!(a[0].uuid, b[0].uuid);
         assert!(uuid::Uuid::parse_str(&a[0].uuid).is_ok());
         assert!(uuid::Uuid::parse_str(&b[0].uuid).is_ok());
+    }
+
+    #[test]
+    fn refreshed_image_uuids_preserve_inline_payload_and_metadata() {
+        let images = vec![CursorSelectedImage {
+            data: "iVBORw0KGgo=".into(),
+            uuid: "old-image-id".into(),
+            path: String::new(),
+            mime_type: "image/png".into(),
+        }];
+        let refreshed = refresh_image_uuids(&images);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].data, images[0].data);
+        assert_eq!(refreshed[0].path, images[0].path);
+        assert_eq!(refreshed[0].mime_type, images[0].mime_type);
+        assert_ne!(refreshed[0].uuid, images[0].uuid);
+        assert!(uuid::Uuid::parse_str(&refreshed[0].uuid).is_ok());
+    }
+
+    #[test]
+    fn refreshed_image_uuids_keep_order_for_multi_image_retry() {
+        let images = vec![
+            CursorSelectedImage {
+                data: "AAAA".into(),
+                uuid: "one".into(),
+                path: String::new(),
+                mime_type: "image/png".into(),
+            },
+            CursorSelectedImage {
+                data: "/9j/4AAQ".into(),
+                uuid: "two".into(),
+                path: String::new(),
+                mime_type: "image/jpeg".into(),
+            },
+        ];
+        let refreshed = refresh_image_uuids(&images);
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|image| image.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AAAA", "/9j/4AAQ"]
+        );
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|image| image.mime_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image/png", "image/jpeg"]
+        );
+        assert!(
+            refreshed
+                .iter()
+                .zip(images.iter())
+                .all(|(new, old)| new.uuid != old.uuid)
+        );
     }
 
     #[test]

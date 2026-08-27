@@ -718,6 +718,10 @@ pub struct ToolCall {
     /// `ExecServerMessage.pi_write_args` (field 48).
     #[prost(message, optional, tag = "64")]
     pub pi_write_tool_call: Option<PiWriteToolCall>,
+    /// Cursor 3.12+ Pi string-replacement edit tool (field 63).  The matching
+    /// filesystem exec is `ExecServerMessage.pi_edit_args` (field 47).
+    #[prost(message, optional, tag = "63")]
+    pub pi_edit_tool_call: Option<PiEditToolCall>,
 }
 
 /// Cursor Pi write tool call used in `InteractionUpdate.tool_call_started`.
@@ -761,6 +765,68 @@ pub struct PiWriteToolError {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct PiWriteToolRejected {
+    #[prost(string, tag = "1")]
+    pub reason: String,
+}
+
+/// Cursor Pi edit tool call used in `InteractionUpdate.tool_call_started`.
+///
+/// Pi edit is distinct from the legacy Cursor `EditToolCall`: it carries one
+/// or more exact string replacements rather than a complete file body.
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditToolCall {
+    #[prost(message, optional, tag = "1")]
+    pub args: Option<PiEditToolArgs>,
+    #[prost(message, optional, tag = "2")]
+    pub result: Option<PiEditToolResult>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditToolArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(message, repeated, tag = "2")]
+    pub edits: Vec<PiEditReplacement>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditReplacement {
+    #[prost(string, tag = "1")]
+    pub old_text: String,
+    #[prost(string, tag = "2")]
+    pub new_text: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditToolResult {
+    #[prost(message, optional, tag = "1")]
+    pub success: Option<PiEditToolSuccess>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<PiEditToolError>,
+    #[prost(message, optional, tag = "3")]
+    pub rejected: Option<PiEditToolRejected>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditToolSuccess {
+    #[prost(string, tag = "1")]
+    pub output: String,
+    #[prost(string, tag = "2")]
+    pub diff: String,
+    #[prost(string, tag = "3")]
+    pub patch: String,
+    #[prost(uint32, optional, tag = "4")]
+    pub first_changed_line: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditToolError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditToolRejected {
     #[prost(string, tag = "1")]
     pub reason: String,
 }
@@ -1253,6 +1319,9 @@ pub struct ExecServerMessage {
     /// Cursor 3.12+ Pi write exec (field 48).
     #[prost(message, optional, tag = "48")]
     pub pi_write_args: Option<PiWriteExecArgs>,
+    /// Cursor 3.12+ Pi string-replacement edit exec (field 47).
+    #[prost(message, optional, tag = "47")]
+    pub pi_edit_args: Option<PiEditExecArgs>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1312,6 +1381,9 @@ pub struct ExecClientMessage {
     /// Result for `ExecServerMessage.pi_write_args` (field 49).
     #[prost(message, optional, tag = "49")]
     pub pi_write_result: Option<PiWriteExecResult>,
+    /// Result for `ExecServerMessage.pi_edit_args` (field 48).
+    #[prost(message, optional, tag = "48")]
+    pub pi_edit_result: Option<PiEditExecResult>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1372,6 +1444,50 @@ pub struct PiWriteExecError {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct PiWriteExecRejected {
+    #[prost(string, tag = "1")]
+    pub reason: String,
+}
+
+/// Cursor Pi edit exec args.  The shape intentionally mirrors
+/// [`PiEditToolArgs`], but it is a separate wire message in agent.v1.
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditExecArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(message, repeated, tag = "2")]
+    pub edits: Vec<PiEditReplacement>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditExecResult {
+    #[prost(message, optional, tag = "1")]
+    pub success: Option<PiEditExecSuccess>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<PiEditExecError>,
+    #[prost(message, optional, tag = "3")]
+    pub rejected: Option<PiEditExecRejected>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditExecSuccess {
+    #[prost(string, tag = "1")]
+    pub output: String,
+    #[prost(string, tag = "2")]
+    pub diff: String,
+    #[prost(string, tag = "3")]
+    pub patch: String,
+    #[prost(uint32, optional, tag = "4")]
+    pub first_changed_line: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditExecError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PiEditExecRejected {
     #[prost(string, tag = "1")]
     pub reason: String,
 }
@@ -2073,6 +2189,89 @@ mod tests {
             decoded.pi_write_tool_call.unwrap().args.unwrap().path,
             "new.txt"
         );
+    }
+
+    #[test]
+    fn pi_edit_exec_uses_modern_cursor_field_47() {
+        let exec = ExecServerMessage {
+            id: 45,
+            exec_id: Some("pi-edit-45".into()),
+            pi_edit_args: Some(PiEditExecArgs {
+                path: "src/lib.rs".into(),
+                edits: vec![PiEditReplacement {
+                    old_text: "old".into(),
+                    new_text: "new".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        exec.encode(&mut buf).unwrap();
+        // field 47, length-delimited -> key 0xfa 0x02.
+        assert!(
+            buf.windows(2).any(|w| w == [0xfa, 0x02]),
+            "pi_edit_args field 47 missing from {buf:?}"
+        );
+        let decoded = ExecServerMessage::decode(&buf[..]).unwrap();
+        let args = decoded.pi_edit_args.unwrap();
+        assert_eq!(args.path, "src/lib.rs");
+        assert_eq!(args.edits[0].old_text, "old");
+        assert_eq!(args.edits[0].new_text, "new");
+    }
+
+    #[test]
+    fn pi_edit_tool_uses_field_63() {
+        let call = ToolCall {
+            pi_edit_tool_call: Some(PiEditToolCall {
+                args: Some(PiEditToolArgs {
+                    path: "src/lib.rs".into(),
+                    edits: vec![PiEditReplacement {
+                        old_text: "one".into(),
+                        new_text: "two".into(),
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        call.encode(&mut buf).unwrap();
+        // field 63, length-delimited -> key 0xfa 0x03.
+        assert!(
+            buf.windows(2).any(|w| w == [0xfa, 0x03]),
+            "pi_edit_tool_call field 63 missing from {buf:?}"
+        );
+        let decoded = ToolCall::decode(&buf[..]).unwrap();
+        let args = decoded.pi_edit_tool_call.unwrap().args.unwrap();
+        assert_eq!(args.path, "src/lib.rs");
+        assert_eq!(args.edits[0].old_text, "one");
+    }
+
+    #[test]
+    fn pi_edit_result_uses_exec_client_field_48() {
+        let result = ExecClientMessage {
+            id: 46,
+            pi_edit_result: Some(PiEditExecResult {
+                success: Some(PiEditExecSuccess {
+                    output: "ok".into(),
+                    diff: "-old +new".into(),
+                    patch: String::new(),
+                    first_changed_line: Some(3),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        result.encode(&mut buf).unwrap();
+        assert!(
+            buf.windows(2).any(|w| w == [0x82, 0x03]),
+            "pi_edit_result field 48 missing from {buf:?}"
+        );
+        let decoded = ExecClientMessage::decode(&buf[..]).unwrap();
+        let success = decoded.pi_edit_result.unwrap().success.unwrap();
+        assert_eq!(success.output, "ok");
+        assert_eq!(success.first_changed_line, Some(3));
     }
 
     fn proto_varint(mut value: u32) -> Vec<u8> {

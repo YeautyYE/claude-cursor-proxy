@@ -38,9 +38,10 @@ use super::exec_results::{
 };
 use super::http1::{self, BidiAppendSession};
 use super::native_tools::{
-    accumulate_partial_args_text, adapt_client_tool_input, adapt_native_task_to_spawn_subagent,
-    adapt_tool_input_for_client, advertised_name_fallbacks, map_ask_question_args,
-    map_tool_call_started, merge_partial_args_json, resolve_glob_client_name,
+    MappedClaudeTool, accumulate_partial_args_text, adapt_client_tool_input,
+    adapt_native_task_to_spawn_subagent, adapt_tool_input_for_client, advertised_name_fallbacks,
+    map_ask_question_args, map_tool_call_started, merge_partial_args_json,
+    resolve_glob_client_name,
 };
 use super::proto::{
     self, AgentClientMessage, AskQuestionArgs, AskQuestionInteractionQuery,
@@ -54,13 +55,15 @@ use super::proto::{
 use super::request::{
     CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, claude_tool_names_equivalent,
     cursor_mcp_wire_name, is_claude_local_mcp_spelling, is_claude_local_tool_name,
-    is_grok_build_subagent_lifecycle_tool, is_xml_client_only_native_tool_name,
-    normalize_grok_build_lifecycle_name, strip_mcp_provider_prefix,
+    is_grok_build_subagent_lifecycle_tool, is_text_editor_tool_name,
+    is_xml_client_only_native_tool_name, normalize_grok_build_lifecycle_name,
+    preferred_text_editor_name, strip_mcp_provider_prefix,
 };
 use super::response::CursorStreamEvent;
 use super::sse::{
     CursorSseEncoder, EVENT_ERROR, EVENT_MESSAGE_DELTA, EVENT_PING, format_sse_event_bytes,
 };
+use super::tool_bridge::tool_result_is_error;
 use super::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
 
 /// Outbound client messages: BiDi request body stream, or HTTP/1 BidiAppend.
@@ -923,9 +926,36 @@ fn encode_tool_result_batch(
         .collect();
     let mut frames = Vec::new();
     for current in pending {
-        let result = result_by_id
-            .get(current.tool_use_id.as_str())
-            .expect("validated result batch contains every pending tool");
+        // A modern text-editor multi-PiEdit is represented by one real Cursor
+        // exec plus synthetic sibling tool_use calls. If any sibling belonging
+        // to *this* primary failed, send that failure on the single upstream
+        // PiEdit envelope instead of silently reporting success.  Scope the
+        // lookup by parent id: parallel PiEdit calls in one batch must not
+        // inherit one another's continuation errors.
+        let result = match &current.kind {
+            CursorExecKind::PiEdit { .. } => pending
+                .iter()
+                .filter(|exec| {
+                    matches!(
+                        &exec.kind,
+                        CursorExecKind::PiEditContinuation { parent_id, .. }
+                            if *parent_id == current.id
+                    )
+                })
+                .filter_map(|exec| result_by_id.get(exec.tool_use_id.as_str()).copied())
+                .find(|result| tool_result_is_error(result))
+                .or_else(|| result_by_id.get(current.tool_use_id.as_str()).copied()),
+            _ => result_by_id.get(current.tool_use_id.as_str()).copied(),
+        }
+        .ok_or_else(|| {
+            format!(
+                "Cursor tool result id {} was validated but no payload was found",
+                current.tool_use_id
+            )
+        })?;
+        // `PiEditContinuation` entries are local acknowledgements. Their
+        // encoder intentionally returns no frames, so only the primary
+        // PiEdit contributes a result/close pair to Cursor.
         frames.extend(
             encode_tool_result_frames(current, result)
                 .map_err(|error| format!("encode Cursor tool result: {error}"))?,
@@ -1244,9 +1274,486 @@ struct LogicalToolTracker {
     oldest_since: Option<Instant>,
     /// Aggregated `partial_tool_call.args_text_delta` keyed by call_id.
     partial_args: HashMap<String, String>,
+    /// Pi Edit calls are announced on `ToolCallStarted.tool_call.pi_edit_tool_call`
+    /// (field 63) before the filesystem exec envelope (field 47).  Most Cursor
+    /// versions send both.  A few versions only send field 63, however; keep
+    /// the started call here until a matching exec arrives, then expose it as a
+    /// client-local text-editor call at the turn boundary.  This avoids both
+    /// the historical "Edit unavailable" drop and duplicate tool_use blocks
+    /// when field 47 does arrive later.
+    pi_edit_fallbacks: Vec<PendingPiEditFallback>,
+    /// Signatures already represented by an authoritative field-47 exec (or a
+    /// completed field-63 call). Reconnects may replay the transcript marker;
+    /// retaining this per-run set prevents a second tool_use.
+    resolved_pi_edit_keys: HashSet<String>,
+    /// Signatures promoted to a client-local editor because field 63 did not
+    /// have a matching field-47 exec before the turn boundary.  A late field
+    /// 47 for one of these operations must be acknowledged to Cursor, not
+    /// exposed as a second Anthropic tool_use.  Entries are removed after the
+    /// synthetic acknowledgement is sent; `resolved_pi_edit_keys` remains as
+    /// the replay fence for the rest of the segment.
+    promoted_pi_edit_keys: HashSet<String>,
+    /// Exact identities already represented by a field-63/field-47 PiEdit.
+    /// Payload alone is not an identity: Claude/Cursor can legitimately emit
+    /// two parallel edits with identical path/replacement data. Keep call,
+    /// exec, and numeric ids so the replay fence suppresses retransmissions
+    /// without swallowing those siblings.
+    resolved_pi_edit_ids: HashSet<String>,
+    /// Number of client-local promotions for each payload. A pair of
+    /// identical parallel fallbacks needs one late field-47 acknowledgement
+    /// per promotion, rather than a single boolean payload fence.
+    promoted_pi_edit_counts: HashMap<String, usize>,
+    /// Payload → exact identities represented by a native/fallback PiEdit.
+    /// `resolved_pi_edit_keys` is retained as a conservative fence for old
+    /// frames that carry no identity.  When an identity is available, this
+    /// side table lets a second parallel operation with the same payload be
+    /// distinguished from a replay of the first one.
+    resolved_pi_edit_payload_ids: HashMap<String, HashSet<String>>,
+}
+
+/// How an incoming field-47 PiEdit relates to the field-63 transcript marker.
+/// Keeping this distinction explicit makes the field-63/field-47 race
+/// idempotent: the first authoritative exec is queued, a replay is ignored,
+/// and an exec that arrives after a client-local fallback is auto-acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiEditResolution {
+    /// This is not a PiEdit exec (or the caller did not ask for a resolution).
+    NotPiEdit,
+    /// No prior marker represented this operation; queue the native exec.
+    New,
+    /// The operation was already represented by a native exec or completed
+    /// field-63 result.  Do not queue a duplicate.
+    AlreadyResolved,
+    /// The operation was promoted to a client-local editor.  Send one
+    /// synthetic success result to Cursor, then suppress the native exec.
+    AlreadyPromoted,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPiEditFallback {
+    call_id: String,
+    model_call_id: String,
+    /// Exact field-63 identity, when Cursor supplied a non-empty call_id.
+    /// `model_call_id` is deliberately not an identity: Cursor shares it for
+    /// parallel siblings.
+    identity: Option<String>,
+    path: String,
+    edits: Vec<proto::PiEditReplacement>,
+    mapped: MappedClaudeTool,
 }
 
 impl LogicalToolTracker {
+    fn pi_edit_key(path: &str, edits: &[proto::PiEditReplacement]) -> String {
+        let mut key = String::with_capacity(path.len() + edits.len() * 16);
+        key.push_str(path);
+        for edit in edits {
+            key.push('\u{1f}');
+            key.push_str(&edit.old_text);
+            key.push('\u{1e}');
+            key.push_str(&edit.new_text);
+        }
+        key
+    }
+
+    fn started_pi_edit_identity(started: &proto::ToolCallStarted) -> Option<String> {
+        if !started.call_id.is_empty() {
+            Some(format!("call:{}", started.call_id))
+        } else {
+            // `model_call_id` is intentionally not used as an exact identity:
+            // Cursor legitimately shares it across parallel siblings.
+            None
+        }
+    }
+
+    fn exec_pi_edit_identities(exec: &PendingCursorExec) -> Vec<String> {
+        let mut ids = Vec::with_capacity(3);
+        ids.push(format!("numeric:{}", exec.id));
+        if let Some(exec_id) = exec.exec_id.as_deref().filter(|id| !id.is_empty()) {
+            ids.push(format!("exec:{exec_id}"));
+        }
+        if !exec.tool_use_id.is_empty() {
+            ids.push(format!("tool:{}", exec.tool_use_id));
+        }
+        ids
+    }
+
+    /// Record a represented PiEdit.  Keep the historical payload fence for
+    /// id-less/reconnect frames, while remembering every exact identity seen
+    /// for this payload so legitimate parallel calls are not collapsed.
+    fn remember_pi_edit_resolution(&mut self, key: &str, identities: &[String]) {
+        self.resolved_pi_edit_keys.insert(key.to_string());
+        if !identities.is_empty() {
+            self.resolved_pi_edit_payload_ids
+                .entry(key.to_string())
+                .or_default()
+                .extend(identities.iter().cloned());
+        }
+    }
+
+    fn pi_edit_exact_identity_seen(&self, identities: &[String]) -> bool {
+        identities
+            .iter()
+            .any(|identity| self.resolved_pi_edit_ids.contains(identity))
+    }
+
+    fn remember_pi_edit_exact_identities(&mut self, key: &str, identities: &[String]) {
+        self.resolved_pi_edit_ids.extend(identities.iter().cloned());
+        self.remember_pi_edit_resolution(key, identities);
+    }
+
+    fn fallback_matches_started(
+        fallback: &PendingPiEditFallback,
+        started: &proto::ToolCallStarted,
+    ) -> bool {
+        if let Some(identity) = Self::started_pi_edit_identity(started) {
+            fallback.identity.as_deref() == Some(identity.as_str())
+        } else {
+            !started.model_call_id.is_empty()
+                && fallback.model_call_id == started.model_call_id
+                && fallback.call_id.is_empty()
+        }
+    }
+
+    fn remember_pi_edit_fallback(
+        &mut self,
+        started: &proto::ToolCallStarted,
+        mapped: &MappedClaudeTool,
+    ) -> Option<bool> {
+        let tool = started.tool_call.as_ref()?;
+        let edit = tool.pi_edit_tool_call.as_ref()?;
+        // A replayed transcript can carry only the completed result (without
+        // args), or can include both args and result. In either form Cursor
+        // has already applied the edit, so this marker must never enter the
+        // generic logical-tool wait set. Returning `Some(false)` tells the
+        // caller to skip `started()` and prevents a phantom timeout at
+        // turn_end when no separate ToolCallCompleted frame follows.
+        if edit.result.is_some() {
+            if let Some(args) = edit.args.as_ref()
+                && !args.path.is_empty()
+                && !args.edits.is_empty()
+            {
+                let key = Self::pi_edit_key(&args.path, &args.edits);
+                let identities = Self::started_pi_edit_identity(started)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if self.pi_edit_exact_identity_seen(&identities)
+                    || (identities.is_empty() && self.resolved_pi_edit_keys.contains(&key))
+                {
+                    return Some(false);
+                }
+                self.remember_pi_edit_exact_identities(&key, &identities);
+                // A reconnect can replay a completed field-63 marker while
+                // the original provisional marker is still queued. Retire
+                // that provisional entry now; otherwise turn-end flushing
+                // would promote an already-completed edit a second time.
+                let id_index = self
+                    .pi_edit_fallbacks
+                    .iter()
+                    .position(|fallback| Self::fallback_matches_started(fallback, started));
+                let payload_index = if id_index.is_none() {
+                    let mut matches = self
+                        .pi_edit_fallbacks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, fallback)| {
+                            Self::pi_edit_key(&fallback.path, &fallback.edits) == key
+                        })
+                        .map(|(index, _)| index);
+                    let first = matches.next();
+                    first.filter(|_| matches.next().is_none())
+                } else {
+                    None
+                };
+                if let Some(index) = id_index.or(payload_index) {
+                    let fallback = self.pi_edit_fallbacks.remove(index);
+                    self.remove_fallback_logical_marker(&fallback);
+                }
+            }
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
+            return Some(false);
+        }
+        let Some(args) = edit.args.as_ref() else {
+            // A field-63 marker without arguments is only a transcript hint;
+            // there is no executable edit to wait for.  Treat it as handled
+            // rather than adding a generic logical-tool entry that can keep a
+            // run stuck at turn_end forever.
+            return Some(false);
+        };
+        if args.path.is_empty() || args.edits.is_empty() {
+            // Likewise, malformed/empty PiEdit payloads must not become a
+            // phantom outstanding tool.  The real exec path validates edits
+            // before exposing them, and an invalid marker is safe to ignore.
+            return Some(false);
+        }
+        let edit_key = Self::pi_edit_key(&args.path, &args.edits);
+        let identities = Self::started_pi_edit_identity(started)
+            .into_iter()
+            .collect::<Vec<_>>();
+        // An exact call id is authoritative. A different call id carrying an
+        // identical payload can be a real parallel edit and must be retained.
+        // Only id-less markers use the conservative payload replay fence.
+        if self.pi_edit_exact_identity_seen(&identities)
+            || (identities.is_empty() && self.resolved_pi_edit_keys.contains(&edit_key))
+        {
+            return Some(false);
+        }
+        if started.call_id.is_empty() && started.model_call_id.is_empty() {
+            return None;
+        }
+        // A retransmitted ToolCallStarted frame is common around reconnects.
+        // Keep the first entry and never expose the same editor twice.
+        if self
+            .pi_edit_fallbacks
+            .iter()
+            .any(|fallback| Self::fallback_matches_started(fallback, started))
+        {
+            return Some(false);
+        }
+        if self.is_empty() {
+            self.oldest_since = Some(Instant::now());
+        }
+        self.pi_edit_fallbacks.push(PendingPiEditFallback {
+            call_id: started.call_id.clone(),
+            model_call_id: started.model_call_id.clone(),
+            identity: Self::started_pi_edit_identity(started),
+            path: args.path.clone(),
+            edits: args.edits.clone(),
+            mapped: mapped.clone(),
+        });
+        Some(true)
+    }
+
+    /// Remove a field-63 fallback once its authoritative field-47 exec is
+    /// observed. Match ids first, then the exact path/replacement payload so a
+    /// provider that changes ids between the two frames still deduplicates.
+    ///
+    /// The return value is important for the fallback race.  A field-47 exec
+    /// that arrives *after* a field-63 marker was promoted to a client-local
+    /// editor must not create a second Anthropic `tool_use`; the caller sends a
+    /// synthetic result back to Cursor instead.
+    fn resolve_pi_edit_fallback(&mut self, exec: &PendingCursorExec) -> PiEditResolution {
+        let CursorExecKind::PiEdit { path, edits } = &exec.kind else {
+            return PiEditResolution::NotPiEdit;
+        };
+        let exec_id = exec.exec_id.as_deref().unwrap_or_default();
+        let tool_id = exec.tool_use_id.as_str();
+        let edit_key = Self::pi_edit_key(path, edits);
+        let identities = Self::exec_pi_edit_identities(exec);
+
+        // Exact ids are the primary replay fence. A payload can legitimately
+        // occur in several parallel PiEdit calls, so a payload-only check is
+        // insufficient whenever this exec carries an identity.
+        if self.pi_edit_exact_identity_seen(&identities) {
+            return PiEditResolution::AlreadyResolved;
+        }
+
+        // Prefer an id match.  Payload matching is needed for Cursor builds
+        // that regenerate ids between field 63 and field 47, but it is only
+        // used to consume one provisional marker at a time. Two identical
+        // edits may be legitimate parallel calls; each distinct exec identity
+        // consumes one marker rather than fencing the whole payload.
+        let id_index = self.pi_edit_fallbacks.iter().position(|fallback| {
+            (!exec_id.is_empty() && fallback.call_id == exec_id)
+                || (!tool_id.is_empty() && fallback.call_id == tool_id)
+        });
+        let payload_index = if id_index.is_none() {
+            self.pi_edit_fallbacks
+                .iter()
+                .position(|fallback| fallback.path == *path && fallback.edits == *edits)
+        } else {
+            None
+        };
+        if let Some(index) = id_index.or(payload_index) {
+            let fallback = self.pi_edit_fallbacks.remove(index);
+            self.remove_fallback_logical_marker(&fallback);
+        }
+
+        // A promoted client-local fallback owns this payload until its late
+        // field-47 exec is acknowledged. Consume exactly one promotion for
+        // each *new* exec identity; a retransmission was fenced above.
+        let was_promoted = self
+            .promoted_pi_edit_counts
+            .get(&edit_key)
+            .copied()
+            .unwrap_or_default()
+            > 0;
+
+        // If there was no active provisional marker and no client promotion,
+        // an id-less frame may still be a replay covered by the legacy payload
+        // fence. For identified execs, a previously recorded payload with a
+        // known identity means this is a new parallel operation, not a replay.
+        let payload_only_replay = identities.is_empty()
+            && self.resolved_pi_edit_keys.contains(&edit_key)
+            || (!identities.is_empty()
+                && self.resolved_pi_edit_keys.contains(&edit_key)
+                && !self.resolved_pi_edit_payload_ids.contains_key(&edit_key));
+
+        if id_index.is_none() && payload_index.is_none() && was_promoted {
+            self.remember_pi_edit_exact_identities(&edit_key, &identities);
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
+            return PiEditResolution::AlreadyPromoted;
+        }
+
+        if id_index.is_none() && payload_index.is_none() && payload_only_replay {
+            // Preserve the historical fence for old/id-less transcripts. Do
+            // not add a new identity for this replay.
+            if self.is_empty() {
+                self.oldest_since = None;
+            }
+            return PiEditResolution::AlreadyResolved;
+        }
+
+        // A first authoritative field-47 operation (including one matched to
+        // a field-63 marker) gets a durable exact-id fence. For id-less
+        // protocol variants the payload fence remains the only discriminator.
+        self.remember_pi_edit_exact_identities(&edit_key, &identities);
+        if self.is_empty() {
+            self.oldest_since = None;
+        }
+        PiEditResolution::New
+    }
+
+    /// Remove a provisional PiEdit marker from the legacy logical tracker.
+    /// Older callers used to mirror field-63 into `named`; retain this cleanup
+    /// for state created by an earlier driver generation and for reconnects
+    /// that race an exec with the marker.
+    fn remove_fallback_logical_marker(&mut self, fallback: &PendingPiEditFallback) {
+        let removed_named = self.named.remove(&fallback.call_id);
+        if !fallback.model_call_id.is_empty() {
+            self.named.remove(&fallback.model_call_id);
+        }
+        if !removed_named
+            && let Some(count) = self.anonymous_by_model.get_mut(&fallback.model_call_id)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.anonymous_by_model.remove(&fallback.model_call_id);
+            }
+        }
+        self.partial_args.remove(&fallback.call_id);
+        if !fallback.model_call_id.is_empty() {
+            self.partial_args.remove(&fallback.model_call_id);
+        }
+    }
+
+    /// A completed field-63 transcript can arrive without field 47. Remove
+    /// its provisional fallback; Cursor has already applied the operation.
+    fn complete_pi_edit_fallback(&mut self, call_id: &str, model_call_id: &str) {
+        if call_id.is_empty() && model_call_id.is_empty() {
+            return;
+        }
+        // A model call id can be shared by parallel siblings.  Complete only
+        // one fallback (call id takes precedence), mirroring the anonymous
+        // sibling counter used by the generic tracker instead of retiring an
+        // entire group on the first completion frame.
+        let index = if !call_id.is_empty() {
+            self.pi_edit_fallbacks
+                .iter()
+                .position(|fallback| fallback.call_id == call_id)
+        } else {
+            self.pi_edit_fallbacks.iter().position(|fallback| {
+                !model_call_id.is_empty() && fallback.model_call_id == model_call_id
+            })
+        };
+        if let Some(index) = index {
+            let fallback = self.pi_edit_fallbacks.remove(index);
+            self.remove_fallback_logical_marker(&fallback);
+            let key = Self::pi_edit_key(&fallback.path, &fallback.edits);
+            if let Some(identity) = fallback.identity.as_deref() {
+                self.resolved_pi_edit_ids.insert(identity.to_string());
+                self.remember_pi_edit_resolution(&key, &[identity.to_string()]);
+            } else {
+                self.remember_pi_edit_resolution(&key, &[]);
+            }
+        }
+        if self.is_empty() {
+            self.oldest_since = None;
+        }
+    }
+
+    fn take_pi_edit_fallbacks(&mut self) -> Vec<PendingPiEditFallback> {
+        let fallbacks = std::mem::take(&mut self.pi_edit_fallbacks);
+        for fallback in &fallbacks {
+            self.remove_fallback_logical_marker(fallback);
+        }
+        if self.is_empty() {
+            self.oldest_since = None;
+        }
+        fallbacks
+    }
+
+    /// Put a provisional field-63 marker back when promotion is not possible.
+    /// `take_pi_edit_fallbacks` removes the legacy logical marker as part of
+    /// its ownership transfer; restoring the payload must therefore also
+    /// restore its age so a later turn-boundary/idle pass can try again after
+    /// the downstream advertises a compatible editor.
+    fn restore_pi_edit_fallback(&mut self, fallback: PendingPiEditFallback) {
+        if self.pi_edit_fallbacks.is_empty() {
+            self.oldest_since = Some(Instant::now());
+        }
+        self.pi_edit_fallbacks.push(fallback);
+    }
+
+    /// The fallback queue was claimed, but a native field-47 entry was already
+    /// pending.  Keep the replay fence while dropping the client-promotion
+    /// state so a later duplicate field-47 is simply ignored (the native
+    /// entry remains authoritative).
+    fn mark_pi_edit_authoritative(&mut self, fallback: &PendingPiEditFallback) {
+        let key = Self::pi_edit_key(&fallback.path, &fallback.edits);
+        if let Some(identity) = fallback.identity.as_deref() {
+            self.resolved_pi_edit_ids.insert(identity.to_string());
+            self.remember_pi_edit_resolution(&key, &[identity.to_string()]);
+        } else {
+            self.remember_pi_edit_resolution(&key, &[]);
+        }
+        if self
+            .promoted_pi_edit_counts
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+            == 0
+        {
+            self.promoted_pi_edit_keys.remove(&key);
+        }
+    }
+
+    /// Claim a fallback for client-local exposure.  This is deliberately
+    /// separate from `take_pi_edit_fallbacks`: callers may discover that no
+    /// compatible editor was advertised, in which case a later field-47 exec
+    /// should still follow the normal native/error path.
+    fn mark_pi_edit_promoted(&mut self, fallback: &PendingPiEditFallback) {
+        let key = Self::pi_edit_key(&fallback.path, &fallback.edits);
+        if let Some(identity) = fallback.identity.as_deref() {
+            self.resolved_pi_edit_ids.insert(identity.to_string());
+            self.remember_pi_edit_resolution(&key, &[identity.to_string()]);
+        } else {
+            self.remember_pi_edit_resolution(&key, &[]);
+        }
+        *self.promoted_pi_edit_counts.entry(key.clone()).or_default() += 1;
+        self.promoted_pi_edit_keys.insert(key);
+    }
+
+    /// Mark a promoted fallback as acknowledged by the synthetic field-47
+    /// result.  Keeping the resolved key prevents a second acknowledgement if
+    /// Cursor retransmits the same exec frame.
+    fn mark_pi_edit_acknowledged(&mut self, path: &str, edits: &[proto::PiEditReplacement]) {
+        let key = Self::pi_edit_key(path, edits);
+        if let Some(count) = self.promoted_pi_edit_counts.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.promoted_pi_edit_counts.remove(&key);
+                self.promoted_pi_edit_keys.remove(&key);
+            }
+        } else {
+            self.promoted_pi_edit_keys.remove(&key);
+        }
+        self.remember_pi_edit_resolution(&key, &[]);
+    }
+
     fn started(&mut self, call_id: &str, model_call_id: &str) {
         if self.is_empty() {
             self.oldest_since = Some(Instant::now());
@@ -1325,6 +1832,27 @@ impl LogicalToolTracker {
         self.resolve_only_outstanding();
     }
 
+    /// Resolve only explicit ids, without the legacy "one outstanding tool"
+    /// heuristic.  PiEdit has a dedicated payload/id race fence; an unrelated
+    /// UI-only marker must survive while that native exec is replayed.
+    fn resolve_exec_exact(&mut self, exec: &PendingCursorExec) {
+        let mut removed = self.named.remove(&exec.tool_use_id);
+        if let Some(exec_id) = exec.exec_id.as_deref()
+            && self.named.remove(exec_id)
+        {
+            removed = true;
+        }
+        if removed {
+            self.partial_args.remove(&exec.tool_use_id);
+            if let Some(exec_id) = exec.exec_id.as_deref() {
+                self.partial_args.remove(exec_id);
+            }
+        }
+        if self.is_empty() {
+            self.oldest_since = None;
+        }
+    }
+
     fn resolve_server_exec_hint(&mut self, exec: &proto::ExecServerMessage) {
         if let Some(tool_call_id) = exec
             .read_args
@@ -1350,24 +1878,64 @@ impl LogicalToolTracker {
     }
 
     fn resolve_only_outstanding(&mut self) {
-        if self.len() == 1 {
+        // A provisional PiEdit fallback is not resolved by an unrelated exec
+        // hint.  Clearing it here loses the only edit payload and can leave
+        // the turn with neither a native request nor a client-local fallback.
+        // The legacy one-outstanding heuristic applies only to generic UI
+        // starts.
+        let generic_len = self.named.len() + self.anonymous_by_model.values().sum::<usize>();
+        if self.pi_edit_fallbacks.is_empty() && self.len() == generic_len && generic_len == 1 {
             self.clear();
         }
     }
 
     fn len(&self) -> usize {
-        self.named.len() + self.anonymous_by_model.values().sum::<usize>()
+        self.named.len()
+            + self.anonymous_by_model.values().sum::<usize>()
+            + self.pi_edit_fallbacks.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.named.is_empty() && self.anonymous_by_model.is_empty()
+        self.named.is_empty()
+            && self.anonymous_by_model.is_empty()
+            && self.pi_edit_fallbacks.is_empty()
     }
 
     fn clear(&mut self) {
         self.named.clear();
         self.anonymous_by_model.clear();
         self.partial_args.clear();
+        // Drop fallback payloads through the same cleanup path used by an
+        // authoritative exec.  This also removes legacy marker/partial-args
+        // entries left by an older driver generation.
+        let fallbacks = std::mem::take(&mut self.pi_edit_fallbacks);
+        for fallback in &fallbacks {
+            self.remove_fallback_logical_marker(fallback);
+        }
         self.oldest_since = None;
+    }
+
+    /// Begin a fresh downstream Anthropic segment while retaining the replay
+    /// fence until already-queued upstream frames have been drained.  The
+    /// ResumeBatch command is accepted before its result frames are written;
+    /// frames visible in that short pre-submit window still belong to the old
+    /// Cursor operation and may replay its field-63 PiEdit marker.  Clearing
+    /// the fence too early turns that replay into a second client-local edit
+    /// after the old awaiting entry is completed.
+    fn begin_new_segment(&mut self) {
+        self.clear();
+    }
+
+    /// Finish the segment transition after tool-result frames were written.
+    /// Frames drained from this point onward are part of the new Cursor
+    /// continuation, so a later legitimate edit with the same payload must be
+    /// accepted rather than hidden behind the old replay fence.
+    fn finish_new_segment(&mut self) {
+        self.resolved_pi_edit_keys.clear();
+        self.promoted_pi_edit_keys.clear();
+        self.resolved_pi_edit_ids.clear();
+        self.promoted_pi_edit_counts.clear();
+        self.resolved_pi_edit_payload_ids.clear();
     }
 
     fn oldest_since(&self) -> Option<Instant> {
@@ -5314,7 +5882,7 @@ fn annotate_connect_end_error(
         }
         fields.insert("checkpointCleared".into(), serde_json::json!(true));
         text = format!(
-            "{text} (this turn had no new image; a stale Cursor image id was in the conversation checkpoint — checkpoint cleared, retry the message)"
+            "{text} (stale Cursor image asset; conversation checkpoint cleared, retrying once with fresh inline image metadata)"
         );
     }
     crate::logging::create_logger("cursor").warn("connect_end_error", Some(fields));
@@ -5746,11 +6314,15 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     {
         return true;
     }
+    // A stale selected-image asset can be recovered by rotating the Cursor
+    // conversation and re-uploading the original inline bytes once. The
+    // caller owns the one-attempt budget; keeping this classified as
+    // retryable lets both Connect END and start/open errors use that path.
+    if cursor_connect_error_is_missing_image(message) {
+        return true;
+    }
     let classified = crate::retry::classify_proxy_error_status(502, message);
     if (400..500).contains(&classified) && !crate::retry::is_upstream_rate_limit(message) {
-        return false;
-    }
-    if cursor_connect_error_is_missing_image(message) {
         return false;
     }
     // Cursor may report exhaustion of its internal step loop as a 502/[internal]
@@ -5797,11 +6369,16 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
     {
         return true;
     }
+    if cursor_connect_error_is_missing_image(&text)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(cursor_connect_error_is_missing_image)
+    {
+        return true;
+    }
     let classified = crate::retry::classify_proxy_error_status(err.status, &text);
     if (400..500).contains(&classified) && !crate::retry::is_upstream_rate_limit(&text) {
-        return false;
-    }
-    if cursor_connect_error_is_missing_image(&text) {
         return false;
     }
     crate::retry::should_retry_upstream(err.status, &text)
@@ -6690,6 +7267,15 @@ async fn control_close_natives(
     outbound: &ClientOutbound,
 ) -> Result<bool, CursorError> {
     for exec in pending.drain_natives() {
+        // Modern multi-PiEdit continuations are local sibling tool_use
+        // acknowledgements, not independent Cursor execs.  Closing their
+        // synthetic ids would send duplicate/unknown stream-close frames.
+        if matches!(
+            exec.kind,
+            CursorExecKind::PiEditContinuation { .. } | CursorExecKind::ClientOnly
+        ) {
+            continue;
+        }
         if let Ok(frame) = encode_control_close(exec.id) {
             match classify_outbound_send(outbound.send_connect_frame(frame).await) {
                 Ok(true) => {}
@@ -6710,6 +7296,12 @@ async fn control_close_collecting_natives(
     let mut iter = natives.into_iter();
     let mut all_ok = true;
     for exec in iter.by_ref() {
+        if matches!(
+            exec.kind,
+            CursorExecKind::PiEditContinuation { .. } | CursorExecKind::ClientOnly
+        ) {
+            continue;
+        }
         let Ok(frame) = encode_control_close(exec.id) else {
             all_ok = false;
             unsent.push(exec);
@@ -7353,7 +7945,31 @@ async fn drive_live_run(
                 .oldest_since()
                 .is_some_and(|since| since.elapsed() >= stream_idle)
             {
-                logical_tools_waiting.clear();
+                // If a PiEdit field-63 marker never got its field-47 exec,
+                // prefer a deterministic client-local fallback over silently
+                // clearing the tracker and eventually returning an unusable
+                // empty turn. Other UI-only starts retain the old timeout
+                // behavior.
+                flush_pi_edit_fallbacks(
+                    &mut logical_tools_waiting,
+                    &mut pending,
+                    allowed_tool_names.as_ref(),
+                )
+                .await;
+                if pending.can_expose()
+                    && !expose_collected_tools(
+                        &mut pending,
+                        &pending_shared,
+                        &mut sink,
+                        &mut segment_replay,
+                    )
+                    .await
+                {
+                    break 'driver;
+                }
+                if !pending.is_empty() || logical_tools_waiting.pi_edit_fallbacks.is_empty() {
+                    logical_tools_waiting.clear();
+                }
             }
         } else if !wait_for_turn_ended && saw_text && last_progress.elapsed() >= complete_idle {
             emit_cursor_or_defer(
@@ -7746,13 +8362,18 @@ async fn drive_live_run(
                         // replaying Anthropic history and executing the tools
                         // again.
                         user_prompt = EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT.to_string();
+                        // A ResumeBatch starts a new downstream segment. Clear
+                        // provisional waiters now, but retain the PiEdit replay
+                        // fence while draining bytes that were already queued
+                        // before the tool-result submit. The fence is released
+                        // immediately after the submit below.
+                        logical_tools_waiting.begin_new_segment();
                         // The command arm is biased. Absorb already-queued
                         // upstream bytes before snapshotting the baseline, or a
                         // pre-submit checkpoint can later look like post-tool
                         // proof.
                         post_tool_checkpoint = PostToolCheckpointEvidence::default();
                         drain_queued_upstream!('driver);
-                        logical_tools_waiting.clear();
                         last_progress = Instant::now();
                         last_liveness = last_progress;
 
@@ -7929,6 +8550,12 @@ async fn drive_live_run(
                             }
                         }
                         pending.complete_awaiting();
+                        // The pre-submit drain above was still classified
+                        // against the old segment's replay fence.  Once all
+                        // tool-result frames are on the wire, subsequent
+                        // frames belong to the new continuation and may
+                        // legitimately repeat an edit payload.
+                        logical_tools_waiting.finish_new_segment();
                         accepted_resume_unconfirmed = true;
                         pending_shared
                             .lock()
@@ -8208,6 +8835,12 @@ async fn drive_live_run(
                         }
                         // Same empty-turn recovery as FLAG_END: flush trailing
                         // Workflow XML, then surface a note instead of Out:0.
+                        flush_pi_edit_fallbacks(
+                            &mut logical_tools_waiting,
+                            &mut pending,
+                            allowed_tool_names.as_ref(),
+                        )
+                        .await;
                         if !flush_xml_tool_uses(
                             &mut xml_parser,
                             &mut pending,
@@ -8366,7 +8999,11 @@ async fn drive_live_run(
                 let ids: Vec<u32> = pending
                     .all()
                     .filter(|current| {
-                        !matches!(current.kind, super::exec_results::CursorExecKind::ClientOnly)
+                        !matches!(
+                            current.kind,
+                            super::exec_results::CursorExecKind::ClientOnly
+                                | super::exec_results::CursorExecKind::PiEditContinuation { .. }
+                        )
                     })
                     .map(|current| current.id)
                     .collect();
@@ -8549,6 +9186,10 @@ async fn process_live_frame(
             report_terminal_error(sink, terminal_error, message).await;
             return false;
         }
+        // A PiEdit announcement may be the only edit signal on older Cursor
+        // builds. Promote it before evaluating pending tools so the client
+        // still receives one usable text-editor call at END.
+        flush_pi_edit_fallbacks(logical_tools_waiting, pending, allowed_tool_names).await;
         // Trailing Workflow/Skill XML may still be buffered when Connect END arrives.
         if !flush_xml_tool_uses(
             xml_parser,
@@ -8838,9 +9479,59 @@ async fn process_live_frame(
             }
             return true;
         };
-        let Some(emit_name) = resolve_advertised_name(&native.claude_name, allowed_tool_names)
-        else {
+        // Resolve the field-63 transcript marker before consulting the
+        // downstream allow-list.  A late field-47 PiEdit can arrive after its
+        // field-63 fallback was already exposed as a client-local editor; in
+        // that case there must be no second Anthropic tool_use, even when the
+        // current catalog no longer contains the editor alias.
+        let pi_edit_resolution = logical_tools_waiting.resolve_pi_edit_fallback(&native);
+        if pi_edit_resolution == PiEditResolution::AlreadyPromoted {
+            logical_tools_waiting.resolve_exec_exact(&native);
+            if !acknowledge_promoted_pi_edit(
+                &native,
+                outbound,
+                sink,
+                terminal_error,
+                frame_session_id,
+            )
+            .await
+            {
+                return false;
+            }
+            if let CursorExecKind::PiEdit { path, edits } = &native.kind {
+                logical_tools_waiting.mark_pi_edit_acknowledged(path, edits);
+            }
+            *useful = true;
+            *last_progress = Instant::now();
+            return true;
+        }
+        if pi_edit_resolution == PiEditResolution::AlreadyResolved {
+            logical_tools_waiting.resolve_exec_exact(&native);
+            // This is a replay of an exec whose result/close was already
+            // represented in the current segment.  Keep the replay fence and
+            // avoid queueing a duplicate downstream tool call.
+            *useful = true;
+            *last_progress = Instant::now();
+            return true;
+        }
+        // For a first field-47 PiEdit (or a non-PiEdit native exec), clear any
+        // matching legacy UI-start marker.  Do this only after the duplicate
+        // branches above: the one-outstanding fallback heuristic must not
+        // consume an unrelated marker when Cursor retransmits an exec.
+        if matches!(native.kind, CursorExecKind::PiEdit { .. }) {
+            logical_tools_waiting.resolve_exec_exact(&native);
+        } else {
             logical_tools_waiting.resolve_exec(&native);
+        }
+        // PiEdit's mapper uses the legacy `Edit`/`MultiEdit` labels, but the
+        // modern Claude Code editor has a single-operation schema.  Resolve
+        // native PiEdit by kind so a multi-replacement payload can use the
+        // modern editor (and be expanded below) while an XML/generic
+        // `MultiEdit` call remains on its own legacy contract.  Trying the
+        // ordinary mapped name first would return `None` for a modern-only
+        // allow-list because `MultiEdit` deliberately has no modern alias.
+        let Some(emit_name) = resolve_native_exec_advertised_name(&native, allowed_tool_names)
+        else {
             if let Ok(frames) = encode_control_throw(
                 exec.id,
                 format!("Tool {} is not advertised", native.claude_name),
@@ -8865,9 +9556,17 @@ async fn process_live_frame(
             return true;
         };
         native.claude_input = adapt_tool_input_for_client(&emit_name, native.claude_input);
-        native.claude_name = emit_name;
-        logical_tools_waiting.resolve_exec(&native);
-        pending.queue(native, tool_batch_quiet);
+        native.claude_name = emit_name.clone();
+        // Claude Code's modern text editor accepts one `str_replace` per
+        // tool_use. Cursor's PiEdit protobuf can carry several replacements in
+        // one exec, and its legacy `MultiEdit` mapping is not a valid modern
+        // payload. Expand that one upstream exec into sibling modern calls;
+        // the first sibling retains the PiEdit result envelope while the
+        // synthetic continuations are acknowledged locally (see
+        // `CursorExecKind::PiEditContinuation`).
+        for part in expand_modern_pi_edit(native, &emit_name) {
+            pending.queue(part, tool_batch_quiet);
+        }
         *useful = true;
         *last_progress = Instant::now();
         return true;
@@ -8897,6 +9596,90 @@ async fn process_live_frame(
         .await;
     }
     true
+}
+
+/// Expand a multi-replacement PiEdit into valid Anthropic text-editor calls.
+///
+/// `text_editor_20250728` has no `MultiEdit` shape: every `str_replace`
+/// invocation carries exactly one `old_str`/`new_str` pair.  Keep the original
+/// `PiEdit` entry as the primary (so Cursor receives one
+/// `pi_edit_result`) and add synthetic siblings for the remaining edits. The
+/// siblings are marked `PiEditContinuation` and therefore never emit a second
+/// upstream result envelope.
+fn expand_modern_pi_edit(
+    native: PendingCursorExec,
+    advertised_name: &str,
+) -> Vec<PendingCursorExec> {
+    if !is_text_editor_tool_name(advertised_name) {
+        return vec![native];
+    }
+    let (path, edits) = match &native.kind {
+        CursorExecKind::PiEdit { path, edits } if edits.len() > 1 => (path, edits),
+        _ => return vec![native],
+    };
+
+    let base_tool_use_id = native.tool_use_id.clone();
+    let base_exec_id = native.exec_id.clone();
+    let mut expanded = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let mut part = native.clone();
+        if index > 0 {
+            part.tool_use_id = format!("{base_tool_use_id}__part_{}", index + 1);
+            // `PendingExecState::queue` deduplicates by (Cursor id, exec_id).
+            // Give synthetic siblings distinct local discriminators while the
+            // primary keeps Cursor's original exec id for its result envelope.
+            part.exec_id = Some(format!(
+                "{}__part_{}",
+                base_exec_id
+                    .as_deref()
+                    .unwrap_or("pi_edit")
+                    .replace(['\n', '\r'], "_"),
+                index + 1
+            ));
+            part.id = native.id.saturating_add(index as u32);
+            part.kind = CursorExecKind::PiEditContinuation {
+                path: path.clone(),
+                parent_id: native.id,
+            };
+        }
+        part.claude_name = advertised_name.to_string();
+        part.claude_input = serde_json::json!({
+            "command": "str_replace",
+            "path": path,
+            "old_str": edit.old_text,
+            "new_str": edit.new_text,
+        });
+        expanded.push(part);
+    }
+    expanded
+}
+
+/// Resolve an exec-backed native tool against the downstream catalog.
+///
+/// `PendingCursorExec::from_server` maps a PiEdit with several replacements to
+/// `MultiEdit` so old Claude clients receive the complete array payload.  The
+/// current text-editor contract (`str_replace_based_edit_tool`) accepts one
+/// replacement per call, however, and the live path expands that payload into
+/// siblings.  Prefer the `Edit` family for PiEdit when a modern editor is
+/// advertised, then retain the exact `MultiEdit` spelling as a legacy fallback
+/// for multi-edit-only clients.  Non-PiEdit execs use the regular resolver.
+fn resolve_native_exec_advertised_name(
+    native: &PendingCursorExec,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    match &native.kind {
+        CursorExecKind::PiEdit { edits, .. } if edits.len() > 1 => {
+            // A multi-edit payload cannot be sent under Claude's single-edit
+            // `Edit` schema. Ask the resolver for a modern text-editor name
+            // directly (rather than `Edit`, which may resolve to a legacy
+            // exact hit), then fall back to the array-preserving MultiEdit
+            // spelling for older clients.
+            let modern = allowed.and_then(preferred_text_editor_name);
+            modern.or_else(|| resolve_advertised_name("MultiEdit", allowed))
+        }
+        CursorExecKind::PiEdit { .. } => resolve_advertised_name("Edit", allowed),
+        _ => resolve_advertised_name(&native.claude_name, allowed),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8974,7 +9757,35 @@ async fn process_interaction_update(
         // Claude-local tools advertised via RunRequest.mcp_tools arrive as
         // MCP tool_call_started (not ExecServerMessage). Expose immediately
         // so Claude Code can fulfill Workflow/Skill locally.
-        if let Some(mut mapped) = map_tool_call_started(&started) {
+        // Modern PiEdit has a canonical Claude name (`Edit`) but remains an
+        // upstream exec-backed tool.  Do not route its UI transcript marker
+        // through the ClientOnly MCP path: the corresponding
+        // ExecServerMessage.pi_edit_args carries the id needed for the
+        // PiEdit result envelope.  Without this guard Claude receives a
+        // duplicate ClientOnly Edit and Cursor keeps waiting on exec 503s.
+        let pi_edit_exec_backed = started
+            .tool_call
+            .as_ref()
+            .is_some_and(|tool| tool.pi_edit_tool_call.is_some());
+        // PiEdit's field-63 marker is execution-backed (or already complete),
+        // never a generic UI-only tool.  Default to skipping the logical wait
+        // entry; only a valid, still-running marker that was stored as a
+        // fallback should participate in fallback tracking.  This prevents a
+        // result-less/invalid marker from creating a ghost wait and causing an
+        // empty-turn stall.
+        // PiEdit has its own bounded fallback tracker.  Do not also add the
+        // marker to the generic `named` UI-start set: when Cursor changes the
+        // call id between field 63 and field 47, that extra entry cannot be
+        // matched and leaves a phantom waiter that stalls the turn forever.
+        // The fallback tracker records its own age and is removed when the
+        // authoritative exec (or a completed field-63 result) arrives.
+        let skip_logical_start = pi_edit_exec_backed;
+        if pi_edit_exec_backed && let Some(mapped) = map_tool_call_started(&started) {
+            let _ = logical_tools_waiting.remember_pi_edit_fallback(&started, &mapped);
+        }
+        if let Some(mut mapped) = map_tool_call_started(&started)
+            && !pi_edit_exec_backed
+        {
             let streamed = logical_tools_waiting
                 .partial_args_for(&started.call_id, &started.model_call_id)
                 .map(str::to_owned);
@@ -9118,11 +9929,15 @@ async fn process_interaction_update(
         }
         // Native UI transcript only. Execution is driven by ExecServerMessage,
         // otherwise tool_call_started + exec duplicates.
-        logical_tools_waiting.started(&started.call_id, &started.model_call_id);
+        if !skip_logical_start {
+            logical_tools_waiting.started(&started.call_id, &started.model_call_id);
+        }
         *useful = true;
         *last_progress = Instant::now();
     }
     if let Some(completed) = update.tool_call_completed {
+        logical_tools_waiting
+            .complete_pi_edit_fallback(&completed.call_id, &completed.model_call_id);
         logical_tools_waiting.completed(&completed.call_id, &completed.model_call_id);
         *last_progress = Instant::now();
     }
@@ -9256,6 +10071,10 @@ async fn process_interaction_update(
             *last_progress = Instant::now();
             return true;
         }
+        // Some Cursor protocol revisions omit ExecServerMessage.pi_edit_args
+        // and only send field-63 PiEditToolCall. Promote that provisional call
+        // before the turn-end pending/empty-turn checks.
+        flush_pi_edit_fallbacks(logical_tools_waiting, pending, allowed_tool_names).await;
         // Flush trailing `<tool_use>` still in the XML buffer — Fable often
         // closes the turn in the same InteractionUpdate as Workflow XML.
         if !flush_xml_tool_uses(
@@ -9705,6 +10524,203 @@ async fn flush_xml_tool_uses(
     true
 }
 
+/// A field-47 PiEdit that arrives after its field-63 fallback was promoted is
+/// a transport-ordering race, not a second user-visible edit.  Cursor still
+/// waits for the field-47 exec envelope, so acknowledge it once with a small
+/// successful PiEdit result while keeping the synthetic Claude tool as the
+/// only downstream `tool_use`.
+async fn acknowledge_promoted_pi_edit(
+    native: &PendingCursorExec,
+    outbound: &ClientOutbound,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    frame_session_id: &str,
+) -> bool {
+    let content = match &native.kind {
+        CursorExecKind::PiEdit { path, .. } if !path.is_empty() => {
+            format!("Edit delegated to the client-local editor for {path}")
+        }
+        _ => "Edit delegated to the client-local editor".to_string(),
+    };
+    let result = serde_json::json!({
+        "type": "tool_result",
+        "content": content,
+    });
+    let frames = match encode_tool_result_frames(native, &result) {
+        Ok(frames) => frames,
+        Err(error) => {
+            report_terminal_error(
+                sink,
+                terminal_error,
+                format!("Cursor PiEdit fallback acknowledgement encode failed: {error}"),
+            )
+            .await;
+            return false;
+        }
+    };
+    for frame in frames {
+        if !send_frame_or_fail(
+            outbound,
+            sink,
+            terminal_error,
+            frame,
+            "PiEdit fallback acknowledgement",
+            frame_session_id,
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Promote Pi Edit field-63 announcements that never received their matching
+/// field-47 filesystem exec.  Such announcements are client-owned in Cursor
+/// builds that execute the edit directly in the Claude Code process.  Emit a
+/// single modern text-editor `tool_use` so Claude Code can perform the edit;
+/// when field 47 is later observed, `resolve_pi_edit_fallback` has already
+/// removed this entry and the authoritative PiEdit result path wins.
+#[allow(clippy::too_many_arguments)]
+async fn flush_pi_edit_fallbacks(
+    logical_tools_waiting: &mut LogicalToolTracker,
+    pending: &mut PendingExecState,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+) {
+    // An absent/empty catalog cannot receive a client-local editor. Keep the
+    // fallback payload queued so a later authoritative field-47 exec can still
+    // be handled by the native path.
+    if allowed_tool_names.is_none_or(|allowed| allowed.is_empty()) {
+        // The downstream did not advertise any compatible editor.  Keep the
+        // event out of the Anthropic stream rather than inventing an `Edit`
+        // tool that Claude Code cannot dispatch.
+        return;
+    }
+    let fallbacks = logical_tools_waiting.take_pi_edit_fallbacks();
+    if fallbacks.is_empty() {
+        return;
+    }
+    // Match field-63 fallbacks to already-queued authoritative field-47
+    // entries one-for-one. A boolean `contains_pi_edit` would make two
+    // parallel, identical edits both look authoritative and drop one call.
+    let mut authoritative_counts: HashMap<String, usize> = HashMap::new();
+    for exec in pending.all() {
+        if let CursorExecKind::PiEdit { path, edits } = &exec.kind {
+            *authoritative_counts
+                .entry(LogicalToolTracker::pi_edit_key(path, edits))
+                .or_default() += 1;
+        }
+    }
+    for fallback in fallbacks {
+        let fallback_key = LogicalToolTracker::pi_edit_key(&fallback.path, &fallback.edits);
+        let has_authoritative = authoritative_counts
+            .get_mut(&fallback_key)
+            .is_some_and(|count| {
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    true
+                }
+            });
+        if has_authoritative {
+            // Field 47 arrived before this transcript marker (possible when
+            // both frames share a transport batch). The real native pending
+            // entry is authoritative; do not emit a second client tool_use.
+            logical_tools_waiting.mark_pi_edit_authoritative(&fallback);
+            continue;
+        }
+        // A multi-edit fallback can preserve its array when the client still
+        // advertises the legacy MultiEdit tool.  Otherwise split it into
+        // independent legacy Edit calls; never pass an `edits` array through
+        // the strict single-edit schema.
+        let Some(emit_name) = (if fallback.edits.len() > 1 {
+            allowed_tool_names
+                .and_then(preferred_text_editor_name)
+                .or_else(|| resolve_advertised_name("MultiEdit", allowed_tool_names))
+                .or_else(|| resolve_advertised_name("Edit", allowed_tool_names))
+        } else {
+            resolve_advertised_name("Edit", allowed_tool_names)
+        }) else {
+            // Keep the payload available for a later authoritative field-47
+            // exec (or a request whose catalog includes an editor). Do not
+            // mark it promoted: no client-side tool_use was emitted, so a
+            // future matching exec must take the normal native path.
+            logical_tools_waiting.restore_pi_edit_fallback(fallback);
+            continue;
+        };
+        // Only fence a fallback after a concrete downstream tool name was
+        // selected. Marking it before resolution would make an unsupported
+        // catalog look promoted and cause a late field-47 exec to receive a
+        // synthetic success despite no tool_use ever reaching Claude Code.
+        logical_tools_waiting.mark_pi_edit_promoted(&fallback);
+        let mut parts = Vec::new();
+        if is_text_editor_tool_name(&emit_name) {
+            // The modern text-editor contract has one replacement per call.
+            // Expand a multi-edit field-63 announcement just like the field-47
+            // path, retaining order and unique ids for Claude's result array.
+            for (index, edit) in fallback.edits.iter().enumerate() {
+                parts.push((
+                    index,
+                    serde_json::json!({
+                        "command": "str_replace",
+                        "path": fallback.path,
+                        "old_str": edit.old_text,
+                        "new_str": edit.new_text,
+                    }),
+                ));
+            }
+        } else if emit_name == "MultiEdit" && fallback.edits.len() > 1 {
+            parts.push((
+                0,
+                adapt_client_tool_input(&emit_name, fallback.mapped.input),
+            ));
+        } else if fallback.edits.len() > 1 {
+            // Legacy `Edit` accepts one old/new pair.  Split the PiEdit
+            // payload while retaining deterministic order and unique ids.
+            for (index, edit) in fallback.edits.iter().enumerate() {
+                parts.push((
+                    index,
+                    adapt_client_tool_input(
+                        &emit_name,
+                        serde_json::json!({
+                            "file_path": fallback.path,
+                            "old_string": edit.old_text,
+                            "new_string": edit.new_text,
+                        }),
+                    ),
+                ));
+            }
+        } else {
+            parts.push((
+                0,
+                adapt_client_tool_input(&emit_name, fallback.mapped.input),
+            ));
+        }
+        for (index, input) in parts {
+            let base_id = if index == 0 {
+                fallback.mapped.tool_use_id.clone()
+            } else {
+                format!("{}__part_{}", fallback.mapped.tool_use_id, index + 1)
+            };
+            let mut hash = 0u32;
+            for byte in base_id.as_bytes() {
+                hash = hash.wrapping_mul(31).wrapping_add(u32::from(*byte));
+            }
+            let id = hash.max(1);
+            let exec = PendingCursorExec {
+                id,
+                exec_id: Some(format!("client_only_pi_edit_{base_id}")),
+                tool_use_id: base_id,
+                claude_name: emit_name.clone(),
+                claude_input: input,
+                kind: CursorExecKind::ClientOnly,
+            };
+            pending.queue(exec, Duration::ZERO);
+        }
+    }
+}
+
 fn client_only_pending_exec(
     tool_use: &crate::providers::cursor::tool_use_xml::RecoveredCursorToolUse,
 ) -> PendingCursorExec {
@@ -9784,16 +10800,18 @@ fn xml_client_only_anthropic_name(
 ) -> Option<String> {
     if is_xml_client_only_native_tool_name(mapped_name) {
         let allowed = allowed.filter(|set| !set.is_empty())?;
-        if !allowed.contains(mapped_name) {
-            return None;
-        }
+        // Resolve Cursor's `StrReplace` spelling to whichever exact
+        // Anthropic-defined name Claude Code advertised. Keep the allow-list
+        // gate; never synthesize a client-side editor when the client omitted
+        // it.
+        let emit_name = resolve_advertised_name(mapped_name, Some(allowed))?;
         // Normalize known aliases below, but reject malformed selector types
         // before normalization. Claude Code's current contract uses a
         // non-empty string `cell_id`; the legacy `cell_number` selector is a
         // non-negative integer. In particular, a numeric `cell_id` must not
         // be silently converted into a different field and exposed as a
         // seemingly valid NotebookEdit call.
-        if mapped_name == "NotebookEdit" {
+        if emit_name == "NotebookEdit" {
             if input
                 .get("cell_id")
                 .is_some_and(|value| value.as_str().is_none_or(|value| value.trim().is_empty()))
@@ -9816,10 +10834,9 @@ fn xml_client_only_anthropic_name(
         // rejecting those aliases before the shared adapter gets a chance to
         // canonicalize them.
         let normalized =
-            adapt_client_tool_input(mapped_name, serde_json::Value::Object(input.clone()));
+            adapt_client_tool_input(&emit_name, serde_json::Value::Object(input.clone()));
         let normalized = normalized.as_object()?;
-        return valid_xml_native_tool_input(mapped_name, normalized)
-            .then(|| mapped_name.to_string());
+        return valid_xml_native_tool_input(&emit_name, normalized).then_some(emit_name);
     }
     client_only_anthropic_name(mapped_name, "", allowed)
 }
@@ -9858,6 +10875,40 @@ fn valid_xml_native_tool_input(
     }
 
     match name {
+        name if is_text_editor_tool_name(name) => {
+            let Some(command) = input.get("command").and_then(|value| value.as_str()) else {
+                return false;
+            };
+            if !nonempty_string(input, "path") {
+                return false;
+            }
+            match command {
+                "view" => {
+                    input
+                        .get("view_range")
+                        .is_none_or(|value| value.as_array().is_some())
+                        && input.get("max_characters").is_none_or(integer_number)
+                }
+                "create" => input
+                    .get("file_text")
+                    .is_some_and(serde_json::Value::is_string),
+                "str_replace" => {
+                    input
+                        .get("old_str")
+                        .is_some_and(serde_json::Value::is_string)
+                        && input
+                            .get("new_str")
+                            .is_some_and(serde_json::Value::is_string)
+                }
+                "insert" => {
+                    input.get("insert_line").is_some_and(integer_number)
+                        && input
+                            .get("insert_text")
+                            .is_some_and(serde_json::Value::is_string)
+                }
+                _ => false,
+            }
+        }
         "Edit" => {
             nonempty_string(input, "file_path")
                 && input
@@ -9968,6 +11019,25 @@ fn client_only_anthropic_name(
                         || cursor_mcp_wire_name(candidate) == reconstructed_wire)
             })
             .cloned();
+    }
+
+    // Cursor can expose the same client-side editor under the legacy `Edit`
+    // spelling even when Claude Code advertised the Anthropic 20250728
+    // contract (`str_replace_based_edit_tool`).  This path handles MCP
+    // `tool_call_started` frames, which do not go through
+    // `resolve_advertised_name`; without the explicit preference below an
+    // allow-list containing both names would select `Edit` via the exact hit
+    // later in this function and Claude Code would report "Edit unavailable"
+    // before falling back to StrReplace.  Restrict the shortcut to an
+    // unqualified name or the explicit claude-local namespace so a foreign
+    // `other/Edit` tool can never be reinterpreted as our editor.
+    let local_editor_name = !is_foreign_qualified_mcp_name(mapped_name)
+        && (stripped.eq_ignore_ascii_case("Edit") || is_text_editor_tool_name(mapped_name));
+    if local_editor_name
+        && let Some(set) = allowed.filter(|set| !set.is_empty())
+        && let Some(preferred) = preferred_text_editor_name(set)
+    {
+        return Some(preferred);
     }
     if normalize_grok_build_lifecycle_name(mapped_name).is_some()
         || normalize_grok_build_lifecycle_name(stripped).is_some()
@@ -10679,6 +11749,18 @@ fn resolve_advertised_name(
     allowed: Option<&BTreeSet<String>>,
 ) -> Option<String> {
     let allowed = allowed.filter(|set| !set.is_empty())?;
+    // PiEdit's mapper historically uses the legacy `Edit` label, while
+    // Claude Code 2.1.193 advertises the schema-less
+    // `str_replace_based_edit_tool`.  Prefer that exact modern spelling when
+    // both entries are present; otherwise Claude Code prints "Edit unavailable
+    // — use StrReplace" and abandons the native edit.  Cursor full-file edits
+    // map to `Write`, so this preference cannot turn an overwrite into a
+    // replacement operation.
+    if (mapped_name.eq_ignore_ascii_case("Edit") || is_text_editor_tool_name(mapped_name))
+        && let Some(name) = preferred_text_editor_name(allowed)
+    {
+        return Some(name);
+    }
     if allowed.contains(mapped_name) {
         return Some(mapped_name.to_string());
     }
@@ -10742,6 +11824,7 @@ fn encode_request_context_reply(
             }),
             shell_stream: None,
             pi_write_result: None,
+            pi_edit_result: None,
         }),
         kv_client_message: None,
         exec_client_control_message: None,
@@ -17428,6 +18511,156 @@ mod tests {
         );
     }
 
+    fn pi_edit_exec(replacements: usize) -> PendingCursorExec {
+        let edits = (0..replacements)
+            .map(|index| proto::PiEditReplacement {
+                old_text: format!("old-{index}"),
+                new_text: format!("new-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let edits_json = edits
+            .iter()
+            .map(|edit| {
+                serde_json::json!({
+                    "old_string": edit.old_text,
+                    "new_string": edit.new_text,
+                })
+            })
+            .collect::<Vec<_>>();
+        PendingCursorExec {
+            id: 700,
+            exec_id: Some("pi-edit-700".into()),
+            tool_use_id: "pi-edit-call-700".into(),
+            claude_name: if replacements > 1 {
+                "MultiEdit".into()
+            } else {
+                "Edit".into()
+            },
+            claude_input: serde_json::json!({
+                "file_path": "/tmp/example.rs",
+                "edits": edits_json,
+            }),
+            kind: CursorExecKind::PiEdit {
+                path: "/tmp/example.rs".into(),
+                edits,
+            },
+        }
+    }
+
+    #[test]
+    fn native_pi_edit_multi_prefers_modern_editor_and_is_not_dropped() {
+        let native = pi_edit_exec(2);
+        let modern = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        assert_eq!(
+            resolve_native_exec_advertised_name(&native, Some(&modern)).as_deref(),
+            Some("str_replace_based_edit_tool")
+        );
+
+        let legacy = BTreeSet::from(["MultiEdit".to_string()]);
+        assert_eq!(
+            resolve_native_exec_advertised_name(&native, Some(&legacy)).as_deref(),
+            Some("MultiEdit"),
+            "legacy clients still receive the complete MultiEdit payload"
+        );
+
+        let only_edit = BTreeSet::from(["Edit".to_string()]);
+        assert_eq!(
+            resolve_native_exec_advertised_name(&native, Some(&only_edit)),
+            None,
+            "do not discard replacements by forcing an array into single-edit Edit"
+        );
+    }
+
+    #[test]
+    fn native_pi_edit_single_does_not_use_multi_edit_shape() {
+        let native = pi_edit_exec(1);
+        let only_multi = BTreeSet::from(["MultiEdit".to_string()]);
+        assert_eq!(
+            resolve_native_exec_advertised_name(&native, Some(&only_multi)),
+            None,
+            "a single replacement must not be sent with MultiEdit's array schema"
+        );
+    }
+
+    #[test]
+    fn generic_multi_edit_stays_unresolved_against_modern_only_catalog() {
+        let modern = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        assert_eq!(
+            resolve_advertised_name("MultiEdit", Some(&modern)),
+            None,
+            "XML/generic MultiEdit must not be silently converted to one str_replace call"
+        );
+    }
+
+    #[test]
+    fn pi_edit_continuation_errors_stay_with_their_primary() {
+        // Two independent multi-edit calls may be exposed in one Anthropic
+        // batch. A failed sibling from the first call must not turn the
+        // second call's Cursor result into an error as well.
+        let mut first = expand_modern_pi_edit(pi_edit_exec(2), "str_replace_based_edit_tool");
+        let mut second_native = pi_edit_exec(2);
+        second_native.id = 701;
+        second_native.exec_id = Some("pi-edit-701".into());
+        second_native.tool_use_id = "pi-edit-call-701".into();
+        let second = expand_modern_pi_edit(second_native, "str_replace_based_edit_tool");
+        first.extend(second);
+
+        let mut results = Vec::new();
+        for (index, exec) in first.iter().enumerate() {
+            let is_first_continuation = matches!(
+                exec.kind,
+                CursorExecKind::PiEditContinuation { parent_id: 700, .. }
+            );
+            let is_second_continuation = matches!(
+                exec.kind,
+                CursorExecKind::PiEditContinuation { parent_id: 701, .. }
+            );
+            let result = if is_first_continuation {
+                serde_json::json!({
+                    "type": "tool_result",
+                    "content": "first sibling failed",
+                    "is_error": true
+                })
+            } else if is_second_continuation {
+                serde_json::json!({
+                    "type": "tool_result",
+                    "content": "second sibling ok"
+                })
+            } else {
+                serde_json::json!({
+                    "type": "tool_result",
+                    "content": format!("primary-{index}")
+                })
+            };
+            results.push((exec.tool_use_id.clone(), result));
+        }
+
+        let frames = encode_tool_result_batch(&first, &results).expect("encode batch");
+        let messages = frames
+            .iter()
+            .flat_map(|frame| super::super::client::decode_upstream_frames(frame).unwrap())
+            .map(|frame| AgentClientMessage::decode(frame.payload.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        let primary_results = messages
+            .iter()
+            .filter_map(|message| {
+                message
+                    .exec_client_message
+                    .as_ref()
+                    .and_then(|exec| exec.pi_edit_result.as_ref())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(primary_results.len(), 2);
+        assert!(
+            primary_results[0].error.is_some(),
+            "the first primary must carry its sibling error"
+        );
+        assert!(
+            primary_results[1].success.is_some(),
+            "the second primary must retain its own successful result"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn unrelated_tool_results_supersede_abandoned_pending_generation() {
@@ -18039,6 +19272,42 @@ mod tests {
                 .as_deref(),
             Some("SendUserMessage"),
             "qualified lowercase alias should preserve the advertised spelling"
+        );
+    }
+
+    #[test]
+    fn client_only_editor_prefers_modern_name_over_legacy_edit() {
+        // MCP tool_call_started is resolved by `client_only_anthropic_name`,
+        // not by the native/XML resolver.  When Claude Code sends both its
+        // legacy Edit entry and the 20250728 editor, the canonical name must
+        // win or the CLI prints "Edit unavailable" and switches tools.
+        let allowed = BTreeSet::from([
+            "Edit".to_string(),
+            "str_replace_based_edit_tool".to_string(),
+        ]);
+        for (mapped, provider) in [
+            ("Edit", "claude-local"),
+            ("StrReplace", "claude-local"),
+            ("claude-local/Edit", ""),
+            ("mcp_claude-local_Edit", ""),
+        ] {
+            assert_eq!(
+                client_only_anthropic_name(mapped, provider, Some(&allowed)).as_deref(),
+                Some("str_replace_based_edit_tool"),
+                "{mapped} must resolve to the canonical Claude text editor"
+            );
+        }
+
+        // Preserve legacy compatibility when the modern contract was not
+        // advertised, and never reinterpret a foreign provider's Edit.
+        let legacy_only = BTreeSet::from(["Edit".to_string()]);
+        assert_eq!(
+            client_only_anthropic_name("Edit", "claude-local", Some(&legacy_only)).as_deref(),
+            Some("Edit")
+        );
+        assert_eq!(
+            client_only_anthropic_name("other/Edit", "other", Some(&allowed)),
+            None
         );
     }
 
@@ -23054,6 +24323,893 @@ mod tests {
         assert_eq!(waiting.len(), 1);
         waiting.completed("", "shared-model-call");
         assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn pi_edit_field63_fallback_is_removed_by_matching_field47_exec() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let started = proto::ToolCallStarted {
+            call_id: "pi-call".into(),
+            model_call_id: "pi-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![replacement.clone()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        waiting.remember_pi_edit_fallback(&started, &mapped);
+        waiting.started(&started.call_id, &started.model_call_id);
+        assert_eq!(waiting.pi_edit_fallbacks.len(), 1);
+
+        let exec = PendingCursorExec {
+            id: 7,
+            exec_id: Some("different-exec-id".into()),
+            tool_use_id: "different-call-id".into(),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::PiEdit {
+                path: "src/lib.rs".into(),
+                edits: vec![replacement],
+            },
+        };
+        waiting.resolve_pi_edit_fallback(&exec);
+        assert!(waiting.pi_edit_fallbacks.is_empty());
+        assert!(
+            waiting.is_empty(),
+            "matching field-47 must also clear any legacy logical marker"
+        );
+        assert!(waiting.resolved_pi_edit_keys.len() == 1);
+    }
+
+    #[test]
+    fn pi_edit_resolution_fence_resets_between_segments() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let started = proto::ToolCallStarted {
+            call_id: "pi-segment-call".into(),
+            model_call_id: "pi-segment-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![replacement.clone()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(true)
+        );
+        let fallback = waiting
+            .take_pi_edit_fallbacks()
+            .pop()
+            .expect("fallback payload");
+        waiting.mark_pi_edit_promoted(&fallback);
+
+        let native = PendingCursorExec {
+            id: 41,
+            exec_id: Some("pi-segment-exec".into()),
+            tool_use_id: "pi-segment-exec".into(),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::PiEdit {
+                path: "src/lib.rs".into(),
+                edits: vec![replacement],
+            },
+        };
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&native),
+            PiEditResolution::AlreadyPromoted,
+            "a late field-47 frame in the same segment must hit the promotion fence"
+        );
+        waiting.mark_pi_edit_acknowledged(
+            "src/lib.rs",
+            match &native.kind {
+                CursorExecKind::PiEdit { edits, .. } => edits,
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&native),
+            PiEditResolution::AlreadyResolved,
+            "a retransmitted late field-47 frame must be ignored after one ack"
+        );
+
+        // The runtime transition is two-phase: queued bytes drained before
+        // the tool-result submit still need the old replay fence, while bytes
+        // after the submit belong to the new segment.
+        waiting.begin_new_segment();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(false),
+            "a pre-submit replay must remain fenced during the transition"
+        );
+        waiting.finish_new_segment();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(true),
+            "the next segment may legitimately request the same edit payload"
+        );
+    }
+
+    #[test]
+    fn pi_edit_replay_does_not_clear_an_unrelated_logical_start() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let native = PendingCursorExec {
+            id: 51,
+            exec_id: Some("pi-replay-exec".into()),
+            tool_use_id: "pi-replay-call".into(),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::PiEdit {
+                path: "src/lib.rs".into(),
+                edits: vec![replacement],
+            },
+        };
+        let mut waiting = LogicalToolTracker::default();
+        waiting.started("unrelated-call", "unrelated-model");
+        waiting
+            .resolved_pi_edit_keys
+            .insert(LogicalToolTracker::pi_edit_key(
+                "src/lib.rs",
+                match &native.kind {
+                    CursorExecKind::PiEdit { edits, .. } => edits,
+                    _ => unreachable!(),
+                },
+            ));
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&native),
+            PiEditResolution::AlreadyResolved
+        );
+        waiting.resolve_exec_exact(&native);
+        assert_eq!(waiting.len(), 1, "unrelated marker must remain pending");
+        assert!(waiting.named.contains("unrelated-call"));
+    }
+
+    #[test]
+    fn pi_edit_completion_with_shared_model_id_retires_one_fallback() {
+        let make_started = |call_id: &str, old: &str| proto::ToolCallStarted {
+            call_id: call_id.into(),
+            model_call_id: "shared-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![proto::PiEditReplacement {
+                            old_text: old.into(),
+                            new_text: format!("{old}-new"),
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let first = make_started("pi-one", "one");
+        let second = make_started("pi-two", "two");
+        let mut waiting = LogicalToolTracker::default();
+        let mapped_first = super::super::native_tools::map_tool_call_started(&first).unwrap();
+        let mapped_second = super::super::native_tools::map_tool_call_started(&second).unwrap();
+        waiting.remember_pi_edit_fallback(&first, &mapped_first);
+        waiting.remember_pi_edit_fallback(&second, &mapped_second);
+        assert_eq!(waiting.pi_edit_fallbacks.len(), 2);
+
+        waiting.complete_pi_edit_fallback("", "shared-model");
+        assert_eq!(
+            waiting.pi_edit_fallbacks.len(),
+            1,
+            "a shared model id completion must consume one sibling only"
+        );
+        waiting.complete_pi_edit_fallback("", "shared-model");
+        assert!(waiting.pi_edit_fallbacks.is_empty());
+    }
+
+    #[test]
+    fn pi_edit_parallel_identical_field63_calls_keep_distinct_fallbacks() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "same-old".into(),
+            new_text: "same-new".into(),
+        };
+        let make_started = |call_id: &str| proto::ToolCallStarted {
+            call_id: call_id.into(),
+            model_call_id: "shared-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/parallel.rs".into(),
+                        edits: vec![replacement.clone()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let first = make_started("parallel-call-a");
+        let second = make_started("parallel-call-b");
+        let mapped_first = super::super::native_tools::map_tool_call_started(&first).unwrap();
+        let mapped_second = super::super::native_tools::map_tool_call_started(&second).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&first, &mapped_first),
+            Some(true)
+        );
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&second, &mapped_second),
+            Some(true),
+            "different call ids make identical payloads independent operations"
+        );
+        assert_eq!(waiting.pi_edit_fallbacks.len(), 2);
+    }
+
+    #[test]
+    fn pi_edit_parallel_identical_field47_execs_are_not_payload_deduped() {
+        let edits = vec![proto::PiEditReplacement {
+            old_text: "same-old".into(),
+            new_text: "same-new".into(),
+        }];
+        let make_exec = |id: u32| PendingCursorExec {
+            id,
+            exec_id: Some(format!("parallel-exec-{id}")),
+            tool_use_id: format!("parallel-tool-{id}"),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::PiEdit {
+                path: "src/parallel.rs".into(),
+                edits: edits.clone(),
+            },
+        };
+        let first = make_exec(301);
+        let second = make_exec(302);
+        let mut waiting = LogicalToolTracker::default();
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&first),
+            PiEditResolution::New
+        );
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&second),
+            PiEditResolution::New,
+            "a distinct numeric/exec/tool identity must survive an equal payload"
+        );
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&first),
+            PiEditResolution::AlreadyResolved,
+            "the exact identity still fences a replay"
+        );
+    }
+
+    #[test]
+    fn pi_edit_parallel_promotions_require_one_ack_each() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "same-old".into(),
+            new_text: "same-new".into(),
+        };
+        let make_started = |call_id: &str| proto::ToolCallStarted {
+            call_id: call_id.into(),
+            model_call_id: "shared-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/parallel.rs".into(),
+                        edits: vec![replacement.clone()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let first = make_started("promoted-call-a");
+        let second = make_started("promoted-call-b");
+        let mapped_first = super::super::native_tools::map_tool_call_started(&first).unwrap();
+        let mapped_second = super::super::native_tools::map_tool_call_started(&second).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        waiting.remember_pi_edit_fallback(&first, &mapped_first);
+        waiting.remember_pi_edit_fallback(&second, &mapped_second);
+        let first_fallback = waiting.pi_edit_fallbacks.remove(0);
+        let second_fallback = waiting.pi_edit_fallbacks.remove(0);
+        waiting.mark_pi_edit_promoted(&first_fallback);
+        waiting.mark_pi_edit_promoted(&second_fallback);
+        let key =
+            LogicalToolTracker::pi_edit_key("src/parallel.rs", std::slice::from_ref(&replacement));
+        assert_eq!(waiting.promoted_pi_edit_counts.get(&key), Some(&2));
+
+        let make_exec = |id: u32| PendingCursorExec {
+            id,
+            exec_id: Some(format!("late-exec-{id}")),
+            tool_use_id: format!("late-tool-{id}"),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::PiEdit {
+                path: "src/parallel.rs".into(),
+                edits: vec![replacement.clone()],
+            },
+        };
+        let first_exec = make_exec(401);
+        let second_exec = make_exec(402);
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&first_exec),
+            PiEditResolution::AlreadyPromoted
+        );
+        waiting.mark_pi_edit_acknowledged("src/parallel.rs", std::slice::from_ref(&replacement));
+        assert_eq!(waiting.promoted_pi_edit_counts.get(&key), Some(&1));
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&second_exec),
+            PiEditResolution::AlreadyPromoted,
+            "the second late exec consumes the second promotion"
+        );
+        waiting.mark_pi_edit_acknowledged("src/parallel.rs", std::slice::from_ref(&replacement));
+        assert!(waiting.promoted_pi_edit_counts.get(&key).is_none());
+        assert!(waiting.promoted_pi_edit_keys.is_empty());
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&second_exec),
+            PiEditResolution::AlreadyResolved
+        );
+    }
+
+    #[tokio::test]
+    async fn late_pi_edit_field47_is_acked_without_a_second_tool_use() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let started = proto::ToolCallStarted {
+            call_id: "pi-late-call".into(),
+            model_call_id: "pi-late-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![replacement.clone()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut logical = LogicalToolTracker::default();
+        logical.remember_pi_edit_fallback(&started, &mapped);
+        let mut pending = PendingExecState::default();
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        flush_pi_edit_fallbacks(&mut logical, &mut pending, Some(&allowed)).await;
+        assert_eq!(pending.collecting.len(), 1);
+        assert!(matches!(
+            pending.collecting[0].kind,
+            CursorExecKind::ClientOnly
+        ));
+
+        let (request_tx, mut request_rx) = mpsc::channel(8);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut replay = SegmentReplayLog::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
+        let server_message = proto::AgentServerMessage {
+            exec_server_message: Some(proto::ExecServerMessage {
+                id: 41,
+                exec_id: Some("pi-late-exec".into()),
+                pi_edit_args: Some(proto::PiEditExecArgs {
+                    path: "src/lib.rs".into(),
+                    edits: vec![replacement.clone()],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        server_message.encode(&mut payload).unwrap();
+        let frame = ConnectFrame {
+            flags: 0,
+            payload: Bytes::from(payload),
+        };
+        assert!(
+            process_live_frame(
+                frame,
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut replay,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut checkpoint,
+                &terminal_error,
+                None,
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::from_millis(25),
+                &mut xml_parser,
+                None,
+            )
+            .await,
+            "late field-47 acknowledgement should keep the live stream running"
+        );
+        assert_eq!(
+            pending
+                .all()
+                .filter(|exec| matches!(exec.kind, CursorExecKind::PiEdit { .. }))
+                .count(),
+            0,
+            "late field-47 must not enqueue a second Anthropic tool_use"
+        );
+
+        let result_frame = request_rx.recv().await.unwrap().unwrap();
+        let result_messages = super::super::client::decode_upstream_frames(&result_frame).unwrap();
+        assert_eq!(result_messages.len(), 1);
+        let result = AgentClientMessage::decode(result_messages[0].payload.as_ref()).unwrap();
+        assert!(
+            result
+                .exec_client_message
+                .and_then(|message| message.pi_edit_result)
+                .and_then(|result| result.success)
+                .is_some(),
+            "late field-47 must receive a PiEdit success envelope"
+        );
+        let close_frame = request_rx.recv().await.unwrap().unwrap();
+        let close_messages = super::super::client::decode_upstream_frames(&close_frame).unwrap();
+        let close = AgentClientMessage::decode(close_messages[0].payload.as_ref()).unwrap();
+        assert_eq!(
+            close
+                .exec_client_control_message
+                .and_then(|control| control.stream_close)
+                .map(|close| close.id),
+            Some(41)
+        );
+
+        // A retransmitted field-47 frame is fenced after the first synthetic
+        // acknowledgement and must not produce another outbound message.
+        let mut payload = Vec::new();
+        server_message.encode(&mut payload).unwrap();
+        assert!(
+            process_live_frame(
+                ConnectFrame {
+                    flags: 0,
+                    payload: Bytes::from(payload),
+                },
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut replay,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut checkpoint,
+                &terminal_error,
+                None,
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::from_millis(25),
+                &mut xml_parser,
+                None,
+            )
+            .await
+        );
+        assert!(
+            request_rx.try_recv().is_err(),
+            "duplicate field-47 must not receive a second acknowledgement"
+        );
+    }
+
+    #[test]
+    fn pi_edit_started_with_embedded_result_does_not_leave_logical_wait() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let started = proto::ToolCallStarted {
+            call_id: "pi-completed-call".into(),
+            model_call_id: "pi-completed-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![replacement],
+                    }),
+                    result: Some(proto::PiEditToolResult {
+                        success: Some(proto::PiEditToolSuccess {
+                            output: "already applied".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(false),
+            "an embedded result is already complete"
+        );
+        // process_interaction_update uses Some(false) to skip started().
+        assert!(waiting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_pi_edit_replay_retires_queued_fallback() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let mut started = proto::ToolCallStarted {
+            call_id: "pi-replayed-call".into(),
+            model_call_id: "pi-replayed-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![replacement],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(true)
+        );
+        assert_eq!(waiting.pi_edit_fallbacks.len(), 1);
+
+        // A reconnect may replay the same marker with its result attached
+        // before the turn-end flusher runs. It must retire the provisional
+        // payload rather than promoting it as a fresh client tool.
+        if let Some(tool) = started.tool_call.as_mut()
+            && let Some(edit) = tool.pi_edit_tool_call.as_mut()
+        {
+            edit.result = Some(proto::PiEditToolResult {
+                success: Some(proto::PiEditToolSuccess {
+                    output: "already applied".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(false)
+        );
+        assert!(waiting.pi_edit_fallbacks.is_empty());
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        let mut pending = PendingExecState::default();
+        flush_pi_edit_fallbacks(&mut waiting, &mut pending, Some(&allowed)).await;
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pi_edit_field63_fallback_promotes_once_as_modern_client_tool() {
+        let replacement = proto::PiEditReplacement {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        };
+        let started = proto::ToolCallStarted {
+            call_id: "pi-only-call".into(),
+            model_call_id: "pi-only-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/lib.rs".into(),
+                        edits: vec![replacement],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        waiting.remember_pi_edit_fallback(&started, &mapped);
+        waiting.started(&started.call_id, &started.model_call_id);
+        let mut pending = PendingExecState::default();
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        flush_pi_edit_fallbacks(&mut waiting, &mut pending, Some(&allowed)).await;
+        assert!(waiting.pi_edit_fallbacks.is_empty());
+        assert_eq!(pending.collecting.len(), 1);
+        assert_eq!(
+            pending.collecting[0].claude_name,
+            "str_replace_based_edit_tool"
+        );
+        assert_eq!(pending.collecting[0].claude_input["command"], "str_replace");
+        assert_eq!(pending.collecting[0].claude_input["path"], "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn pi_edit_field63_only_turn_end_exposes_one_tool_use() {
+        use super::super::connect::{ConnectFrameDecoder, encode_connect_frame};
+        use prost::Message;
+
+        let started = proto::ToolCallStarted {
+            call_id: "pi-only-frame".into(),
+            model_call_id: "pi-only-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/main.rs".into(),
+                        edits: vec![proto::PiEditReplacement {
+                            old_text: "before".into(),
+                            new_text: "after".into(),
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let message = proto::AgentServerMessage {
+            interaction_update: Some(proto::InteractionUpdate {
+                tool_call_started: Some(started),
+                turn_ended: Some(proto::TurnEnded {
+                    output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        message.encode(&mut payload).unwrap();
+        let mut decoder = ConnectFrameDecoder::new();
+        let frame = decoder
+            .push(encode_connect_frame(payload, 0))
+            .unwrap()
+            .pop()
+            .expect("frame");
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut replay = SegmentReplayLog::default();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        let continued = process_live_frame(
+            frame,
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut replay,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(25),
+            &mut xml_parser,
+            None,
+        )
+        .await;
+        assert!(!continued);
+        let event = event_rx.recv().await.expect("tool batch").unwrap();
+        let LiveRunEvent::NativeToolBatch(tools) = event else {
+            panic!("expected native tool batch")
+        };
+        assert_eq!(tools.len(), 1, "field-63-only edit must not duplicate");
+        assert_eq!(tools[0].name, "str_replace_based_edit_tool");
+        assert_eq!(tools[0].input["command"], "str_replace");
+        assert_eq!(tools[0].input["path"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn pi_edit_field63_multi_replacement_expands_modern_calls_in_order() {
+        let edits = vec![
+            proto::PiEditReplacement {
+                old_text: "one".into(),
+                new_text: "1".into(),
+            },
+            proto::PiEditReplacement {
+                old_text: "two".into(),
+                new_text: "2".into(),
+            },
+        ];
+        let started = proto::ToolCallStarted {
+            call_id: "pi-multi-only".into(),
+            model_call_id: "pi-multi-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/main.rs".into(),
+                        edits: edits.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        waiting.remember_pi_edit_fallback(&started, &mapped);
+        waiting.started(&started.call_id, &started.model_call_id);
+        let mut pending = PendingExecState::default();
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        flush_pi_edit_fallbacks(&mut waiting, &mut pending, Some(&allowed)).await;
+        assert_eq!(pending.collecting.len(), 2);
+        assert_eq!(pending.collecting[0].claude_input["old_str"], "one");
+        assert_eq!(pending.collecting[1].claude_input["old_str"], "two");
+        assert_ne!(
+            pending.collecting[0].tool_use_id,
+            pending.collecting[1].tool_use_id
+        );
+    }
+
+    #[tokio::test]
+    async fn pi_edit_field63_multi_replacement_preserves_legacy_shapes() {
+        let edits = vec![
+            proto::PiEditReplacement {
+                old_text: "one".into(),
+                new_text: "1".into(),
+            },
+            proto::PiEditReplacement {
+                old_text: "two".into(),
+                new_text: "2".into(),
+            },
+        ];
+        let started = proto::ToolCallStarted {
+            call_id: "pi-legacy-multi".into(),
+            model_call_id: "pi-legacy-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/main.rs".into(),
+                        edits: edits.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+
+        // With only legacy Edit advertised, split the array into valid
+        // single-edit calls instead of dropping `edits` during adaptation.
+        let mut waiting = LogicalToolTracker::default();
+        waiting.remember_pi_edit_fallback(&started, &mapped);
+        let mut pending = PendingExecState::default();
+        let legacy_edit = BTreeSet::from(["Edit".to_string()]);
+        flush_pi_edit_fallbacks(&mut waiting, &mut pending, Some(&legacy_edit)).await;
+        assert_eq!(pending.collecting.len(), 2);
+        assert!(
+            pending
+                .collecting
+                .iter()
+                .all(|exec| exec.claude_name == "Edit")
+        );
+        assert_eq!(pending.collecting[0].claude_input["old_string"], "one");
+        assert_eq!(pending.collecting[1].claude_input["old_string"], "two");
+        assert!(
+            pending
+                .collecting
+                .iter()
+                .all(|exec| exec.claude_input.get("edits").is_none())
+        );
+
+        // If MultiEdit is advertised, retain its atomic array shape.
+        let mut waiting = LogicalToolTracker::default();
+        waiting.remember_pi_edit_fallback(&started, &mapped);
+        let mut pending = PendingExecState::default();
+        let legacy_multi = BTreeSet::from(["MultiEdit".to_string()]);
+        flush_pi_edit_fallbacks(&mut waiting, &mut pending, Some(&legacy_multi)).await;
+        assert_eq!(pending.collecting.len(), 1);
+        assert_eq!(pending.collecting[0].claude_name, "MultiEdit");
+        assert_eq!(
+            pending.collecting[0].claude_input["edits"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn pi_edit_fallback_is_retained_when_catalog_has_no_editor() {
+        // A non-empty Claude tool catalog can still omit every compatible
+        // editor (for example a client advertising only MultiEdit while the
+        // upstream sent one replacement). Promotion must not consume the
+        // field-63 payload or install a promoted fence in that case.
+        let started = proto::ToolCallStarted {
+            call_id: "pi-no-editor".into(),
+            model_call_id: "pi-no-editor-model".into(),
+            tool_call: Some(proto::ToolCall {
+                pi_edit_tool_call: Some(proto::PiEditToolCall {
+                    args: Some(proto::PiEditToolArgs {
+                        path: "src/main.rs".into(),
+                        edits: vec![proto::PiEditReplacement {
+                            old_text: "before".into(),
+                            new_text: "after".into(),
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mapped = super::super::native_tools::map_tool_call_started(&started).unwrap();
+        let mut waiting = LogicalToolTracker::default();
+        assert_eq!(
+            waiting.remember_pi_edit_fallback(&started, &mapped),
+            Some(true)
+        );
+        let mut pending = PendingExecState::default();
+        let only_multi = BTreeSet::from(["MultiEdit".to_string()]);
+
+        flush_pi_edit_fallbacks(&mut waiting, &mut pending, Some(&only_multi)).await;
+
+        assert!(
+            pending.is_empty(),
+            "no incompatible tool_use should be emitted"
+        );
+        assert_eq!(waiting.pi_edit_fallbacks.len(), 1);
+        assert!(waiting.promoted_pi_edit_keys.is_empty());
+
+        // The matching field-47 exec must still be treated as a first
+        // authoritative native operation, not as an acknowledgement for a
+        // client tool that was never exposed.
+        let native = PendingCursorExec {
+            id: 91,
+            exec_id: Some("pi-no-editor-exec".into()),
+            tool_use_id: "pi-no-editor-exec".into(),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::PiEdit {
+                path: "src/main.rs".into(),
+                edits: vec![proto::PiEditReplacement {
+                    old_text: "before".into(),
+                    new_text: "after".into(),
+                }],
+            },
+        };
+        assert_eq!(
+            waiting.resolve_pi_edit_fallback(&native),
+            PiEditResolution::New
+        );
     }
 
     #[test]

@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::providers::cursor::request::claude_tool_names_equivalent;
+use crate::providers::cursor::request::{
+    claude_tool_names_equivalent, is_text_editor_tool_name, preferred_text_editor_name,
+};
 
 /// An event recovered from a text delta chunk.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,33 +233,45 @@ impl CursorToolUseXmlParser {
 
     fn canonicalize_allowed_tool_name(&self, name: &str) -> Option<String> {
         match &self.allowed_tool_names {
-            Some(allowed) => allowed
-                .get(name)
-                .cloned()
-                .or_else(|| {
-                    // Prefer the same built-in spelling (case-insensitively)
-                    // when both a canonical name and a historical alias are
-                    // advertised. This prevents a lower-cased `taskoutput`
-                    // from being selected by BTreeSet order as AgentOutput.
-                    if !is_case_insensitive_builtin_tool(name) {
-                        return None;
-                    }
-                    allowed
-                        .iter()
-                        .find(|advertised| advertised.eq_ignore_ascii_case(name))
-                        .cloned()
-                })
-                .or_else(|| {
-                    // Claude Code keeps a handful of source-level aliases across
-                    // releases (for example Workflow/RunWorkflow and
-                    // Brief/SendUserMessage). XML-oriented models may emit the
-                    // other spelling, so resolve only the explicit bounded alias
-                    // families; arbitrary MCP names still require an exact match.
-                    allowed
-                        .iter()
-                        .find(|advertised| claude_tool_names_equivalent(name, advertised))
-                        .cloned()
-                }),
+            Some(allowed) => {
+                // Cursor's native PiEdit/XML bridge historically labels this
+                // operation `Edit`, while Claude Code 2.1.x handles it under
+                // the Anthropic-defined `str_replace_based_edit_tool` name.
+                // When both spellings are present, select the modern handler
+                // before the exact legacy hit; otherwise Claude Code reports
+                // "Edit unavailable" and falls back to StrReplace.
+                let editor_alias =
+                    name.eq_ignore_ascii_case("Edit") || is_text_editor_tool_name(name);
+                let modern_editor = editor_alias
+                    .then(|| preferred_text_editor_name(allowed))
+                    .flatten();
+                modern_editor
+                    .or_else(|| allowed.get(name).cloned())
+                    .or_else(|| {
+                        // Prefer the same built-in spelling (case-insensitively)
+                        // when both a canonical name and a historical alias are
+                        // advertised. This prevents a lower-cased `taskoutput`
+                        // from being selected by BTreeSet order as AgentOutput.
+                        if !is_case_insensitive_builtin_tool(name) {
+                            return None;
+                        }
+                        allowed
+                            .iter()
+                            .find(|advertised| advertised.eq_ignore_ascii_case(name))
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        // Claude Code keeps a handful of source-level aliases across
+                        // releases (for example Workflow/RunWorkflow and
+                        // Brief/SendUserMessage). XML-oriented models may emit the
+                        // other spelling, so resolve only the explicit bounded alias
+                        // families; arbitrary MCP names still require an exact match.
+                        allowed
+                            .iter()
+                            .find(|advertised| claude_tool_names_equivalent(name, advertised))
+                            .cloned()
+                    })
+            }
             None => Some(name.to_string()),
         }
     }
@@ -304,6 +318,10 @@ fn is_case_insensitive_builtin_tool(name: &str) -> bool {
         "Edit",
         "MultiEdit",
         "NotebookEdit",
+        "str_replace_based_edit_tool",
+        "str_replace_editor",
+        "StrReplace",
+        "StrReplaceTool",
         "NotebookRead",
         "PowerShell",
         "Task",

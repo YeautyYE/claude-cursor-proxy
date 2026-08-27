@@ -3,7 +3,9 @@ use std::time::{Duration, Instant};
 use crate::providers::cursor::client::CursorUpstreamResponse;
 use crate::providers::cursor::connect::anthropic_error_type_from_live_error;
 use crate::providers::cursor::native_tools::adapt_tool_input_for_client;
-use crate::providers::cursor::response::{CursorStreamEvent, decode_upstream_response};
+use crate::providers::cursor::response::{
+    CursorStreamEvent, decode_upstream_response, decode_upstream_response_with_allowed,
+};
 use crate::providers::cursor::tool_bridge::resolve_advertised_name;
 use std::collections::BTreeSet;
 
@@ -121,7 +123,13 @@ fn frame_cursor_stream_with_allowed_mode(
     allowed_tool_names: Option<&BTreeSet<String>>,
     compaction_mode: bool,
 ) -> Vec<u8> {
-    let events = match decode_upstream_response(&upstream.body) {
+    let decoded = match (allowed_tool_names, compaction_mode) {
+        (Some(allowed), false) => {
+            decode_upstream_response_with_allowed(&upstream.body, Some(allowed))
+        }
+        _ => decode_upstream_response(&upstream.body),
+    };
+    let events = match decoded {
         Ok(e) => e,
         Err(e) => {
             return format_sse_error(&e.to_string());
@@ -135,7 +143,29 @@ fn frame_cursor_stream_with_allowed_mode(
         CursorSseFramer::new(&mut sse, message_id, model)
     };
 
+    // A buffered Cursor response can contain several native execs in one
+    // turn.  Anthropic represents those as sibling `tool_use` blocks followed
+    // by a single `message_delta(stop_reason="tool_use")`.  The framer marks
+    // itself finalized after `emit_tool_pause`, so queue the translated native
+    // calls and emit them as one batch after all preceding text/usage events
+    // have been handled.  Without this, only the first PiEdit replacement
+    // survives the response and later replacements silently disappear.
+    let mut pending_tools: Vec<(String, String, String)> = Vec::new();
+    let mut saw_tool = false;
+
     for event in &events {
+        // Once a native tool has appeared, visible text after it belongs to a
+        // later Cursor segment and must not be appended after Anthropic's
+        // tool-use stop.  Continue scanning only to collect sibling native
+        // calls from the same buffered turn.
+        if saw_tool
+            && !matches!(
+                event,
+                CursorStreamEvent::NativeTool { .. } | CursorStreamEvent::Usage { .. }
+            )
+        {
+            continue;
+        }
         match event {
             CursorStreamEvent::ThinkingDelta { text } => framer.emit_thinking_delta(text),
             CursorStreamEvent::TextDelta { text } => {
@@ -179,12 +209,21 @@ fn frame_cursor_stream_with_allowed_mode(
                     None => (name.clone(), input.clone()),
                 };
                 let input_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                framer.emit_tool_pause(tool_use_id, &name, &input_json);
+                pending_tools.push((tool_use_id.clone(), name, input_json));
+                saw_tool = true;
             }
         }
     }
 
-    framer.finalize();
+    if pending_tools.is_empty() {
+        framer.finalize();
+    } else {
+        framer.emit_tool_batch(
+            pending_tools
+                .iter()
+                .map(|(id, name, input)| (id.as_str(), name.as_str(), input.as_str())),
+        );
+    }
     sse
 }
 
@@ -898,6 +937,26 @@ impl<'a> CursorSseFramer<'a> {
     pub fn emit_tool_pause(&mut self, tool_use_id: &str, tool_name: &str, partial_json: &str) {
         self.emit_tool_use_block(tool_use_id, tool_name, partial_json);
         self.emit_final_message("tool_use");
+    }
+
+    /// Emit several sibling tool-use blocks and terminate the message once.
+    /// Buffered responses can carry multiple native execs in one turn; using
+    /// this helper keeps every block instead of finalizing after the first.
+    pub fn emit_tool_batch<'b, I>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = (&'b str, &'b str, &'b str)>,
+    {
+        if self.state.finalized {
+            return;
+        }
+        let mut emitted = false;
+        for (tool_use_id, tool_name, partial_json) in tools {
+            self.emit_tool_use_block(tool_use_id, tool_name, partial_json);
+            emitted = true;
+        }
+        if emitted {
+            self.emit_final_message("tool_use");
+        }
     }
 
     pub fn emit_final_message(&mut self, stop_reason: &str) {
@@ -1668,6 +1727,7 @@ mod tests {
                 request_context_args: None,
                 shell_stream_args: None,
                 pi_write_args: None,
+                pi_edit_args: None,
             }),
         };
         let mut payload = Vec::new();
@@ -1695,6 +1755,79 @@ mod tests {
                 .all(|(_, data)| data["type"] != "content_block_start"
                     || data["content_block"]["type"] != "tool_use")
         );
+    }
+
+    #[test]
+    fn buffered_pi_edit_sse_emits_modern_single_replacement_blocks() {
+        use crate::providers::cursor::proto::{
+            AgentServerMessage, ExecServerMessage, PiEditExecArgs, PiEditReplacement,
+        };
+        use crate::providers::cursor::test_frames;
+        use prost::Message;
+        use std::collections::BTreeSet;
+
+        let msg = AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_message: Some(ExecServerMessage {
+                id: 18,
+                exec_id: Some("pi-sse-18".into()),
+                shell_args: None,
+                write_args: None,
+                delete_args: None,
+                grep_args: None,
+                read_args: None,
+                ls_args: None,
+                request_context_args: None,
+                shell_stream_args: None,
+                pi_write_args: None,
+                pi_edit_args: Some(PiEditExecArgs {
+                    path: "/tmp/example.rs".into(),
+                    edits: vec![
+                        PiEditReplacement {
+                            old_text: "a".into(),
+                            new_text: "b".into(),
+                        },
+                        PiEditReplacement {
+                            old_text: "c".into(),
+                            new_text: "d".into(),
+                        },
+                    ],
+                }),
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let mut body =
+            crate::providers::cursor::connect::encode_connect_frame(&payload, 0).to_vec();
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+        let allowed = BTreeSet::from(["str_replace_based_edit_tool".to_string()]);
+        let rendered = frame_cursor_stream_with_allowed(
+            &upstream,
+            "msg_pi_sse",
+            "claude-fable-5",
+            Some(&allowed),
+        );
+        let events = parse_sse_events(&String::from_utf8(rendered).unwrap());
+        let tools: Vec<_> = events
+            .iter()
+            .filter(|(_, data)| {
+                data["type"] == "content_block_start" && data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            tools[0].1["content_block"]["name"],
+            "str_replace_based_edit_tool"
+        );
+        assert_eq!(tools[1].1["content_block"]["id"], "pi-sse-18__part_2");
     }
 
     #[test]

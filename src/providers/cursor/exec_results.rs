@@ -23,6 +23,24 @@ pub enum CursorExecKind {
         path: String,
         content: String,
     },
+    /// Cursor 3.12+ Pi string-replacement edit exec. Its result lives on
+    /// `ExecClientMessage.pi_edit_result` (field 48).
+    PiEdit {
+        path: String,
+        edits: Vec<PiEditReplacement>,
+    },
+    /// Synthetic sibling for a modern text-editor multi-edit. The
+    /// `str_replace` contract accepts one replacement per tool call; these
+    /// continuation entries are acknowledged by Claude Code and are folded
+    /// into the primary PiEdit result rather than sending another protobuf
+    /// result to Cursor. `parent_id` ties each sibling to its primary when
+    /// several PiEdit calls are exposed in one Anthropic batch; without that
+    /// fence an error from one edit could be copied onto every other primary
+    /// during result encoding.
+    PiEditContinuation {
+        path: String,
+        parent_id: u32,
+    },
     Delete {
         path: String,
     },
@@ -75,6 +93,11 @@ impl PendingCursorExec {
             CursorExecKind::PiWrite {
                 path: args.path.clone(),
                 content: args.content.clone(),
+            }
+        } else if let Some(args) = exec.pi_edit_args.as_ref() {
+            CursorExecKind::PiEdit {
+                path: args.path.clone(),
+                edits: args.edits.clone(),
             }
         } else if let Some(args) = exec.delete_args.as_ref() {
             CursorExecKind::Delete {
@@ -196,6 +219,32 @@ pub fn encode_tool_result_frames(
                 }
             }),
         )?],
+        CursorExecKind::PiEdit { path, .. } => vec![encode_exec_message(
+            pending,
+            ExecPayload::PiEdit(if is_error {
+                PiEditExecResult {
+                    success: None,
+                    error: Some(PiEditExecError { error: content }),
+                    rejected: None,
+                }
+            } else {
+                PiEditExecResult {
+                    success: Some(PiEditExecSuccess {
+                        output: if content.is_empty() {
+                            format!("Applied edits to {path}")
+                        } else {
+                            content
+                        },
+                        diff: String::new(),
+                        patch: String::new(),
+                        first_changed_line: None,
+                    }),
+                    error: None,
+                    rejected: None,
+                }
+            }),
+        )?],
+        CursorExecKind::PiEditContinuation { .. } => Vec::new(),
         CursorExecKind::Delete { path } => vec![encode_exec_message(
             pending,
             ExecPayload::Delete(if is_error {
@@ -427,6 +476,7 @@ enum ExecPayload {
     Read(ReadResult),
     Write(WriteResult),
     PiWrite(PiWriteExecResult),
+    PiEdit(PiEditExecResult),
     Delete(DeleteResult),
     Grep(GrepResult),
     Ls(LsResult),
@@ -451,11 +501,13 @@ fn encode_exec_message(
         request_context_result: None,
         shell_stream: None,
         pi_write_result: None,
+        pi_edit_result: None,
     };
     match payload {
         ExecPayload::Read(value) => exec.read_result = Some(value),
         ExecPayload::Write(value) => exec.write_result = Some(value),
         ExecPayload::PiWrite(value) => exec.pi_write_result = Some(value),
+        ExecPayload::PiEdit(value) => exec.pi_edit_result = Some(value),
         ExecPayload::Delete(value) => exec.delete_result = Some(value),
         ExecPayload::Grep(value) => exec.grep_result = Some(value),
         ExecPayload::Ls(value) => exec.ls_result = Some(value),
@@ -603,5 +655,67 @@ mod tests {
         let result = msg.exec_client_message.unwrap().pi_write_result.unwrap();
         assert!(result.success.is_none());
         assert_eq!(result.error.unwrap().error, "permission denied");
+    }
+
+    #[test]
+    fn pi_edit_success_uses_pi_edit_result_tag_and_closes_exec() {
+        let pending = PendingCursorExec {
+            id: 14,
+            exec_id: Some("pi-edit-14".into()),
+            tool_use_id: "edit-14".into(),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({
+                "file_path": "/tmp/edit.rs",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+            kind: CursorExecKind::PiEdit {
+                path: "/tmp/edit.rs".into(),
+                edits: vec![PiEditReplacement {
+                    old_text: "old".into(),
+                    new_text: "new".into(),
+                }],
+            },
+        };
+        let frames = encode_tool_result_frames(
+            &pending,
+            &serde_json::json!({"type":"tool_result","content":"Applied"}),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
+        let decoded = decode_upstream_frames(&frames[0]).unwrap();
+        let msg = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        let exec = msg.exec_client_message.unwrap();
+        let success = exec.pi_edit_result.unwrap().success.unwrap();
+        assert_eq!(success.output, "Applied");
+        assert!(success.diff.is_empty());
+        assert!(success.patch.is_empty());
+        assert_eq!(exec.id, 14);
+        assert_eq!(exec.exec_id.as_deref(), Some("pi-edit-14"));
+    }
+
+    #[test]
+    fn pi_edit_error_uses_error_variant() {
+        let pending = PendingCursorExec {
+            id: 15,
+            exec_id: None,
+            tool_use_id: "edit-15".into(),
+            claude_name: "Edit".into(),
+            claude_input: serde_json::json!({"file_path":"/tmp/nope"}),
+            kind: CursorExecKind::PiEdit {
+                path: "/tmp/nope".into(),
+                edits: vec![],
+            },
+        };
+        let frames = encode_tool_result_frames(
+            &pending,
+            &serde_json::json!({"type":"tool_result","content":"not found","is_error":true}),
+        )
+        .unwrap();
+        let decoded = decode_upstream_frames(&frames[0]).unwrap();
+        let msg = AgentClientMessage::decode(decoded[0].payload.as_ref()).unwrap();
+        let result = msg.exec_client_message.unwrap().pi_edit_result.unwrap();
+        assert!(result.success.is_none());
+        assert_eq!(result.error.unwrap().error, "not found");
     }
 }

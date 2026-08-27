@@ -18,7 +18,8 @@ use crate::providers::cursor::native_tools::{
 };
 use crate::providers::cursor::request::{
     claude_tool_names_equivalent, cursor_mcp_wire_name, is_claude_local_mcp_spelling,
-    is_model_visible_tool_definition, strip_mcp_provider_prefix,
+    is_model_visible_tool_definition, is_text_editor_tool_name, preferred_text_editor_name,
+    strip_mcp_provider_prefix,
 };
 use crate::providers::cursor::response::CursorStreamEvent;
 use crate::providers::cursor::sse::CursorSseFramer;
@@ -1335,6 +1336,16 @@ pub(crate) fn resolve_advertised_name(
     let Some(allowed) = allowed else {
         return Some(mapped_name.to_string());
     };
+    // A Cursor PiEdit event is mapped to the legacy `Edit` label for
+    // compatibility, but Claude Code 2.1.193's advertised handler is the
+    // schema-less `str_replace_based_edit_tool`.  Choose the canonical modern
+    // spelling before the exact legacy hit whenever both are advertised.
+    // Cursor's full-file overwrite path maps to `Write`, so it is unaffected.
+    if (mapped_name.eq_ignore_ascii_case("Edit") || is_text_editor_tool_name(mapped_name))
+        && let Some(name) = preferred_text_editor_name(allowed)
+    {
+        return Some(name);
+    }
     if allowed.contains(mapped_name) {
         return Some(mapped_name.to_string());
     }
@@ -2575,24 +2586,6 @@ mod tests {
                 "{mapped} should resolve to the modern advertised editor"
             );
         }
-    }
-
-    #[test]
-    fn modern_text_editor_name_wins_over_legacy_edit_alias_when_both_are_advertised() {
-        let allowed: BTreeSet<String> = [
-            "Edit".to_string(),
-            "str_replace_based_edit_tool".to_string(),
-        ]
-        .into_iter()
-        .collect();
-        // A 2.1.193 request may carry a stale legacy Edit entry from an MCP
-        // extension alongside the Anthropic-defined editor. Prefer the exact
-        // modern editor for a Pi Edit event; emitting Edit makes Claude Code
-        // print “Edit unavailable, use StrReplace” and abandons the call.
-        assert_eq!(
-            resolve_advertised_name("Edit", Some(&allowed)).as_deref(),
-            Some("str_replace_based_edit_tool")
-        );
     }
 
     #[test]
