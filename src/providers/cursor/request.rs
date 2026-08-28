@@ -1219,6 +1219,62 @@ pub(crate) fn current_user_blocks(req: &MessagesRequest) -> Vec<&serde_json::Val
     blocks
 }
 
+/// Detect Claude Code's local/reactive compaction prompt.
+///
+/// Claude Code's `m0(... querySource: "compact", forkLabel: ... )` path is a
+/// normal Anthropic Messages request: unlike the server-side compaction
+/// extension it does not carry `context_management.edits`.  The only stable
+/// wire signal is the summary prompt appended as the latest user turn.  Keep
+/// this matcher intentionally strict so an ordinary user message such as
+/// `/compact` is never routed to the summary-only lane.
+pub(crate) fn is_reactive_compact_prompt(req: &MessagesRequest) -> bool {
+    let current = current_user_messages(req);
+    let Some(message) = current.last() else {
+        return false;
+    };
+    let mut text = String::new();
+    collect_text_for_compaction(&message.content, &mut text);
+    is_compaction_summary_prompt(&text)
+}
+
+fn collect_text_for_compaction(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(text) => out.push_str(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_text_for_compaction(value, out);
+                out.push('\n');
+            }
+        }
+        serde_json::Value::Object(object) => {
+            // Anthropic text blocks are the normal shape.  Accept nested
+            // `content` wrappers as well because a few Claude Code releases
+            // wrap prompt text while attaching cache metadata.
+            if let Some(text) = object.get("text").and_then(serde_json::Value::as_str) {
+                out.push_str(text);
+            }
+            if let Some(content) = object.get("content") {
+                collect_text_for_compaction(content, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_compaction_summary_prompt(text: &str) -> bool {
+    let text = text.trim_start();
+    // Both manual `/compact` and automatic reactive compact use this exact
+    // contract in Claude Code 2.1.x.  Require several independent phrases so
+    // quoting one line in a normal conversation cannot opt into compaction.
+    text.starts_with("CRITICAL: Respond with TEXT ONLY")
+        && text.contains("Do NOT call any tools")
+        && text.contains("Do NOT use Read, Bash, Grep")
+        && text.contains("entire response must be plain text")
+        && text.contains("Your task is to create a detailed summary")
+        && text.contains("conversation")
+        && (text.contains("<summary>") || text.contains("&lt;summary&gt;"))
+}
+
 /// True when the current logical user turn is only `tool_result` blocks.
 pub(crate) fn latest_user_is_only_tool_results(req: &MessagesRequest) -> bool {
     let current = current_user_messages(req);
@@ -2040,6 +2096,72 @@ mod tests {
 
     /// Serialize tests that mutate process-wide CCP_CURSOR_* env flags.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reactive_compact_prompt() -> &'static str {
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n\
+         - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n\
+         - You already have all the context you need in the conversation above.\n\
+         - Tool calls will be REJECTED and will waste your only turn — you will fail the task.\n\
+         - Your entire response must be plain text: an <analysis> block followed by a <summary> block.\n\
+         Your task is to create a detailed summary of this conversation.\n\
+         Before providing your final summary, wrap your analysis in <analysis> tags.\n\
+         <summary>"
+    }
+
+    #[test]
+    fn detects_claude_reactive_compact_summary_prompt() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": reactive_compact_prompt()}]
+        }))
+        .expect("valid compact request");
+        assert!(is_reactive_compact_prompt(&req));
+    }
+
+    #[test]
+    fn detects_compact_prompt_in_nested_text_blocks() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": {
+                "content": [{"type": "text", "text": reactive_compact_prompt()}]
+            }}]
+        }))
+        .expect("valid nested compact request");
+        assert!(is_reactive_compact_prompt(&req));
+    }
+
+    #[test]
+    fn ordinary_compact_text_and_quoted_fragments_are_not_reactive_compaction() {
+        for content in [
+            "/compact",
+            "Please run this prompt:\nCRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour task is to create a detailed summary of this conversation.",
+        ] {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "gemini-3.1-pro",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("valid ordinary request");
+            assert!(
+                !is_reactive_compact_prompt(&req),
+                "ordinary/partial text must not enter compaction lane: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_latest_user_turn_can_trigger_reactive_compaction() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "messages": [
+                {"role": "user", "content": reactive_compact_prompt()},
+                {"role": "assistant", "content": "previous summary"},
+                {"role": "user", "content": "continue from here"}
+            ]
+        }))
+        .expect("valid conversation");
+        assert!(!is_reactive_compact_prompt(&req));
+    }
 
     #[test]
     fn normalize_grok_build_lifecycle_name_accepts_cursor_mcp_spellings() {

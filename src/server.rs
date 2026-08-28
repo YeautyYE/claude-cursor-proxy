@@ -454,6 +454,12 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
     let context = RequestContext {
         req_id: req_id.clone(),
         client_request_id: client_request_id.clone(),
+        // The Anthropic SDK's ToolRunner compaction request layers a second
+        // `x-stainless-helper: compaction` value over its constructor header
+        // (`BetaToolRunner, ...`).  Hyper preserves repeated fields, and
+        // HeaderMap::get returns only the first one; collect all values so the
+        // provider can still see the compaction marker.
+        stainless_helper: header_text_all(&headers, "x-stainless-helper"),
         session_id,
         session_seq: None,
         provider: provider.name().to_string(),
@@ -1099,6 +1105,7 @@ async fn dispatch_request(
     let context = RequestContext {
         req_id: req_id.clone(),
         client_request_id: client_request_id.clone(),
+        stainless_helper: header_text_all(&headers, "x-stainless-helper"),
         session_id,
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
@@ -1710,6 +1717,26 @@ fn header_text(headers: &http::HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Read every occurrence of a potentially repeated textual header.
+///
+/// Anthropic's JavaScript SDK intentionally layers request options by appending
+/// headers.  In particular, ToolRunner starts with `BetaToolRunner` and its
+/// compaction pass appends `compaction` as a second field.  `HeaderMap::get`
+/// exposes only the first value, so using it would silently lose the operation
+/// marker depending on which HTTP stack combined the fields.  Preserve order
+/// and join with commas (the same representation used by Fetch/undici).
+fn header_text_all(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    let values: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
 fn claude_code_headers_from(headers: &http::HeaderMap) -> ClaudeCodeAgentHeaders {
     ClaudeCodeAgentHeaders {
         agent_id: header_text(headers, "x-claude-code-agent-id"),
@@ -1803,8 +1830,9 @@ fn set_mode(path: &Path, mode: u32) {
 mod tests {
     use super::{
         advertised_surface_model, claude_code_headers_from, derive_fallback_session_id,
-        enable_accepted_tcp_nodelay, parse_advertised_models, resolve_responses_session_id,
-        resolve_session_id, session_id_from_headers, wrap_anthropic_as_responses,
+        enable_accepted_tcp_nodelay, header_text_all, parse_advertised_models,
+        resolve_responses_session_id, resolve_session_id, session_id_from_headers,
+        wrap_anthropic_as_responses,
     };
     use crate::anthropic::error::json_error;
     use crate::anthropic::schema::MessagesRequest;
@@ -2106,6 +2134,38 @@ mod tests {
         );
         assert_eq!(resolved.session_id, "parent-session");
         assert!(!resolved.fallback);
+    }
+
+    #[test]
+    fn repeated_stainless_helper_headers_are_preserved_for_compaction_detection() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            "x-stainless-helper",
+            "BetaToolRunner".parse().expect("header value"),
+        );
+        headers.append(
+            "x-stainless-helper",
+            "compaction".parse().expect("header value"),
+        );
+        assert_eq!(
+            header_text_all(&headers, "x-stainless-helper").as_deref(),
+            Some("BetaToolRunner, compaction")
+        );
+        // Header names are case-insensitive and a Fetch-style already joined
+        // value should remain equivalent to two repeated fields.
+        assert_eq!(
+            header_text_all(&headers, "X-Stainless-Helper").as_deref(),
+            Some("BetaToolRunner, compaction")
+        );
+        let mut joined = http::HeaderMap::new();
+        joined.insert(
+            "x-stainless-helper",
+            "BetaToolRunner, compaction".parse().expect("header value"),
+        );
+        assert_eq!(
+            header_text_all(&joined, "x-stainless-helper").as_deref(),
+            Some("BetaToolRunner, compaction")
+        );
     }
 
     #[test]

@@ -61,9 +61,9 @@ use crate::providers::cursor::live::{
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
     CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, current_user_blocks,
-    cursor_request_context, latest_user_is_only_tool_results, refresh_image_uuids,
-    reject_orphaned_native_results_when_live_slot_is_free, render_cursor_prompt,
-    render_cursor_prompt_parts_with, request_has_client_only_tool_results,
+    cursor_request_context, is_reactive_compact_prompt, latest_user_is_only_tool_results,
+    refresh_image_uuids, reject_orphaned_native_results_when_live_slot_is_free,
+    render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_compaction,
@@ -838,8 +838,33 @@ fn is_context_management_compact_request(body: &MessagesRequest) -> bool {
         })
 }
 
+#[cfg(test)]
 fn is_compact_request(body: &MessagesRequest, client_request_id: Option<&str>) -> bool {
-    is_xai_compact_request(client_request_id) || is_context_management_compact_request(body)
+    is_compact_request_with_helper(body, client_request_id, None)
+}
+
+/// Detect every Claude/Cursor compaction transport variant.  Grok Build marks
+/// its operation with `xai-compact-*`; Anthropic's server-side extension uses
+/// `context_management.edits`; Claude Code's local `/compact` and reactive
+/// compaction use a strict summary prompt (and newer SDK helper calls add
+/// `x-stainless-helper: compaction`).
+fn is_compact_request_with_helper(
+    body: &MessagesRequest,
+    client_request_id: Option<&str>,
+    stainless_helper: Option<&str>,
+) -> bool {
+    is_xai_compact_request(client_request_id)
+        || is_context_management_compact_request(body)
+        || is_stainless_compaction_helper(stainless_helper)
+        || is_reactive_compact_prompt(body)
+}
+
+fn is_stainless_compaction_helper(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .any(|part| part.eq_ignore_ascii_case("compaction"))
+    })
 }
 
 /// Give a context-compaction operation its own live-run/conversation lane
@@ -3997,7 +4022,11 @@ impl Provider for CursorProvider {
         let mut ctx = ctx;
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let xai_compact = is_compact_request(&body, ctx.client_request_id.as_deref());
+        let xai_compact = is_compact_request_with_helper(
+            &body,
+            ctx.client_request_id.as_deref(),
+            ctx.stainless_helper.as_deref(),
+        );
         if xai_compact {
             // Context compaction is a distinct operation on the same Claude
             // session.  Keep the session for Cursor's long-lived transport,
@@ -5189,10 +5218,85 @@ mod tests {
         assert!(is_compact_request(&body, None));
     }
 
+    #[test]
+    fn stainless_helper_compaction_is_detected_and_other_helpers_are_ignored() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": "summarize"}]
+        }))
+        .expect("valid helper request");
+        assert!(is_stainless_compaction_helper(Some(
+            "BetaToolRunner, compaction"
+        )));
+        assert!(is_stainless_compaction_helper(Some("COMPACTION")));
+        assert!(!is_stainless_compaction_helper(Some("BetaToolRunner")));
+        assert!(!is_stainless_compaction_helper(Some("not-compaction")));
+        assert!(is_compact_request_with_helper(
+            &body,
+            None,
+            Some("BetaToolRunner, compaction")
+        ));
+        assert!(!is_compact_request_with_helper(
+            &body,
+            None,
+            Some("BetaToolRunner")
+        ));
+    }
+
+    #[test]
+    fn stainless_compaction_helper_is_case_insensitive_and_supports_lists() {
+        assert!(is_stainless_compaction_helper(Some("compaction")));
+        assert!(is_stainless_compaction_helper(Some(" Compaction ")));
+        assert!(is_stainless_compaction_helper(Some(
+            "stream, compaction, retry"
+        )));
+        assert!(is_stainless_compaction_helper(Some("STREAM,COMPACTION")));
+        assert!(!is_stainless_compaction_helper(Some("compact")));
+        assert!(!is_stainless_compaction_helper(Some("precompaction")));
+        assert!(!is_stainless_compaction_helper(None));
+    }
+
+    #[test]
+    fn stainless_compaction_helper_routes_gemini_summary_to_isolated_lane() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": "summarize"}],
+            "tools": [{"name": "Read", "input_schema": {}}]
+        }))
+        .expect("valid Gemini request");
+        assert!(is_compact_request_with_helper(
+            &body,
+            None,
+            Some("compaction")
+        ));
+        // The same predicate used by handle_messages must suppress tools for
+        // compaction, even if Claude Code included its regular tool catalog.
+        let compaction_mode = is_compact_request_with_helper(&body, None, Some("compaction"));
+        let allowed = if compaction_mode {
+            Some(BTreeSet::new())
+        } else {
+            advertised_tool_names(&body)
+        };
+        assert!(compaction_mode);
+        assert_eq!(allowed.expect("tool set"), BTreeSet::new());
+    }
+
+    #[test]
+    fn non_compaction_helper_does_not_change_regular_request_lane() {
+        let body = hello_body();
+        assert!(!is_compact_request_with_helper(&body, None, Some("stream")));
+        assert!(!is_compact_request_with_helper(
+            &body,
+            None,
+            Some("compactible")
+        ));
+    }
+
     fn compact_test_context(client_request_id: Option<&str>) -> RequestContext {
         RequestContext {
             req_id: "compact-test-req".into(),
             client_request_id: client_request_id.map(str::to_owned),
+            stainless_helper: None,
             session_id: Some("compact-test-session".into()),
             session_seq: None,
             provider: "cursor".into(),
@@ -5207,6 +5311,7 @@ mod tests {
         RequestContext {
             req_id: "policy-test-req".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: session_id.map(str::to_owned),
             session_seq: None,
             provider: "cursor".into(),
@@ -7547,6 +7652,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "req".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some("parent-session".into()),
             session_seq: None,
             provider: "cursor".into(),
@@ -7571,6 +7677,7 @@ mod tests {
         let parent = RequestContext {
             req_id: "req-parent".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some("shared-session".into()),
             session_seq: None,
             provider: "cursor".into(),
@@ -7582,6 +7689,7 @@ mod tests {
         let child = RequestContext {
             req_id: "req-child".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some("shared-session".into()),
             session_seq: None,
             provider: "cursor".into(),
@@ -7627,6 +7735,7 @@ mod tests {
         let nested = RequestContext {
             req_id: "req".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some(session.clone()),
             session_seq: None,
             provider: "cursor".into(),
@@ -7648,6 +7757,7 @@ mod tests {
         let parent = RequestContext {
             req_id: "req".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some(session.clone()),
             session_seq: None,
             provider: "cursor".into(),

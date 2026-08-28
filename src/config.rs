@@ -1131,6 +1131,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CURSOR_SAND_MODELS");
+            std::env::remove_var("CCP_CURSOR_CLIENT_TYPE");
         }
     }
 
@@ -1374,6 +1375,66 @@ mod tests {
         let from_env = cursor_sand_policy();
         assert!(from_env.matches("grok-4.5"));
         assert!(!from_env.matches("claude-fable-5"));
+    }
+
+    #[test]
+    fn sand_route_selects_gemini_aliases_without_changing_unmatched_models() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["gemini-3.1-pro"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.1-pro"),
+            "sand",
+            "exact Gemini id selected in TUI must use Sand"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.1-pro[1m]"),
+            "sand",
+            "Claude Code context suffix must not change the route"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("cursor:gemini-3.1-pro"),
+            "sand",
+            "Cursor prefix aliases must retain the selected route"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.6-flash-high"),
+            "cli",
+            "unmatched Gemini models must keep the normal CLI identity"
+        );
+    }
+
+    #[test]
+    fn explicit_default_client_type_only_applies_to_unmatched_models() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["gemini-3.1-pro"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "ide");
+
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.1-pro"),
+            "sand",
+            "Sand policy takes precedence for the selected model"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.6-flash-high"),
+            "ide",
+            "explicit default identity remains available for other models"
+        );
     }
 
     #[test]

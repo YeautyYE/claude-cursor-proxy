@@ -51,6 +51,11 @@ pub struct RequestContext {
     /// Stable client operation id, currently `x-grok-req-id`.
     /// Unlike `req_id`, this survives HTTP retries of the same logical turn.
     pub client_request_id: Option<String>,
+    /// Anthropic SDK helper marker (`x-stainless-helper`).  Claude Code uses
+    /// the `compaction` value for its ToolRunner/server-side compaction path;
+    /// preserve it alongside the parsed request so providers can keep that
+    /// operation on an isolated summary-only lane.
+    pub stainless_helper: Option<String>,
     pub session_id: Option<String>,
     pub session_seq: Option<u64>,
     pub provider: String,

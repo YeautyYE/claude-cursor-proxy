@@ -3,6 +3,19 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.85 (2026-08-28)
+
+- Preserve Claude Code's repeated `x-stainless-helper` values so ToolRunner
+  compaction is recognized even when the SDK appends `compaction` as a second
+  header field.
+- Detect Claude Code 2.1.x local/reactive compaction prompts only on the latest
+  user turn and route them through a synthetic, isolated summary lane.
+- Keep compaction summary runs free of native tools/MCP registrations and
+  promote reasoning-only Cursor output to visible plain-text summaries.
+- Add Gemini compaction end-to-end coverage and exact Gemini Sand/CLI routing
+  regressions. Sand policy 429s remain explicit; switching a model to `[cli]`
+  is an intentional TUI action rather than a silent quota fallback.
+
 ## v0.1.84 (2026-08-28)
 
 - Recover Cursor KV blob-store 413s by rotating the exhausted conversation

@@ -1009,6 +1009,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "request".to_string(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: None,
             session_seq: None,
             provider: "codex".to_string(),

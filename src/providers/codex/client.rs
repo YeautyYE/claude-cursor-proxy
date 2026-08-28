@@ -1313,6 +1313,7 @@ mod tests {
         RequestContext {
             req_id: "http-body-test".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
@@ -1693,6 +1694,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some("s".into()),
             session_seq: None,
             provider: "codex".into(),
@@ -1720,6 +1722,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
@@ -1750,6 +1753,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
@@ -1774,6 +1778,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some("bad\nsession".into()),
             session_seq: None,
             provider: "codex".into(),
@@ -1832,6 +1837,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: Some("session".into()),
             session_seq: None,
             provider: "codex".into(),
@@ -1910,6 +1916,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             client_request_id: None,
+            stainless_helper: None,
             session_id: None,
             session_seq: None,
             provider: "codex".into(),

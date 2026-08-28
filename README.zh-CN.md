@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.84 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.85 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -475,6 +475,7 @@ takeover。这属于本地 Lobster/会话生命周期问题，不是 Cursor 推�
 | 流式一直卡住 | 看日志 `~/.local/state/claude-cursor-proxy/proxy.log`；可试 `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 | 附带图片立即报 502 `Image not found [internal]` | 升级到 ≥0.1.83 并重启 `serve`。代理会保留原始内联图片字节，只轮换一次图片 id，并在新的 Cursor conversation 中重试；上游持续报错时会直接返回，不再形成无限重试波次。 |
 | grok-build 返回 413 `Cursor KV blob store limit exceeded`（`blobs=4097` / 约 64 MiB） | 升级到 ≥0.1.84 并重启 `serve`。代理会在下一回合前轮换接近上限的 Cursor conversation；如果上游先返回 413，会在全量 Anthropic 历史和新图片 id 上进行一次有界的新会话重试，不需手动 `/compact` 或新建聊天。 |
+| Gemini/Fable 在 Sand 下返回 `ERROR_PRO_USER_RATE_LIMIT_EXCEEDED`，但切 CLI 正常 | Sand 与 CLI 是 Cursor 的两个请求身份和额度桶。请在 TUI 按 `s`，选中模型并切换为 `[cli]`；代理会保留清晰的 Sand 429，不会静默消耗 CLI/API 额度。 |
 | grok-build 在未付款账单或不支持的国家/区域时报 `Server error (500) - Something went wrong on our side` | 升级到 ≥0.1.47 并重启 serve。未付款是 HTTP 429 并带发票原文；地区限制是 HTTP 403 并带国家/区域原文。 |
 | grok-build 在 `Cursor live open timed out` 后报 `Server error (500)` / 重复开 Cursor Run | 升级到 ≥0.1.57 并重启 serve。没有响应、接受状态不明的 live open 会 fail-closed 为 HTTP 409；本地打开槽饱和改为带抖动的 HTTP 503。 |
 | Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。 |
