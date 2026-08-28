@@ -2078,6 +2078,7 @@ fn render_request_detail(
 
 fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let ui = account_ui_lock();
+    let columns = account_list_columns(area.width);
     let mut lines = vec![Line::from(vec![
         Span::raw("  "),
         Span::styled("Enter", Style::default().fg(TEAL)),
@@ -2101,7 +2102,7 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
         // Keep the selected account in view when a user has more accounts
         // than fit in the panel.  The selected row gets a second line for its
         // id, so leave room for that line and the optional range indicators.
-        let visible_rows = usize::from(area.height.saturating_sub(8)).max(1);
+        let visible_rows = usize::from(area.height.saturating_sub(9)).max(1);
         let start = ui
             .selected
             .saturating_sub(visible_rows.saturating_sub(1) / 2);
@@ -2112,6 +2113,7 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
                 Style::default().fg(DIM),
             )));
         }
+        lines.push(account_list_header(&columns));
         for (index, account) in ui
             .accounts
             .iter()
@@ -2126,23 +2128,32 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
                 Style::default().fg(DIM_WHITE)
             };
             let marker = if account.active { "*" } else { " " };
-            let name = ellipsize(account.display_name(), 26);
-            let email = account.email().unwrap_or("");
-            let usage = ui
-                .usage
-                .get(&account.id)
-                .map(|state| state.header_line())
-                .unwrap_or_else(|| "usage  not fetched".to_string());
-            let usage = ellipsize(&usage, 64);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {marker} {} ", if selected { ">" } else { " " }),
-                    selected_style,
-                ),
-                Span::styled(format!("{name:<26} "), selected_style),
-                Span::styled(format!("{:<30} ", ellipsize(email, 29)), selected_style),
-                Span::styled(usage, selected_style),
-            ]));
+            let usage_state = ui.usage.get(&account.id);
+            let usage_snapshot = usage_state.and_then(|state| match state {
+                crate::monitor::AccountUsageState::Ready(snapshot) => Some(snapshot),
+                _ => None,
+            });
+            // An opaque Cursor token may not contain an email. Once the
+            // dashboard response arrives, its `/auth/me` identity is the
+            // most useful account identity available to the operator.
+            let email = usage_snapshot
+                .and_then(|snapshot| snapshot.email.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| account.email().filter(|value| !value.trim().is_empty()));
+            let name = account_name_for_display(account, email);
+            let metrics = account_usage_metrics(usage_state, columns.compact);
+            let mut row = vec![Span::styled(
+                format!(" {marker} {} ", if selected { ">" } else { " " }),
+                selected_style,
+            )];
+            push_account_cell(&mut row, &name, columns.name_width, selected_style);
+            if let Some(width) = columns.email_width {
+                push_account_cell(&mut row, email.unwrap_or("-"), width, selected_style);
+            }
+            for (metric, width) in metrics.iter().zip(columns.metric_widths) {
+                push_account_cell(&mut row, metric, width, selected_style);
+            }
+            lines.push(Line::from(row));
             // Keep ids available for accounts without an email, and make it
             // possible to distinguish two accounts sharing a display label.
             if selected && !account.id.is_empty() {
@@ -2173,6 +2184,147 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountListColumns {
+    name_width: usize,
+    email_width: Option<usize>,
+    metric_widths: [usize; 4],
+    compact: bool,
+}
+
+/// Keep account rows readable at every monitor width. The account name and
+/// all four quota meters remain visible; the duplicate email column is the
+/// first field dropped on narrow terminals.
+fn account_list_columns(area_width: u16) -> AccountListColumns {
+    let inner_width = usize::from(area_width.saturating_sub(2));
+    let compact = inner_width < 105;
+    let metric_widths = if compact {
+        [8, 8, 8, 12]
+    } else {
+        [11, 10, 9, 13]
+    };
+    // Five marker characters plus one separator after every cell.
+    let fixed_metrics = 6 + metric_widths.iter().map(|width| width + 1).sum::<usize>();
+    let email_width = if inner_width >= 96 {
+        Some(if inner_width < 132 { 24 } else { 32 })
+    } else {
+        None
+    };
+    let fixed_email = email_width.map_or(0, |width| width + 1);
+    let name_width = inner_width
+        .saturating_sub(fixed_metrics + fixed_email)
+        .max(1)
+        .min(if email_width.is_some() { 24 } else { 32 });
+    AccountListColumns {
+        name_width,
+        email_width,
+        metric_widths,
+        compact,
+    }
+}
+
+fn account_list_header(columns: &AccountListColumns) -> Line<'static> {
+    let mut spans = vec![Span::styled("     ", Style::default().fg(DIM))];
+    spans.push(Span::styled(
+        format!("{:<width$} ", "Name", width = columns.name_width),
+        Style::default().fg(TEAL),
+    ));
+    if let Some(width) = columns.email_width {
+        spans.push(Span::styled(
+            format!("{:<width$} ", "Email", width = width),
+            Style::default().fg(TEAL),
+        ));
+    }
+    let labels = if columns.compact {
+        ["Total", "Auto", "API", "Bot"]
+    } else {
+        ["Total", "Auto", "API", "Bot/wk"]
+    };
+    for (label, width) in labels.into_iter().zip(columns.metric_widths) {
+        spans.push(Span::styled(
+            format!("{label:>width$} ", width = width),
+            Style::default().fg(TEAL),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn push_account_cell<'a>(row: &mut Vec<Span<'a>>, value: &str, width: usize, style: Style) {
+    let text = ellipsize(value, width);
+    row.push(Span::styled(
+        format!("{text:<width$} ", width = width),
+        style,
+    ));
+}
+
+fn account_name_for_display(
+    account: &crate::providers::cursor::auth::CursorAccountProfile,
+    email: Option<&str>,
+) -> String {
+    let label = account
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty() && *label != account.id);
+    if let Some(label) = label {
+        // Login historically defaulted the label to the email. Showing the
+        // local part in Name keeps that case useful without hiding the full
+        // address in Email.
+        if email.is_none_or(|address| !label.eq_ignore_ascii_case(address)) {
+            return label.to_string();
+        }
+    }
+    if let Some(email) = email {
+        let local = email.split_once('@').map_or(email, |(local, _)| local);
+        if !local.trim().is_empty() {
+            return local.to_string();
+        }
+    }
+    account.display_name().to_string()
+}
+
+fn account_usage_metrics(
+    state: Option<&crate::monitor::AccountUsageState>,
+    compact: bool,
+) -> [String; 4] {
+    match state {
+        Some(crate::monitor::AccountUsageState::Ready(snapshot)) => [
+            snapshot
+                .total_percent
+                .map(format_usage_percent)
+                .unwrap_or_else(|| "-".into()),
+            snapshot
+                .auto_percent
+                .map(format_usage_percent)
+                .unwrap_or_else(|| "-".into()),
+            snapshot
+                .api_percent
+                .map(format_usage_percent)
+                .unwrap_or_else(|| "-".into()),
+            snapshot.grok_bot_percent.map_or_else(
+                || "-".into(),
+                |value| {
+                    let value = format_usage_percent(value);
+                    if compact {
+                        value
+                    } else {
+                        format!("{value}/wk")
+                    }
+                },
+            ),
+        ],
+        Some(crate::monitor::AccountUsageState::Unknown) => {
+            ["…".into(), "…".into(), "…".into(), "…".into()]
+        }
+        Some(crate::monitor::AccountUsageState::Failed(_)) => {
+            ["err".into(), "err".into(), "err".into(), "err".into()]
+        }
+        Some(crate::monitor::AccountUsageState::MissingAuth) | None => {
+            ["-".into(), "-".into(), "-".into(), "-".into()]
+        }
+    }
 }
 
 fn render_usage_detail(frame: &mut ratatui::Frame<'_>, area: Rect, state: &MonitorState) {
@@ -2687,6 +2839,8 @@ mod tests {
 
     use super::*;
     use crate::monitor::{EndpointKind, mock_state};
+
+    static ACCOUNT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn draw(width: u16, height: u16, render: impl FnOnce(&mut ratatui::Frame<'_>)) -> Buffer {
         let backend = TestBackend::new(width, height);
@@ -3336,6 +3490,9 @@ mod tests {
 
     #[test]
     fn accounts_view_renders_active_marker_and_usage_per_account() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let first = crate::providers::cursor::auth::CursorAccountProfile {
             id: "account-a".to_string(),
             label: Some("Primary".to_string()),
@@ -3377,18 +3534,124 @@ mod tests {
         let buffer = draw(140, 14, |frame| render_accounts_detail(frame, frame.area()));
         let text = buffer_text(&buffer);
         assert!(text.contains("Cursor accounts"), "{text}");
+        assert!(text.contains("Name"), "{text}");
+        assert!(text.contains("Email"), "{text}");
+        assert!(text.contains("Total"), "{text}");
+        assert!(text.contains("Auto"), "{text}");
+        assert!(text.contains("API"), "{text}");
+        assert!(text.contains("Bot/wk"), "{text}");
         assert!(text.contains("*   Primary"), "{text}");
-        assert!(text.contains("> secondary@example.com"), "{text}");
+        assert!(text.contains("> secondary"), "{text}");
         assert!(text.contains("secondary@example.com"), "{text}");
-        assert!(text.contains("bot 25%/wk"), "{text}");
-        assert!(text.contains("bot 75%/wk"), "{text}");
+        assert!(text.contains("25.0%/wk"), "{text}");
+        assert!(text.contains("75.0%/wk"), "{text}");
+        // API must be rendered as its own meter rather than being lost in a
+        // truncated account-wide usage summary.
+        assert!(text.matches("5.0%").count() >= 6, "{text}");
 
         let mut ui = account_ui_lock();
         *ui = AccountUiState::default();
     }
 
     #[test]
+    fn accounts_view_keeps_api_and_bot_visible_at_narrow_width() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let account = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-narrow".to_string(),
+            label: None,
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-narrow".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: Some("user-narrow".to_string()),
+                email: Some("narrow@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: true,
+        };
+        let mut ui = account_ui_lock();
+        ui.accounts = vec![account];
+        ui.selected = 0;
+        ui.usage.insert(
+            "account-narrow".to_string(),
+            crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+                email: Some("narrow@example.com".to_string()),
+                membership: Some("ultra".to_string()),
+                auto_percent: Some(12.5),
+                api_percent: Some(87.5),
+                total_percent: Some(50.0),
+                plan_used_usd: None,
+                plan_limit_usd: None,
+                on_demand_used_usd: None,
+                on_demand_limit_usd: None,
+                grok_bot_percent: Some(6.25),
+                grok_bot_period_start: None,
+                grok_bot_reset: None,
+                total_cost_usd: None,
+                usage_event_count: None,
+                usage_events: Vec::new(),
+                fetched_at: SystemTime::now(),
+            }),
+        );
+        ui.message = None;
+        drop(ui);
+
+        let buffer = draw(88, 14, |frame| render_accounts_detail(frame, frame.area()));
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Name"), "{text}");
+        assert!(text.contains("API"), "{text}");
+        assert!(text.contains("Bot"), "{text}");
+        assert!(text.contains("87.5%"), "{text}");
+        assert!(text.contains("6.2%"), "{text}");
+        // The email column is intentionally omitted at this width, while the
+        // account name remains identifiable from the email local part.
+        assert!(!text.lines().any(|line| line.contains("Email")), "{text}");
+        assert!(text.contains("narrow"), "{text}");
+
+        let mut ui = account_ui_lock();
+        *ui = AccountUiState::default();
+    }
+
+    #[test]
+    fn account_name_prefers_custom_label_and_falls_back_to_email_local_part() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut account = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-name".to_string(),
+            label: Some("Work".to_string()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-name".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: None,
+                email: Some("person@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: false,
+        };
+        assert_eq!(account_name_for_display(&account, account.email()), "Work");
+        account.label = None;
+        assert_eq!(
+            account_name_for_display(&account, account.email()),
+            "person"
+        );
+        account.auth.email = None;
+        assert_eq!(
+            account_name_for_display(&account, Some("dashboard@example.net")),
+            "dashboard"
+        );
+    }
+
+    #[test]
     fn account_usage_cancellation_invalidates_pending_workers() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (_tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut ui = AccountUiState {
