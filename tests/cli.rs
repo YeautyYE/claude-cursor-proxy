@@ -103,3 +103,50 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
     cmd.assert().success().stdout(contains("User: u"));
     Ok(())
 }
+
+#[test]
+fn cursor_auth_list_reads_multi_account_registry() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("cursor");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("accounts.json"),
+        r#"{"activeId":"account-a","accounts":[{"id":"account-a","label":"primary","auth":{"accessToken":"token-a"}},{"id":"account-b","label":"backup","auth":{"accessToken":"token-b"}}]}"#,
+    )?;
+
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
+    cmd.args(["cursor", "auth", "list"]);
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.assert()
+        .success()
+        .stdout(contains("Cursor accounts (2):"))
+        .stdout(contains("* account-a"))
+        .stdout(contains("account-b"));
+    Ok(())
+}
+
+#[test]
+fn cursor_auth_use_switches_legacy_active_file() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("cursor");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("accounts.json"),
+        r#"{"activeId":"account-a","accounts":[{"id":"account-a","auth":{"accessToken":"token-a"}},{"id":"account-b","auth":{"accessToken":"token-b"}}]}"#,
+    )?;
+
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
+    cmd.args(["cursor", "auth", "use", "account-b"]);
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.assert()
+        .success()
+        .stdout(contains("Account id: account-b"));
+
+    let active: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(auth_dir.join("auth.json"))?)?;
+    assert_eq!(active["accessToken"], "token-b");
+    let accounts: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(auth_dir.join("accounts.json"))?)?;
+    assert_eq!(accounts["activeId"], "account-b");
+    Ok(())
+}

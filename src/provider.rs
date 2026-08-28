@@ -17,6 +17,37 @@ pub enum AuthCommand {
     Status,
     /// Delete stored authentication credentials
     Logout,
+    /// Add another login to the Cursor account registry.
+    ///
+    /// This variant is accepted by all provider parsers so the command tree
+    /// stays uniform; non-Cursor providers report it as unsupported.
+    Add {
+        /// Optional display label. Cursor falls back to the account email.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List persisted Cursor accounts.
+    List,
+    /// Make a persisted Cursor account active.
+    Use {
+        /// Account id printed by `cursor auth list` (email is also accepted by
+        /// the Cursor implementation when it is unambiguous).
+        account: String,
+    },
+    /// Remove a persisted Cursor account.
+    Remove {
+        /// Account id printed by `cursor auth list` (email is also accepted by
+        /// the Cursor implementation when it is unambiguous).
+        account: String,
+    },
+    /// Fetch Cursor dashboard usage for one account or every account.
+    Usage {
+        /// Optional account id; omit to fetch all persisted accounts.
+        account: Option<String>,
+        /// Emit machine-readable JSON instead of the compact text view.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[async_trait]

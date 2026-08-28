@@ -258,8 +258,221 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
                 handlers.logout()?;
                 Ok(())
             }
+            command @ (claude_cursor_proxy::provider::AuthCommand::Add { .. }
+            | claude_cursor_proxy::provider::AuthCommand::List
+            | claude_cursor_proxy::provider::AuthCommand::Use { .. }
+            | claude_cursor_proxy::provider::AuthCommand::Remove { .. }
+            | claude_cursor_proxy::provider::AuthCommand::Usage { .. }) => {
+                if name != "cursor" {
+                    anyhow::bail!(
+                        "{name} auth {} is only available for the cursor provider",
+                        auth_command_name(&command)
+                    );
+                }
+                run_cursor_account_cli(command)
+            }
         },
     }
+}
+
+fn auth_command_name(command: &claude_cursor_proxy::provider::AuthCommand) -> &'static str {
+    use claude_cursor_proxy::provider::AuthCommand;
+    match command {
+        AuthCommand::Add { .. } => "add",
+        AuthCommand::List => "list",
+        AuthCommand::Use { .. } => "use",
+        AuthCommand::Remove { .. } => "remove",
+        AuthCommand::Usage { .. } => "usage",
+        AuthCommand::Login => "login",
+        AuthCommand::Device => "device",
+        AuthCommand::Status => "status",
+        AuthCommand::Logout => "logout",
+    }
+}
+
+fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -> Result<()> {
+    use claude_cursor_proxy::provider::AuthCommand;
+    use claude_cursor_proxy::providers::cursor::auth as cursor_auth;
+
+    match command {
+        AuthCommand::Add { label } => {
+            let auth = cursor_auth::run_cursor_login_add()?
+                .ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
+            // `run_cursor_login_add` already persisted the account. Apply a
+            // supplied label as a small follow-up update without exposing the
+            // bearer token in command output.
+            let account = if label
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                let stored = cursor_auth::StoredCursorAuth {
+                    access_token: auth.access_token.clone(),
+                    refresh_token: auth.refresh_token.clone(),
+                    api_key: auth.api_key.clone(),
+                };
+                cursor_auth::add_cursor_auth(stored, label)?
+            } else {
+                auth
+            };
+            println!("Cursor account added: {}", account_display_name(&account));
+            if let Some(id) = cursor_auth::active_cursor_account_id()? {
+                println!("Active account: {id}");
+            }
+            Ok(())
+        }
+        AuthCommand::List => {
+            let accounts = cursor_auth::list_cursor_accounts()?;
+            if accounts.is_empty() {
+                println!("No Cursor accounts saved.");
+                println!(
+                    "Run `claude-cursor-proxy cursor auth login` to replace the current login, or `... cursor auth add` to keep it."
+                );
+                return Ok(());
+            }
+            println!("Cursor accounts ({}):", accounts.len());
+            for account in accounts {
+                let marker = if account.active { '*' } else { ' ' };
+                let label = account_display_name(&account.auth);
+                let email = account.auth.email.as_deref().unwrap_or("-");
+                println!("{marker} {id}  {label}  ({email})", id = account.id);
+            }
+            Ok(())
+        }
+        AuthCommand::Use { account } => {
+            let profile = resolve_cursor_account(&account)?;
+            let selected = cursor_auth::switch_cursor_account(&profile.id)?;
+            println!(
+                "Active Cursor account: {}",
+                account_display_name(&selected.auth)
+            );
+            println!("Account id: {}", selected.id);
+            Ok(())
+        }
+        AuthCommand::Remove { account } => {
+            let profile = resolve_cursor_account(&account)?;
+            let replacement = cursor_auth::remove_cursor_account(&profile.id)?;
+            println!("Removed Cursor account: {}", profile.id);
+            if let Some(replacement) = replacement {
+                println!(
+                    "Active Cursor account: {}",
+                    account_display_name(&replacement.auth)
+                );
+                println!("Account id: {}", replacement.id);
+            } else {
+                println!("No Cursor account is active.");
+            }
+            Ok(())
+        }
+        AuthCommand::Usage { account, json } => {
+            let accounts = cursor_auth::list_cursor_accounts()?;
+            if accounts.is_empty() {
+                anyhow::bail!("No Cursor accounts saved; run `cursor auth login` first");
+            }
+            let selected = match account {
+                Some(ref selector) => vec![resolve_cursor_account_from(&accounts, selector)?],
+                None => accounts.iter().collect(),
+            };
+            let mut rows = Vec::with_capacity(selected.len());
+            for profile in selected {
+                let usage = claude_cursor_proxy::providers::cursor::usage::fetch_account_usage(
+                    &profile.auth,
+                );
+                match usage {
+                    Ok(snapshot) if json => rows.push(serde_json::json!({
+                        "id": profile.id,
+                        "label": profile.label,
+                        "email": profile.auth.email,
+                        "active": profile.active,
+                        "usage": usage_snapshot_json(&snapshot),
+                    })),
+                    Ok(snapshot) => {
+                        let marker = if profile.active { '*' } else { ' ' };
+                        println!("{marker} {}  {}", profile.id, snapshot.header_line());
+                    }
+                    Err(error) if json => rows.push(serde_json::json!({
+                        "id": profile.id,
+                        "label": profile.label,
+                        "email": profile.auth.email,
+                        "active": profile.active,
+                        "error": error.to_string(),
+                    })),
+                    Err(error) => {
+                        let marker = if profile.active { '*' } else { ' ' };
+                        println!("{marker} {}  usage failed: {error}", profile.id);
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            }
+            Ok(())
+        }
+        _ => unreachable!("cursor account command dispatched separately"),
+    }
+}
+
+fn account_display_name(auth: &claude_cursor_proxy::providers::cursor::auth::CursorAuth) -> String {
+    auth.email
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Cursor account".to_string())
+}
+
+fn resolve_cursor_account(
+    selector: &str,
+) -> Result<claude_cursor_proxy::providers::cursor::auth::CursorAccountProfile> {
+    let accounts = claude_cursor_proxy::providers::cursor::auth::list_cursor_accounts()?;
+    resolve_cursor_account_from(&accounts, selector).cloned()
+}
+
+fn resolve_cursor_account_from<'a>(
+    accounts: &'a [claude_cursor_proxy::providers::cursor::auth::CursorAccountProfile],
+    selector: &str,
+) -> Result<&'a claude_cursor_proxy::providers::cursor::auth::CursorAccountProfile> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        anyhow::bail!("Cursor account id or email is required");
+    }
+    let matches: Vec<_> = accounts
+        .iter()
+        .filter(|account| {
+            account.id == selector
+                || account.auth.email.as_deref() == Some(selector)
+                || account.label.as_deref() == Some(selector)
+        })
+        .collect();
+    match matches.as_slice() {
+        [account] => Ok(account),
+        [] => anyhow::bail!("Cursor account not found: {selector}"),
+        _ => anyhow::bail!("Cursor account selector is ambiguous: {selector}"),
+    }
+}
+
+fn usage_snapshot_json(
+    snapshot: &claude_cursor_proxy::monitor::AccountUsageSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "email": snapshot.email,
+        "membership": snapshot.membership,
+        "autoPercent": snapshot.auto_percent,
+        "apiPercent": snapshot.api_percent,
+        "totalPercent": snapshot.total_percent,
+        "planUsedUsd": snapshot.plan_used_usd,
+        "planLimitUsd": snapshot.plan_limit_usd,
+        "onDemandUsedUsd": snapshot.on_demand_used_usd,
+        "onDemandLimitUsd": snapshot.on_demand_limit_usd,
+        "grokBotPercent": snapshot.grok_bot_percent,
+        "grokBotPeriodStart": snapshot.grok_bot_period_start,
+        "grokBotReset": snapshot.grok_bot_reset,
+        "totalCostUsd": snapshot.total_cost_usd,
+        "usageEventCount": snapshot.usage_event_count,
+        "usageEvents": snapshot.usage_events.iter().map(|event| serde_json::json!({
+            "timestamp": event.timestamp,
+            "model": event.model,
+            "chargedUsd": event.charged_usd,
+            "kind": event.kind,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn print_models(registry: &Registry, full: bool) {
