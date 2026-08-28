@@ -22,9 +22,11 @@ use prost::Message;
 use rand::Rng;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
+use crate::logging::create_logger;
+
 use super::client::{
     CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
-    encode_client_heartbeat_frame, retry_after_header,
+    continuation_binding_changed, encode_client_heartbeat_frame, retry_after_header,
 };
 use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
@@ -75,6 +77,17 @@ enum ClientOutbound {
 
 fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorError {
     if is_pre_connect_failure(&error) {
+        return error;
+    }
+    // A deterministic Cursor KV quota response means this particular append
+    // was rejected before it could be applied.  Preserve the structured
+    // diagnostic without adding the generic ambiguity marker so the caller
+    // can rotate the conversation and replay complete history.  If a batch
+    // already carried an explicit partial-acceptance marker, keep the normal
+    // fail-closed wrapper below.
+    if cursor_error_is_kv_blob_overflow(&error)
+        && live_error_is_kv_blob_overflow_replayable(&error.client_message())
+    {
         return error;
     }
     let CursorError {
@@ -175,6 +188,18 @@ pub struct LiveRunIdentity<'a> {
     pub parent_agent_id: Option<&'a str>,
 }
 
+/// Prompt/image recovery hints captured by the request handler before it
+/// renders a checkpoint delta.  KV-store normalization can rotate the
+/// conversation between that snapshot and the actual BiDi open; in that case
+/// the delta belongs to the old binding and the complete Anthropic history
+/// must be sent to the fresh conversation.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LiveStartRecovery<'a> {
+    pub expected_conversation_id: Option<&'a str>,
+    pub reset_user_text: Option<&'a str>,
+    pub reset_images: Option<&'a [CursorSelectedImage]>,
+}
+
 impl<'a> LiveRunIdentity<'a> {
     pub fn parent(session_id: &'a str) -> Self {
         Self {
@@ -268,6 +293,14 @@ fn terminal_outcome_is_fresh(outcome: &TerminalOutcome) -> bool {
 pub struct LiveRunStart {
     pub handle: Arc<CursorLiveRunHandle>,
     pub events: mpsc::Receiver<LiveEventResult>,
+    /// Cursor conversation binding used by this opened generation.
+    ///
+    /// The request handler may have captured a continuation before the live
+    /// opener ran.  KV normalization or a concurrent recovery can rotate that
+    /// binding in the meantime; callers must update their retry snapshot from
+    /// this value rather than performing a racy session lookup after `start`
+    /// returns.
+    pub conversation_id: String,
 }
 
 struct LiveResumePermit {
@@ -3610,11 +3643,52 @@ impl CursorHttpClient {
         mcp_tools: Option<super::proto::McpTools>,
         request_context: super::proto::RequestContext,
         original_request_id: Option<&str>,
+        cancel: Option<watch::Receiver<bool>>,
+        upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
+        pre_admission: Option<LiveGenerationPermit>,
+        client_type_override: Option<&str>,
+        compaction_mode: bool,
+    ) -> Result<LiveRunStart, CursorError> {
+        self.start_live_agent_with_identity_guarded_profile_mode_with_recovery(
+            token,
+            prompt,
+            model,
+            images,
+            custom_system_prompt,
+            identity,
+            allowed_tool_names,
+            mcp_tools,
+            request_context,
+            original_request_id,
+            cancel,
+            upstream_open_guard,
+            pre_admission,
+            client_type_override,
+            compaction_mode,
+            LiveStartRecovery::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_live_agent_with_identity_guarded_profile_mode_with_recovery(
+        &self,
+        token: &str,
+        prompt: &str,
+        model: &str,
+        images: &[CursorSelectedImage],
+        custom_system_prompt: Option<&str>,
+        identity: LiveRunIdentity<'_>,
+        allowed_tool_names: Option<BTreeSet<String>>,
+        mcp_tools: Option<super::proto::McpTools>,
+        request_context: super::proto::RequestContext,
+        original_request_id: Option<&str>,
         mut cancel: Option<watch::Receiver<bool>>,
         upstream_open_guard: Option<Arc<LiveUpstreamOpenGuard>>,
         pre_admission: Option<LiveGenerationPermit>,
         client_type_override: Option<&str>,
         compaction_mode: bool,
+        recovery: LiveStartRecovery<'_>,
     ) -> Result<LiveRunStart, CursorError> {
         if !self.live_bidi_enabled() {
             return Err(CursorError::internal(
@@ -3704,10 +3778,41 @@ impl CursorHttpClient {
                 names.len()
             );
         }
+        let binding_rotated = continuation_binding_changed(
+            recovery.expected_conversation_id,
+            continuation.conversation_id.as_deref(),
+        );
+        let opening_prompt = if binding_rotated {
+            recovery.reset_user_text.unwrap_or(prompt)
+        } else {
+            prompt
+        };
+        let opening_images = if binding_rotated {
+            recovery.reset_images.unwrap_or(images)
+        } else {
+            images
+        };
+        if binding_rotated {
+            create_logger("cursor").warn(
+                "continuation_binding_changed_before_live_open",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(identity.session_id)),
+                    (
+                        "expectedConversationId".into(),
+                        serde_json::json!(recovery.expected_conversation_id),
+                    ),
+                    (
+                        "actualConversationId".into(),
+                        serde_json::json!(continuation.conversation_id),
+                    ),
+                    ("replay".into(), serde_json::json!("full_history")),
+                ])),
+            );
+        }
         let run_request = build_run_request_with_continuation(
-            prompt,
+            opening_prompt,
             &resolved,
-            images,
+            opening_images,
             &request_id,
             custom_system_prompt,
             &continuation,
@@ -3806,13 +3911,17 @@ impl CursorHttpClient {
             worker_session,
             run_id,
             seeded_blobs,
-            prompt.to_string(),
+            opening_prompt.to_string(),
             request_context,
             reconnect,
             generation_permit,
         ));
 
-        Ok(LiveRunStart { handle, events })
+        Ok(LiveRunStart {
+            handle,
+            events,
+            conversation_id: conversation_id.to_string(),
+        })
     }
 
     /// Open BiDi `Run` or HTTP/1 `RunSSE`+`BidiAppend`. When BiDi fails with a
@@ -5746,6 +5855,27 @@ fn hollow_resume_terminal_message(
     kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     fallback: impl Into<String>,
 ) -> String {
+    let fallback = fallback.into();
+    // Keep the structured 413 diagnostic intact for the outer late-retry
+    // pump.  A reconnect failure is often wrapped in the hollow-resume
+    // message while no client-visible output has been committed; the normal
+    // hollow path would replace that text with a generic reset note, causing
+    // the retry classifier to miss KV overflow and resend a checkpoint delta.
+    // The late retry owns the one-shot conversation rotation and full-history
+    // replay, so do not pre-rotate or redact this marker here.
+    if live_error_is_kv_blob_overflow(&fallback) {
+        // A partial tool-result batch may have reached Cursor before the
+        // quota rejection. Keep its explicit acceptance marker intact so the
+        // classifier below can fail closed; only a hollow, uncommitted 413 is
+        // eligible for the fresh-conversation replay.
+        return annotate_kv_overflow_acceptance_with_progress(
+            fallback,
+            retain_completed_tool_checkpoint.then_some(EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT),
+            post_tool_checkpoint_confirmed,
+            saw_text,
+            !pending_empty,
+        );
+    }
     // Merely sending tool results does not prove Cursor committed them: the
     // checkpoint already present when they were submitted may describe the
     // pre-tool state. Only a newer checkpoint observed after submission is a
@@ -5783,7 +5913,7 @@ fn hollow_resume_terminal_message(
             );
             return format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})");
         }
-        return fallback.into();
+        return fallback;
     }
     // A hollow ResumeAction that never exposed assistant text or tools can be
     // retried on a fresh Cursor conversation. Thinking-only frames must not
@@ -5805,7 +5935,7 @@ fn hollow_resume_terminal_message(
              ({CONVERSATION_RESET_RETRY_NOTE})"
         );
     }
-    fallback.into()
+    fallback
 }
 
 /// A stall while the upstream transport is still delivering heartbeats cannot
@@ -5863,6 +5993,14 @@ fn annotate_connect_end_error(
     fields.insert("code".into(), serde_json::json!(error.code));
     fields.insert("message".into(), serde_json::json!(error.message));
     let mut text = error.to_string();
+    // Connect END's short `message` can be generic while the useful 413 KV
+    // diagnostic lives only in the serialized error detail. Preserve a
+    // bounded copy so the outer late-retry pump can classify and recover it.
+    if live_error_is_kv_blob_overflow(&error.detail) && !live_error_is_kv_blob_overflow(&text) {
+        let detail = error.detail.chars().take(4096).collect::<String>();
+        text.push_str(" — ");
+        text.push_str(&detail);
+    }
     if cursor_connect_error_is_missing_conversation_data(&error.message)
         || cursor_connect_error_is_missing_conversation_data(&error.detail)
     {
@@ -6110,12 +6248,31 @@ fn is_http1_fallback_error(err: &CursorError) -> bool {
 }
 
 fn live_send_failure_is_terminal(err: &CursorError) -> bool {
+    // A Cursor KV quota rejection is deterministic but recoverable: the
+    // caller can rotate the conversation id and replay the request.  Keep it
+    // out of the fail-closed transport bucket even when the rejection arrived
+    // while opening a reconnect stream (where the useful diagnostic normally
+    // lives in `detail`).
+    if cursor_error_is_kv_blob_overflow(err)
+        && !kv_overflow_acceptance_is_ambiguous(&err.client_message())
+    {
+        return false;
+    }
     cursor_error_is_missing_conversation_data(err)
         || err.message.contains("acceptance is ambiguous")
         || !is_retryable_live_transport_error(err)
 }
 
 fn live_reconnect_open_error_is_fatal(err: &CursorError) -> bool {
+    // HTTP/1 RunSSE/H2 open errors put the Connect body in `detail`, while the
+    // short `message` is only "Cursor upstream HTTP 413".  A KV overflow is
+    // safe to recover by rotating the conversation; do not turn it into an
+    // ambiguous tombstone merely because the status is a 4xx transport error.
+    if cursor_error_is_kv_blob_overflow(err)
+        && !kv_overflow_acceptance_is_ambiguous(&err.client_message())
+    {
+        return false;
+    }
     cursor_error_is_missing_conversation_data(err)
         || terminal_error_allows_fresh_retry(&err.message)
         || live_send_failure_is_terminal(err)
@@ -6206,6 +6363,14 @@ pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
     if is_local_live_overload(err) {
         return false;
     }
+    // A KV overflow is recoverable by rotating the conversation.  The
+    // structured error may put the diagnostic only in `detail`, so inspect
+    // the assembled client message rather than just `message` below.
+    if cursor_error_is_kv_blob_overflow(err)
+        && !kv_overflow_acceptance_is_ambiguous(&err.client_message())
+    {
+        return false;
+    }
     if terminal_error_allows_fresh_retry(&err.message) {
         return false;
     }
@@ -6241,8 +6406,48 @@ pub(crate) fn live_probe_error_blocks_new_run(error: &str) -> bool {
     terminal_error_is_ambiguous_accept(error) || !live_error_is_same_request_retryable(error)
 }
 
+/// Cursor rejects a SetBlob once the remote conversation's aggregate KV
+/// budget is exhausted. This is a deterministic conversation-state failure,
+/// not a generic HTTP 413 prompt-size failure: retrying the same conversation
+/// only repeats the rejection. A fresh conversation with the full history is
+/// the bounded recovery strategy.
+pub(crate) fn live_error_is_kv_blob_overflow(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("kv blob store limit exceeded")
+        || (lower.contains("cursor kv blob") && lower.contains("limit exceeded"))
+        || (lower.contains("request too large (413)")
+            && lower.contains("blob store")
+            && lower.contains("cursor"))
+}
+
+/// A KV 413 is replay-safe only when no earlier operation in the same request
+/// was accepted. Partial BidiAppend/tool-result errors carry an explicit
+/// acceptance marker; rotating there could execute a tool twice.
+fn kv_overflow_acceptance_is_ambiguous(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("acceptance is ambiguous") || lower.contains("partially sent")
+}
+
+pub(crate) fn live_error_is_kv_blob_overflow_replayable(message: &str) -> bool {
+    live_error_is_kv_blob_overflow(message) && !kv_overflow_acceptance_is_ambiguous(message)
+}
+
+/// Match a KV blob-store overflow across every structured Cursor error field.
+/// HTTP status errors commonly keep the Connect/JSON body in `detail`, while
+/// live Connect END errors expose the same text through `message` alone.
+pub(crate) fn cursor_error_is_kv_blob_overflow(err: &CursorError) -> bool {
+    let client_message = err.client_message();
+    live_error_is_kv_blob_overflow(&client_message)
+        || live_error_is_kv_blob_overflow(&err.message)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(live_error_is_kv_blob_overflow)
+}
+
 fn terminal_error_allows_fresh_retry(message: &str) -> bool {
     message.contains(CONVERSATION_RESET_RETRY_NOTE)
+        || live_error_is_kv_blob_overflow_replayable(message)
 }
 
 fn live_error_is_resource_exhausted(message: &str) -> bool {
@@ -6287,6 +6492,16 @@ pub(crate) fn live_error_needs_checkpoint_continue(message: &str) -> bool {
 }
 
 pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
+    // A KV quota rejection is a deterministic conversation-state failure. It
+    // can be wrapped by the hollow/reconnect formatter with an "ambiguous"
+    // suffix even though no client-visible output was committed; the bounded
+    // KV recovery must still get a chance to rotate the conversation. Callers
+    // that specifically guard duplicate execution (for example
+    // `live_probe_error_blocks_new_run`) keep their ambiguity check ahead of
+    // this helper.
+    if live_error_is_kv_blob_overflow(message) {
+        return live_error_is_kv_blob_overflow_replayable(message);
+    }
     if terminal_error_is_ambiguous_accept(message) {
         return false;
     }
@@ -6353,6 +6568,9 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
         || crate::retry::is_policy_rate_limit(&err.message)
     {
         return false;
+    }
+    if cursor_error_is_kv_blob_overflow(err) {
+        return live_error_is_kv_blob_overflow_replayable(&text);
     }
     if is_local_live_overload(err) {
         return false;
@@ -6996,6 +7214,26 @@ async fn try_live_reconnect(
         match opened {
             Err(err) => {
                 let err = annotate_live_cursor_error(&reconnect.session_id, err);
+                // Cursor's aggregate KV quota is tied to the conversation id.
+                // A ResumeAction against that id can never make progress, so
+                // do not spend the reconnect budget (or seal an ambiguous
+                // tombstone) retrying it.  Preserve `detail` in the returned
+                // text: the late live retry classifier uses the diagnostic to
+                // rotate the conversation and replay full history once.
+                if cursor_error_is_kv_blob_overflow(&err)
+                    && live_error_is_kv_blob_overflow_replayable(&err.client_message())
+                {
+                    let message = err.client_message();
+                    let outcome = LiveReconnectOutcome::Failed(message);
+                    log_live_reconnect(
+                        &outcome,
+                        *reconnect_attempts,
+                        max_reconnects,
+                        &reconnect.http,
+                        &reconnect.last_trigger,
+                    );
+                    return outcome;
+                }
                 if live_reconnect_open_error_is_fatal(&err) {
                     let message = if is_response_less_send_error(&err)
                         && !cursor_error_is_missing_conversation_data(&err)
@@ -7557,6 +7795,12 @@ async fn drive_live_run(
     let mut segment_replay = SegmentReplayLog::default();
     let mut decoder = ConnectFrameDecoder::new();
     let mut kv_blobs = seeded_blobs;
+    // Keep the aggregate blob payload size alongside the map.  SetBlob frames
+    // can arrive by the thousands; recomputing a full fold for every frame
+    // turns a near-limit run into an avoidable O(n²) hot path.
+    let mut kv_total_bytes = kv_blobs
+        .values()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
     let mut latest_checkpoint = reconnect.opening_checkpoint.clone();
     let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
     let mut prefetched_upstream = VecDeque::<Result<Option<Bytes>, String>>::new();
@@ -7673,7 +7917,7 @@ async fn drive_live_run(
                 };
                 let saw_text_before = saw_text;
                 let pending_was_empty = pending.is_empty();
-                let frame_kept_running = process_live_frame(
+                let frame_kept_running = process_live_frame_with_total(
                     frame,
                     &outbound,
                     &mut sink,
@@ -7682,6 +7926,7 @@ async fn drive_live_run(
                     &mut pending,
                     &pending_shared,
                     &mut kv_blobs,
+                    &mut kv_total_bytes,
                     &mut latest_checkpoint,
                     &terminal_error,
                     allowed_tool_names.as_ref(),
@@ -7694,6 +7939,13 @@ async fn drive_live_run(
                     Some(&mut turn),
                 )
                 .await;
+                // A terminal recovery path may clear the in-memory blob map
+                // (for example stale conversation / hollow-turn rotation).
+                // Keep the O(1) aggregate in sync before the next frame if a
+                // future protocol revision returns from that path alive.
+                if kv_blobs.is_empty() {
+                    kv_total_bytes = 0;
+                }
                 // Thinking/metadata is speculative and can precede Sand's
                 // payload-less quota END, so it must not clear the consecutive
                 // empty-END evidence. Real text or a queued tool proves that
@@ -7770,10 +8022,16 @@ async fn drive_live_run(
                                 .then(|| parse_connect_error(&frame.payload))
                                 .flatten()
                         }) {
-                            let message = annotate_connect_end_error(
-                                &session_id,
-                                error,
-                                Some((&mut latest_checkpoint, &mut kv_blobs)),
+                            let message = annotate_kv_overflow_acceptance_with_progress(
+                                annotate_connect_end_error(
+                                    &session_id,
+                                    error,
+                                    Some((&mut latest_checkpoint, &mut kv_blobs)),
+                                ),
+                                Some(user_prompt.as_str()),
+                                post_tool_checkpoint.submitted,
+                                saw_text,
+                                !pending.is_empty(),
                             );
                             report_terminal_error(&mut sink, &terminal_error, message).await;
                             break $driver;
@@ -8631,10 +8889,16 @@ async fn drive_live_run(
                                 .then(|| parse_connect_error(&frame.payload))
                                 .flatten()
                         }) {
-                            let message = annotate_connect_end_error(
+                            let message = annotate_kv_overflow_acceptance_with_progress(
+                                annotate_connect_end_error(
                                 &session_id,
                                 error,
                                 Some((&mut latest_checkpoint, &mut kv_blobs)),
+                                ),
+                                Some(user_prompt.as_str()),
+                                post_tool_checkpoint.submitted,
+                                saw_text,
+                                !pending.is_empty(),
                             );
                             report_terminal_error(&mut sink, &terminal_error, message).await;
                             break 'driver;
@@ -9151,7 +9415,12 @@ async fn drive_live_run(
     }
 }
 
+/// Compatibility wrapper used by focused unit tests and older internal
+/// callers. Production live runs use [`process_live_frame_with_total`] so the
+/// aggregate blob byte count is carried across frames instead of recomputed on
+/// every SetBlob message.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn process_live_frame(
     frame: ConnectFrame,
     outbound: &ClientOutbound,
@@ -9170,6 +9439,104 @@ async fn process_live_frame(
     last_progress: &mut Instant,
     tool_batch_quiet: Duration,
     xml_parser: &mut CursorToolUseXmlParser,
+    turn_ctx: Option<&mut LiveTurnCtx<'_>>,
+) -> bool {
+    let mut kv_total_bytes = kv_blobs
+        .values()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
+    process_live_frame_impl(
+        frame,
+        outbound,
+        sink,
+        deferred,
+        replay,
+        pending,
+        pending_shared,
+        kv_blobs,
+        &mut kv_total_bytes,
+        latest_checkpoint,
+        terminal_error,
+        allowed_tool_names,
+        saw_text,
+        useful,
+        logical_tools_waiting,
+        last_progress,
+        tool_batch_quiet,
+        xml_parser,
+        turn_ctx,
+    )
+    .await
+}
+
+/// Process one upstream frame with a caller-owned aggregate blob byte count.
+/// The count is updated on every SetBlob insert/overwrite, making the hot path
+/// O(1) per frame even when a conversation carries thousands of blobs.
+#[allow(clippy::too_many_arguments)]
+async fn process_live_frame_with_total(
+    frame: ConnectFrame,
+    outbound: &ClientOutbound,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    kv_total_bytes: &mut usize,
+    latest_checkpoint: &mut Option<Vec<u8>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    saw_text: &mut bool,
+    useful: &mut bool,
+    logical_tools_waiting: &mut LogicalToolTracker,
+    last_progress: &mut Instant,
+    tool_batch_quiet: Duration,
+    xml_parser: &mut CursorToolUseXmlParser,
+    turn_ctx: Option<&mut LiveTurnCtx<'_>>,
+) -> bool {
+    process_live_frame_impl(
+        frame,
+        outbound,
+        sink,
+        deferred,
+        replay,
+        pending,
+        pending_shared,
+        kv_blobs,
+        kv_total_bytes,
+        latest_checkpoint,
+        terminal_error,
+        allowed_tool_names,
+        saw_text,
+        useful,
+        logical_tools_waiting,
+        last_progress,
+        tool_batch_quiet,
+        xml_parser,
+        turn_ctx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_live_frame_impl(
+    frame: ConnectFrame,
+    outbound: &ClientOutbound,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    kv_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    kv_total_bytes: &mut usize,
+    latest_checkpoint: &mut Option<Vec<u8>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    saw_text: &mut bool,
+    useful: &mut bool,
+    logical_tools_waiting: &mut LogicalToolTracker,
+    last_progress: &mut Instant,
+    tool_batch_quiet: Duration,
+    xml_parser: &mut CursorToolUseXmlParser,
     mut turn_ctx: Option<&mut LiveTurnCtx<'_>>,
 ) -> bool {
     let frame_session_id = turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or("");
@@ -9178,10 +9545,18 @@ async fn process_live_frame(
         // XML or exposing any client-only tools, or a poisoned conversation
         // can bypass the reset and leave later requests bound to missing blobs.
         if let Some(error) = parse_connect_error(&frame.payload) {
-            let message = annotate_connect_end_error(
-                turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
-                error,
-                Some((latest_checkpoint, kv_blobs)),
+            let message = annotate_kv_overflow_acceptance_with_progress(
+                annotate_connect_end_error(
+                    turn_ctx.as_ref().map(|ctx| ctx.session_id).unwrap_or(""),
+                    error,
+                    Some((latest_checkpoint, kv_blobs)),
+                ),
+                turn_ctx.as_ref().map(|ctx| ctx.user_prompt),
+                turn_ctx
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.post_tool_checkpoint.submitted),
+                *saw_text,
+                !pending.is_empty(),
             );
             report_terminal_error(sink, terminal_error, message).await;
             return false;
@@ -9336,15 +9711,30 @@ async fn process_live_frame(
     }
 
     if let Some(kv) = message.kv_server_message {
-        match encode_kv_reply(&kv, kv_blobs) {
+        match encode_kv_reply_with_total(&kv, kv_blobs, kv_total_bytes) {
             Ok(Some(reply)) => {
-                if !send_frame_or_fail(
+                // A BidiAppend response can reject this KV reply with the
+                // remote 413 quota diagnostic.  Unlike an initial-open
+                // rejection, that append may arrive after text/tool output
+                // from the same segment (or after a tool-result ResumeBatch)
+                // was already accepted.  Mark the error as acceptance
+                // ambiguous in those cases so the late-retry pump does not
+                // rotate the conversation and replay an already-observed
+                // operation.
+                let user_prompt = turn_ctx.as_ref().map(|ctx| ctx.user_prompt);
+                let post_tool_checkpoint_submitted = turn_ctx
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.post_tool_checkpoint.submitted);
+                if !send_kv_frame_or_fail(
                     outbound,
                     sink,
                     terminal_error,
                     reply,
-                    "KV reply",
                     frame_session_id,
+                    user_prompt,
+                    post_tool_checkpoint_submitted,
+                    *saw_text,
+                    !pending.is_empty(),
                 )
                 .await
                 {
@@ -9353,7 +9743,14 @@ async fn process_live_frame(
             }
             Ok(None) => {}
             Err(error) => {
-                report_terminal_error(sink, terminal_error, error.to_string()).await;
+                let message = annotate_kv_overflow_acceptance(
+                    error.to_string(),
+                    turn_ctx.as_ref().map(|ctx| ctx.user_prompt),
+                    turn_ctx
+                        .as_ref()
+                        .is_some_and(|ctx| ctx.post_tool_checkpoint.submitted),
+                );
+                report_terminal_error(sink, terminal_error, message).await;
                 return false;
             }
         }
@@ -10334,6 +10731,41 @@ async fn send_frame_or_fail(
                 format!("Cursor {what} send failed: {error}"),
             )
             .await;
+            false
+        }
+    }
+}
+
+/// Send a KV acknowledgement while retaining the acceptance boundary in the
+/// diagnostic.  HTTP/1 `BidiAppend` reports upstream 4xx responses from this
+/// call directly; a KV-store 413 is replay-safe only when no client-visible
+/// output or tool-result resume preceded it.  Without the marker, the outer
+/// late-retry pump treats every KV 413 as a fresh-conversation opportunity and
+/// can execute an already accepted tool a second time.
+#[allow(clippy::too_many_arguments)]
+async fn send_kv_frame_or_fail(
+    outbound: &ClientOutbound,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    terminal_error: &Arc<Mutex<Option<TerminalOutcome>>>,
+    frame: Bytes,
+    session_id: &str,
+    user_prompt: Option<&str>,
+    post_tool_checkpoint_submitted: bool,
+    saw_text: bool,
+    pending_nonempty: bool,
+) -> bool {
+    match outbound.send_connect_frame(frame).await {
+        Ok(()) => true,
+        Err(error) => {
+            let error = annotate_live_cursor_error(session_id, error);
+            let message = annotate_kv_overflow_acceptance_with_progress(
+                format!("Cursor KV reply send failed: {}", error.client_message()),
+                user_prompt,
+                post_tool_checkpoint_submitted,
+                saw_text,
+                pending_nonempty,
+            );
+            report_terminal_error(sink, terminal_error, message).await;
             false
         }
     }
@@ -11841,20 +12273,85 @@ fn encode_request_context_reply(
 }
 
 const MAX_LIVE_KV_BLOB_BYTES: usize = 32 * 1024 * 1024;
-const MAX_LIVE_KV_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-const MAX_LIVE_KV_BLOBS: usize = 4_096;
+// Stop an active Run at the same soft ceiling used by the between-turn
+// conversation normalizer. A Run can receive hundreds of SetBlob messages
+// after it opens; waiting for the 4,096-blob / 64 MiB hard ceiling leaves no
+// recovery headroom and was the source of the observed `blobs=4097` failure.
+// Before client-visible output, the existing one-shot KV recovery rotates the
+// conversation and replays complete Anthropic history. After output commits,
+// it remains fail-closed so a retry cannot duplicate tools or text.
+const MAX_LIVE_KV_TOTAL_BYTES: usize = super::conversation::CURSOR_KV_SOFT_MAX_BYTES;
+const MAX_LIVE_KV_BLOBS: usize = super::conversation::CURSOR_KV_SOFT_MAX_BLOBS;
 
+/// A KV quota error on the post-tool continuation is not replay-safe. The
+/// ResumeBatch frames have already been accepted by Cursor before the next
+/// segment asks us for blobs; rotating and replaying the Anthropic history
+/// would execute those native tools a second time. The continuation prompt is
+/// an internal sentinel set immediately after a tool-result dispatch, so it
+/// gives this low-level frame handler the acceptance context without widening
+/// every test/helper call to `process_live_frame`.
+fn annotate_kv_overflow_acceptance(
+    message: String,
+    user_prompt: Option<&str>,
+    post_tool_checkpoint_submitted: bool,
+) -> String {
+    if live_error_is_kv_blob_overflow(&message)
+        && (post_tool_checkpoint_submitted
+            || user_prompt == Some(EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT))
+        && !kv_overflow_acceptance_is_ambiguous(&message)
+    {
+        return format!("{message}; acceptance is ambiguous after an accepted tool-result resume");
+    }
+    message
+}
+
+/// Extend [`annotate_kv_overflow_acceptance`] with the segment-level commit
+/// evidence that is available to the live frame driver.  A KV 413 after text
+/// was emitted or a tool was queued is not safe to replay even when the
+/// current prompt is not the checkpoint-continuation sentinel.  Keep the
+/// marker explicit so the late-retry classifier and persistence gate both
+/// fail closed.
+fn annotate_kv_overflow_acceptance_with_progress(
+    message: String,
+    user_prompt: Option<&str>,
+    post_tool_checkpoint_submitted: bool,
+    saw_text: bool,
+    pending_nonempty: bool,
+) -> String {
+    let mut message =
+        annotate_kv_overflow_acceptance(message, user_prompt, post_tool_checkpoint_submitted);
+    if live_error_is_kv_blob_overflow(&message)
+        && (saw_text || pending_nonempty)
+        && !kv_overflow_acceptance_is_ambiguous(&message)
+    {
+        message.push_str("; acceptance is ambiguous after client-visible output or a pending tool");
+    }
+    message
+}
+
+/// Encode a KV reply for callers that do not retain a running aggregate.
+/// This compatibility path computes the initial total once; the live driver
+/// uses [`encode_kv_reply_with_total`] directly across frames.
+#[allow(dead_code)]
 fn encode_kv_reply(
     message: &KvServerMessage,
     blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
 ) -> Result<Option<Bytes>, CursorError> {
+    let mut total_bytes = blobs
+        .values()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
+    encode_kv_reply_with_total(message, blobs, &mut total_bytes)
+}
+
+fn encode_kv_reply_with_total(
+    message: &KvServerMessage,
+    blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    total_bytes: &mut usize,
+) -> Result<Option<Bytes>, CursorError> {
     let reply = if let Some(args) = message.set_blob_args.as_ref() {
         let existing_len = blobs.get(&args.blob_id).map(Vec::len).unwrap_or_default();
         let next_count = blobs.len() + usize::from(!blobs.contains_key(&args.blob_id));
-        let current_total = blobs
-            .values()
-            .fold(0usize, |total, blob| total.saturating_add(blob.len()));
-        let next_total = current_total
+        let next_total = total_bytes
             .saturating_sub(existing_len)
             .saturating_add(args.blob_data.len());
         if args.blob_data.len() > MAX_LIVE_KV_BLOB_BYTES
@@ -11873,6 +12370,7 @@ fn encode_kv_reply(
             ));
         }
         blobs.insert(args.blob_id.clone(), args.blob_data.clone());
+        *total_bytes = next_total;
         KvClientMessage {
             id: message.id,
             get_blob_result: None,
@@ -13248,6 +13746,43 @@ mod tests {
     }
 
     #[test]
+    fn hollow_resume_keeps_kv_overflow_marker_for_late_rotation() {
+        let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
+        super::super::conversation::reset_for_test();
+        let session_id = "sess-kv-hollow-detail";
+        let original =
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id;
+        super::super::conversation::save_checkpoint(session_id, vec![0x08, 0x01]);
+        let mut latest_checkpoint = Some(vec![0x08, 0x01]);
+        let mut kv_blobs = HashMap::from([(vec![0xaa], vec![0xbb])]);
+        let diagnostic = "Cursor error 413: Cursor KV blob store limit exceeded (blobs=4097)";
+
+        let message = hollow_resume_terminal_message(
+            session_id,
+            false,
+            true,
+            false,
+            false,
+            &mut latest_checkpoint,
+            &mut kv_blobs,
+            format!("Cursor upstream ended without turn_ended (reconnect failed: {diagnostic})"),
+        );
+
+        assert!(
+            message.contains("KV blob store limit exceeded"),
+            "{message}"
+        );
+        assert!(live_error_is_kv_blob_overflow(&message));
+        assert_eq!(
+            super::super::conversation::continuation_for(Some(session_id)).conversation_id,
+            original,
+            "late retry must own the one-shot reset; hollow formatting must not rotate first"
+        );
+        assert_eq!(latest_checkpoint, Some(vec![0x08, 0x01]));
+        assert_eq!(kv_blobs, HashMap::from([(vec![0xaa], vec![0xbb])]));
+    }
+
+    #[test]
     fn heartbeat_alive_stall_with_delivered_text_stays_ambiguous() {
         let _guard = super::super::conversation::STORE_TEST_LOCK.lock().unwrap();
         super::super::conversation::reset_for_test();
@@ -13487,6 +14022,28 @@ mod tests {
             live_start_error_seals_tombstone(&ambiguous_initial_append),
             "an HTTP/1 open whose initial append may have landed must seal Starting"
         );
+        let kv_append = CursorError::new(
+            413,
+            "BidiAppend failed with HTTP 413",
+            Some("Cursor KV blob store limit exceeded (blobs=4097)".into()),
+        );
+        let kv_initial_append = ambiguous_http1_append_error(kv_append.clone(), "initial Run");
+        assert_eq!(
+            kv_initial_append.message, kv_append.message,
+            "a deterministic KV rejection must remain recoverable on HTTP/1"
+        );
+        assert!(live_error_is_kv_blob_overflow(
+            &kv_initial_append.client_message()
+        ));
+        assert!(!live_start_error_seals_tombstone(&kv_initial_append));
+        let partial_kv = partial_tool_result_send_error(kv_append, 1, 2);
+        let wrapped_partial_kv = ambiguous_http1_append_error(partial_kv, "send");
+        assert!(
+            wrapped_partial_kv
+                .client_message()
+                .contains("acceptance is ambiguous"),
+            "partial KV batches must remain fail-closed"
+        );
         let reset_open = CursorError::new(
             502,
             format!("Cursor RunSSE HTTP 502 ({CONVERSATION_RESET_RETRY_NOTE})"),
@@ -13622,6 +14179,85 @@ mod tests {
             !live_start_error_seals_tombstone(&url_send),
             "16:37 BidiAppend URL errors must not brick the session with 409"
         );
+    }
+
+    #[test]
+    fn structured_kv_overflow_detail_is_recoverable_everywhere() {
+        let diagnostic = "Cursor error 413: Cursor KV blob store limit exceeded (blob=3559 bytes, blobs=4097, total=62731560 bytes)";
+        let error = CursorError::new(
+            413,
+            "Cursor upstream HTTP 413",
+            Some(diagnostic.to_string()),
+        );
+        assert!(cursor_error_is_kv_blob_overflow(&error));
+        assert!(cursor_start_error_is_same_request_retryable(&error));
+        assert!(!live_start_error_seals_tombstone(&error));
+        assert!(!live_reconnect_open_error_is_fatal(&error));
+        assert!(!live_send_failure_is_terminal(&error));
+        // `client_message` must retain the body because the late retry path
+        // receives a string rather than the structured CursorError.
+        assert!(live_error_is_kv_blob_overflow(&error.client_message()));
+    }
+
+    #[test]
+    fn connect_end_kv_overflow_detail_survives_annotation() {
+        let detail = r#"{"error":{"code":"invalid_argument","message":"Request too large (413): Cursor KV blob store limit exceeded (blob=3559 bytes, blobs=4097, total=62731560 bytes)"}}"#;
+        let message = annotate_connect_end_error(
+            "sess-kv-connect-detail",
+            ConnectEndError {
+                status: 413,
+                code: "invalid_argument".into(),
+                message: "Request too large (413)".into(),
+                detail: detail.into(),
+            },
+            None,
+        );
+        assert!(live_error_is_kv_blob_overflow(&message), "{message}");
+        assert!(message.contains("blobs=4097"), "{message}");
+    }
+
+    #[test]
+    fn partial_kv_overflow_stays_fail_closed() {
+        let partial = partial_tool_result_send_error(
+            CursorError::new(
+                413,
+                "Cursor upstream HTTP 413",
+                Some("Cursor KV blob store limit exceeded (blobs=4097)".into()),
+            ),
+            1,
+            2,
+        );
+        let message = partial.client_message();
+        assert!(live_error_is_kv_blob_overflow(&message), "{message}");
+        assert!(!live_error_is_kv_blob_overflow_replayable(&message));
+        assert!(!live_error_is_same_request_retryable(&message));
+        assert!(live_send_failure_is_terminal(&partial));
+        assert!(live_start_error_seals_tombstone(&partial));
+    }
+
+    #[test]
+    fn kv_overflow_marker_survives_hollow_ambiguous_wrapper_without_probe_replay() {
+        let message = "Cursor upstream ended without turn_ended (reconnect failed: Cursor error 413: Cursor KV blob store limit exceeded (blobs=4097)); completion is ambiguous";
+        assert!(live_error_is_kv_blob_overflow(message));
+        // The late pump has established that no client-visible event was
+        // committed, so it may spend the one-shot fresh-conversation budget.
+        assert!(live_error_is_same_request_retryable(message));
+        // A generic new POST probing a still-running generation remains
+        // fail-closed; only the owning late-retry path may rotate it.
+        assert!(live_probe_error_blocks_new_run(message));
+
+        let post_tool = hollow_resume_terminal_message(
+            "sess-kv-post-tool",
+            false,
+            true,
+            true,
+            false,
+            &mut Some(vec![0x08, 0x01]),
+            &mut HashMap::new(),
+            message,
+        );
+        assert!(post_tool.contains("acceptance is ambiguous"), "{post_tool}");
+        assert!(!live_error_is_kv_blob_overflow_replayable(&post_tool));
     }
 
     #[test]
@@ -16199,6 +16835,59 @@ mod tests {
     }
 
     #[test]
+    fn kv_running_total_tracks_overwrites_without_scanning_the_map() {
+        let key = b"running-total".to_vec();
+        let mut blobs = HashMap::new();
+        let mut total = 0usize;
+        let set =
+            |id: u32, data: &[u8], blobs: &mut HashMap<Vec<u8>, Vec<u8>>, total: &mut usize| {
+                encode_kv_reply_with_total(
+                    &KvServerMessage {
+                        id,
+                        get_blob_args: None,
+                        set_blob_args: Some(proto::SetBlobArgs {
+                            blob_id: key.clone(),
+                            blob_data: data.to_vec(),
+                        }),
+                        span_context: None,
+                    },
+                    blobs,
+                    total,
+                )
+                .expect("small SetBlob should encode")
+                .expect("SetBlob should produce a reply");
+            };
+
+        set(75, b"12345", &mut blobs, &mut total);
+        assert_eq!(total, 5);
+        set(76, b"xy", &mut blobs, &mut total);
+        assert_eq!(total, 2, "an overwrite replaces, rather than adds, bytes");
+        assert_eq!(blobs.get(&key).map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn kv_running_total_stays_unchanged_when_growth_is_rejected() {
+        let mut blobs: HashMap<Vec<u8>, Vec<u8>> = (0..MAX_LIVE_KV_BLOBS)
+            .map(|index| (index.to_be_bytes().to_vec(), Vec::new()))
+            .collect();
+        let mut total = 0usize;
+        let message = KvServerMessage {
+            id: 77,
+            get_blob_args: None,
+            set_blob_args: Some(proto::SetBlobArgs {
+                blob_id: b"rejected-growth".to_vec(),
+                blob_data: b"would-overflow-count".to_vec(),
+            }),
+            span_context: None,
+        };
+        let error = encode_kv_reply_with_total(&message, &mut blobs, &mut total)
+            .expect_err("the soft blob-count ceiling must reject growth");
+        assert_eq!(error.status, 413);
+        assert_eq!(total, 0);
+        assert_eq!(blobs.len(), MAX_LIVE_KV_BLOBS);
+    }
+
+    #[test]
     fn kv_blob_store_rejects_an_oversized_blob() {
         let mut blobs = HashMap::new();
         let set = KvServerMessage {
@@ -16214,6 +16903,84 @@ mod tests {
         let error = encode_kv_reply(&set, &mut blobs).expect_err("oversized KV blob must fail");
         assert_eq!(error.status, 413);
         assert!(blobs.is_empty(), "rejected data must not enter live memory");
+    }
+
+    #[test]
+    fn kv_blob_store_rejects_growth_at_the_soft_conversation_ceiling() {
+        // A long tool-heavy Run can append many blobs after its opening
+        // continuation snapshot. Enforce the same headroom during the Run,
+        // rather than waiting for the server-equivalent hard count of 4096.
+        let mut blobs: HashMap<Vec<u8>, Vec<u8>> = (0..MAX_LIVE_KV_BLOBS)
+            .map(|index| (index.to_be_bytes().to_vec(), Vec::new()))
+            .collect();
+        let set = KvServerMessage {
+            id: 74,
+            get_blob_args: None,
+            set_blob_args: Some(proto::SetBlobArgs {
+                blob_id: b"soft-ceiling-next".to_vec(),
+                blob_data: b"one-more".to_vec(),
+            }),
+            span_context: None,
+        };
+
+        let error = encode_kv_reply(&set, &mut blobs)
+            .expect_err("active KV growth must stop before the hard server ceiling");
+        assert_eq!(error.status, 413);
+        assert!(live_error_is_kv_blob_overflow(&error.client_message()));
+        assert_eq!(blobs.len(), MAX_LIVE_KV_BLOBS);
+    }
+
+    #[test]
+    fn kv_overflow_after_tool_resume_is_marked_ambiguous() {
+        let raw = "Cursor error 413: Cursor KV blob store limit exceeded (blobs=3841)";
+        let marked = annotate_kv_overflow_acceptance(
+            raw.to_string(),
+            Some(EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT),
+            false,
+        );
+        assert!(marked.contains("acceptance is ambiguous"), "{marked}");
+        assert!(!live_error_is_kv_blob_overflow_replayable(&marked));
+
+        let initial =
+            annotate_kv_overflow_acceptance(raw.to_string(), Some("ordinary prompt"), false);
+        assert!(live_error_is_kv_blob_overflow_replayable(&initial));
+
+        let submitted =
+            annotate_kv_overflow_acceptance(raw.to_string(), Some("ordinary prompt"), true);
+        assert!(!live_error_is_kv_blob_overflow_replayable(&submitted));
+    }
+
+    #[test]
+    fn kv_overflow_after_client_progress_is_not_replayed() {
+        let raw = "Cursor KV reply send failed: Cursor upstream HTTP 413 — Cursor KV blob store limit exceeded (blobs=4097)";
+        let marked = annotate_kv_overflow_acceptance_with_progress(
+            raw.to_string(),
+            Some("ordinary prompt"),
+            false,
+            true,
+            false,
+        );
+        assert!(marked.contains("acceptance is ambiguous"), "{marked}");
+        assert!(!live_error_is_kv_blob_overflow_replayable(&marked));
+
+        let pending = annotate_kv_overflow_acceptance_with_progress(
+            raw.to_string(),
+            Some("ordinary prompt"),
+            false,
+            false,
+            true,
+        );
+        assert!(pending.contains("acceptance is ambiguous"), "{pending}");
+        assert!(!live_error_is_kv_blob_overflow_replayable(&pending));
+
+        let hollow = annotate_kv_overflow_acceptance_with_progress(
+            raw.to_string(),
+            Some("ordinary prompt"),
+            false,
+            false,
+            false,
+        );
+        assert!(live_error_is_kv_blob_overflow_replayable(&hollow));
     }
 
     #[test]
@@ -22956,11 +23723,20 @@ mod tests {
         assert!(recovered.pre_fetched_blobs.is_empty());
     }
 
+    #[allow(clippy::await_holding_lock)]
     async fn run_post_tool_checkpoint_scenario(
         prefetch_before_resume: bool,
         new_checkpoint_after_submit: bool,
         checkpoint_while_submit_is_blocked: bool,
     ) -> String {
+        // The conversation test store is process-global.  Keep the complete
+        // scenario behind the shared test guard so another reset-for-test
+        // case cannot evict this freshly-created binding between `get_or_create`
+        // and `pin` (the three public scenarios intentionally run as separate
+        // async tests under the default parallel test runner).
+        let _store_guard = super::super::conversation::STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Unique per invocation: the three scenario variants run in parallel
         // and a shared session id lets one driver's conversation rotation
         // invalidate another driver's binding mid-run.

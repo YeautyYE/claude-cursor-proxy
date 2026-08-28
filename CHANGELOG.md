@@ -3,6 +3,18 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.84 (2026-08-28)
+
+- Recover Cursor KV blob-store 413s by rotating the exhausted conversation
+  once and replaying the complete Anthropic history with refreshed image ids;
+  cover live open, reconnect, late-stream, and buffered fallback paths.
+- Rotate proactively at 3,840 blobs or 60 MiB, before Cursor's 4,096-blob /
+  roughly 64 MiB hard ceiling, while keeping partially accepted tool-result
+  sends fail-closed rather than risking duplicate execution.
+- Serialize durable checkpoint/blob snapshots and conditional cleanup so
+  concurrent writes, resets, evictions, and persisted-state sweeps cannot
+  restore an older conversation binding.
+
 ## v0.1.83 (2026-08-28)
 
 - Fix Claude Code 2.1.193 text-editor dispatch. Cursor PiEdit events now

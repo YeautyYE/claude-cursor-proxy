@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.83 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.84 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -504,6 +504,7 @@ Use this order:
 | `/deep-research` uses Bash/curl only | Update proxy (≥ Workflow passthrough); confirm `Workflow` in transcript; set `enableWorkflows: true` if needed |
 | Hung SSE | Check `~/.local/state/claude-cursor-proxy/proxy.log`; try `CCP_LOG_STDERR=1 CCP_TRAFFIC_LOG=1 serve --no-monitor` |
 | Image attachment immediately fails with 502 `Image not found [internal]` | Update to ≥0.1.83 and restart `serve`. The proxy keeps the original inline bytes, rotates the selected-image id once, and retries on a fresh Cursor conversation; a persistent upstream error is then surfaced instead of opening an unbounded retry loop. |
+| grok-build returns 413 `Cursor KV blob store limit exceeded` (`blobs=4097` / about 64 MiB) | Update to ≥0.1.84 and restart `serve`. The proxy rotates a near-limit Cursor conversation before the next turn; an upstream 413 receives one bounded fresh-conversation retry with the complete Anthropic history and refreshed image ids. No manual `/compact` or new chat is needed. |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
 | grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.57 and restart serve. Response-less live opens fail closed as HTTP 409; local open-slot saturation is jittered HTTP 503. |
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |

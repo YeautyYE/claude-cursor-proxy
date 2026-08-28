@@ -39,6 +39,24 @@ pub struct CursorUpstreamResponse {
 pub(crate) struct CursorRunOptions<'a> {
     pub session_id: Option<&'a str>,
     pub client_type: Option<&'a str>,
+    /// Conversation binding observed while rendering the caller's prompt.
+    /// The request handler may render a checkpoint delta and then yield before
+    /// this client opens the upstream stream.  If KV normalization rotates the
+    /// binding in that window, the delta belongs to the old conversation and
+    /// must be replaced with the caller's full-history replay text.
+    pub expected_conversation_id: Option<&'a str>,
+    pub reset_user_text: Option<&'a str>,
+    pub reset_images: Option<&'a [CursorSelectedImage]>,
+}
+
+/// Compare the continuation binding captured while rendering a request with
+/// the just-in-time binding used for upstream dispatch.  A changed UUID means
+/// the old checkpoint delta cannot be applied to the new Cursor conversation.
+pub(crate) fn continuation_binding_changed(
+    expected_conversation_id: Option<&str>,
+    actual_conversation_id: Option<&str>,
+) -> bool {
+    expected_conversation_id.is_some_and(|expected| actual_conversation_id != Some(expected))
 }
 
 impl CursorUpstreamResponse {
@@ -328,6 +346,9 @@ impl CursorHttpClient {
             CursorRunOptions {
                 session_id,
                 client_type: Some(&client_type),
+                expected_conversation_id: None,
+                reset_user_text: None,
+                reset_images: None,
             },
         )
         .await
@@ -350,10 +371,45 @@ impl CursorHttpClient {
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let continuation = super::conversation::continuation_for(options.session_id);
+        // `continuation_for` is intentionally called as close to dispatch as
+        // possible, but the handler may have rendered a checkpoint delta from
+        // an earlier snapshot.  A KV-overflow normalization in that gap binds
+        // this request to a fresh conversation; replay the complete history
+        // rather than sending the stale delta against an empty checkpoint.
+        let binding_rotated = continuation_binding_changed(
+            options.expected_conversation_id,
+            continuation.conversation_id.as_deref(),
+        );
+        let request_prompt = if binding_rotated {
+            options.reset_user_text.unwrap_or(prompt)
+        } else {
+            prompt
+        };
+        let request_images = if binding_rotated {
+            options.reset_images.unwrap_or(images)
+        } else {
+            images
+        };
+        if binding_rotated {
+            create_logger("cursor").warn(
+                "continuation_binding_changed_before_buffered_open",
+                Some(serde_json::Map::from_iter([
+                    (
+                        "expectedConversationId".into(),
+                        serde_json::json!(options.expected_conversation_id),
+                    ),
+                    (
+                        "actualConversationId".into(),
+                        serde_json::json!(continuation.conversation_id),
+                    ),
+                    ("replay".into(), serde_json::json!("full_history")),
+                ])),
+            );
+        }
         let run_request = build_run_request_with_continuation(
-            prompt,
+            request_prompt,
             &resolved,
-            images,
+            request_images,
             &request_id,
             custom_system_prompt,
             &continuation,
@@ -599,6 +655,13 @@ impl CursorHttpClient {
         let mut last_progress = Instant::now();
 
         let mut body_bytes: Vec<u8> = Vec::with_capacity(64 * 1024);
+        // Keep a bounded copy of error responses.  The normal success path
+        // intentionally retains only useful Connect frames, so a plain JSON
+        // 4xx body can otherwise disappear when the decoder reports an error
+        // before producing a frame.  In particular, Cursor's KV-overflow 413
+        // diagnostic is often delivered as an unframed body (or alongside a
+        // stream read error) and must remain visible to the recovery classifier.
+        let mut raw_error_body: Vec<u8> = Vec::new();
         let mut decoder = ConnectFrameDecoder::new();
         let mut saw_end = false;
         let mut saw_turn_ended = false;
@@ -686,6 +749,10 @@ impl CursorHttpClient {
                     ));
                 }
                 Ok(Some(Ok(chunk))) => {
+                    if status >= 400 && raw_error_body.len() < MAX_BUFFERED_ERROR_BODY_BYTES {
+                        let remaining = MAX_BUFFERED_ERROR_BODY_BYTES - raw_error_body.len();
+                        raw_error_body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
                     // Decode frames first; only retain interaction/exec/end frames in
                     // body_bytes. Live Fable runs stream ~200KB of kv_server_message
                     // blobs we never decode for Anthropic output — buffering them
@@ -851,6 +918,28 @@ impl CursorHttpClient {
                 );
                 // fall through to Ok
             } else {
+                // Preserve an upstream HTTP status even when the response
+                // body stream itself failed.  Rewriting a 413 to 502 loses
+                // Cursor's KV-overflow signal and sends the generic transport
+                // retry path into a loop.  Include all available diagnostics:
+                // raw body, Connect-selected frames, grpc-message, and the
+                // local stream error.
+                if status >= 400 {
+                    let detail = buffered_http_error_detail(
+                        status,
+                        &raw_error_body,
+                        &body_bytes,
+                        error_detail.as_deref(),
+                        Some(msg),
+                        frame_count,
+                    );
+                    return Err(CursorError::new(
+                        status,
+                        format!("Cursor upstream HTTP {status}"),
+                        detail,
+                    )
+                    .with_retry_after(retry_after));
+                }
                 let detail = if body_bytes.is_empty() {
                     run_agent_empty_body_detail(msg, frame_count)
                 } else {
@@ -887,15 +976,14 @@ impl CursorHttpClient {
         }
 
         if status >= 400 {
-            let detail = parse_error_body(&body_bytes, &headers).or_else(|| {
-                if body_bytes.is_empty() {
-                    Some(format!(
-                        "HTTP {status} empty body (often a local proxy/VPN reject — e.g. Surge HTTP/1.1 464 — not a Cursor model error)"
-                    ))
-                } else {
-                    String::from_utf8(body_bytes.to_vec()).ok()
-                }
-            });
+            let detail = buffered_http_error_detail(
+                status,
+                &raw_error_body,
+                &body_bytes,
+                error_detail.as_deref(),
+                None,
+                frame_count,
+            );
             return Err(
                 CursorError::new(status, format!("Cursor upstream HTTP {status}"), detail)
                     .with_retry_after(retry_after),
@@ -1530,6 +1618,72 @@ pub(crate) fn build_resume_run_request(
     }
 }
 
+// Error responses are expected to be small JSON/Connect diagnostics. Keep a
+// hard cap so a misbehaving upstream cannot turn an HTTP failure into an
+// unbounded allocation while we preserve its status/details.
+const MAX_BUFFERED_ERROR_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Assemble a useful detail for a non-success buffered Run response.
+///
+/// Success responses retain only selected Connect frames in `body_bytes`; the
+/// bounded `raw_body` copy is therefore preferred for HTTP errors, where the
+/// server may return plain JSON (or a body that the Connect decoder cannot
+/// frame).  Header and stream diagnostics are appended without duplicating
+/// text already present.  Keeping this logic pure makes status-preservation
+/// behavior easy to regression-test without a network server.
+fn buffered_http_error_detail(
+    status: u16,
+    raw_body: &[u8],
+    selected_body: &[u8],
+    grpc_detail: Option<&str>,
+    stream_error: Option<&str>,
+    frame_count: u32,
+) -> Option<String> {
+    let body = if raw_body.is_empty() {
+        selected_body
+    } else {
+        raw_body
+    };
+    let mut parts = Vec::<String>::new();
+
+    if !body.is_empty() {
+        if let Some(detail) = parse_error_body(body, &reqwest::header::HeaderMap::new()) {
+            if !detail.trim().is_empty() {
+                parts.push(detail);
+            }
+        } else if let Ok(text) = std::str::from_utf8(body) {
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+    }
+    if let Some(detail) = grpc_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        if !parts.iter().any(|part| part.contains(detail)) {
+            parts.push(detail.to_string());
+        }
+    }
+    if let Some(error) = stream_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        if !parts.iter().any(|part| part.contains(error)) {
+            parts.push(error.to_string());
+        }
+    }
+    if parts.is_empty() {
+        Some(format!(
+            "HTTP {status} empty body ({} Connect frames; often a local proxy/VPN reject — e.g. Surge HTTP/1.1 464 — not a Cursor model error)",
+            frame_count
+        ))
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
 fn parse_error_body(body_bytes: &[u8], _headers: &reqwest::header::HeaderMap) -> Option<String> {
     if body_bytes.len() < 5 {
         return None;
@@ -1886,6 +2040,47 @@ mod tests {
             "an H2 client must not take RunSSE just because CCP_CURSOR_HTTP1 might be set elsewhere"
         );
         assert!(!buffered_run_use_http1_sse(false, true));
+    }
+
+    #[test]
+    fn continuation_binding_change_requires_an_expected_snapshot() {
+        assert!(!continuation_binding_changed(None, Some("fresh")));
+        assert!(!continuation_binding_changed(Some("same"), Some("same")));
+        assert!(continuation_binding_changed(Some("old"), Some("fresh")));
+        assert!(continuation_binding_changed(Some("old"), None));
+    }
+
+    #[test]
+    fn buffered_http_error_detail_preserves_kv_diagnostic_after_stream_failure() {
+        let raw = br#"{"error":{"message":"Request too large (413): Cursor KV blob store limit exceeded (blobs=4097)"}}"#;
+        let detail =
+            buffered_http_error_detail(413, raw, &[], None, Some("connection reset by peer"), 0)
+                .expect("error detail");
+        assert!(detail.contains("KV blob store limit exceeded"), "{detail}");
+        assert!(detail.contains("connection reset by peer"), "{detail}");
+    }
+
+    #[test]
+    fn buffered_http_error_detail_uses_original_status_for_classifier_input() {
+        // This mirrors the status/read_err branch in `run_agent_with_session_profile`:
+        // the caller constructs CursorError with the returned status rather than
+        // collapsing an upstream 413 into a generic 502.
+        let detail = buffered_http_error_detail(
+            413,
+            &[],
+            &[],
+            Some("Cursor KV blob store limit exceeded"),
+            Some("read body: connection reset"),
+            0,
+        )
+        .expect("error detail");
+        let error = CursorError::new(413, "Cursor upstream HTTP 413", Some(detail));
+        assert_eq!(error.status, 413);
+        assert!(
+            error
+                .client_message()
+                .contains("KV blob store limit exceeded")
+        );
     }
 
     #[test]

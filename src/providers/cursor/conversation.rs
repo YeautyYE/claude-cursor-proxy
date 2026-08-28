@@ -4,10 +4,10 @@
 //! addressed blob store between Run streams. Without this, each Claude turn is a
 //! fresh Cursor run that re-uploads the entire Anthropic history + tools schema.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,9 +17,66 @@ use sha2::{Digest, Sha256};
 const IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_CONVERSATIONS: usize = 10_000;
 const PERSISTED_SWEEP_INTERVAL_MS: u64 = 60_000;
+
+// Keep persisted-state decoding bounded even when a stale/corrupt JSON file
+// was left by an older build. These mirror the local live KV reply ceilings;
+// snapshots at or below the limits are still loaded and then proactively
+// rotated by `normalize_kv_store` when they cross the soft threshold.
+const CURSOR_KV_HARD_MAX_BLOBS: usize = 4_096;
+const CURSOR_KV_HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
+// Live frame handling rejects checkpoints above this size. Apply the same
+// bound while loading a persisted snapshot so a hand-edited/corrupt file
+// cannot allocate an unbounded opaque protobuf before the next request.
+const CURSOR_CHECKPOINT_MAX_BYTES: usize = 32 * 1024 * 1024;
+// Base64 expands the 64 MiB blob budget and 32 MiB checkpoint budget to just
+// over 170 MiB once JSON keys/separators are included. Keep a bounded decoder
+// guard, but leave enough room for a valid near-ceiling snapshot.
+const MAX_PERSISTED_JSON_BYTES: usize = 192 * 1024 * 1024;
+
+// Cursor's server-side KV store currently accepts at most 4096 blobs and
+// roughly 64 MiB per conversation.  A conversation that gets that close to
+// either ceiling is not recoverable by dropping entries locally: the remote
+// store keeps the old blobs as well.  Rotate a binding before the hard limit
+// so the next request can replay the Anthropic history on a clean Cursor
+// conversation.  Leave enough headroom for a long tool-heavy turn between
+// requests (and for small server-side accounting differences).
+pub(crate) const CURSOR_KV_SOFT_MAX_BLOBS: usize = 3_840;
+pub(crate) const CURSOR_KV_SOFT_MAX_BYTES: usize = 60 * 1024 * 1024;
 static LAST_PERSISTED_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static PERSISTED_SWEEP_RUNS: AtomicU64 = AtomicU64::new(0);
+
+// Snapshot construction happens under `STORE`, while the durable write is
+// intentionally performed after releasing that mutex (blob values can be
+// large).  Serialize the filesystem side of those writes and re-read the
+// current in-memory binding before writing so an older, slower snapshot can
+// never overwrite a newer checkpoint/blob update or a rotated conversation.
+// Keep this lock separate from `STORE`: callers must not hold `STORE` while
+// acquiring it, otherwise a concurrent conditional writer could deadlock.
+static PERSIST_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Files that should be removed once the filesystem write lock is available.
+///
+/// Conversation eviction runs while `STORE` is held.  Taking
+/// `PERSIST_WRITE_LOCK` from that critical section would invert the lock order
+/// used by snapshot writers (`PERSIST_WRITE_LOCK` -> `STORE`) and can deadlock
+/// an in-flight writer.  Eviction therefore only queues a conditional delete;
+/// the queue is drained after the store guard is released.  The binding
+/// metadata captured at eviction time prevents a newly-created/rebound
+/// conversation with the same session id from losing its file.
+#[derive(Debug, Clone)]
+struct PendingPersistDelete {
+    session_id: String,
+    conversation_id: Option<String>,
+}
+
+static PENDING_PERSIST_DELETES: LazyLock<Mutex<Vec<PendingPersistDelete>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+// Most continuation lookups have no deferred unlink to flush.  Keep a cheap
+// lock-free hint so those hot paths do not contend on `PERSIST_WRITE_LOCK`
+// (which may be held while a large snapshot is serialized and fsynced).  The
+// queue mutex remains authoritative; this flag is only an optimization.
+static PENDING_PERSIST_DELETES_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Default)]
 pub struct CursorConversation {
@@ -99,7 +156,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
-fn persist_conversation(session_id: &str, conv: &CursorConversation) -> io::Result<()> {
+fn persist_conversation_unlocked(session_id: &str, conv: &CursorConversation) -> io::Result<()> {
     let Some(path) = persist_path(session_id) else {
         return Ok(());
     };
@@ -153,6 +210,170 @@ fn persist_conversation(session_id: &str, conv: &CursorConversation) -> io::Resu
     write_result
 }
 
+fn persist_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    PERSIST_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn queue_persisted_delete(session_id: &str, conversation: Option<&CursorConversation>) {
+    let pending = PendingPersistDelete {
+        session_id: session_id.to_string(),
+        conversation_id: conversation.map(|entry| entry.conversation_id.clone()),
+    };
+    let mut queue = PENDING_PERSIST_DELETES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Keep one entry per `(session, binding)`; repeated eviction passes should
+    // not grow an unbounded queue while the persistence directory is blocked.
+    if !queue.iter().any(|existing| {
+        existing.session_id == pending.session_id
+            && existing.conversation_id == pending.conversation_id
+    }) {
+        queue.push(pending);
+    }
+    // Store the hint while holding the queue mutex.  The drainer clears it
+    // under that same mutex, so a producer racing a drain cannot have its
+    // newly queued entry hidden by a later `false` store.
+    PENDING_PERSIST_DELETES_READY.store(!queue.is_empty(), Ordering::Release);
+}
+
+/// Drain conditional deletes while the caller owns `PERSIST_WRITE_LOCK`.
+/// `STORE` is acquired only after that lock, matching all snapshot writers.
+fn flush_pending_persisted_deletes_locked() {
+    let pending = {
+        let mut queue = PENDING_PERSIST_DELETES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let pending = std::mem::take(&mut *queue);
+        // Clear the fast-path hint before releasing the queue mutex.  Any
+        // producer that queues after this point acquires the mutex later and
+        // publishes `true` again, preventing a lost flush notification.
+        PENDING_PERSIST_DELETES_READY.store(false, Ordering::Release);
+        pending
+    };
+    for pending in pending {
+        let store = store_lock();
+        // A reload of the *same* binding still owns this file, so preserve it.
+        // A replacement binding, however, must not inherit an evicted
+        // conversation's durable snapshot: remove the stale file before the
+        // replacement gets persisted.  Compare the on-disk owner before the
+        // unlink as well: a replacement may already have written its fresh
+        // snapshot after this delete was queued, and deleting by session id
+        // alone would erase that newer state.
+        let current = store.map.get(&pending.session_id);
+        let same_binding = pending
+            .conversation_id
+            .as_deref()
+            .zip(current)
+            .is_some_and(|(expected, current)| current.conversation_id == expected);
+        let pinned = store.pins.contains_key(&pending.session_id);
+        let should_delete = if pinned || same_binding {
+            false
+        } else if let Some(path) = persist_path(&pending.session_id) {
+            // The path is deterministic for this session. A malformed or
+            // concurrently replaced file is left untouched rather than
+            // turning a bookkeeping race into data loss.
+            let on_disk = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PersistedConversation>(&bytes).ok());
+            match (
+                pending.conversation_id.as_deref(),
+                current,
+                on_disk.as_ref(),
+            ) {
+                // An evicted in-memory binding: unlink only the exact old
+                // snapshot. If a replacement already won the file race, keep
+                // its checkpoint for the next continuation.
+                (Some(expected), _, Some(dto)) => {
+                    dto.session_id == pending.session_id && dto.conversation_id == expected
+                }
+                // An expired disk-only binding has no owner metadata. Delete
+                // it when the file is not the current resident binding. If a
+                // replacement already persisted its own snapshot, preserve
+                // that newer DTO; otherwise remove the stale bytes before a
+                // process crash can resurrect them on restart.
+                (None, None, Some(dto)) => dto.session_id == pending.session_id,
+                (None, Some(current), Some(dto)) => {
+                    dto.session_id != pending.session_id
+                        || dto.conversation_id != current.conversation_id
+                }
+                (None, Some(_), None) => false,
+                // Unknown/corrupt bytes are retained for a later TTL sweep.
+                (_, _, None) => false,
+            }
+        } else {
+            false
+        };
+        if should_delete {
+            if let Some(path) = persist_path(&pending.session_id) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        // Keep the filesystem operation in the same `PERSIST_WRITE_LOCK` /
+        // `STORE` order as writers. It is a single unlink and avoids a race
+        // with a concurrent load/rebind between the check and removal.
+        drop(store);
+    }
+}
+
+fn flush_pending_persisted_deletes() {
+    if !PENDING_PERSIST_DELETES_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let _write_guard = persist_write_lock();
+    // Another flusher may have drained the queue while we waited for the
+    // serialized filesystem lock.  Avoid taking `STORE` in that case.
+    if !PENDING_PERSIST_DELETES_READY.load(Ordering::Acquire) {
+        return;
+    }
+    flush_pending_persisted_deletes_locked();
+}
+
+/// Persist the latest state currently bound to `session_id`.
+///
+/// The caller may have captured an older snapshot before another thread
+/// updated the same conversation.  Re-reading the map while the serialized
+/// write lock is held makes the latest state win; if the entry was evicted,
+/// there is no reason to resurrect its disk file.
+fn persist_conversation(session_id: &str, _proposed: &CursorConversation) -> io::Result<()> {
+    let _write_guard = persist_write_lock();
+    flush_pending_persisted_deletes_locked();
+    let snapshot = {
+        let store = store_lock();
+        store.map.get(session_id).cloned()
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    persist_conversation_unlocked(session_id, &snapshot)
+}
+
+/// Persist only while the live driver's conversation binding is still the
+/// expected one.  If another writer changed checkpoint/blob contents without
+/// rotating the binding, persist that newer in-memory snapshot instead of the
+/// stale proposal.  A changed conversation id is a genuine stale binding and
+/// must not be written by the old driver.
+fn persist_conversation_if_current(
+    session_id: &str,
+    expected_conversation_id: &str,
+    _proposed: &CursorConversation,
+) -> io::Result<bool> {
+    let _write_guard = persist_write_lock();
+    flush_pending_persisted_deletes_locked();
+    let snapshot = {
+        let store = store_lock();
+        let Some(current) = store.map.get(session_id).cloned() else {
+            return Ok(false);
+        };
+        if current.conversation_id != expected_conversation_id {
+            return Ok(false);
+        }
+        current
+    };
+    persist_conversation_unlocked(session_id, &snapshot).map(|()| true)
+}
+
 fn log_persist_failure(session_id: &str, error: &io::Error) {
     crate::logging::create_logger("cursor").warn(
         "conversation_persist_failed",
@@ -166,34 +387,60 @@ fn log_persist_failure(session_id: &str, error: &io::Error) {
 fn expire_abandoned_persisted(now: u64) {
     #[cfg(test)]
     PERSISTED_SWEEP_RUNS.fetch_add(1, Ordering::Relaxed);
+    flush_pending_persisted_deletes();
     let Some(dir) = persist_dir() else {
         return;
     };
-    let pinned: HashSet<String> = {
-        let store = store_lock();
-        store.pins.keys().cloned().collect()
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    // Directory enumeration and JSON decoding can be expensive when a prior
+    // process left thousands of large blob snapshots. Do that work without the
+    // global write lock; each candidate is re-read and checked while the lock
+    // is held immediately before unlinking.
+    let Ok(paths) = std::fs::read_dir(dir).map(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>()
+    }) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
+    for path in paths {
+        let _write_guard = persist_write_lock();
+        // A writer may have replaced this file after enumeration. Re-read the
+        // current bytes under the same lock so an old parsed DTO can never
+        // cause a fresh snapshot to be removed.
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         let Ok(dto) = serde_json::from_slice::<PersistedConversation>(&bytes) else {
             continue;
         };
-        if !pinned.contains(&dto.session_id) && now.saturating_sub(dto.last_seen) > IDLE_TTL_MS {
+        if now.saturating_sub(dto.last_seen) <= IDLE_TTL_MS {
+            continue;
+        }
+        // Re-check the in-memory binding while the write lock is held. A
+        // request may have loaded/pinned/touched this session after the
+        // directory scan began; deleting it based on an old snapshot would
+        // erase a live continuation or race a subsequent rename.
+        let store = store_lock();
+        let should_delete = match store.map.get(&dto.session_id) {
+            Some(current) => {
+                !store.pins.contains_key(&dto.session_id)
+                    && now.saturating_sub(current.last_seen) > IDLE_TTL_MS
+            }
+            None => !store.pins.contains_key(&dto.session_id),
+        };
+        if should_delete {
             let _ = std::fs::remove_file(path);
         }
+        drop(store);
     }
 }
 
 fn maybe_expire_abandoned_persisted(now: u64) {
+    // Evictions can happen on a read-only path that does not otherwise write a
+    // snapshot. Flush their deferred unlinks before rate-limiting the sweep.
+    flush_pending_persisted_deletes();
     let mut observed = LAST_PERSISTED_SWEEP_MS.load(Ordering::Acquire);
     loop {
         if observed != 0 && now.saturating_sub(observed) < PERSISTED_SWEEP_INTERVAL_MS {
@@ -215,23 +462,58 @@ fn maybe_expire_abandoned_persisted(now: u64) {
 fn load_persisted(session_id: &str) -> Option<CursorConversation> {
     let path = persist_path(session_id)?;
     let bytes = std::fs::read(path).ok()?;
+    // Reject an unexpectedly large file before serde or the decoder allocates
+    // thousands of untrusted strings. The bound is deliberately above the
+    // base64-expanded KV + checkpoint ceilings so valid near-limit snapshots
+    // remain recoverable.
+    if bytes.len() > MAX_PERSISTED_JSON_BYTES {
+        return None;
+    }
     let dto: PersistedConversation = serde_json::from_slice(&bytes).ok()?;
+    // The filename is derived from the requested session id, but the JSON
+    // carries its own owner. Validate both fields before accepting state so a
+    // stale/corrupt file can never leak another Claude session's checkpoint or
+    // blobs into this continuation.
+    if dto.session_id != session_id || dto.conversation_id.trim().is_empty() {
+        return None;
+    }
+    let checkpoint = match dto.checkpoint_b64.as_deref() {
+        Some(encoded) => {
+            let checkpoint = b64_decode(encoded)?;
+            if checkpoint.len() > CURSOR_CHECKPOINT_MAX_BYTES {
+                return None;
+            }
+            Some(checkpoint)
+        }
+        None => None,
+    };
     let mut blobs = HashMap::new();
+    // Keep the aggregate while decoding instead of summing every previously
+    // decoded value for each entry.  A near-limit snapshot can contain 4,096
+    // blobs; repeatedly walking the map would turn restart recovery into an
+    // O(n²) scan of tens of GiB even though the final payload is only ~64 MiB.
+    let mut total_blob_bytes = 0usize;
     for (k, v) in dto.blobs_b64 {
-        blobs.insert(b64_decode(&k)?, b64_decode(&v)?);
+        let key = b64_decode(&k)?;
+        let value = b64_decode(&v)?;
+        let existing_len = blobs.get(&key).map(Vec::len).unwrap_or_default();
+        let is_new = !blobs.contains_key(&key);
+        let next_count = blobs.len() + usize::from(is_new);
+        let next_total = total_blob_bytes
+            .saturating_sub(existing_len)
+            .saturating_add(value.len());
+        if next_count > CURSOR_KV_HARD_MAX_BLOBS || next_total > CURSOR_KV_HARD_MAX_BYTES {
+            return None;
+        }
+        blobs.insert(key, value);
+        total_blob_bytes = next_total;
     }
     Some(CursorConversation {
         conversation_id: dto.conversation_id,
-        checkpoint: dto.checkpoint_b64.as_deref().and_then(b64_decode),
+        checkpoint,
         blobs,
         last_seen: dto.last_seen,
     })
-}
-
-fn delete_persisted(session_id: &str) {
-    if let Some(path) = persist_path(session_id) {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 fn touch_and_evict(store: &mut Store, session_id: &str, now: u64) {
@@ -245,8 +527,8 @@ fn touch_and_evict(store: &mut Store, session_id: &str, now: u64) {
             if store.pins.contains_key(&evict) {
                 store.order.push_back(evict);
             } else {
-                store.map.remove(&evict);
-                delete_persisted(&evict);
+                let removed = store.map.remove(&evict);
+                queue_persisted_delete(&evict, removed.as_ref());
             }
         } else {
             break;
@@ -265,10 +547,107 @@ fn touch_and_evict(store: &mut Store, session_id: &str, now: u64) {
         if key == session_id {
             continue;
         }
-        store.map.remove(&key);
+        let removed = store.map.remove(&key);
         store.order.retain(|item| item != &key);
-        delete_persisted(&key);
+        queue_persisted_delete(&key, removed.as_ref());
     }
+}
+
+fn blob_total_bytes(blobs: &HashMap<Vec<u8>, Vec<u8>>) -> usize {
+    blobs
+        .values()
+        .fold(0usize, |total, value| total.saturating_add(value.len()))
+}
+
+fn kv_store_near_limit(conv: &CursorConversation) -> bool {
+    conv.blobs.len() >= CURSOR_KV_SOFT_MAX_BLOBS
+        || blob_total_bytes(&conv.blobs) >= CURSOR_KV_SOFT_MAX_BYTES
+}
+
+/// Return diagnostic counts when a local snapshot approaches the server KV
+/// ceiling. Cursor's remote KV store is append-only for a conversation id, so
+/// deleting local entries cannot release the server-side quota; the caller
+/// always rotates the binding.
+fn kv_store_stats_for_rotation(conv: &CursorConversation) -> (usize, usize) {
+    if !kv_store_near_limit(conv) {
+        return (0, 0);
+    }
+    // Avoid scanning opaque checkpoint bytes here. A checkpoint can be tens
+    // of MiB and the blob map can contain thousands of entries; a byte-pattern
+    // scan would turn recovery into an accidental O(N*M) latency spike.
+    // Rotation is unconditional, so reachability is deliberately unknown.
+    (conv.blobs.len(), 0)
+}
+
+/// Rotate an oversized binding atomically with respect to live drivers. A
+/// pinned conversation is never rebound under an active stream; its driver
+/// surfaces the bounded KV error and the normal late-retry path rotates it once
+/// the stream has closed.
+fn normalize_kv_store(
+    session_id: &str,
+    expected_conversation_id: &str,
+) -> Option<CursorConversation> {
+    let now = now_millis();
+    let (snapshot, removed, reachable, rotated) = {
+        let mut store = store_lock();
+        let is_pinned = store.pins.contains_key(session_id);
+        let entry = store.map.get_mut(session_id)?;
+        if entry.conversation_id != expected_conversation_id
+            || is_pinned
+            || !kv_store_near_limit(entry)
+        {
+            return Some(entry.clone());
+        }
+
+        // Either the checkpoint references too many values or has no
+        // recognizable ids.  A fresh conversation is the only reliable way
+        // to clear Cursor's remote blob store; a local GC would leave those
+        // remote values counted against the same conversation id. The caller
+        // replays the complete Anthropic history because checkpoint is empty.
+        let (removed, reachable) = kv_store_stats_for_rotation(entry);
+        let fresh = CursorConversation {
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+            checkpoint: None,
+            blobs: HashMap::new(),
+            last_seen: now,
+        };
+        entry.clone_from(&fresh);
+        let snapshot = fresh;
+        (snapshot, removed, reachable, true)
+    };
+
+    if let Err(error) = persist_conversation(session_id, &snapshot) {
+        log_persist_failure(session_id, &error);
+    }
+    // The durable write is intentionally outside `STORE` because a large blob
+    // snapshot can take noticeable time.  A concurrent reset may therefore
+    // have replaced this binding while the file was being written.  Never
+    // hand that stale UUID to the caller: fetch the current binding after the
+    // write and let the caller build its request from the winner.
+    let snapshot = {
+        let store = store_lock();
+        let current = store.map.get(session_id)?;
+        current.clone()
+    };
+    let mut fields = serde_json::Map::from_iter([
+        ("sessionId".into(), serde_json::json!(session_id)),
+        (
+            "conversationId".into(),
+            serde_json::json!(expected_conversation_id),
+        ),
+        ("removed".into(), serde_json::json!(removed)),
+        ("reachable".into(), serde_json::json!(reachable)),
+        ("remaining".into(), serde_json::json!(snapshot.blobs.len())),
+        ("rotated".into(), serde_json::json!(rotated)),
+    ]);
+    if rotated {
+        fields.insert(
+            "newConversationId".into(),
+            serde_json::json!(&snapshot.conversation_id),
+        );
+    }
+    crate::logging::create_logger("cursor").warn("cursor_kv_store_normalized", Some(fields));
+    Some(snapshot)
 }
 
 /// Get or create the Cursor conversation binding for a Claude session id.
@@ -276,25 +655,38 @@ pub fn get_or_create(session_id: &str) -> CursorConversation {
     let now = now_millis();
     maybe_expire_abandoned_persisted(now);
     let mut store = store_lock();
+    // If an in-memory binding crossed its idle TTL, it is authoritative for
+    // this process and must not be resurrected from the older JSON snapshot
+    // below.  The deferred unlink is flushed after releasing `STORE`; skip
+    // the disk lookup in this branch so the old checkpoint cannot win the
+    // race before that flush runs.
+    let mut discard_persisted = false;
     if let Some(existing) = store.map.get(session_id).cloned() {
         if store.pins.contains_key(session_id)
             || now.saturating_sub(existing.last_seen) <= IDLE_TTL_MS
         {
             touch_and_evict(&mut store, session_id, now);
+            drop(store);
+            flush_pending_persisted_deletes();
             return existing;
         }
-        store.map.remove(session_id);
+        let removed = store.map.remove(session_id);
         store.order.retain(|item| item != session_id);
-        delete_persisted(session_id);
+        queue_persisted_delete(session_id, removed.as_ref());
+        discard_persisted = true;
     }
-    if let Some(disk) = load_persisted(session_id) {
-        if now.saturating_sub(disk.last_seen) <= IDLE_TTL_MS {
-            store.order.push_back(session_id.to_string());
-            store.map.insert(session_id.to_string(), disk.clone());
-            touch_and_evict(&mut store, session_id, now);
-            return disk;
+    if !discard_persisted {
+        if let Some(disk) = load_persisted(session_id) {
+            if now.saturating_sub(disk.last_seen) <= IDLE_TTL_MS {
+                store.order.push_back(session_id.to_string());
+                store.map.insert(session_id.to_string(), disk.clone());
+                touch_and_evict(&mut store, session_id, now);
+                drop(store);
+                flush_pending_persisted_deletes();
+                return disk;
+            }
+            queue_persisted_delete(session_id, None);
         }
-        delete_persisted(session_id);
     }
     let created = CursorConversation {
         conversation_id: uuid::Uuid::new_v4().to_string(),
@@ -305,6 +697,11 @@ pub fn get_or_create(session_id: &str) -> CursorConversation {
     store.order.push_back(session_id.to_string());
     store.map.insert(session_id.to_string(), created.clone());
     touch_and_evict(&mut store, session_id, now);
+    // Filesystem persistence acquires `PERSIST_WRITE_LOCK` and re-reads the
+    // store. Release `STORE` first to keep the lock order consistent with all
+    // other snapshot writers.
+    drop(store);
+    flush_pending_persisted_deletes();
     if let Err(error) = persist_conversation(session_id, &created) {
         log_persist_failure(session_id, &error);
     }
@@ -313,27 +710,40 @@ pub fn get_or_create(session_id: &str) -> CursorConversation {
 
 pub fn get(session_id: &str) -> Option<CursorConversation> {
     let now = now_millis();
+    flush_pending_persisted_deletes();
     let mut store = store_lock();
     if let Some(existing) = store.map.get(session_id).cloned() {
         if !store.pins.contains_key(session_id)
             && now.saturating_sub(existing.last_seen) > IDLE_TTL_MS
         {
-            store.map.remove(session_id);
+            let removed = store.map.remove(session_id);
             store.order.retain(|item| item != session_id);
-            delete_persisted(session_id);
+            queue_persisted_delete(session_id, removed.as_ref());
+            drop(store);
+            flush_pending_persisted_deletes();
             return None;
         }
         touch_and_evict(&mut store, session_id, now);
+        drop(store);
+        flush_pending_persisted_deletes();
         return Some(existing);
     }
-    let disk = load_persisted(session_id)?;
+    let Some(disk) = load_persisted(session_id) else {
+        drop(store);
+        flush_pending_persisted_deletes();
+        return None;
+    };
     if now.saturating_sub(disk.last_seen) > IDLE_TTL_MS {
-        delete_persisted(session_id);
+        queue_persisted_delete(session_id, None);
+        drop(store);
+        flush_pending_persisted_deletes();
         return None;
     }
     store.order.push_back(session_id.to_string());
     store.map.insert(session_id.to_string(), disk.clone());
     touch_and_evict(&mut store, session_id, now);
+    drop(store);
+    flush_pending_persisted_deletes();
     Some(disk)
 }
 
@@ -437,8 +847,9 @@ pub(crate) fn save_checkpoint_if_current(
         touch_and_evict(&mut store, session_id, now);
         (snapshot, previous)
     };
-    match persist_conversation(session_id, &snapshot) {
-        Ok(()) => ConditionalPersist::Saved,
+    match persist_conversation_if_current(session_id, expected_conversation_id, &snapshot) {
+        Ok(true) => ConditionalPersist::Saved,
+        Ok(false) => ConditionalPersist::StaleBinding,
         Err(error) => {
             roll_back_checkpoint(
                 session_id,
@@ -511,8 +922,9 @@ pub(crate) fn clear_checkpoint_if_current(
         touch_and_evict(&mut store, session_id, now);
         (snapshot, previous)
     };
-    match persist_conversation(session_id, &snapshot) {
-        Ok(()) => ConditionalPersist::Saved,
+    match persist_conversation_if_current(session_id, expected_conversation_id, &snapshot) {
+        Ok(true) => ConditionalPersist::Saved,
+        Ok(false) => ConditionalPersist::StaleBinding,
         Err(error) => {
             roll_back_checkpoint(session_id, expected_conversation_id, &None, previous);
             log_persist_failure(session_id, &error);
@@ -595,8 +1007,9 @@ pub(crate) fn merge_blobs_if_current(
         touch_and_evict(&mut store, session_id, now);
         (snapshot, replaced)
     };
-    match persist_conversation(session_id, &snapshot) {
-        Ok(()) => ConditionalPersist::Saved,
+    match persist_conversation_if_current(session_id, expected_conversation_id, &snapshot) {
+        Ok(true) => ConditionalPersist::Saved,
+        Ok(false) => ConditionalPersist::StaleBinding,
         Err(error) => {
             roll_back_blobs(session_id, expected_conversation_id, blobs, replaced);
             log_persist_failure(session_id, &error);
@@ -653,7 +1066,14 @@ pub fn continuation_for(session_id: Option<&str>) -> RunContinuation {
     let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
         return RunContinuation::default();
     };
-    let conv = get_or_create(session_id);
+    let initial = get_or_create(session_id);
+    // A completed run is no longer pinned, so this is the safe point to
+    // compact stale checkpoint-unreachable blobs or rotate the remote Cursor
+    // conversation before constructing the next request.  If a concurrent
+    // reset won the binding race, fetch its replacement rather than sending
+    // the stale snapshot we first observed.
+    let conv = normalize_kv_store(session_id, &initial.conversation_id)
+        .unwrap_or_else(|| get_or_create(session_id));
     let has_checkpoint = conv.checkpoint.as_ref().is_some_and(|c| !c.is_empty());
     RunContinuation {
         conversation_id: Some(conv.conversation_id),
@@ -672,6 +1092,15 @@ pub fn reset_for_test() {
     let pinned: std::collections::HashSet<String> = store.pins.keys().cloned().collect();
     store.map.retain(|key, _| pinned.contains(key));
     store.order.retain(|key| pinned.contains(key));
+    drop(store);
+    // Test cases frequently swap `CCP_CURSOR_CONV_DIR` to a fresh temporary
+    // directory. Do not let a deferred unlink from a previous case target the
+    // next case's directory.
+    let mut pending = PENDING_PERSIST_DELETES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    pending.clear();
+    PENDING_PERSIST_DELETES_READY.store(false, Ordering::Release);
     LAST_PERSISTED_SWEEP_MS.store(0, Ordering::Relaxed);
     PERSISTED_SWEEP_RUNS.store(0, Ordering::Relaxed);
 }
@@ -800,6 +1229,138 @@ mod tests {
     }
 
     #[test]
+    fn expired_in_memory_binding_is_not_resurrected_from_disk_snapshot() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let session = "sess-expired-memory-authoritative";
+        let original = get_or_create(session);
+        save_checkpoint(session, vec![0xde, 0xad]);
+        let path = persist_path(session).expect("path");
+        assert!(path.exists());
+
+        // Leave a recent JSON snapshot in place while making the resident
+        // binding idle.  `get_or_create` must create a fresh conversation;
+        // loading the old file here would resurrect the expired checkpoint.
+        {
+            let mut store = store_lock();
+            let entry = store.map.get_mut(session).expect("resident binding");
+            entry.last_seen = 1;
+        }
+        let replacement = get_or_create(session);
+        assert_ne!(replacement.conversation_id, original.conversation_id);
+        assert!(replacement.checkpoint.is_none());
+
+        // The replacement is what survives a simulated process restart.
+        drop_unpinned_in_memory_for_test();
+        let recovered = continuation_for(Some(session));
+        assert_eq!(
+            recovered.conversation_id.as_deref(),
+            Some(replacement.conversation_id.as_str())
+        );
+        assert!(!recovered.has_checkpoint);
+    }
+
+    #[test]
+    fn persisted_snapshot_owner_must_match_requested_session() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let requested = "sess-owner-requested";
+        let path = persist_path(requested).expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&PersistedConversation {
+                session_id: "sess-other".into(),
+                conversation_id: uuid::Uuid::new_v4().to_string(),
+                checkpoint_b64: Some(b64_encode(b"private")),
+                blobs_b64: Vec::new(),
+                last_seen: now_millis(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_persisted(requested).is_none(),
+            "a deterministic filename is not sufficient ownership proof"
+        );
+    }
+
+    #[test]
+    fn persisted_snapshot_rejects_kv_hard_limit_before_replay() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let requested = "sess-persist-limit";
+        let path = persist_path(requested).expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let blobs_b64 = (0..=CURSOR_KV_HARD_MAX_BLOBS)
+            .map(|index| {
+                (
+                    b64_encode(&(index as u32).to_be_bytes()),
+                    b64_encode(b"blob"),
+                )
+            })
+            .collect();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&PersistedConversation {
+                session_id: requested.into(),
+                conversation_id: uuid::Uuid::new_v4().to_string(),
+                checkpoint_b64: None,
+                blobs_b64,
+                last_seen: now_millis(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_persisted(requested).is_none(),
+            "a snapshot beyond Cursor's hard blob count must not be replayed"
+        );
+    }
+
+    #[test]
     fn reset_overwrites_poisoned_binding_instead_of_only_deleting() {
         let _guard = STORE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -825,6 +1386,88 @@ mod tests {
         assert_ne!(recovered.conversation_id, original);
         assert!(!recovered.has_checkpoint);
         assert!(recovered.pre_fetched_blobs.is_empty());
+    }
+
+    #[test]
+    fn continuation_rotates_oversized_store_even_with_referenced_blobs() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let session = "sess-kv-gc";
+        let original = get_or_create(session).conversation_id;
+        let referenced = vec![0x7a, 0x7b, 0x7c, 0x7d];
+        {
+            let mut store = store_lock();
+            let entry = store.map.get_mut(session).expect("conversation");
+            entry.checkpoint = Some(referenced.clone());
+            for index in 0..CURSOR_KV_SOFT_MAX_BLOBS {
+                let id = (index as u32).to_be_bytes().to_vec();
+                entry.blobs.insert(id, vec![0xaa]);
+            }
+            entry.blobs.insert(referenced.clone(), vec![0xbb]);
+        }
+
+        let continuation = continuation_for(Some(session));
+        assert_ne!(
+            continuation.conversation_id.as_deref(),
+            Some(original.as_str())
+        );
+        assert!(continuation.pre_fetched_blobs.is_empty());
+        assert!(!continuation.has_checkpoint);
+    }
+
+    #[test]
+    fn oversized_store_rotation_does_not_replay_nested_blob_payloads() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let session = "sess-kv-nested-gc";
+        let original = get_or_create(session).conversation_id;
+        let root = b"root-blob-id-0000000000000001".to_vec();
+        let child = b"child-blob-id-0000000000000002".to_vec();
+        {
+            let mut store = store_lock();
+            let entry = store.map.get_mut(session).expect("conversation");
+            entry.checkpoint = Some(root.clone());
+            entry.blobs.insert(root.clone(), child.clone());
+            entry.blobs.insert(child.clone(), vec![0xbb]);
+            for index in 0..(CURSOR_KV_SOFT_MAX_BLOBS - 2) {
+                let id = format!("stale-{index:04}").into_bytes();
+                entry.blobs.insert(id, vec![0xaa]);
+            }
+        }
+
+        let continuation = continuation_for(Some(session));
+        assert_ne!(
+            continuation.conversation_id.as_deref(),
+            Some(original.as_str())
+        );
+        assert!(continuation.pre_fetched_blobs.is_empty());
+        assert!(!continuation.has_checkpoint);
+    }
+
+    #[test]
+    fn continuation_rotates_when_oversized_checkpoint_has_no_known_references() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let session = "sess-kv-rotate";
+        let original = get_or_create(session).conversation_id;
+        {
+            let mut store = store_lock();
+            let entry = store.map.get_mut(session).expect("conversation");
+            entry.checkpoint = Some(vec![0xff, 0xfe, 0xfd]);
+            for index in 0..CURSOR_KV_SOFT_MAX_BLOBS {
+                let id = (index as u32).to_be_bytes().to_vec();
+                entry.blobs.insert(id, vec![0xaa]);
+            }
+        }
+
+        let continuation = continuation_for(Some(session));
+        assert_ne!(
+            continuation.conversation_id.as_deref(),
+            Some(original.as_str())
+        );
+        assert!(!continuation.has_checkpoint);
+        assert!(continuation.conversation_state.is_empty());
+        assert!(continuation.pre_fetched_blobs.is_empty());
     }
 
     #[cfg(unix)]
@@ -859,6 +1502,194 @@ mod tests {
             .expect("persisted json");
         let file_mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn deferred_eviction_delete_does_not_remove_reloaded_binding() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let session = "sess-deferred-delete";
+        let original = get_or_create(session);
+        let path = persist_path(session).expect("path");
+        assert!(path.exists());
+
+        // Simulate an eviction that queues its unlink, then a concurrent
+        // request reloading the same on-disk binding before the queue drains.
+        let removed = {
+            let mut store = store_lock();
+            let removed = store.map.remove(session).expect("binding");
+            store.order.retain(|item| item != session);
+            removed
+        };
+        queue_persisted_delete(session, Some(&removed));
+        let reloaded = load_persisted(session).expect("reload");
+        assert_eq!(reloaded.conversation_id, original.conversation_id);
+        {
+            let mut store = store_lock();
+            store.order.push_back(session.to_string());
+            store.map.insert(session.to_string(), reloaded);
+        }
+        flush_pending_persisted_deletes();
+        assert!(
+            path.exists(),
+            "a reloaded binding must not lose its persistence file"
+        );
+
+        // If the session is rebound before the deferred unlink drains and the
+        // replacement has already persisted, the newer file must survive. A
+        // delete keyed only by session id would erase this replacement.
+        let replacement = CursorConversation {
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+            checkpoint: None,
+            blobs: HashMap::new(),
+            last_seen: now_millis(),
+        };
+        let removed = {
+            let mut store = store_lock();
+            let removed = store.map.remove(session).expect("binding");
+            store.order.retain(|item| item != session);
+            removed
+        };
+        queue_persisted_delete(session, Some(&removed));
+        {
+            let mut store = store_lock();
+            store.order.push_back(session.to_string());
+            store.map.insert(session.to_string(), replacement.clone());
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&PersistedConversation {
+                session_id: session.to_string(),
+                conversation_id: replacement.conversation_id.clone(),
+                checkpoint_b64: None,
+                blobs_b64: Vec::new(),
+                last_seen: replacement.last_seen,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        flush_pending_persisted_deletes();
+        assert!(
+            path.exists(),
+            "a replacement snapshot already on disk must not be removed"
+        );
+        let persisted: PersistedConversation =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.conversation_id, replacement.conversation_id);
+
+        // Conversely, if the queued file still belongs to the evicted
+        // binding, a different replacement must not inherit it. The flush
+        // removes the old file; the replacement can then be persisted on the
+        // deterministic path without a stale checkpoint race.
+        let replacement2 = CursorConversation {
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+            checkpoint: None,
+            blobs: HashMap::new(),
+            last_seen: now_millis(),
+        };
+        let removed = {
+            let mut store = store_lock();
+            let removed = store.map.remove(session).expect("replacement binding");
+            store.order.retain(|item| item != session);
+            removed
+        };
+        queue_persisted_delete(session, Some(&removed));
+        {
+            let mut store = store_lock();
+            store.order.push_back(session.to_string());
+            store.map.insert(session.to_string(), replacement2.clone());
+        }
+        flush_pending_persisted_deletes();
+        assert!(
+            !path.exists(),
+            "a rebound binding must not retain an evicted snapshot"
+        );
+        persist_conversation(session, &replacement2).expect("persist replacement");
+        let persisted: PersistedConversation =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.conversation_id, replacement2.conversation_id);
+
+        // Once the replacement is actually absent, the deferred delete is
+        // allowed to remove its persisted file as well.
+        let removed = {
+            let mut store = store_lock();
+            let removed = store.map.remove(session).expect("replacement binding");
+            store.order.retain(|item| item != session);
+            removed
+        };
+        queue_persisted_delete(session, Some(&removed));
+        flush_pending_persisted_deletes();
+        assert!(!path.exists(), "unbound eviction should unlink the file");
+
+        // Disk-only expiry uses `None` metadata; it must not be treated as a
+        // matching empty binding and left behind indefinitely.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&PersistedConversation {
+                session_id: session.to_string(),
+                conversation_id: uuid::Uuid::new_v4().to_string(),
+                checkpoint_b64: None,
+                blobs_b64: Vec::new(),
+                last_seen: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        queue_persisted_delete(session, None);
+        flush_pending_persisted_deletes();
+        assert!(
+            !path.exists(),
+            "pending disk-only expiry must unlink the file"
+        );
+    }
+
+    #[test]
+    fn persisted_sweep_preserves_a_recent_in_memory_binding() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let session = "sess-live-sweep";
+        let _ = get_or_create(session);
+        let path = persist_path(session).expect("path");
+        let mut dto: PersistedConversation =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        dto.last_seen = 1;
+        std::fs::write(&path, serde_json::to_vec(&dto).unwrap()).unwrap();
+
+        // The disk copy looks abandoned, but the in-memory binding was just
+        // touched. The sweep must leave it for the next snapshot write.
+        expire_abandoned_persisted(now_millis());
+        assert!(
+            path.exists(),
+            "sweep must not delete a recent in-memory conversation"
+        );
     }
 
     #[test]
@@ -1056,5 +1887,74 @@ mod tests {
             continuation_for(Some("sess-clear-failure")).has_checkpoint,
             "a failed clear must keep the durable checkpoint visible in memory"
         );
+    }
+
+    #[test]
+    fn stale_snapshot_writer_cannot_overwrite_newer_checkpoint() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let session = "sess-persist-order";
+        let _ = get_or_create(session);
+        save_checkpoint(session, vec![0x01]);
+        // Simulate a slow writer that captured this older snapshot before a
+        // newer checkpoint was committed in memory.
+        let stale = get(session).expect("checkpoint binding");
+        save_checkpoint(session, vec![0x02]);
+        persist_conversation(session, &stale).expect("stale write is harmless");
+
+        drop_unpinned_in_memory_for_test();
+        let recovered = continuation_for(Some(session));
+        assert_eq!(recovered.conversation_state, vec![0x02]);
+    }
+
+    #[test]
+    fn conditional_stale_binding_cannot_overwrite_rotated_disk_state() {
+        let _guard = STORE_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CCP_CURSOR_CONV_DIR", dir.path());
+        }
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("CCP_CURSOR_CONV_DIR");
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        reset_for_test();
+
+        let session = "sess-persist-rotation-order";
+        let original = get_or_create(session);
+        save_checkpoint(session, vec![0x03]);
+        let stale = get(session).expect("stale binding");
+        reset(session);
+        assert!(matches!(
+            persist_conversation_if_current(session, &original.conversation_id, &stale),
+            Ok(false)
+        ));
+
+        drop_unpinned_in_memory_for_test();
+        let recovered = continuation_for(Some(session));
+        assert_ne!(
+            recovered.conversation_id.as_deref(),
+            Some(original.conversation_id.as_str())
+        );
+        assert!(!recovered.has_checkpoint);
     }
 }

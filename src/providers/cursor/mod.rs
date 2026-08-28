@@ -49,13 +49,14 @@ use crate::providers::cursor::hosted_web_search::{
 use crate::providers::cursor::live::{
     CursorLiveRunHandle, EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, LIVE_AMBIGUOUS_OPEN_TTL,
     LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim, LiveRunEvent, LiveRunIdentity,
-    LiveRunProbe, LiveRunRegistry, LiveRunReservation, LiveSlotClaim,
-    cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
-    finish_replacement_after_cancel, live_error_is_empty_turn_retry,
-    live_error_is_same_request_retryable, live_error_needs_checkpoint_continue,
-    live_pending_must_supersede, live_probe_error_blocks_new_run, live_request_fingerprint,
-    live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
-    live_start_error_seals_tombstone, local_overload_retry_after, same_request_retry_wait_ms,
+    LiveRunProbe, LiveRunRegistry, LiveRunReservation, LiveSlotClaim, LiveStartRecovery,
+    cursor_error_is_kv_blob_overflow, cursor_start_error_is_same_request_retryable,
+    exhausted_live_start_error, finish_replacement_after_cancel, live_error_is_empty_turn_retry,
+    live_error_is_kv_blob_overflow_replayable, live_error_is_same_request_retryable,
+    live_error_needs_checkpoint_continue, live_pending_must_supersede,
+    live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
+    live_run_key_for, live_sse_response, live_start_error_seals_tombstone,
+    local_overload_retry_after, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
@@ -925,6 +926,20 @@ struct LiveRetryStart {
     /// retries and policy attribution must continue with that effective token.
     effective_token: Arc<Mutex<String>>,
     user_text: String,
+    /// Full Anthropic-history prompt retained for a one-shot recovery that
+    /// rotates a poisoned Cursor conversation (KV overflow, stale assets,
+    /// etc.). `user_text` may be a checkpoint delta and is therefore not
+    /// sufficient after the conversation id changes.
+    reset_user_text: String,
+    /// Conversation binding observed while rendering this request.  The live
+    /// client compares it with its just-in-time continuation snapshot and
+    /// switches to `reset_user_text` when another task rotated the binding.
+    ///
+    /// This is shared with late retries. A recovery can intentionally rotate
+    /// the Cursor conversation; retaining the original immutable UUID would
+    /// make every subsequent checkpoint continuation look like another
+    /// rotation and replay the complete history (including completed tools).
+    expected_conversation_id: Arc<Mutex<Option<String>>>,
     model: String,
     /// Images appropriate for the currently persisted Cursor continuation.
     /// With a checkpoint this is limited to the current user turn.
@@ -936,6 +951,16 @@ struct LiveRetryStart {
     /// initial open, late stream pump, and any internal restart so one request
     /// cannot create an unbounded fresh-UUID wave.
     image_recovery_attempted: Arc<AtomicBool>,
+    /// The exact refreshed image metadata used by the first stale-image
+    /// recovery. A late KV rotation can happen after that recovery; retaining
+    /// the wave prevents it from falling back to stale UUIDs (or minting a
+    /// second, unrelated set while a queued asset upload is still settling).
+    image_recovery_images: Arc<Mutex<Option<Vec<CursorSelectedImage>>>>,
+    /// Shared one-shot fence for KV blob-store overflow recovery.  It spans
+    /// initial-open peeks and late stream-pump retries so one logical request
+    /// cannot repeatedly rotate conversations when the upstream keeps
+    /// rejecting the same oversized state.
+    kv_recovery_attempted: Arc<AtomicBool>,
     custom_system: Option<String>,
     session_id: String,
     agent_id: Option<String>,
@@ -1007,6 +1032,58 @@ fn live_request_image_sets(
     (images, reset_retry_images)
 }
 
+/// Select image metadata for a one-shot KV conversation rotation.
+///
+/// A stale-image recovery may already have rebuilt the selected-image entries
+/// for this request.  Re-generating UUIDs when the subsequent KV error arrives
+/// creates a second asset identity wave and can make Cursor associate queued
+/// image bytes with the wrong turn.  Keep the first refreshed set; otherwise
+/// issue fresh UUIDs from the original full-history payload.
+fn kv_recovery_images(
+    current_images: &[CursorSelectedImage],
+    reset_images: &[CursorSelectedImage],
+    image_recovery_attempted: bool,
+) -> Vec<CursorSelectedImage> {
+    if image_recovery_attempted {
+        current_images.to_vec()
+    } else {
+        refresh_image_uuids(reset_images)
+    }
+}
+
+/// Return the request-scoped image recovery wave, minting it exactly once.
+///
+/// `image_recovery_attempted` is an atomic fence, but it intentionally carries
+/// no payload. The late stream retry therefore needs this small side channel
+/// to reuse the UUIDs selected by an earlier initial-open recovery. Keeping the
+/// bytes and MIME/path metadata cloned here is cheap (the base64 payload is
+/// already reference-owned by the request) and avoids a second UUID wave.
+fn cached_image_recovery_images(
+    shared: &Arc<Mutex<Option<Vec<CursorSelectedImage>>>>,
+    reset_images: &[CursorSelectedImage],
+) -> Vec<CursorSelectedImage> {
+    let mut slot = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(images) = slot.as_ref() {
+        return images.clone();
+    }
+    let refreshed = refresh_image_uuids(reset_images);
+    *slot = Some(refreshed.clone());
+    refreshed
+}
+
+/// Read an already-minted image recovery wave without creating a new one.
+/// Generic late retries (for example an empty turn after a successful stale
+/// image recovery) must reuse that wave; minting another UUID set there would
+/// make Cursor's asset index observe two competing identities for one turn.
+fn cached_image_recovery_snapshot(
+    shared: &Arc<Mutex<Option<Vec<CursorSelectedImage>>>>,
+) -> Option<Vec<CursorSelectedImage>> {
+    shared
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
 /// Match image lookup failures across the structured Cursor error fields.
 /// Connect END errors often put the useful text in `detail`, while HTTP/SSE
 /// failures expose it through `client_message`; checking all three keeps the
@@ -1022,6 +1099,13 @@ fn cursor_error_is_missing_image(error: &CursorError) -> bool {
 }
 
 impl LiveRetryStart {
+    fn expected_conversation_snapshot(&self) -> Option<String> {
+        self.expected_conversation_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
     fn effective_token(&self) -> String {
         self.effective_token
             .lock()
@@ -1052,6 +1136,36 @@ impl LiveRetryStart {
         // continuation is different: clearing it could replay completed tools.
         let conversation_key =
             live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+        if live_error_is_kv_blob_overflow_replayable(error) {
+            // Cursor's KV store is append-only for the lifetime of a remote
+            // conversation. Replaying the delta against the same id cannot
+            // make progress, so rotate once and replay complete history.
+            if self
+                .kv_recovery_attempted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(CursorError::new(413, error, None));
+            }
+            conversation::reset(&conversation_key);
+            create_logger("cursor").warn(
+                "kv_blob_overflow_recovery",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(&self.session_id)),
+                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                    ("replay".into(), serde_json::json!("full_history")),
+                ])),
+            );
+            // A prior image-recovery attempt may have left the original
+            // selected-image UUIDs stale in Cursor's asset index.  The fresh
+            // conversation must receive new metadata even when KV recovery
+            // happens later in the same logical request.
+            let images =
+                cached_image_recovery_images(&self.image_recovery_images, &self.reset_retry_images);
+            return self
+                .start_with_user_text_and_images(&self.reset_user_text, &images, None)
+                .await;
+        }
         if cursor_connect_error_is_missing_image(error) {
             // The same request can encounter the stale asset during the
             // initial open *and* again when a late stream pump is restarted.
@@ -1069,7 +1183,8 @@ impl LiveRetryStart {
             // upstream asset index. Rotate the binding and replay the original
             // Anthropic bytes with fresh UUIDs for one bounded recovery.
             conversation::reset(&conversation_key);
-            let images = refresh_image_uuids(&self.reset_retry_images);
+            let images =
+                cached_image_recovery_images(&self.image_recovery_images, &self.reset_retry_images);
             create_logger("cursor").warn(
                 "image_checkpoint_recovery",
                 Some(serde_json::Map::from_iter([
@@ -1078,12 +1193,13 @@ impl LiveRetryStart {
                     ("recovery".into(), serde_json::json!("fresh_conversation")),
                 ])),
             );
-            self.start_with_user_text_and_images(&self.user_text, &images, None)
+            self.start_with_user_text_and_images(&self.reset_user_text, &images, None)
                 .await
         } else {
             prepare_live_retry_conversation(&conversation_key, error);
+            let cached_images = cached_image_recovery_snapshot(&self.image_recovery_images);
             let images = if live_retry_needs_fresh_history(error) {
-                &self.reset_retry_images
+                cached_images.as_deref().unwrap_or(&self.reset_retry_images)
             } else {
                 &self.images
             };
@@ -1111,7 +1227,13 @@ impl LiveRetryStart {
         // serves identical attach/replay and late tool-result retries, which
         // create no new upstream load. The start loop checks the breaker after
         // it has a reservation and immediately before the first Cursor open.
-        start_live_events_with_retries_with_client_type(
+        let expected_conversation_id = self.expected_conversation_snapshot();
+        // Keep the opener's actual binding in a separate slot.  The session
+        // map may be reset by another recovery task as soon as the upstream
+        // open succeeds; publishing from a post-await map lookup would then
+        // associate this generation with that unrelated replacement.
+        let opened_conversation_id = Arc::new(Mutex::new(None));
+        let result = start_live_events_with_retries_with_client_type(
             self.client.clone(),
             self.effective_token(),
             user_text,
@@ -1123,6 +1245,7 @@ impl LiveRetryStart {
             // image error still needs the original bytes to rebuild a fresh
             // conversation.
             Some(&self.reset_retry_images),
+            Some(&self.reset_user_text),
             self.custom_system.as_deref(),
             LiveRunIdentity {
                 session_id: &self.session_id,
@@ -1140,8 +1263,32 @@ impl LiveRetryStart {
             self.compaction_mode,
             Some(Arc::clone(&self.effective_token)),
             Some(Arc::clone(&self.image_recovery_attempted)),
+            Some(Arc::clone(&self.image_recovery_images)),
+            Some(Arc::clone(&self.kv_recovery_attempted)),
+            Some(Arc::clone(&opened_conversation_id)),
+            LiveStartRecovery {
+                expected_conversation_id: expected_conversation_id.as_deref(),
+                reset_user_text: Some(&self.reset_user_text),
+                reset_images: Some(&self.reset_retry_images),
+            },
         )
-        .await
+        .await;
+        // Only a successful start owns a generation whose binding should be
+        // used by subsequent late retries.  If every attempt failed, retain
+        // the old snapshot so the next caller can detect a concurrent reset
+        // and request a full-history replay.
+        if result.is_ok()
+            && let Some(conversation_id) = opened_conversation_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        {
+            *self
+                .expected_conversation_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(conversation_id);
+        }
+        result
     }
 }
 
@@ -1430,6 +1577,7 @@ async fn start_live_events_with_retries(
         model,
         images,
         None,
+        None,
         custom_system,
         identity,
         allowed,
@@ -1443,6 +1591,10 @@ async fn start_live_events_with_retries(
         false,
         None,
         None,
+        None,
+        None,
+        None,
+        LiveStartRecovery::default(),
     )
     .await
 }
@@ -1455,6 +1607,7 @@ async fn start_live_events_with_retries_with_client_type(
     model: &str,
     images: &[CursorSelectedImage],
     reset_retry_images: Option<&[CursorSelectedImage]>,
+    reset_user_text: Option<&str>,
     custom_system: Option<&str>,
     identity: LiveRunIdentity<'_>,
     allowed: Option<BTreeSet<String>>,
@@ -1468,6 +1621,14 @@ async fn start_live_events_with_retries_with_client_type(
     compaction_mode: bool,
     effective_token: Option<Arc<Mutex<String>>>,
     image_recovery_attempted: Option<Arc<AtomicBool>>,
+    image_recovery_images: Option<Arc<Mutex<Option<Vec<CursorSelectedImage>>>>>,
+    kv_recovery_attempted: Option<Arc<AtomicBool>>,
+    // Receives the exact Cursor conversation binding used by the generation
+    // that successfully opened.  This avoids re-reading the session map after
+    // start, where a concurrent reset could make a different generation look
+    // like the one we just opened.
+    opened_conversation_id: Option<Arc<Mutex<Option<String>>>>,
+    recovery: LiveStartRecovery<'_>,
 ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
     let publish_effective_token = |token: &str| {
         if let Some(shared) = effective_token.as_ref() {
@@ -1481,16 +1642,33 @@ async fn start_live_events_with_retries_with_client_type(
     let mut transient_retries = 0_u32;
     let image_recovery_attempted =
         image_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let image_recovery_images = image_recovery_images.unwrap_or_else(|| Arc::new(Mutex::new(None)));
+    let kv_recovery_attempted =
+        kv_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     // Normally the original request slice is reused across transport retries.
     // A stale Cursor asset requires a new UUID and a fresh conversation; keep
     // that replacement owned by this start loop so both initial-open and
     // Connect END errors share the same bounded recovery state.
-    let mut image_retry_images: Option<Vec<CursorSelectedImage>> = None;
+    // Carry a UUID wave minted by an earlier segment/recovery into this start
+    // invocation.  Late KV/image errors can call back into the same helper
+    // after the first stream has already been torn down; starting from `None`
+    // here would make the binding-race recovery path reintroduce stale image
+    // ids even though the request-scoped cache already has fresh metadata.
+    let mut image_retry_images = image_recovery_images
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     // `images` is normally the current checkpoint delta.  On a stale-image
     // response the conversation is reset and the original Anthropic history
     // must be replayed; callers that have no separate history slice (the
     // compatibility wrapper) simply use the current slice for both roles.
     let reset_retry_images = reset_retry_images.unwrap_or(images);
+    let reset_user_text = reset_user_text.unwrap_or(user_text);
+    // The initial continuation is only a snapshot.  Once Cursor accepts an
+    // open, carry the binding returned by that exact generation through every
+    // internal retry instead of comparing against the stale caller snapshot.
+    let mut expected_conversation_id = recovery.expected_conversation_id.map(str::to_owned);
+    let mut retry_user_text: Option<String> = None;
     let mut account_swaps = 0_u32;
     loop {
         // Local admission strictly precedes the session-slot claim. A start
@@ -1832,10 +2010,21 @@ async fn start_live_events_with_retries_with_client_type(
 
         let upstream_open_guard = reservation.upstream_open_guard();
         let attempt_images = image_retry_images.as_deref().unwrap_or(images);
+        let attempt_prompt = retry_user_text.as_deref().unwrap_or(user_text);
+        // If a prior stale-image/KV recovery already minted fresh asset
+        // identities, keep that exact wave when the continuation-binding race
+        // below is detected.  Falling back to the original full-history slice
+        // here would silently reintroduce the stale UUIDs (and create a second
+        // refresh wave on the next error).
+        let attempt_recovery = LiveStartRecovery {
+            expected_conversation_id: expected_conversation_id.as_deref(),
+            reset_user_text: recovery.reset_user_text,
+            reset_images: Some(image_retry_images.as_deref().unwrap_or(reset_retry_images)),
+        };
         let start = match client
-            .start_live_agent_with_identity_guarded_profile_mode(
+            .start_live_agent_with_identity_guarded_profile_mode_with_recovery(
                 &token,
-                user_text,
+                attempt_prompt,
                 model,
                 attempt_images,
                 custom_system,
@@ -1849,6 +2038,7 @@ async fn start_live_events_with_retries_with_client_type(
                 Some(admission),
                 Some(client_type),
                 compaction_mode,
+                attempt_recovery,
             )
             .await
         {
@@ -1875,9 +2065,9 @@ async fn start_live_events_with_retries_with_client_type(
                             },
                         );
                         client
-                            .start_live_agent_with_identity_guarded_profile_mode(
+                            .start_live_agent_with_identity_guarded_profile_mode_with_recovery(
                                 &token,
-                                user_text,
+                                attempt_prompt,
                                 model,
                                 attempt_images,
                                 custom_system,
@@ -1891,6 +2081,7 @@ async fn start_live_events_with_retries_with_client_type(
                                 None,
                                 Some(client_type),
                                 compaction_mode,
+                                attempt_recovery,
                             )
                             .await
                     }
@@ -1902,6 +2093,16 @@ async fn start_live_events_with_retries_with_client_type(
 
         match start {
             Ok(start) => {
+                // `LiveRunStart` carries the binding pinned by the opener. It
+                // is authoritative even if another task rotates the same
+                // session immediately after this point; late retries use the
+                // shared snapshot and the generation fence to avoid blindly
+                // reading whichever conversation happens to be current.
+                expected_conversation_id = Some(start.conversation_id.clone());
+                if let Some(shared) = opened_conversation_id.as_ref() {
+                    *shared.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                        expected_conversation_id.clone();
+                }
                 start.handle.set_request_fingerprint(operation_fingerprint);
                 if let Err(orphaned) = reservation.insert(Arc::clone(&start.handle)) {
                     drop(probe_admission.take());
@@ -1943,6 +2144,7 @@ async fn start_live_events_with_retries_with_client_type(
                     }
                     LiveStartPeek::Retryable(error) => {
                         let image_error = cursor_connect_error_is_missing_image(&error);
+                        let kv_error = live_error_is_kv_blob_overflow_replayable(&error);
                         let policy_limited = crate::retry::is_policy_rate_limit(&error);
                         if policy_limited {
                             probe_admission
@@ -1954,6 +2156,36 @@ async fn start_live_events_with_retries_with_client_type(
                         }
                         let _ = start.handle.cancel_and_wait().await;
                         let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
+                        if kv_error {
+                            if kv_recovery_attempted
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                return Err(CursorError::new(413, error, None));
+                            }
+                            let key =
+                                live_retry_conversation_key(identity.session_id, identity.agent_id);
+                            conversation::reset(&key);
+                            // A checkpoint delta only carries images from the
+                            // current turn. A fresh conversation needs the
+                            // complete image set as well; preserve an already
+                            // refreshed set if the same request hit the image
+                            // recovery path first.
+                            image_retry_images = Some(cached_image_recovery_images(
+                                &image_recovery_images,
+                                reset_retry_images,
+                            ));
+                            retry_user_text = Some(reset_user_text.to_string());
+                            create_logger("cursor").warn(
+                                "kv_blob_start_recovery",
+                                Some(serde_json::Map::from_iter([
+                                    ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                    ("replay".into(), serde_json::json!("full_history")),
+                                ])),
+                            );
+                            continue;
+                        }
                         if image_error {
                             if image_recovery_attempted
                                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1964,7 +2196,11 @@ async fn start_live_events_with_retries_with_client_type(
                             let key =
                                 live_retry_conversation_key(identity.session_id, identity.agent_id);
                             conversation::reset(&key);
-                            image_retry_images = Some(refresh_image_uuids(reset_retry_images));
+                            image_retry_images = Some(cached_image_recovery_images(
+                                &image_recovery_images,
+                                reset_retry_images,
+                            ));
+                            retry_user_text = Some(reset_user_text.to_string());
                             create_logger("cursor").warn(
                                 "image_start_recovery",
                                 Some(serde_json::Map::from_iter([
@@ -2011,6 +2247,42 @@ async fn start_live_events_with_retries_with_client_type(
                 }
             }
             Err(error) => {
+                let kv_error = cursor_error_is_kv_blob_overflow(&error)
+                    && live_error_is_kv_blob_overflow_replayable(&error.client_message());
+                if kv_error {
+                    // A start-level 413 can arrive before a live event exists
+                    // (for example Cursor rejects the first SetBlob while
+                    // opening the stream).  Rotate the composite binding and
+                    // replay the full prompt once; a second 413 is terminal
+                    // for this logical request rather than a same-id retry.
+                    if kv_recovery_attempted
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        drop(probe_admission.take());
+                        reservation.release();
+                        let key =
+                            live_retry_conversation_key(identity.session_id, identity.agent_id);
+                        conversation::reset(&key);
+                        image_retry_images = Some(cached_image_recovery_images(
+                            &image_recovery_images,
+                            reset_retry_images,
+                        ));
+                        retry_user_text = Some(reset_user_text.to_string());
+                        create_logger("cursor").warn(
+                            "kv_blob_start_recovery",
+                            Some(serde_json::Map::from_iter([
+                                ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                ("replay".into(), serde_json::json!("full_history")),
+                            ])),
+                        );
+                        continue;
+                    }
+                    drop(probe_admission.take());
+                    reservation.release();
+                    return Err(error);
+                }
                 let image_error = cursor_connect_error_is_missing_image(&error.client_message())
                     || cursor_connect_error_is_missing_image(&error.message)
                     || error
@@ -2026,7 +2298,11 @@ async fn start_live_events_with_retries_with_client_type(
                     reservation.release();
                     let key = live_retry_conversation_key(identity.session_id, identity.agent_id);
                     conversation::reset(&key);
-                    image_retry_images = Some(refresh_image_uuids(reset_retry_images));
+                    image_retry_images = Some(cached_image_recovery_images(
+                        &image_recovery_images,
+                        reset_retry_images,
+                    ));
+                    retry_user_text = Some(reset_user_text.to_string());
                     create_logger("cursor").warn(
                         "image_start_recovery",
                         Some(serde_json::Map::from_iter([
@@ -2068,6 +2344,7 @@ async fn start_live_events_with_retries_with_client_type(
                     continue;
                 }
                 let retryable = !image_error
+                    && !kv_error
                     && transient_retries < cursor_transient_retry_limit(&error.client_message())
                     && cursor_start_error_is_same_request_retryable(&error);
                 if retryable {
@@ -2103,6 +2380,8 @@ fn spawn_streaming_live_sse(
     client: CursorHttpClient,
     token: String,
     user_text: String,
+    reset_user_text: String,
+    expected_conversation_id: Option<String>,
     model: String,
     images: Vec<CursorSelectedImage>,
     reset_retry_images: Vec<CursorSelectedImage>,
@@ -2130,10 +2409,14 @@ fn spawn_streaming_live_sse(
             client,
             effective_token: Arc::new(Mutex::new(token)),
             user_text,
+            reset_user_text,
+            expected_conversation_id: Arc::new(Mutex::new(expected_conversation_id)),
             model,
             images,
             reset_retry_images,
             image_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            image_recovery_images: Arc::new(Mutex::new(None)),
+            kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
             custom_system,
             session_id: sid,
             agent_id,
@@ -2402,7 +2685,13 @@ async fn forward_empty_turn_deadline(
 }
 
 fn live_late_retry_limit(error: &str, policy: LiveLateRetryPolicy) -> u32 {
-    if live_error_is_empty_turn_retry(error) {
+    if live_error_is_kv_blob_overflow_replayable(error) {
+        // A KV overflow can only be repaired by changing the Cursor
+        // conversation id. The shared recovery fence makes this one attempt
+        // per logical request; keep the explicit limit here as a second guard
+        // against malformed/repeated upstream frames.
+        1
+    } else if live_error_is_empty_turn_retry(error) {
         policy.empty_turn_max_retries
     } else if is_transient_step_failure(error) {
         cursor_step_failure_retry_limit(error)
@@ -2452,6 +2741,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
     let mut transient_retries = 0_u32;
     let mut empty_turn_retries = 0_u32;
     let mut image_retries = 0_u32;
+    let mut kv_retries = 0_u32;
     let mut empty_turn_deadline = None;
     let mut last_empty_turn_error = None::<String>;
     // Event receivers do not carry their owning Run id. Capture the current
@@ -2495,10 +2785,13 @@ async fn forward_live_events_with_retries_context<F, Fut>(
             LivePumpOutcome::Retry(error) => {
                 let empty_turn = live_error_is_empty_turn_retry(&error);
                 let image_error = cursor_connect_error_is_missing_image(&error);
+                let kv_error = live_error_is_kv_blob_overflow_replayable(&error);
                 let retry_index = if empty_turn {
                     empty_turn_retries
                 } else if image_error {
                     image_retries
+                } else if kv_error {
+                    kv_retries
                 } else {
                     transient_retries
                 };
@@ -2524,6 +2817,8 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                                 "recovery".into(),
                                 serde_json::json!(if empty_turn {
                                     "empty_turn_exhausted"
+                                } else if kv_error {
+                                    "kv_blob_overflow_exhausted"
                                 } else {
                                     "transient_exhausted"
                                 }),
@@ -2611,6 +2906,8 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                     empty_turn_retries += 1;
                 } else if image_error {
                     image_retries += 1;
+                } else if kv_error {
+                    kv_retries += 1;
                 } else {
                     transient_retries += 1;
                 }
@@ -2628,6 +2925,8 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                                 "checkpoint_continue"
                             } else if image_error {
                                 "image_fresh_conversation"
+                            } else if kv_error {
+                                "kv_blob_fresh_conversation"
                             } else if empty_turn {
                                 "fresh_conversation"
                             } else {
@@ -4143,6 +4442,23 @@ impl Provider for CursorProvider {
                 ])),
             );
         }
+        // A checkpoint-backed request normally uses a compact delta prompt.
+        // If the remote conversation must be rotated (for example after a KV
+        // blob-store 413), replay the complete Anthropic history instead of
+        // sending that delta to a brand-new Cursor conversation. Native tool
+        // schemas remain omitted when the live bridge supplies them directly.
+        let reset_user_text = if continuation.has_checkpoint {
+            render_cursor_prompt_parts_with(
+                &body,
+                CursorPromptOptions {
+                    omit_tools: xai_compact || bridge_eligible,
+                    delta_only: false,
+                },
+            )
+            .user_text
+        } else {
+            parts.user_text.clone()
+        };
         let custom_system = parts.custom_system_prompt.as_deref();
         let user_text = parts.user_text.as_str();
 
@@ -4164,10 +4480,16 @@ impl Provider for CursorProvider {
                 client: client.clone(),
                 effective_token: Arc::new(Mutex::new(token)),
                 user_text: user_text.to_string(),
+                reset_user_text: reset_user_text.clone(),
+                expected_conversation_id: Arc::new(Mutex::new(
+                    continuation.conversation_id.clone(),
+                )),
                 model: model.to_string(),
                 images,
                 reset_retry_images,
                 image_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                image_recovery_images: Arc::new(Mutex::new(None)),
+                kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4252,6 +4574,8 @@ impl Provider for CursorProvider {
                     client.clone(),
                     token,
                     user_text.to_string(),
+                    reset_user_text.clone(),
+                    continuation.conversation_id.clone(),
                     model.to_string(),
                     images,
                     reset_retry_images,
@@ -4278,10 +4602,16 @@ impl Provider for CursorProvider {
                 client: client.clone(),
                 effective_token: Arc::new(Mutex::new(token)),
                 user_text: user_text.to_string(),
+                reset_user_text,
+                expected_conversation_id: Arc::new(Mutex::new(
+                    continuation.conversation_id.clone(),
+                )),
                 model: model.to_string(),
                 images,
                 reset_retry_images,
                 image_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                image_recovery_images: Arc::new(Mutex::new(None)),
+                kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4318,11 +4648,18 @@ impl Provider for CursorProvider {
         let mut transport_retries = 0_u32;
         let mut refreshed_once = false;
         let mut image_recovery_attempted = false;
+        let mut kv_recovery_attempted = false;
         // Keep the current continuation delta untouched for ordinary
         // transport retries.  A stale selected-image id is different: after
         // one bounded conversation reset, replay the original history with
         // fresh UUID metadata so Cursor receives the inline bytes again.
         let mut request_images = images.clone();
+        // Keep the recovery image slice aligned with the current request
+        // images.  When the binding changes after a first stale-image/KV
+        // recovery, the client-side continuation guard must not substitute
+        // the original (now stale) UUIDs back into the retried request.
+        let mut binding_reset_images = reset_retry_images.clone();
+        let mut request_prompt = user_text;
         let upstream = loop {
             // The buffered fallback can also wait behind auth/session work;
             // honor a breaker opened in that interval before dispatching, and
@@ -4335,13 +4672,16 @@ impl Provider for CursorProvider {
             match client
                 .run_agent_with_session_profile(
                     &token,
-                    user_text,
+                    request_prompt,
                     model,
                     &request_images,
                     custom_system,
                     CursorRunOptions {
                         session_id: continuation_key.as_deref(),
                         client_type: Some(&client_type),
+                        expected_conversation_id: continuation.conversation_id.as_deref(),
+                        reset_user_text: Some(&reset_user_text),
+                        reset_images: Some(&binding_reset_images),
                     },
                 )
                 .await
@@ -4368,6 +4708,8 @@ impl Provider for CursorProvider {
                         conversation::reset(key);
                     }
                     request_images = refresh_image_uuids(&reset_retry_images);
+                    binding_reset_images = request_images.clone();
+                    request_prompt = &reset_user_text;
                     create_logger("cursor").warn(
                         "image_buffered_recovery",
                         Some(serde_json::Map::from_iter([
@@ -4380,6 +4722,46 @@ impl Provider for CursorProvider {
                         ])),
                     );
                     continue;
+                }
+                Err(e)
+                    if cursor_error_is_kv_blob_overflow(&e)
+                        && live_error_is_kv_blob_overflow_replayable(&e.client_message()) =>
+                {
+                    if !kv_recovery_attempted {
+                        drop(probe_admission);
+                        kv_recovery_attempted = true;
+                        if let Some(key) = continuation_key.as_deref() {
+                            conversation::reset(key);
+                        }
+                        request_prompt = &reset_user_text;
+                        // A KV rotation is a fresh Cursor conversation. Do
+                        // not carry selected-image UUIDs from the poisoned
+                        // conversation into it; preserve bytes/MIME while
+                        // issuing CLI-style fresh asset identities. If the
+                        // same request already performed stale-image
+                        // recovery, retain that refreshed set rather than
+                        // generating a second UUID wave.
+                        request_images = kv_recovery_images(
+                            &request_images,
+                            &reset_retry_images,
+                            image_recovery_attempted,
+                        );
+                        binding_reset_images = request_images.clone();
+                        create_logger("cursor").warn(
+                            "kv_blob_buffered_recovery",
+                            Some(serde_json::Map::from_iter([
+                                (
+                                    "sessionId".into(),
+                                    serde_json::json!(session_id.unwrap_or_default()),
+                                ),
+                                ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                ("replay".into(), serde_json::json!("full_history")),
+                            ])),
+                        );
+                        continue;
+                    }
+                    drop(probe_admission);
+                    return map_cursor_error_to_response(&e);
                 }
                 // A second missing-image response means the bounded
                 // re-upload did not repair the upstream asset lookup. Surface
@@ -4776,7 +5158,9 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::cursor::live::live_error_allows_fresh_conversation;
+    use crate::providers::cursor::live::{
+        live_error_allows_fresh_conversation, live_error_is_kv_blob_overflow,
+    };
 
     static POLICY_RATE_LIMIT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -5151,6 +5535,27 @@ mod tests {
             policy_rate_limit_key("cursor", "cli", "token-a"),
             "Sand and CLI policy state must remain independent"
         );
+    }
+
+    #[test]
+    fn kv_blob_store_overflow_rotates_once_and_replays_full_history() {
+        let message = "Request too large (413) — invalid_request_error: Cursor error 413: Cursor KV blob store limit exceeded (blob=3559 bytes, blobs=4097, total=62731560 bytes)";
+        assert!(live_error_is_kv_blob_overflow(message));
+        assert!(live_error_allows_fresh_conversation(message));
+        assert!(live_error_is_same_request_retryable(message));
+        assert_eq!(same_request_retry_wait_ms(0, message), 0);
+        assert_eq!(
+            live_late_retry_limit(message, LiveLateRetryPolicy::default()),
+            1,
+            "KV overflow must have an independent single reset budget"
+        );
+        assert_eq!(
+            classify_live_pump_item(false, &Err(message.to_string())),
+            LivePumpAction::Retry
+        );
+        let start = CursorError::new(413, "Request too large (413)", Some(message.into()));
+        assert!(cursor_start_error_is_same_request_retryable(&start));
+        assert!(!live_start_error_seals_tombstone(&start));
     }
 
     #[tokio::test]
@@ -6176,6 +6581,90 @@ mod tests {
     }
 
     #[test]
+    fn kv_recovery_reuses_image_wave_after_stale_image_recovery() {
+        let original = vec![CursorSelectedImage {
+            data: "aW1hZ2U=".into(),
+            uuid: "old-image-id".into(),
+            path: String::new(),
+            mime_type: "image/png".into(),
+        }];
+        let refreshed = refresh_image_uuids(&original);
+        let selected = kv_recovery_images(&refreshed, &original, true);
+        assert_eq!(selected[0].uuid, refreshed[0].uuid);
+        assert_eq!(selected[0].data, original[0].data);
+
+        let first_kv_wave = kv_recovery_images(&original, &original, false);
+        assert_ne!(first_kv_wave[0].uuid, original[0].uuid);
+    }
+
+    #[test]
+    fn cached_image_recovery_wave_is_stable_across_late_kv_retry() {
+        let original = vec![CursorSelectedImage {
+            data: "aW1hZ2U=".into(),
+            uuid: "stale-image-id".into(),
+            path: String::new(),
+            mime_type: "image/png".into(),
+        }];
+        let shared = Arc::new(Mutex::new(None));
+        // Simulate the initial stale-image recovery minting a UUID wave.
+        let first = cached_image_recovery_images(&shared, &original);
+        // A later KV 413 must reuse that exact wave, not mint another UUID.
+        let late = cached_image_recovery_images(&shared, &original);
+        assert_eq!(late[0].uuid, first[0].uuid);
+        assert_eq!(late[0].data, first[0].data);
+        assert_ne!(first[0].uuid, original[0].uuid);
+    }
+
+    #[test]
+    fn late_retry_binding_snapshot_advances_after_conversation_rotation() {
+        let _guard = conversation::STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        conversation::reset_for_test();
+        let session = format!("late-retry-binding-{}", uuid::Uuid::new_v4());
+        let key = live_retry_conversation_key(&session, None);
+        let original = conversation::get_or_create(&key).conversation_id;
+        let retry = LiveRetryStart {
+            client: CursorHttpClient::new(),
+            effective_token: Arc::new(Mutex::new(String::new())),
+            user_text: "delta".into(),
+            reset_user_text: "full history".into(),
+            expected_conversation_id: Arc::new(Mutex::new(Some(original.clone()))),
+            model: "claude-fable-5".into(),
+            images: Vec::new(),
+            reset_retry_images: Vec::new(),
+            image_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            image_recovery_images: Arc::new(Mutex::new(None)),
+            kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            custom_system: None,
+            session_id: session.clone(),
+            agent_id: None,
+            parent_agent_id: None,
+            allowed: None,
+            mcp_tools: None,
+            request_context: crate::providers::cursor::proto::RequestContext::default(),
+            fingerprint: Vec::new(),
+            has_refresh: false,
+            unbounded_conflict_wait: false,
+            client_type: "sand".into(),
+            compaction_mode: false,
+        };
+
+        conversation::reset(&key);
+        let rotated = conversation::get_or_create(&key).conversation_id;
+        assert_ne!(rotated, original);
+        // This mirrors the successful recovery path: the next checkpoint
+        // continuation must compare against the fresh binding, not the UUID
+        // captured before KV/image rotation.
+        *retry
+            .expected_conversation_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(rotated.clone());
+        assert_eq!(retry.expected_conversation_snapshot(), Some(rotated));
+        conversation::reset_for_test();
+    }
+
+    #[test]
     fn transient_resource_exhaustion_gets_extended_retry_budget() {
         let transient = "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]";
         assert!(is_transient_resource_exhausted(transient));
@@ -7124,6 +7613,9 @@ mod tests {
 
     #[test]
     fn nested_agent_prompt_continuation_ignores_parent_checkpoint() {
+        let _store_guard = crate::providers::cursor::conversation::STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let session = format!("parent-session-{}", uuid::Uuid::new_v4());
         // Conversations are keyed by the live run key, exactly as the live
         // driver persists checkpoints for the parent slot.
