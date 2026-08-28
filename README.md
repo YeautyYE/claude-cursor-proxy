@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.85 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.86 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -101,6 +101,28 @@ is running. Credentials are re-read from the store on every request, so:
 `CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN` is set in the `serve` process's
 environment, the env token shadows the store and a login hot swap will not
 take effect until you unset it.
+
+#### Multiple Cursor accounts
+
+Use `login` when you want the newly authenticated account to become active.
+Use `add` when you want to keep the current account active and append another
+login to the local account pool:
+
+```bash
+claude-cursor-proxy cursor auth add --label work
+claude-cursor-proxy cursor auth list
+claude-cursor-proxy cursor auth use ACCOUNT_ID
+claude-cursor-proxy cursor auth usage                 # every saved account
+claude-cursor-proxy cursor auth usage ACCOUNT_ID      # one account
+claude-cursor-proxy cursor auth usage --json          # machine-readable
+```
+
+`ACCOUNT_ID` may be the id printed by `list`, an unambiguous email, or a label.
+The pool is stored in `cursor/accounts.json`; the selected credential remains
+mirrored to the existing `cursor/auth.json` so older installations continue to
+work. In the monitor TUI, press `a` to open the account panel, `Enter` to
+switch, `u` to fetch the selected account, and `U` to fetch every account in
+parallel. Adding or switching accounts does not require restarting `serve`.
 
 ### Point Claude Code at the proxy (Fable 5)
 
@@ -237,6 +259,7 @@ Kimi, and Grok routes are unchanged.
 | `Space` / `Enter` | Toggle the selected model between `[sand]` and `[cli]` |
 | `a` | Add a model id manually (for example `claude-fable-5`) |
 | `u` | Open the account-usage view |
+| `a` (main view) | Open the Cursor account panel |
 | `Esc` / `s` | Close the Sand editor |
 
 ### Fast setup

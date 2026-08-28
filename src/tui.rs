@@ -10,7 +10,9 @@ use layout::{
 use std::{
     collections::HashMap,
     io::{self, Stdout},
-    sync::mpsc,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, LazyLock, Mutex, mpsc},
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -97,6 +99,10 @@ fn run_monitor_loop(
     config: MonitorUiConfig<'_>,
     setup_text_override: Option<String>,
 ) -> Result<MonitorExit, anyhow::Error> {
+    // A process can open the monitor more than once (for example, after a
+    // terminal resize/restart in an embedding application). Do not inherit a
+    // previous account usage fan-out into the new event loop.
+    cancel_account_usage_workers();
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = MonitorApp {
@@ -121,6 +127,10 @@ fn run_monitor_loop(
     };
 
     let run_result = run_monitor_events(&mut terminal, &mut snapshot, &mut app);
+    // Usage calls run outside the event loop. Signal detached workers before
+    // leaving the TUI so a force-quit stops any queued fan-out; a request that
+    // is already inside reqwest finishes at its normal bounded timeout.
+    cancel_account_usage_workers();
     if run_result.is_err() {
         app.begin_shutdown();
         let state = snapshot();
@@ -139,6 +149,7 @@ fn run_monitor_events(
     app: &mut MonitorApp,
 ) -> Result<MonitorExit, anyhow::Error> {
     loop {
+        poll_account_usage_results();
         let state = snapshot();
         app.clamp_selection(state.sessions.len(), state.recent.len());
         app.tick = app.tick.wrapping_add(1);
@@ -166,6 +177,9 @@ fn run_monitor_events(
                     }
                     _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
                     _ if app.show_sand_settings => app.handle_sand_key(key.code),
+                    _ if app.detail == Some(DetailView::Accounts) => {
+                        handle_account_key(app, key.code)
+                    }
                     KeyCode::Char('q') => app.request_shutdown_confirmation(),
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
@@ -175,6 +189,7 @@ fn run_monitor_events(
                         app.show_sand_settings = false;
                         app.show_help = false;
                     }
+                    KeyCode::Char('a') => open_accounts_view(app),
                     KeyCode::Char('s') => {
                         app.refresh_sand_models();
                         app.show_sand_settings = true;
@@ -243,7 +258,40 @@ enum DetailView {
     Session,
     Request,
     Usage,
+    Accounts,
 }
+
+/// State for the account manager overlay.  It is kept outside `MonitorApp` so
+/// the monitor's request snapshot remains the single source of truth and the
+/// account list can be refreshed without threading credentials through every
+/// render/test fixture.
+#[derive(Default)]
+struct AccountUiState {
+    accounts: Vec<crate::providers::cursor::auth::CursorAccountProfile>,
+    selected: usize,
+    usage: HashMap<String, crate::monitor::AccountUsageState>,
+    usage_rx: Option<mpsc::Receiver<AccountUsageResult>>,
+    usage_pending: usize,
+    usage_generation: u64,
+    usage_cancel: Option<Arc<AtomicBool>>,
+    usage_scope: Option<AccountUsageScope>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AccountUsageScope {
+    Selected(String),
+    All,
+}
+
+struct AccountUsageResult {
+    account_id: String,
+    state: crate::monitor::AccountUsageState,
+    generation: u64,
+}
+
+static ACCOUNT_UI: LazyLock<Mutex<AccountUiState>> =
+    LazyLock::new(|| Mutex::new(AccountUiState::default()));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorPhase {
@@ -527,6 +575,279 @@ impl MonitorApp {
     }
 }
 
+fn account_ui_lock() -> std::sync::MutexGuard<'static, AccountUiState> {
+    ACCOUNT_UI
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn cancel_usage_locked(ui: &mut AccountUiState) {
+    if let Some(cancel) = ui.usage_cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    // Advance the generation so a worker racing the cancellation signal can
+    // never apply its result to a later request.
+    ui.usage_generation = ui.usage_generation.wrapping_add(1);
+    ui.usage_rx = None;
+    ui.usage_pending = 0;
+    ui.usage_scope = None;
+}
+
+fn cancel_account_usage_workers() {
+    let mut ui = account_ui_lock();
+    cancel_usage_locked(&mut ui);
+}
+
+fn open_accounts_view(app: &mut MonitorApp) {
+    app.detail = Some(DetailView::Accounts);
+    app.show_setup = false;
+    app.show_sand_settings = false;
+    app.show_help = false;
+    refresh_account_list();
+    // Prime the selected account only.  Fetching every account is available
+    // with `U`, while opening the panel stays responsive even with a large
+    // account pool.
+    request_account_usage(false);
+}
+
+fn refresh_account_list() {
+    // Invalidate snapshots before doing any potentially slow auth/file work.
+    // The next caller can explicitly start a fresh selected/all poll.
+    cancel_account_usage_workers();
+    let result = crate::providers::cursor::auth::list_cursor_accounts();
+    let mut ui = account_ui_lock();
+    match result {
+        Ok(accounts) => {
+            let selected_id = ui
+                .accounts
+                .get(ui.selected)
+                .map(|account| account.id.clone());
+            ui.accounts = accounts;
+            ui.selected = selected_id
+                .and_then(|id| ui.accounts.iter().position(|account| account.id == id))
+                .unwrap_or(0)
+                .min(ui.accounts.len().saturating_sub(1));
+            let ids = ui
+                .accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            ui.usage.retain(|id, _| ids.contains(id.as_str()));
+            if ui.accounts.is_empty() {
+                ui.message = Some(
+                    "No Cursor accounts. Run `cursor auth login` or `cursor auth add`.".to_string(),
+                );
+            } else {
+                ui.message = None;
+            }
+        }
+        Err(error) => {
+            ui.accounts.clear();
+            ui.selected = 0;
+            ui.message = Some(format!("Account list failed: {error}"));
+        }
+    }
+}
+
+fn handle_account_key(app: &mut MonitorApp, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('a') => {
+            app.detail = None;
+            cancel_account_usage_workers();
+            let mut ui = account_ui_lock();
+            ui.message = None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let mut ui = account_ui_lock();
+            ui.selected = ui.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let mut ui = account_ui_lock();
+            ui.selected = ui
+                .selected
+                .saturating_add(1)
+                .min(ui.accounts.len().saturating_sub(1));
+        }
+        KeyCode::Enter => switch_selected_account(),
+        KeyCode::Char('u') => request_account_usage(false),
+        KeyCode::Char('U') => request_account_usage(true),
+        KeyCode::Char('r') => {
+            refresh_account_list();
+            request_account_usage_force(true);
+        }
+        _ => {}
+    }
+}
+
+fn switch_selected_account() {
+    let selected = {
+        let ui = account_ui_lock();
+        ui.accounts.get(ui.selected).cloned()
+    };
+    let Some(account) = selected else {
+        let mut ui = account_ui_lock();
+        ui.message = Some("No Cursor accounts are available".to_string());
+        return;
+    };
+    if account.active {
+        let mut ui = account_ui_lock();
+        ui.message = Some(format!("{} is already active", account.display_name()));
+        return;
+    }
+    match crate::providers::cursor::auth::switch_cursor_account(&account.id) {
+        Ok(switched) => {
+            refresh_account_list();
+            {
+                let mut ui = account_ui_lock();
+                ui.message = Some(format!("Active account: {}", switched.display_name()));
+            }
+            request_account_usage(false);
+        }
+        Err(error) => {
+            let mut ui = account_ui_lock();
+            ui.message = Some(format!("Account switch failed: {error}"));
+        }
+    }
+}
+
+fn request_account_usage(all: bool) {
+    request_account_usage_inner(all, false);
+}
+
+fn request_account_usage_force(all: bool) {
+    request_account_usage_inner(all, true);
+}
+
+fn request_account_usage_inner(all: bool, force: bool) {
+    let profiles = {
+        let ui = account_ui_lock();
+        if all {
+            ui.accounts.clone()
+        } else {
+            ui.accounts.get(ui.selected).cloned().into_iter().collect()
+        }
+    };
+    if profiles.is_empty() {
+        let mut ui = account_ui_lock();
+        ui.message = Some("No Cursor accounts are available".to_string());
+        return;
+    }
+
+    let scope = if all {
+        AccountUsageScope::All
+    } else {
+        AccountUsageScope::Selected(profiles[0].id.clone())
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let (generation, cancel) = {
+        let mut ui = account_ui_lock();
+        // Repeated `u`/`U` input should not create another wave of dashboard
+        // calls while the same request is still in flight. The refresh key
+        // cancels and replaces it through the explicit force helper below.
+        if !force && ui.usage_pending > 0 && ui.usage_scope.as_ref() == Some(&scope) {
+            return;
+        }
+        cancel_usage_locked(&mut ui);
+        let generation = ui.usage_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        ui.usage_pending = profiles.len();
+        ui.usage_rx = Some(rx);
+        ui.usage_cancel = Some(Arc::clone(&cancel));
+        ui.usage_scope = Some(scope);
+        ui.message = Some(if all {
+            format!("Fetching usage for {} account(s)...", profiles.len())
+        } else {
+            "Fetching account usage...".to_string()
+        });
+        for profile in &profiles {
+            ui.usage.insert(
+                profile.id.clone(),
+                crate::monitor::AccountUsageState::Unknown,
+            );
+        }
+        (generation, cancel)
+    };
+    // Keep usage fan-out bounded.  Each account query performs several
+    // dashboard calls, so one OS thread per saved account could otherwise
+    // exhaust sockets when a large account pool is refreshed.
+    let profiles = Arc::new(profiles);
+    let worker_count = profiles.len().min(8);
+    for worker in 0..worker_count {
+        let profiles = Arc::clone(&profiles);
+        let tx = tx.clone();
+        let cancel = Arc::clone(&cancel);
+        thread::spawn(move || {
+            for index in (worker..profiles.len()).step_by(worker_count) {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                let profile = &profiles[index];
+                let state =
+                    match crate::providers::cursor::auth::refresh_cursor_account_for_usage(profile)
+                    {
+                        Ok(auth) => {
+                            match crate::providers::cursor::usage::fetch_account_usage(&auth) {
+                                Ok(snapshot) => crate::monitor::AccountUsageState::Ready(snapshot),
+                                Err(error) => {
+                                    crate::monitor::AccountUsageState::Failed(error.to_string())
+                                }
+                            }
+                        }
+                        Err(error) => crate::monitor::AccountUsageState::Failed(error.to_string()),
+                    };
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = tx.send(AccountUsageResult {
+                    account_id: profile.id.clone(),
+                    state,
+                    generation,
+                });
+            }
+        });
+    }
+}
+
+fn poll_account_usage_results() {
+    let mut ui = account_ui_lock();
+    let mut results = Vec::new();
+    let mut disconnected = false;
+    if let Some(rx) = ui.usage_rx.as_ref() {
+        loop {
+            match rx.try_recv() {
+                Ok(result) => results.push(result),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+    for result in results {
+        if result.generation != ui.usage_generation {
+            continue;
+        }
+        ui.usage.insert(result.account_id, result.state);
+        ui.usage_pending = ui.usage_pending.saturating_sub(1);
+    }
+    if disconnected {
+        ui.usage_pending = 0;
+    }
+    if ui.usage_pending == 0 {
+        ui.usage_rx = None;
+        ui.usage_cancel = None;
+        ui.usage_scope = None;
+        if ui.message.as_deref().is_some_and(|message| {
+            message.starts_with("Fetching account usage")
+                || message.starts_with("Fetching usage for ")
+        }) {
+            ui.message = Some("Usage updated".to_string());
+        }
+    }
+}
+
 fn sand_model_choices(registry: &Registry) -> Vec<String> {
     let mut models = registry.supported_models_for("cursor");
     models.extend(crate::providers::cursor::model::cursor_supported_models());
@@ -576,7 +897,15 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         .split(area);
 
     render_header(frame, root[0], app, state);
-    if matches!(app.detail, Some(DetailView::Usage)) {
+    if matches!(app.detail, Some(DetailView::Accounts)) {
+        let accounts_area = Rect {
+            x: root[1].x,
+            y: root[1].y,
+            width: root[1].width,
+            height: root[4].y + root[4].height - root[1].y,
+        };
+        render_accounts_detail(frame, accounts_area);
+    } else if matches!(app.detail, Some(DetailView::Usage)) {
         // Usage is a full-height detail view so period, cost, and event rows
         // remain visible on ordinary 24-row terminals.
         let usage_area = Rect {
@@ -593,6 +922,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
                 render_request_detail(frame, root[1], state, app.recent_selected)
             }
             Some(DetailView::Usage) => unreachable!("usage detail handled above"),
+            Some(DetailView::Accounts) => unreachable!("accounts detail handled above"),
             None => render_sessions(
                 frame,
                 root[1],
@@ -1746,6 +2076,105 @@ fn render_request_detail(
     );
 }
 
+fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let ui = account_ui_lock();
+    let mut lines = vec![Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Enter", Style::default().fg(TEAL)),
+        Span::styled(" switch  ", Style::default().fg(DIM)),
+        Span::styled("u", Style::default().fg(TEAL)),
+        Span::styled(" selected usage  ", Style::default().fg(DIM)),
+        Span::styled("U", Style::default().fg(TEAL)),
+        Span::styled(" all usage  ", Style::default().fg(DIM)),
+        Span::styled("r", Style::default().fg(TEAL)),
+        Span::styled(" refresh  ", Style::default().fg(DIM)),
+        Span::styled("Esc/a", Style::default().fg(TEAL)),
+        Span::styled(" close", Style::default().fg(DIM)),
+    ])];
+    lines.push(Line::from(""));
+    if ui.accounts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No Cursor accounts saved. Run `cursor auth login` or `cursor auth add`.",
+            Style::default().fg(DIM_WHITE),
+        )));
+    } else {
+        // Keep the selected account in view when a user has more accounts
+        // than fit in the panel.  The selected row gets a second line for its
+        // id, so leave room for that line and the optional range indicators.
+        let visible_rows = usize::from(area.height.saturating_sub(8)).max(1);
+        let start = ui
+            .selected
+            .saturating_sub(visible_rows.saturating_sub(1) / 2);
+        let end = (start + visible_rows).min(ui.accounts.len());
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                "  ^ more accounts",
+                Style::default().fg(DIM),
+            )));
+        }
+        for (index, account) in ui
+            .accounts
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
+        {
+            let selected = index == ui.selected;
+            let selected_style = if selected {
+                Style::default().fg(WHITE).bg(SELECTED_BG)
+            } else {
+                Style::default().fg(DIM_WHITE)
+            };
+            let marker = if account.active { "*" } else { " " };
+            let name = ellipsize(account.display_name(), 26);
+            let email = account.email().unwrap_or("");
+            let usage = ui
+                .usage
+                .get(&account.id)
+                .map(|state| state.header_line())
+                .unwrap_or_else(|| "usage  not fetched".to_string());
+            let usage = ellipsize(&usage, 64);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {marker} {} ", if selected { ">" } else { " " }),
+                    selected_style,
+                ),
+                Span::styled(format!("{name:<26} "), selected_style),
+                Span::styled(format!("{:<30} ", ellipsize(email, 29)), selected_style),
+                Span::styled(usage, selected_style),
+            ]));
+            // Keep ids available for accounts without an email, and make it
+            // possible to distinguish two accounts sharing a display label.
+            if selected && !account.id.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("     id ", Style::default().fg(DIM)),
+                    Span::styled(account.id.clone(), Style::default().fg(DIM)),
+                ]));
+            }
+        }
+        if end < ui.accounts.len() {
+            lines.push(Line::from(Span::styled(
+                "  v more accounts",
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    if let Some(message) = ui.message.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(YELLOW),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .block(panel("Cursor accounts", true))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_usage_detail(frame: &mut ratatui::Frame<'_>, area: Rect, state: &MonitorState) {
     let lines = match &state.account_usage {
         crate::monitor::AccountUsageState::Unknown => vec![detail_line(
@@ -1888,6 +2317,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" setup  ", Style::default().fg(DIM)),
         Span::styled("u", Style::default().fg(TEAL)),
         Span::styled(" usage  ", Style::default().fg(DIM)),
+        Span::styled("a", Style::default().fg(TEAL)),
+        Span::styled(" accounts  ", Style::default().fg(DIM)),
         Span::styled("s", Style::default().fg(TEAL)),
         Span::styled(" sand models  ", Style::default().fg(DIM)),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
@@ -1999,6 +2430,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("?", "toggle help"),
         ("b", "toggle setup"),
         ("u", "show account usage"),
+        ("a", "manage Cursor accounts"),
         ("s", "configure Sand models"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
@@ -2900,6 +3332,82 @@ mod tests {
         assert!(text.contains("dashboard cost"), "{text}");
         assert!(text.contains("claude-fable-5"), "{text}");
         assert!(text.contains("INCLUDED"), "{text}");
+    }
+
+    #[test]
+    fn accounts_view_renders_active_marker_and_usage_per_account() {
+        let first = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-a".to_string(),
+            label: Some("Primary".to_string()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-a".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: Some("user-a".to_string()),
+                email: Some("primary@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: true,
+        };
+        let second = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-b".to_string(),
+            label: None,
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-b".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: Some("user-b".to_string()),
+                email: Some("secondary@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: false,
+        };
+        let mut ui = account_ui_lock();
+        ui.accounts = vec![first, second];
+        ui.selected = 1;
+        ui.usage
+            .insert("account-a".to_string(), usage_state_with_sand_percent(25.0));
+        ui.usage
+            .insert("account-b".to_string(), usage_state_with_sand_percent(75.0));
+        ui.message = None;
+        drop(ui);
+
+        let buffer = draw(140, 14, |frame| render_accounts_detail(frame, frame.area()));
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Cursor accounts"), "{text}");
+        assert!(text.contains("*   Primary"), "{text}");
+        assert!(text.contains("> secondary@example.com"), "{text}");
+        assert!(text.contains("secondary@example.com"), "{text}");
+        assert!(text.contains("bot 25%/wk"), "{text}");
+        assert!(text.contains("bot 75%/wk"), "{text}");
+
+        let mut ui = account_ui_lock();
+        *ui = AccountUiState::default();
+    }
+
+    #[test]
+    fn account_usage_cancellation_invalidates_pending_workers() {
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ui = AccountUiState {
+            usage_rx: Some(rx),
+            usage_pending: 3,
+            usage_generation: 41,
+            usage_cancel: Some(Arc::clone(&cancel)),
+            usage_scope: Some(AccountUsageScope::All),
+            ..AccountUiState::default()
+        };
+
+        cancel_usage_locked(&mut ui);
+
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(ui.usage_generation, 42);
+        assert_eq!(ui.usage_pending, 0);
+        assert!(ui.usage_rx.is_none());
+        assert!(ui.usage_cancel.is_none());
+        assert!(ui.usage_scope.is_none());
     }
 
     #[test]

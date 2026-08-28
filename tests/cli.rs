@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use base64::Engine;
 use predicates::str::contains;
 use std::env;
 use tempfile::TempDir;
@@ -132,11 +133,11 @@ fn cursor_auth_use_switches_legacy_active_file() -> Result<(), Box<dyn std::erro
     std::fs::create_dir_all(&auth_dir)?;
     std::fs::write(
         auth_dir.join("accounts.json"),
-        r#"{"activeId":"account-a","accounts":[{"id":"account-a","auth":{"accessToken":"token-a"}},{"id":"account-b","auth":{"accessToken":"token-b"}}]}"#,
+        r#"{"activeId":"account-a","accounts":[{"id":"account-a","label":"Primary","auth":{"accessToken":"token-a"}},{"id":"account-b","label":"Backup","auth":{"accessToken":"token-b"}}]}"#,
     )?;
 
     let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
-    cmd.args(["cursor", "auth", "use", "account-b"]);
+    cmd.args(["cursor", "auth", "use", "  backup  "]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert()
         .success()
@@ -148,5 +149,126 @@ fn cursor_auth_use_switches_legacy_active_file() -> Result<(), Box<dyn std::erro
     let accounts: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(auth_dir.join("accounts.json"))?)?;
     assert_eq!(accounts["activeId"], "account-b");
+    Ok(())
+}
+
+#[test]
+fn cursor_auth_list_keeps_expired_legacy_auth_visible() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("cursor");
+    std::fs::create_dir_all(&auth_dir)?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(br#"{"exp":1,"sub":"legacy-user","email":"legacy@example.com"}"#);
+    let token = format!("e30.{payload}.sig");
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        serde_json::json!({
+            "accessToken": token,
+            "refreshToken": "legacy-refresh"
+        })
+        .to_string(),
+    )?;
+
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
+    cmd.args(["cursor", "auth", "list"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        // Force the refresh probe to fail quickly; list must then use the raw
+        // auth.json credential instead of dropping the legacy account.
+        .env("CCP_CURSOR_BASE_URL", "http://127.0.0.1:1")
+        .assert()
+        .success()
+        .stdout(contains("legacy@example.com"));
+    Ok(())
+}
+
+#[test]
+fn cursor_auth_remove_does_not_mutate_pool_when_env_auth_is_active()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("cursor");
+    std::fs::create_dir_all(&auth_dir)?;
+    let registry = r#"{"activeId":"account-a","accounts":[{"id":"account-a","auth":{"accessToken":"token-a"}}]}"#;
+    std::fs::write(auth_dir.join("accounts.json"), registry)?;
+
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
+    cmd.args(["cursor", "auth", "remove", "account-a"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_CURSOR_AUTH_TOKEN", "environment-token")
+        .assert()
+        .failure()
+        .stderr(contains("environment Cursor token"));
+    assert_eq!(
+        std::fs::read_to_string(auth_dir.join("accounts.json"))?,
+        registry
+    );
+    Ok(())
+}
+
+#[test]
+fn cursor_auth_remove_migrates_and_removes_legacy_single_account()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("cursor");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        serde_json::json!({"accessToken": "legacy-token"}).to_string(),
+    )?;
+
+    let mut list = Command::cargo_bin("claude-cursor-proxy")?;
+    let output = list
+        .args(["cursor", "auth", "list"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .output()?;
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout)?;
+    let id = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with('*'))
+        .find_map(|line| line.split_whitespace().nth(1))
+        .ok_or("legacy account id missing")?
+        .to_string();
+
+    let mut remove = Command::cargo_bin("claude-cursor-proxy")?;
+    remove
+        .args(["cursor", "auth", "remove", &id])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .assert()
+        .success()
+        .stdout(contains("No Cursor account is active."));
+    let accounts: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(auth_dir.join("accounts.json"))?)?;
+    assert_eq!(accounts["activeId"], serde_json::Value::Null);
+    assert!(accounts["accounts"].as_array().is_some_and(Vec::is_empty));
+    assert!(!auth_dir.join("auth.json").exists());
+    Ok(())
+}
+
+#[test]
+fn cursor_auth_remove_inactive_keeps_active_mirror_and_reports_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("cursor");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("accounts.json"),
+        r#"{"activeId":"account-a","accounts":[{"id":"account-a","label":"primary","auth":{"accessToken":"token-a"}},{"id":"account-b","label":"backup","auth":{"accessToken":"token-b"}}]}"#,
+    )?;
+    std::fs::write(auth_dir.join("auth.json"), r#"{"accessToken":"token-a"}"#)?;
+
+    let mut remove = Command::cargo_bin("claude-cursor-proxy")?;
+    remove
+        .args(["cursor", "auth", "remove", "account-b"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .assert()
+        .success()
+        .stdout(contains("Active Cursor account"));
+    let active: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(auth_dir.join("auth.json"))?)?;
+    assert_eq!(active["accessToken"], "token-a");
+    let accounts: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(auth_dir.join("accounts.json"))?)?;
+    assert_eq!(accounts["activeId"], "account-a");
+    assert_eq!(accounts["accounts"].as_array().map(Vec::len), Some(1));
     Ok(())
 }

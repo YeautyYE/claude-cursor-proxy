@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.85 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.86 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -98,6 +98,25 @@ claude-cursor-proxy serve --port 11435    # 换端口
 `cursor auth status` 可查看当前生效的账号。注意：如果 `serve` 进程的环境里设了
 `CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN`，env token 会遮蔽存储的登录态，
 热切换不会生效，需先取消该环境变量。
+
+#### 多账号管理
+
+需要让新登录账号立即生效时使用 `login`；只想把账号加入账号池、保持当前账号继续
+工作时使用 `add`：
+
+```bash
+claude-cursor-proxy cursor auth add --label work
+claude-cursor-proxy cursor auth list
+claude-cursor-proxy cursor auth use ACCOUNT_ID
+claude-cursor-proxy cursor auth usage                 # 拉取全部账号
+claude-cursor-proxy cursor auth usage ACCOUNT_ID      # 只拉取一个账号
+claude-cursor-proxy cursor auth usage --json          # JSON 输出
+```
+
+`ACCOUNT_ID` 可以是 `list` 输出的 ID，也可以是唯一的邮箱或标签。账号池保存在
+`cursor/accounts.json`，当前账号仍会镜像到原有的 `cursor/auth.json`，旧版本也能继续
+读取。监控 TUI 中按 `a` 打开账号面板，按 `Enter` 切换，按 `u` 拉取选中账号用量，按
+`U` 并行拉取全部账号。添加和切换账号都不需要重启 `serve`。
 
 ### 3. 让 Claude Code 走本机代理（Fable 5）
 
@@ -232,6 +251,7 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 | `空格` / `Enter` | 在 `[sand]` 与 `[cli]` 之间切换 |
 | `a` | 手动添加精确模型 id（例如 `claude-fable-5`） |
 | `u` | 打开账号用量详情 |
+| `a`（主界面） | 打开 Cursor 账号面板 |
 | `Esc` / `s` | 关闭 Sand 编辑器 |
 
 ### 最快配置

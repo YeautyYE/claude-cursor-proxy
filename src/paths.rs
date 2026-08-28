@@ -97,6 +97,22 @@ pub fn cursor_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("cursor").join("auth.json")
 }
 
+/// Persistent registry of additional Cursor accounts.  `auth.json` remains
+/// the active credential for backwards compatibility; this sibling file keeps
+/// the credentials that can be selected from the TUI/CLI.
+pub fn cursor_accounts_file(deps: &DirResolverEnv) -> PathBuf {
+    resolve_config_dir(deps)
+        .join("cursor")
+        .join("accounts.json")
+}
+
+pub fn provider_accounts_file(provider: &str) -> PathBuf {
+    let deps = DirResolverEnv::default();
+    resolve_config_dir(&deps)
+        .join(provider)
+        .join("accounts.json")
+}
+
 pub fn kimi_device_id_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("kimi").join("device_id")
 }

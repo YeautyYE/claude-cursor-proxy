@@ -3,6 +3,22 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.86 (2026-08-29)
+
+- Add Cursor multi-account management. `cursor auth login` keeps its hot-switch
+  behavior while retaining the previous login; `cursor auth add` appends another
+  browser login without changing the active account. Add `list`, `use`,
+  `remove`, and `usage [ACCOUNT] [--json]` commands, with account ids, labels,
+  unique emails, and cross-process registry locking.
+- Add a TUI Cursor account panel on `a`. Select an account with `j`/`k`, press
+  `Enter` to switch, `u` for one account's dashboard usage, `U` for all saved
+  accounts, and `r` to refresh. Usage fan-out is bounded and stale workers are
+  cancelled so repeated refreshes do not create duplicate dashboard requests.
+- Refresh inactive account credentials independently during usage queries and
+  persist rotated tokens with compare-and-swap checks. The active credential
+  remains mirrored to the legacy `cursor/auth.json` for compatibility.
+- Document the TUI-first Sand/model workflow and the one-binary account model.
+
 ## v0.1.85 (2026-08-28)
 
 - Preserve Claude Code's repeated `x-stainless-helper` values so ToolRunner

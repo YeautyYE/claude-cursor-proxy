@@ -9,6 +9,8 @@ use claude_cursor_proxy::{
     tui::{self, MonitorExit, MonitorUiConfig},
 };
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -296,25 +298,32 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
 
     match command {
         AuthCommand::Add { label } => {
-            let auth = cursor_auth::run_cursor_login_add()?
+            let auth = cursor_auth::run_cursor_login_add_with_label(label.clone())?
                 .ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
-            // `run_cursor_login_add` already persisted the account. Apply a
-            // supplied label as a small follow-up update without exposing the
-            // bearer token in command output.
-            let account = if label
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                let stored = cursor_auth::StoredCursorAuth {
-                    access_token: auth.access_token.clone(),
-                    refresh_token: auth.refresh_token.clone(),
-                    api_key: auth.api_key.clone(),
-                };
-                cursor_auth::add_cursor_auth(stored, label)?
+            // Resolve the persisted profile once so the output names the
+            // account just added (which can be inactive) rather than merely
+            // echoing the currently selected account.
+            let proposed_id = cursor_auth::cursor_account_id_for_token(&auth.access_token);
+            let added = cursor_auth::list_cursor_accounts()?
+                .into_iter()
+                .find(|profile| {
+                    profile.id == proposed_id
+                        || profile
+                            .auth
+                            .email
+                            .as_deref()
+                            .zip(auth.email.as_deref())
+                            .is_some_and(|(left, right)| {
+                                left.trim().eq_ignore_ascii_case(right.trim())
+                            })
+                });
+            if let Some(profile) = added {
+                println!("Cursor account added: {}", profile.display_name());
+                println!("Account id: {}", profile.id);
             } else {
-                auth
-            };
-            println!("Cursor account added: {}", account_display_name(&account));
+                println!("Cursor account added: {}", account_display_name(&auth));
+                println!("Account id: {proposed_id}");
+            }
             if let Some(id) = cursor_auth::active_cursor_account_id()? {
                 println!("Active account: {id}");
             }
@@ -332,7 +341,7 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
             println!("Cursor accounts ({}):", accounts.len());
             for account in accounts {
                 let marker = if account.active { '*' } else { ' ' };
-                let label = account_display_name(&account.auth);
+                let label = account.display_name();
                 let email = account.auth.email.as_deref().unwrap_or("-");
                 println!("{marker} {id}  {label}  ({email})", id = account.id);
             }
@@ -369,14 +378,18 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
                 anyhow::bail!("No Cursor accounts saved; run `cursor auth login` first");
             }
             let selected = match account {
-                Some(ref selector) => vec![resolve_cursor_account_from(&accounts, selector)?],
-                None => accounts.iter().collect(),
+                Some(ref selector) => {
+                    vec![resolve_cursor_account_from(&accounts, selector)?.clone()]
+                }
+                None => accounts,
             };
-            let mut rows = Vec::with_capacity(selected.len());
-            for profile in selected {
-                let usage = claude_cursor_proxy::providers::cursor::usage::fetch_account_usage(
-                    &profile.auth,
-                );
+            // Dashboard calls are blocking and can each spend several seconds.
+            // Keep all-account usage responsive without opening an unbounded
+            // wave of sockets, while retaining the deterministic account order
+            // in both text and JSON output.
+            let usage_results = fetch_cursor_usage_bounded(selected);
+            let mut rows = Vec::with_capacity(usage_results.len());
+            for (profile, usage) in usage_results {
                 match usage {
                     Ok(snapshot) if json => rows.push(serde_json::json!({
                         "id": profile.id,
@@ -436,9 +449,16 @@ fn resolve_cursor_account_from<'a>(
     let matches: Vec<_> = accounts
         .iter()
         .filter(|account| {
-            account.id == selector
-                || account.auth.email.as_deref() == Some(selector)
-                || account.label.as_deref() == Some(selector)
+            account.id.trim().eq_ignore_ascii_case(selector)
+                || account
+                    .auth
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.trim().eq_ignore_ascii_case(selector))
+                || account
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.trim().eq_ignore_ascii_case(selector))
         })
         .collect();
     match matches.as_slice() {
@@ -446,6 +466,74 @@ fn resolve_cursor_account_from<'a>(
         [] => anyhow::bail!("Cursor account not found: {selector}"),
         _ => anyhow::bail!("Cursor account selector is ambiguous: {selector}"),
     }
+}
+
+const MAX_CURSOR_USAGE_WORKERS: usize = 8;
+
+fn fetch_cursor_usage_bounded(
+    profiles: Vec<claude_cursor_proxy::providers::cursor::auth::CursorAccountProfile>,
+) -> Vec<(
+    claude_cursor_proxy::providers::cursor::auth::CursorAccountProfile,
+    std::result::Result<claude_cursor_proxy::monitor::AccountUsageSnapshot, String>,
+)> {
+    let results = run_bounded_ordered(&profiles, MAX_CURSOR_USAGE_WORKERS, |profile| {
+        let auth =
+            claude_cursor_proxy::providers::cursor::auth::refresh_cursor_account_for_usage(profile)
+                .map_err(|error| error.to_string());
+        auth.and_then(|auth| {
+            claude_cursor_proxy::providers::cursor::usage::fetch_account_usage(&auth)
+                .map_err(|error| error.to_string())
+        })
+    });
+    profiles.into_iter().zip(results).collect()
+}
+
+/// Execute one blocking task per item with a fixed worker ceiling. Results are
+/// indexed by input position, so callers can render them in stable order even
+/// when individual requests complete out of order.
+fn run_bounded_ordered<T, R, F>(items: &[T], max_workers: usize, task: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let workers = items.len().min(max_workers.max(1));
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            let task = &task;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    if tx.send((index, task(&items[index]))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(tx);
+
+    let mut results: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    for (index, result) in rx {
+        if index < results.len() {
+            results[index] = Some(result);
+        }
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("bounded worker did not return a result"))
+        .collect()
 }
 
 fn usage_snapshot_json(
@@ -592,5 +680,73 @@ mod tests {
     #[test]
     fn listen_url_brackets_ipv6_addresses() {
         assert_eq!(listen_url("::1", 18765), "http://[::1]:18765");
+    }
+
+    #[test]
+    fn cursor_account_selector_ignores_case_and_outer_whitespace() {
+        use claude_cursor_proxy::providers::cursor::auth::{CursorAccountProfile, CursorAuth};
+
+        let profile = CursorAccountProfile {
+            id: "ACCOUNT-ID".to_string(),
+            label: Some("Work Laptop".to_string()),
+            auth: CursorAuth {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: None,
+                email: Some("Person@Example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: false,
+        };
+        let accounts = vec![profile];
+
+        assert_eq!(
+            resolve_cursor_account_from(&accounts, "  account-id  ")
+                .unwrap()
+                .id,
+            "ACCOUNT-ID"
+        );
+        assert_eq!(
+            resolve_cursor_account_from(&accounts, " person@example.COM ")
+                .unwrap()
+                .id,
+            "ACCOUNT-ID"
+        );
+        assert_eq!(
+            resolve_cursor_account_from(&accounts, "  work laptop ")
+                .unwrap()
+                .id,
+            "ACCOUNT-ID"
+        );
+    }
+
+    #[test]
+    fn bounded_usage_worker_preserves_order_and_respects_ceiling() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_observed = Arc::clone(&peak);
+        let active_observed = Arc::clone(&active);
+        let items: Vec<usize> = (0..24).collect();
+        let results = run_bounded_ordered(&items, 3, move |item| {
+            let now = active_observed.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_observed.fetch_max(now, Ordering::SeqCst);
+            // Make completion order differ from input order while workers are
+            // active, then release the slot.
+            std::thread::sleep(Duration::from_millis((4 - item % 4) as u64));
+            active_observed.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        });
+
+        assert_eq!(
+            results,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert!(peak.load(Ordering::SeqCst) > 1);
     }
 }
