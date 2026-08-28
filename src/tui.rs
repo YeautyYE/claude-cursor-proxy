@@ -2206,7 +2206,7 @@ fn account_list_columns(area_width: u16) -> AccountListColumns {
         [11, 10, 9, 13]
     };
     // Five marker characters plus one separator after every cell.
-    let fixed_metrics = 6 + metric_widths.iter().map(|width| width + 1).sum::<usize>();
+    let fixed_metrics = 5 + metric_widths.iter().map(|width| width + 1).sum::<usize>();
     let email_width = if inner_width >= 96 {
         Some(if inner_width < 132 { 24 } else { 32 })
     } else {
