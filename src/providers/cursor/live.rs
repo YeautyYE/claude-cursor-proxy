@@ -673,6 +673,45 @@ impl CursorLiveRunHandle {
             .is_some_and(terminal_outcome_is_fresh)
     }
 
+    /// A replay-safe empty-turn marker has already been sent to the
+    /// downstream request. It is safe for the late-retry pump to hand the slot
+    /// to a fresh generation before the old driver's final cleanup flips
+    /// `completed`; checkpoint-only and ambiguous markers stay excluded until
+    /// cleanup has persisted their state.
+    fn has_retryable_terminal_error(&self) -> bool {
+        self.terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|outcome| terminal_outcome_is_fresh(outcome))
+            // Only the explicit empty-turn marker with a fresh-conversation
+            // note proves that no client-visible text/tool was committed and
+            // that old cleanup has no continuation to persist. Generic
+            // transport errors can be retryable too, but may follow a partial
+            // response; releasing those early would permit duplicate
+            // execution.
+            .is_some_and(|outcome| {
+                live_error_is_empty_turn_retry(&outcome.message)
+                    && terminal_error_allows_fresh_retry(&outcome.message)
+            })
+    }
+
+    /// Read a replay-safe empty-turn marker without consuming it. The driver
+    /// may still be unwinding after publishing the marker; keeping it visible
+    /// makes its cleanup skip continuation persistence and success sealing.
+    fn retryable_terminal_error(&self) -> Option<String> {
+        self.terminal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|outcome| terminal_outcome_is_fresh(outcome))
+            .filter(|outcome| {
+                live_error_is_empty_turn_retry(&outcome.message)
+                    && terminal_error_allows_fresh_retry(&outcome.message)
+            })
+            .map(|outcome| outcome.message.clone())
+    }
+
     fn ensure_replacement_is_safe(&self) -> Result<(), CursorError> {
         let ambiguous = self
             .terminal_error
@@ -3051,12 +3090,21 @@ impl LiveRunRegistry {
         Self::prune_finished(&mut runs);
         let (error, sealed_fingerprint, owner_token) = match runs.runs.get(&key) {
             Some(LiveRunEntry::Running(handle))
-                if handle.is_completed() || handle.is_command_closed() =>
+                if handle.is_completed()
+                    || handle.is_command_closed()
+                    || handle.has_retryable_terminal_error() =>
             {
-                let error = handle.take_terminal_error().or_else(|| {
-                    handle
-                        .is_command_closed()
-                        .then(|| live_control_close_message(true).to_string())
+                // A replay-safe empty-turn marker is published before the
+                // driver finishes its final cleanup. Clone that marker
+                // instead of consuming it, otherwise the old driver could see
+                // an empty error slot and persist stale continuation state
+                // after the fresh retry has already started.
+                let error = handle.retryable_terminal_error().or_else(|| {
+                    handle.take_terminal_error().or_else(|| {
+                        handle
+                            .is_command_closed()
+                            .then(|| live_control_close_message(true).to_string())
+                    })
                 });
                 (
                     error,
@@ -15988,6 +16036,127 @@ mod tests {
                 LiveRunProbe::Free
             ),
             "the next grok turn must not replay a consumed 429 as 502"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn retryable_terminal_error_frees_slot_before_driver_completion() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("empty-turn-live-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "empty-turn-live-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: format!("{EMPTY_TURN_RETRY_NOTE} ({CONVERSATION_RESET_RETRY_NOTE})"),
+                created_at: Instant::now(),
+            }))),
+            // The driver is still unwinding its upstream task.  The terminal
+            // marker itself is the handoff boundary for a safe fresh retry.
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert empty-turn run");
+
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(&session, None),
+                LiveRunProbe::Free
+            ),
+            "a retryable terminal marker must hand off without waiting for driver cleanup"
+        );
+        assert!(
+            handle.has_terminal_error(),
+            "the old driver must retain the marker while it finishes cleanup"
+        );
+        assert!(
+            LiveRunRegistry::running_generation(&session, None).is_none(),
+            "the stale generation must be removed before a fresh retry starts"
+        );
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn ambiguous_terminal_error_stays_occupied_before_driver_completion() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("ambiguous-live-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "ambiguous-live-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: "Cursor live run timed out before completion; acceptance is ambiguous"
+                    .into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(Arc::clone(&handle))
+            .expect("insert ambiguous run");
+
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(&session, None),
+                LiveRunProbe::Occupied
+            ),
+            "ambiguous acceptance must remain occupied until driver cleanup completes"
+        );
+        handle.completed.store(true, Ordering::Release);
+        assert!(matches!(
+            LiveRunRegistry::probe_run(&session, None),
+            LiveRunProbe::TerminalError(_)
+        ));
+        LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn generic_retryable_transport_error_stays_occupied_until_completion() {
+        let _registry = lock_live_registry_for_test();
+        let session = format!("transport-live-{}", uuid::Uuid::new_v4());
+        LiveRunRegistry::clear();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let handle = Arc::new(CursorLiveRunHandle {
+            run_id: "transport-live-run".into(),
+            command_tx,
+            pending: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(Some(TerminalOutcome {
+                message: "Connect error 502: ERROR_OPENAI: Unable to reach the model provider [unavailable]".into(),
+                created_at: Instant::now(),
+            }))),
+            completed: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            resume_in_flight: Arc::new(ResumeAdmission::default()),
+            request_fingerprint: Arc::new(AtomicU64::new(0)),
+            consumer_gone: Arc::new(AtomicBool::new(false)),
+        });
+        LiveRunRegistry::reserve(&session)
+            .expect("reserve")
+            .insert(handle)
+            .expect("insert transport run");
+
+        assert!(
+            matches!(
+                LiveRunRegistry::probe_run(&session, None),
+                LiveRunProbe::Occupied
+            ),
+            "a generic transport error may follow partial output and must not authorize an early duplicate"
         );
         LiveRunRegistry::clear();
     }
