@@ -49,6 +49,10 @@ pub fn is_policy_rate_limit(message: &str) -> bool {
         // ERROR_PRO_USER_/ERROR_FREE_USER_/ERROR_USER_RATE_LIMIT_EXCEEDED:
         // the account's own quota window, not pool capacity.
         || lower.contains("user_rate_limit_exceeded")
+        // The named-model/API allowance uses a distinct code from the
+        // account-wide user meter. It is equally terminal for this account;
+        // retrying it internally only creates another empty-turn wave.
+        || lower.contains("api_rate_limit_exceeded")
         || (lower.contains("error_rate_limited")
             && (lower.contains("free plans")
                 || lower.contains("upgrade plans")
@@ -363,6 +367,11 @@ mod tests {
         assert!(is_policy_rate_limit(
             "Connect error 429: ERROR_FREE_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded [resource_exhausted]"
         ));
+
+        let api_quota = "Connect error 429: ERROR_CURSOR_API_RATE_LIMIT_EXCEEDED: Cursor API usage meter is 100% [resource_exhausted]";
+        assert!(is_policy_rate_limit(api_quota));
+        assert!(!should_retry_upstream(429, api_quota));
+        assert_eq!(classify_proxy_error_status(502, api_quota), 429);
 
         let transient = "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]";
         assert!(

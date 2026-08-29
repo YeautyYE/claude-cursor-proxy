@@ -34,6 +34,11 @@ pub enum RequestStatus {
     Upstream,
     Streaming,
     Completed,
+    /// The downstream consumer closed the response before the body reached a
+    /// terminal frame. This is distinct from an upstream/provider failure:
+    /// the server did not observe an HTTP error, and the accepted live run may
+    /// still finish and be replayed to a retrying client.
+    Abandoned,
     Failed,
 }
 
@@ -45,6 +50,7 @@ impl RequestStatus {
             Self::Upstream => "upstream",
             Self::Streaming => "streaming",
             Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
             Self::Failed => "failed",
         }
     }
@@ -71,6 +77,13 @@ pub enum MonitorEvent {
         provider: String,
         model: String,
         effort: Option<String>,
+    },
+    /// Request-scoped provider surface, such as Cursor's `sand` or `cli`.
+    /// This is captured once so historical rows do not change when the TUI
+    /// routing policy is edited later.
+    ClientTypeResolved {
+        request_id: String,
+        client_type: String,
     },
     ModelResolved {
         request_id: String,
@@ -123,6 +136,7 @@ pub struct ActiveRequest {
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub client_type: Option<String>,
     pub effort: Option<String>,
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
@@ -171,6 +185,7 @@ pub struct CompletedRequest {
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub client_type: Option<String>,
     pub effort: Option<String>,
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
@@ -371,6 +386,7 @@ pub struct SessionSummary {
     pub failure_count: usize,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub client_type: Option<String>,
     pub effort: Option<String>,
     pub last_seen: SystemTime,
     pub input_tokens: u64,
@@ -517,6 +533,17 @@ impl MonitorHandle {
         });
     }
 
+    pub fn client_type_resolved(
+        &self,
+        request_id: impl Into<String>,
+        client_type: impl Into<String>,
+    ) {
+        self.publish(MonitorEvent::ClientTypeResolved {
+            request_id: request_id.into(),
+            client_type: client_type.into(),
+        });
+    }
+
     pub fn model_resolved(&self, request_id: impl Into<String>, model: impl Into<String>) {
         self.publish(MonitorEvent::ModelResolved {
             request_id: request_id.into(),
@@ -645,6 +672,7 @@ impl MonitorStore {
                         project: None,
                         provider: None,
                         model: None,
+                        client_type: None,
                         effort: None,
                         endpoint,
                         started_at: SystemTime::now(),
@@ -692,6 +720,20 @@ impl MonitorStore {
                     active.model = Some(model);
                     active.effort = effort;
                     active.status = RequestStatus::ProviderSelected;
+                }
+            }
+            MonitorEvent::ClientTypeResolved {
+                request_id,
+                client_type,
+            } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.client_type = Some(client_type);
+                } else if let Some(completed) = self
+                    .recent
+                    .iter_mut()
+                    .find(|request| request.request_id == request_id)
+                {
+                    completed.client_type = Some(client_type);
                 }
             }
             MonitorEvent::ModelResolved { request_id, model } => {
@@ -867,7 +909,7 @@ impl MonitorStore {
             MonitorEvent::RequestAbandoned { request_id, error } => {
                 self.finish_active(
                     &request_id,
-                    RequestStatus::Failed,
+                    RequestStatus::Abandoned,
                     None,
                     None,
                     None,
@@ -909,11 +951,17 @@ impl MonitorStore {
     ) {
         if status == RequestStatus::Completed
             && self.recent.iter().any(|request| {
-                request.request_id == request_id && request.status == RequestStatus::Failed
+                request.request_id == request_id
+                    && matches!(
+                        request.status,
+                        RequestStatus::Failed | RequestStatus::Abandoned
+                    )
             })
         {
-            // Live SSE always ends HTTP 200; a prior stream `event: error`
-            // already recorded the Connect failure (typically 502).
+            // Live SSE normally ends HTTP 200. A prior stream `event: error`
+            // or a downstream cancellation already recorded the authoritative
+            // terminal outcome; do not downgrade it to a synthetic 200 when
+            // the response wrapper is dropped or drained late.
             return;
         }
         let mut active = self
@@ -926,6 +974,7 @@ impl MonitorStore {
                 project: None,
                 provider: None,
                 model: None,
+                client_type: None,
                 effort: None,
                 endpoint: EndpointKind::Messages,
                 started_at: SystemTime::now(),
@@ -955,6 +1004,7 @@ impl MonitorStore {
             project: active.project,
             provider: active.provider,
             model: active.model,
+            client_type: active.client_type,
             effort: active.effort,
             endpoint: active.endpoint,
             started_at: active.started_at,
@@ -1035,6 +1085,7 @@ fn session_summaries(
                 failure_count: 0,
                 provider: None,
                 model: None,
+                client_type: None,
                 effort: None,
                 last_seen: request.finished_at,
                 input_tokens: 0,
@@ -1051,6 +1102,7 @@ fn session_summaries(
         entry.project = request.project.clone().or(entry.project.clone());
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
+        entry.client_type = request.client_type.clone().or(entry.client_type.clone());
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
         entry.input_tokens = entry
@@ -1087,6 +1139,7 @@ fn session_summaries(
                 failure_count: 0,
                 provider: None,
                 model: None,
+                client_type: None,
                 effort: None,
                 last_seen: request.started_at,
                 input_tokens: 0,
@@ -1101,6 +1154,7 @@ fn session_summaries(
         entry.project = request.project.clone().or(entry.project.clone());
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
+        entry.client_type = request.client_type.clone().or(entry.client_type.clone());
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.started_at);
         entry.input_tokens = entry
@@ -1352,6 +1406,26 @@ mod tests {
     }
 
     #[test]
+    fn resolved_client_type_is_preserved_in_completed_and_session_rows() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some("session-1".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("r1", "cursor", "gemini-3.1-pro", None);
+        monitor.client_type_resolved("r1", "sand");
+        let active = monitor.snapshot();
+        assert_eq!(active.active[0].client_type.as_deref(), Some("sand"));
+
+        monitor.request_completed("r1", 200, None, None);
+        let state = monitor.snapshot();
+        assert_eq!(state.recent[0].client_type.as_deref(), Some("sand"));
+        assert_eq!(state.sessions[0].client_type.as_deref(), Some("sand"));
+    }
+
+    #[test]
     fn generation_started_does_not_anchor_token_rate_before_output() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
@@ -1495,7 +1569,7 @@ mod tests {
         let state = monitor.snapshot();
         assert!(state.active.is_empty());
         assert_eq!(state.recent.len(), 1);
-        assert_eq!(state.recent[0].status, RequestStatus::Failed);
+        assert_eq!(state.recent[0].status, RequestStatus::Abandoned);
         assert_eq!(state.recent[0].http_status, None);
         assert_eq!(state.recent[0].error.as_deref(), Some("request dropped"));
     }
@@ -1510,6 +1584,40 @@ mod tests {
         assert!(state.active.is_empty());
         assert_eq!(state.recent.len(), 1);
         assert_eq!(state.recent[0].status, RequestStatus::Completed);
+    }
+
+    #[test]
+    fn abandoned_requests_ignore_late_success() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.request_abandoned("r1", "client disconnected");
+        monitor.request_completed("r1", 200, None, None);
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.recent[0].status, RequestStatus::Abandoned);
+        assert_eq!(state.recent[0].http_status, None);
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("client disconnected")
+        );
+    }
+
+    #[test]
+    fn body_failure_is_not_reclassified_as_abandonment() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.request_failed("r1", Some(200), "upstream body reset");
+        monitor.request_abandoned("r1", "client disconnected");
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.recent[0].status, RequestStatus::Failed);
+        assert_eq!(state.recent[0].http_status, Some(200));
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("upstream body reset")
+        );
     }
 
     #[test]
@@ -1571,6 +1679,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             project: None,
             provider: Some("codex".to_string()),
             model: Some("gpt-5.6-sol".to_string()),
+            client_type: None,
             effort: None,
             endpoint: EndpointKind::Messages,
             started_at: SystemTime::UNIX_EPOCH,

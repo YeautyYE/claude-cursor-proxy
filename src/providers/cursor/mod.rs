@@ -51,7 +51,8 @@ use crate::providers::cursor::live::{
     LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim, LiveRunEvent, LiveRunIdentity,
     LiveRunProbe, LiveRunRegistry, LiveRunReservation, LiveSlotClaim, LiveStartRecovery,
     cursor_error_is_kv_blob_overflow, cursor_start_error_is_same_request_retryable,
-    exhausted_live_start_error, finish_replacement_after_cancel, live_error_is_empty_turn_retry,
+    exhausted_live_start_error, finish_replacement_after_cancel,
+    live_error_is_agent_looping_detected, live_error_is_empty_turn_retry,
     live_error_is_kv_blob_overflow_replayable, live_error_is_same_request_retryable,
     live_error_needs_checkpoint_continue, live_pending_must_supersede,
     live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
@@ -644,7 +645,14 @@ fn shared_cursor_http_client(conversation_key: Option<&str>) -> CursorHttpClient
 const MAX_SESSION_USAGE: usize = 10_000;
 const LIVE_USAGE_TAP_CAP: usize = 512;
 const LIVE_EMPTY_TURN_MAX_RETRIES: u32 = 1;
-const LIVE_SAND_GEMINI_EMPTY_TURN_MAX_RETRIES: u32 = 3;
+// Gemini's Cursor route can acknowledge a Run with a clean FLAG_END while
+// the model worker is still warming up.  This happens on both the CLI and
+// Sand identities; limiting the larger recovery budget to Sand made CLI
+// Gemini requests fail after the first fresh-conversation retry and produced
+// a 502 storm when Claude Code fanned out subagents. Keep the extra attempts
+// bounded and scoped to Gemini only so other models retain their stricter
+// duplicate-suppression policy.
+const LIVE_GEMINI_EMPTY_TURN_MAX_RETRIES: u32 = 3;
 const LIVE_EMPTY_TURN_MAX_RETRIES_LIMIT: u32 = 8;
 const LIVE_EMPTY_TURN_EPISODE_MS: u64 = 300_000;
 const CURSOR_RESOURCE_RETRIES_DEFAULT: u32 = 6;
@@ -672,11 +680,11 @@ impl Default for LiveLateRetryPolicy {
 impl LiveLateRetryPolicy {
     fn for_request_with_override(
         model: &str,
-        client_type: &str,
+        _client_type: &str,
         empty_turn_max_retries: Option<&str>,
     ) -> Self {
-        let request_default = if is_sand_gemini_request(model, client_type) {
-            LIVE_SAND_GEMINI_EMPTY_TURN_MAX_RETRIES
+        let request_default = if is_gemini_request(model) {
+            LIVE_GEMINI_EMPTY_TURN_MAX_RETRIES
         } else {
             LIVE_EMPTY_TURN_MAX_RETRIES
         };
@@ -707,10 +715,7 @@ impl LiveLateRetryPolicy {
     }
 }
 
-fn is_sand_gemini_request(model: &str, client_type: &str) -> bool {
-    if !client_type.trim().eq_ignore_ascii_case("sand") {
-        return false;
-    }
+fn is_gemini_request(model: &str) -> bool {
     resolve_cursor_model(model)
         .map(|resolved| resolved.model_id.to_ascii_lowercase())
         .unwrap_or_else(|_| model.trim().to_ascii_lowercase())
@@ -722,6 +727,7 @@ struct LiveLateRetryContext {
     model: String,
     client_type: String,
     effective_token: Arc<Mutex<String>>,
+    compaction_mode: bool,
 }
 
 impl LiveLateRetryContext {
@@ -986,6 +992,10 @@ struct LiveRetryStart {
     /// cannot repeatedly rotate conversations when the upstream keeps
     /// rejecting the same oversized state.
     kv_recovery_attempted: Arc<AtomicBool>,
+    /// Shared one-shot fence for Claude Code compaction loop-detection
+    /// recovery. It spans the initial open and late stream pump so a malformed
+    /// compact request can trigger at most one fresh-conversation replay.
+    compaction_recovery_attempted: Arc<AtomicBool>,
     custom_system: Option<String>,
     session_id: String,
     agent_id: Option<String>,
@@ -1004,6 +1014,10 @@ struct LiveRetryStart {
     /// Captured when the logical request starts; retries must keep the same
     /// client identity even if the live routing config is edited meanwhile.
     client_type: String,
+    /// Stable identity for this logical request. Internal fresh-conversation
+    /// retries reuse it so quota-sentinel observations cannot merge with a
+    /// different request for the same account/model.
+    request_sequence_id: String,
     /// Context compaction uses output-text framing even when Cursor emits
     /// reasoning deltas. Keep this bit stable across transport retries.
     compaction_mode: bool,
@@ -1154,6 +1168,37 @@ impl LiveRetryStart {
         &self,
         error: &str,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        if self.compaction_mode && live_error_is_agent_looping_detected(error) {
+            // Cursor's loop detector can leave the compact lane bound to a
+            // poisoned checkpoint. Rotate that lane once and replay the
+            // summary prompt; a second detector hit is terminal for this
+            // request and must not create an endless Claude Code retry wave.
+            if self
+                .compaction_recovery_attempted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(CursorError::new(400, error, None));
+            }
+            let conversation_key =
+                live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+            conversation::reset(&conversation_key);
+            create_logger("cursor").warn(
+                "compact_loop_recovery",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(&self.session_id)),
+                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                    ("attempt".into(), serde_json::json!(1)),
+                ])),
+            );
+            return self
+                .start_with_user_text_and_images(
+                    &self.reset_user_text,
+                    &self.reset_retry_images,
+                    None,
+                )
+                .await;
+        }
         // Ordinary hollow turns are safe to replay because no client-visible
         // text/tool committed. Fence every retry onto a fresh Cursor
         // conversation even if an unusual upstream termination path failed to
@@ -1286,10 +1331,12 @@ impl LiveRetryStart {
             &self.client_type,
             self.unbounded_conflict_wait,
             self.compaction_mode,
+            Some(&self.request_sequence_id),
             Some(Arc::clone(&self.effective_token)),
             Some(Arc::clone(&self.image_recovery_attempted)),
             Some(Arc::clone(&self.image_recovery_images)),
             Some(Arc::clone(&self.kv_recovery_attempted)),
+            Some(Arc::clone(&self.compaction_recovery_attempted)),
             Some(Arc::clone(&opened_conversation_id)),
             LiveStartRecovery {
                 expected_conversation_id: expected_conversation_id.as_deref(),
@@ -1619,6 +1666,8 @@ async fn start_live_events_with_retries(
         None,
         None,
         None,
+        None,
+        None,
         LiveStartRecovery::default(),
     )
     .await
@@ -1644,10 +1693,12 @@ async fn start_live_events_with_retries_with_client_type(
     client_type: &str,
     unbounded_conflict_wait: bool,
     compaction_mode: bool,
+    request_sequence_id: Option<&str>,
     effective_token: Option<Arc<Mutex<String>>>,
     image_recovery_attempted: Option<Arc<AtomicBool>>,
     image_recovery_images: Option<Arc<Mutex<Option<Vec<CursorSelectedImage>>>>>,
     kv_recovery_attempted: Option<Arc<AtomicBool>>,
+    compaction_recovery_attempted: Option<Arc<AtomicBool>>,
     // Receives the exact Cursor conversation binding used by the generation
     // that successfully opened.  This avoids re-reading the session map after
     // start, where a concurrent reset could make a different generation look
@@ -1662,7 +1713,13 @@ async fn start_live_events_with_retries_with_client_type(
     };
     publish_effective_token(&token);
     let operation_conflict_deadline = live_conflict_wait_deadline(unbounded_conflict_wait);
-    let original_request_id = uuid::Uuid::new_v4().to_string();
+    // Keep Cursor's original-request identity stable across the bounded
+    // fresh-conversation retries of one logical Anthropic request. This is
+    // also used to partition empty-END quota evidence; independent requests
+    // must never satisfy one another's consecutive-observation threshold.
+    let original_request_id = request_sequence_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
     let image_recovery_attempted =
@@ -1670,6 +1727,8 @@ async fn start_live_events_with_retries_with_client_type(
     let image_recovery_images = image_recovery_images.unwrap_or_else(|| Arc::new(Mutex::new(None)));
     let kv_recovery_attempted =
         kv_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let compaction_recovery_attempted =
+        compaction_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     // Normally the original request slice is reused across transport retries.
     // A stale Cursor asset requires a new UUID and a fresh conversation; keep
     // that replacement owned by this start loop so both initial-open and
@@ -2181,6 +2240,31 @@ async fn start_live_events_with_retries_with_client_type(
                         }
                         let _ = start.handle.cancel_and_wait().await;
                         let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
+                        if compaction_mode && live_error_is_agent_looping_detected(&error) {
+                            if compaction_recovery_attempted
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                return Err(CursorError::new(400, error, None));
+                            }
+                            let key =
+                                live_retry_conversation_key(identity.session_id, identity.agent_id);
+                            conversation::reset(&key);
+                            retry_user_text = Some(reset_user_text.to_string());
+                            image_retry_images = Some(cached_image_recovery_images(
+                                &image_recovery_images,
+                                reset_retry_images,
+                            ));
+                            create_logger("cursor").warn(
+                                "compact_loop_recovery",
+                                Some(serde_json::Map::from_iter([
+                                    ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                    ("attempt".into(), serde_json::json!(1)),
+                                ])),
+                            );
+                            continue;
+                        }
                         if kv_error {
                             if kv_recovery_attempted
                                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2272,6 +2356,36 @@ async fn start_live_events_with_retries_with_client_type(
                 }
             }
             Err(error) => {
+                if compaction_mode && live_error_is_agent_looping_detected(&error.client_message())
+                {
+                    if compaction_recovery_attempted
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        drop(probe_admission.take());
+                        reservation.release();
+                        let key =
+                            live_retry_conversation_key(identity.session_id, identity.agent_id);
+                        conversation::reset(&key);
+                        image_retry_images = Some(cached_image_recovery_images(
+                            &image_recovery_images,
+                            reset_retry_images,
+                        ));
+                        retry_user_text = Some(reset_user_text.to_string());
+                        create_logger("cursor").warn(
+                            "compact_loop_recovery",
+                            Some(serde_json::Map::from_iter([
+                                ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                ("attempt".into(), serde_json::json!(1)),
+                            ])),
+                        );
+                        continue;
+                    }
+                    drop(probe_admission.take());
+                    reservation.release();
+                    return Err(error);
+                }
                 let kv_error = cursor_error_is_kv_blob_overflow(&error)
                     && live_error_is_kv_blob_overflow_replayable(&error.client_message());
                 if kv_error {
@@ -2442,6 +2556,7 @@ fn spawn_streaming_live_sse(
             image_recovery_attempted: Arc::new(AtomicBool::new(false)),
             image_recovery_images: Arc::new(Mutex::new(None)),
             kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
             custom_system,
             session_id: sid,
             agent_id,
@@ -2452,6 +2567,7 @@ fn spawn_streaming_live_sse(
             fingerprint,
             has_refresh,
             client_type,
+            request_sequence_id: uuid::Uuid::new_v4().to_string(),
             // Only a fresh request may wait indefinitely. Tool-result
             // continuations keep the bounded, generation-specific handoff
             // semantics even though their SSE lifecycle is already open.
@@ -2606,7 +2722,26 @@ fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
     }
 }
 
+#[cfg(test)]
 fn classify_live_pump_item(committed: bool, item: &LiveEventResult) -> LivePumpAction {
+    classify_live_pump_item_with_mode(committed, item, false)
+}
+
+fn classify_live_pump_item_with_mode(
+    committed: bool,
+    item: &LiveEventResult,
+    compaction_mode: bool,
+) -> LivePumpAction {
+    if compaction_mode
+        && !committed
+        && let Err(error) = item
+        && live_error_is_agent_looping_detected(error)
+    {
+        // A compact summary has no client-visible output yet.  Allow the
+        // bounded fresh-lane recovery below to rotate its poisoned checkpoint;
+        // ordinary turns deliberately keep this 400 terminal.
+        return LivePumpAction::Retry;
+    }
     // Cursor asset lookup failures are recoverable before any client-visible
     // output: rotate the conversation and resend the original inline bytes.
     // Keep this ahead of generic 502 classification, which intentionally
@@ -2633,6 +2768,11 @@ fn classify_live_pump_item(committed: bool, item: &LiveEventResult) -> LivePumpA
     }
 }
 
+fn live_probe_error_blocks_new_run_for_mode(error: &str, compaction_mode: bool) -> bool {
+    live_probe_error_blocks_new_run(error)
+        && !(compaction_mode && live_error_is_agent_looping_detected(error))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LivePumpAction {
     Buffer,
@@ -2641,14 +2781,23 @@ enum LivePumpAction {
     PolicyLimit,
 }
 
+#[cfg(test)]
 async fn pump_live_events_until_commit_or_retry(
     tx: &mpsc::Sender<LiveEventResult>,
+    events: mpsc::Receiver<LiveEventResult>,
+) -> LivePumpOutcome {
+    pump_live_events_until_commit_or_retry_with_mode(tx, events, false).await
+}
+
+async fn pump_live_events_until_commit_or_retry_with_mode(
+    tx: &mpsc::Sender<LiveEventResult>,
     mut events: mpsc::Receiver<LiveEventResult>,
+    compaction_mode: bool,
 ) -> LivePumpOutcome {
     let mut committed = false;
     let mut buffered = Vec::new();
     while let Some(item) = events.recv().await {
-        match classify_live_pump_item(committed, &item) {
+        match classify_live_pump_item_with_mode(committed, &item, compaction_mode) {
             LivePumpAction::Retry => {
                 let Err(error) = item else {
                     continue;
@@ -2674,6 +2823,18 @@ async fn pump_live_events_until_commit_or_retry(
                 }
             }
         }
+    }
+    // A driver can close its event channel cleanly after emitting only
+    // session/thinking/usage metadata.  There is no client-visible result to
+    // replay in that case, so treat the close like the existing hollow-turn
+    // marker instead of letting live_sse_response manufacture a bare 502.
+    // Once text, a native tool, or End has committed, EOF remains terminal and
+    // must stay fail-closed.
+    if !committed {
+        return LivePumpOutcome::Retry(
+            "Cursor upstream finished this turn without text or tool calls; retry this turn (upstream stream ended before a client-visible response; stale Cursor conversation reset; retry this message to continue)"
+                .into(),
+        );
     }
     for pending in buffered {
         if tx.send(pending).await.is_err() {
@@ -2743,6 +2904,7 @@ async fn forward_live_events_with_retries<F, Fut>(
         model: "unknown".into(),
         client_type: "unknown".into(),
         effective_token: Arc::new(Mutex::new(String::new())),
+        compaction_mode: false,
     };
     forward_live_events_with_retries_context(
         tx, events, session_id, agent_id, restart, policy, &context,
@@ -2774,7 +2936,8 @@ async fn forward_live_events_with_retries_context<F, Fut>(
     // cancellation remains generation-bound.
     let mut expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
     loop {
-        let pump = pump_live_events_until_commit_or_retry(tx, events);
+        let pump =
+            pump_live_events_until_commit_or_retry_with_mode(tx, events, context.compaction_mode);
         tokio::pin!(pump);
         let outcome = tokio::select! {
             _ = tx.closed() => {
@@ -2874,7 +3037,10 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                     match LiveRunRegistry::probe_run(session_id, agent_id) {
                         LiveRunProbe::Free => break,
                         LiveRunProbe::TerminalError(terminal)
-                            if live_probe_error_blocks_new_run(&terminal) =>
+                            if live_probe_error_blocks_new_run_for_mode(
+                                &terminal,
+                                context.compaction_mode,
+                            ) =>
                         {
                             let _ = tx.send(Err(terminal)).await;
                             return;
@@ -3030,6 +3196,7 @@ fn spawn_live_events_with_late_retries(
             model: start.model.clone(),
             client_type: start.client_type.clone(),
             effective_token: Arc::clone(&start.effective_token),
+            compaction_mode: start.compaction_mode,
         };
         let retry_policy =
             LiveLateRetryPolicy::for_request(&retry_context.model, &retry_context.client_type);
@@ -4055,6 +4222,12 @@ impl Provider for CursorProvider {
         // Cursor client.  It checks both the public alias and the concrete
         // catalog id, which is important for Fable's `[1m]`/thinking aliases.
         let client_type = crate::config::cursor_client_type_for_model(model);
+        // The server records the incoming model before provider-specific effort
+        // aliases are applied. Publish the final request-scoped route here as
+        // well so the TUI reflects the identity actually sent to Cursor.
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.client_type_resolved(&ctx.req_id, &client_type);
+        }
 
         let resolved = resolve_cursor_model(model);
         if let Err(e) = resolved {
@@ -4519,6 +4692,7 @@ impl Provider for CursorProvider {
                 image_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 image_recovery_images: Arc::new(Mutex::new(None)),
                 kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4532,6 +4706,7 @@ impl Provider for CursorProvider {
                 ),
                 has_refresh: auth.refresh_token.is_some(),
                 client_type: client_type.clone(),
+                request_sequence_id: uuid::Uuid::new_v4().to_string(),
                 unbounded_conflict_wait: false,
                 compaction_mode: xai_compact,
             };
@@ -4641,6 +4816,7 @@ impl Provider for CursorProvider {
                 image_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 image_recovery_images: Arc::new(Mutex::new(None)),
                 kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4651,6 +4827,7 @@ impl Provider for CursorProvider {
                 fingerprint,
                 has_refresh,
                 client_type: client_type.clone(),
+                request_sequence_id: uuid::Uuid::new_v4().to_string(),
                 unbounded_conflict_wait: false,
                 compaction_mode: xai_compact,
             };
@@ -4958,6 +5135,12 @@ impl Provider for CursorProvider {
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let tokens = count_tokens_for_request(ctx.session_id.as_deref(), &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
+            if let Some(model) = body.model.as_deref() {
+                monitor.client_type_resolved(
+                    &ctx.req_id,
+                    crate::config::cursor_client_type_for_model(model),
+                );
+            }
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
         }
         (
@@ -5216,6 +5399,28 @@ mod tests {
         .expect("valid context-management request");
         assert!(is_context_management_compact_request(&body));
         assert!(is_compact_request(&body, None));
+    }
+
+    #[test]
+    fn claude_manual_compact_command_marker_uses_isolated_lane() {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "<command-name>/compact</command-name>"},
+                {"type": "text", "text": "<command-message>compact</command-message>"}
+            ]}],
+            "tools": [{"name": "Read", "input_schema": {}}]
+        }))
+        .expect("valid command-marker request");
+        assert!(is_compact_request(&body, None));
+        let compact_mode = is_compact_request(&body, None);
+        let allowed = if compact_mode {
+            Some(BTreeSet::new())
+        } else {
+            advertised_tool_names(&body)
+        };
+        assert_eq!(allowed.expect("tool set"), BTreeSet::new());
     }
 
     #[test]
@@ -5661,6 +5866,32 @@ mod tests {
         let start = CursorError::new(413, "Request too large (413)", Some(message.into()));
         assert!(cursor_start_error_is_same_request_retryable(&start));
         assert!(!live_start_error_seals_tombstone(&start));
+    }
+
+    #[test]
+    fn compact_agent_looping_error_retries_only_in_compaction_mode() {
+        let looping =
+            "Connect error 400: ERROR_INTERNAL: Agent Looping Detected [failed_precondition]";
+        assert_eq!(
+            classify_live_pump_item(false, &Err(looping.to_string())),
+            LivePumpAction::Forward,
+            "ordinary turns must not replay a potentially accepted request"
+        );
+        assert_eq!(
+            classify_live_pump_item_with_mode(false, &Err(looping.to_string()), true),
+            LivePumpAction::Retry,
+            "compaction has a bounded fresh-lane recovery"
+        );
+        assert_eq!(
+            classify_live_pump_item_with_mode(true, &Err(looping.to_string()), true),
+            LivePumpAction::Forward,
+            "a committed compact response must not be replayed"
+        );
+        assert!(live_probe_error_blocks_new_run_for_mode(looping, false));
+        assert!(
+            !live_probe_error_blocks_new_run_for_mode(looping, true),
+            "compaction loop errors must reach the one-shot fresh-lane restart"
+        );
     }
 
     #[tokio::test]
@@ -6520,7 +6751,7 @@ mod tests {
     }
 
     #[test]
-    fn sand_gemini_gets_a_larger_bounded_empty_turn_budget() {
+    fn gemini_gets_a_larger_bounded_empty_turn_budget() {
         assert_eq!(
             LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "sand", None,)
                 .empty_turn_max_retries,
@@ -6529,7 +6760,7 @@ mod tests {
         assert_eq!(
             LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "cli", None,)
                 .empty_turn_max_retries,
-            1
+            3
         );
         assert_eq!(
             LiveLateRetryPolicy::for_request_with_override("claude-fable-5", "sand", None,)
@@ -6741,6 +6972,7 @@ mod tests {
             image_recovery_attempted: Arc::new(AtomicBool::new(false)),
             image_recovery_images: Arc::new(Mutex::new(None)),
             kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
             custom_system: None,
             session_id: session.clone(),
             agent_id: None,
@@ -6752,6 +6984,7 @@ mod tests {
             has_refresh: false,
             unbounded_conflict_wait: false,
             client_type: "sand".into(),
+            request_sequence_id: "test-request-sequence".into(),
             compaction_mode: false,
         };
 
@@ -6891,6 +7124,39 @@ mod tests {
         assert!(
             out_rx.try_recv().is_err(),
             "session + provider 502 must not reach grok-build"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_only_eof_is_retried_without_leaking_a_502() {
+        let (src_tx, src_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        src_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::Session {
+                session_id: "s".into(),
+            })))
+            .await
+            .unwrap();
+        src_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+                text: "speculative reasoning".into(),
+            })))
+            .await
+            .unwrap();
+        drop(src_tx);
+
+        let outcome = pump_live_events_until_commit_or_retry(&out_tx, src_rx).await;
+        let LivePumpOutcome::Retry(error) = outcome else {
+            panic!("metadata-only EOF must enter the hollow-turn retry path: {outcome:?}");
+        };
+        assert!(live_error_is_empty_turn_retry(&error), "{error}");
+        assert!(
+            live_error_is_same_request_retryable(&error),
+            "the outer retry pump must recognize the EOF marker: {error}"
+        );
+        assert!(
+            out_rx.try_recv().is_err(),
+            "speculative metadata must not be exposed before a successful retry"
         );
     }
 
@@ -7082,7 +7348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sand_gemini_empty_turn_recovers_on_its_fourth_upstream_attempt() {
+    async fn gemini_empty_turn_recovers_on_its_fourth_upstream_attempt() {
         let error = "Cursor upstream finished this turn without text or tool calls; retry this turn \
                      (stale Cursor conversation reset; retry this message to continue)";
         let (first_tx, first_rx) = mpsc::channel(1);
@@ -7095,7 +7361,7 @@ mod tests {
         forward_live_events_with_retries(
             &out_tx,
             first_rx,
-            "sess-sand-gemini-empty-fourth-success",
+            "sess-gemini-empty-fourth-success",
             None,
             move |_| {
                 let attempt = restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -7105,7 +7371,7 @@ mod tests {
                 } else {
                     retry_tx
                         .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
-                            text: "recovered after transient Sand hollow turns".into(),
+                            text: "recovered after transient Gemini hollow turns".into(),
                         })))
                         .unwrap();
                     retry_tx
@@ -7115,7 +7381,7 @@ mod tests {
                 drop(retry_tx);
                 std::future::ready(Ok::<_, CursorError>(retry_rx))
             },
-            LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "sand", None),
+            LiveLateRetryPolicy::for_request_with_override("gemini-3.6-flash", "cli", None),
         )
         .await;
 
@@ -7130,7 +7396,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(text, "recovered after transient Sand hollow turns");
+        assert_eq!(text, "recovered after transient Gemini hollow turns");
     }
 
     #[tokio::test]

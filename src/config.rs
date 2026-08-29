@@ -192,7 +192,7 @@ impl SandRoutingPolicy {
             && self
                 .patterns
                 .iter()
-                .any(|pattern| glob_matches(pattern, &model))
+                .any(|pattern| sand_pattern_matches(pattern, &model))
     }
 
     pub fn matches_model(&self, model: &str) -> bool {
@@ -311,6 +311,26 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == pattern.len()
+}
+
+/// Match a Sand rule against a model id and its common upstream preview alias.
+///
+/// Cursor's live catalog and Anthropic-compatible clients do not always agree
+/// on whether a Gemini id carries a trailing `-preview` marker. Treating that
+/// marker as a display/catalog variant keeps a rule for `gemini-3.1-pro`
+/// effective when a request arrives as `gemini-3.1-pro-preview`, while still
+/// requiring the rest of the model id to match the configured glob.
+fn sand_pattern_matches(pattern: &str, model: &str) -> bool {
+    if glob_matches(pattern, model) {
+        return true;
+    }
+
+    // Only strip the marker from the incoming model.  Doing the reverse for a
+    // wildcard rule such as `*-preview` would accidentally make every model
+    // match (`*`), effectively turning Sand on globally.
+    model
+        .strip_suffix("-preview")
+        .is_some_and(|candidate| glob_matches(pattern, candidate))
 }
 
 /// Resolve the current model policy. The env var is an explicit override,
@@ -1409,6 +1429,36 @@ mod tests {
             cursor_client_type_for_model("gemini-3.6-flash-high"),
             "cli",
             "unmatched Gemini models must keep the normal CLI identity"
+        );
+    }
+
+    #[test]
+    fn sand_route_matches_gemini_preview_variant() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["gemini-3.1-pro"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.1-pro-preview"),
+            "sand",
+            "the base Gemini rule must cover Cursor's preview catalog spelling"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("cursor:gemini-3.1-pro-preview"),
+            "sand",
+            "prefix aliases must retain the preview route"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("gemini-3.1-pro-preview-high"),
+            "cli",
+            "only a trailing preview marker is an alias; effort variants stay explicit"
         );
     }
 

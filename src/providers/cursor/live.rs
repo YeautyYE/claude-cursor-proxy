@@ -6535,6 +6535,16 @@ pub(crate) fn live_error_is_empty_turn_retry(message: &str) -> bool {
     message.contains(EMPTY_TURN_RETRY_NOTE)
 }
 
+/// Cursor occasionally rejects a stale compact/summary run with a 400
+/// `failed_precondition` after its agent loop detects that the same operation
+/// has been replayed. This is a deterministic signal for a single fresh
+/// conversation recovery, but it must not make ordinary turns retry: replaying
+/// a regular accepted prompt could execute tools twice.
+pub(crate) fn live_error_is_agent_looping_detected(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("agent looping detected") && lower.contains("failed_precondition")
+}
+
 pub(crate) fn live_error_needs_checkpoint_continue(message: &str) -> bool {
     live_error_is_empty_turn_retry(message) && message.contains(EMPTY_TURN_CHECKPOINT_RETRY_NOTE)
 }
@@ -7655,12 +7665,18 @@ struct LiveTurnCtx<'a> {
 
 /// Request identity needed to distinguish Cursor's Sand quota sentinel from a
 /// transient empty turn. The token is borrowed from `LiveReconnectContext` and
-/// is used only to query account-scoped, hashed dashboard evidence.
+/// is used only to query account-scoped, hashed dashboard evidence. The
+/// request id is a stable logical-request nonce shared by its bounded retries.
 #[derive(Debug, Clone, Copy)]
 struct SandEmptyEndContext<'a> {
     token: &'a str,
     model_id: &'a str,
     client_type: &'a str,
+    /// Stable logical-request identity shared by the bounded fresh-run
+    /// retries.  Keeping it in the sequence key prevents two independent
+    /// requests for the same account/model from satisfying each other's
+    /// consecutive-empty-END evidence.
+    request_id: &'a str,
     fresh_run: bool,
     opened_at: Instant,
 }
@@ -7671,7 +7687,13 @@ struct SandEmptyEndSequence {
     last_seen: Instant,
 }
 
-const SAND_EMPTY_END_IMMEDIATE_MAX: Duration = Duration::from_secs(15);
+// A quota-sentinel FLAG_END is often delayed while Cursor warms a model or
+// waits for an admission slot.  The previous 15s cutoff let those delayed
+// sentinels fall through to the generic empty-turn path and eventually surface
+// as a misleading 502.  Keep the evidence bounded to one recovery episode;
+// the dashboard cache (180s TTL) and consecutive-observation window below
+// still prevent stale meters from classifying an unrelated transient.
+const SAND_EMPTY_END_IMMEDIATE_MAX: Duration = Duration::from_secs(300);
 const SAND_EMPTY_END_SEQUENCE_WINDOW: Duration = Duration::from_secs(60);
 const SAND_EMPTY_END_SEQUENCE_MAX_KEYS: usize = 1024;
 
@@ -7680,15 +7702,19 @@ static SAND_EMPTY_END_SEQUENCES: LazyLock<Mutex<HashMap<String, SandEmptyEndSequ
 
 fn sand_empty_end_sequence_key(context: SandEmptyEndContext<'_>) -> String {
     format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         context.client_type.trim().to_ascii_lowercase(),
         context.model_id.trim().to_ascii_lowercase(),
         super::auth::cursor_account_digest(context.token),
+        context.request_id.trim(),
     )
 }
 
 fn clear_sand_empty_end_sequence(context: SandEmptyEndContext<'_>) {
-    if !context.client_type.trim().eq_ignore_ascii_case("sand") {
+    if !matches!(
+        context.client_type.trim().to_ascii_lowercase().as_str(),
+        "sand" | "cli"
+    ) {
         return;
     }
     SAND_EMPTY_END_SEQUENCES
@@ -7697,18 +7723,21 @@ fn clear_sand_empty_end_sequence(context: SandEmptyEndContext<'_>) {
         .remove(&sand_empty_end_sequence_key(context));
 }
 
-/// Cursor can encode an exhausted Sand allowance as HTTP 200 followed by an
-/// empty `FLAG_END`. One such frame remains retryable because it can also be a
+/// Cursor can encode an exhausted allowance as HTTP 200 followed by an empty
+/// `FLAG_END`. One such frame remains retryable because it can also be a
 /// transient upstream anomaly. Two consecutive immediate fresh-run frames,
 /// combined with a fresh 100% dashboard meter for the same account, are the
-/// typed policy signal that Cursor omitted.
+/// typed policy signal that Cursor omitted. Sand uses its own meter; CLI uses
+/// the named-model/API meter from `usage-summary`.
 fn classify_sand_quota_empty_end(
     context: Option<SandEmptyEndContext<'_>>,
     saw_text: bool,
     reason: &str,
 ) -> Option<String> {
     let context = context?;
-    if !context.client_type.trim().eq_ignore_ascii_case("sand") {
+    let is_sand = context.client_type.trim().eq_ignore_ascii_case("sand");
+    let is_cli = context.client_type.trim().eq_ignore_ascii_case("cli");
+    if !is_sand && !is_cli {
         return None;
     }
     if saw_text
@@ -7719,11 +7748,22 @@ fn classify_sand_quota_empty_end(
         clear_sand_empty_end_sequence(context);
         return None;
     }
-    let Some(evidence) = super::usage::cached_sand_usage_evidence(context.token) else {
-        clear_sand_empty_end_sequence(context);
-        return None;
+    let (usage_percent, next_reset, evidence_retry_after) = if is_sand {
+        let Some(evidence) = super::usage::cached_sand_usage_evidence(context.token) else {
+            clear_sand_empty_end_sequence(context);
+            return None;
+        };
+        let retry_after = evidence.retry_after_secs();
+        (evidence.usage_percent, evidence.next_reset, retry_after)
+    } else {
+        let Some(evidence) = super::usage::cached_api_usage_evidence(context.token) else {
+            clear_sand_empty_end_sequence(context);
+            return None;
+        };
+        let retry_after = evidence.retry_after_secs();
+        (evidence.usage_percent, evidence.next_reset, retry_after)
     };
-    if evidence.usage_percent < 99.999 {
+    if usage_percent < 99.999 {
         clear_sand_empty_end_sequence(context);
         return None;
     }
@@ -7762,13 +7802,10 @@ fn classify_sand_quota_empty_end(
     fields.insert("model".into(), serde_json::json!(context.model_id));
     fields.insert("clientType".into(), serde_json::json!(context.client_type));
     fields.insert("emptyEnds".into(), serde_json::json!(count));
+    fields.insert("quotaUsagePercent".into(), serde_json::json!(usage_percent));
     fields.insert(
-        "sandUsagePercent".into(),
-        serde_json::json!(evidence.usage_percent),
-    );
-    fields.insert(
-        "hasAvailableUsage".into(),
-        serde_json::json!(evidence.has_available_usage),
+        "quotaKind".into(),
+        serde_json::json!(if is_sand { "sand" } else { "api" }),
     );
     crate::logging::create_logger("cursor").warn("sand_empty_end_observed", Some(fields));
 
@@ -7779,15 +7816,19 @@ fn classify_sand_quota_empty_end(
     // The process-local policy breaker deliberately caps long dashboard reset
     // windows. Include a bounded hint that it can turn into Retry-After while
     // preserving the actual reset timestamp in the diagnostic.
-    let retry_after = evidence.retry_after_secs().unwrap_or(600).clamp(5, 600);
-    let reset = evidence
-        .next_reset
+    let retry_after = evidence_retry_after.unwrap_or(600).clamp(5, 600);
+    let reset = next_reset
         .as_deref()
         .map(|value| format!("; dashboard reset {value}"))
         .unwrap_or_default();
+    let (error_code, allowance) = if is_sand {
+        ("ERROR_SAND_USER_RATE_LIMIT_EXCEEDED", "Sand")
+    } else {
+        ("ERROR_CURSOR_API_RATE_LIMIT_EXCEEDED", "Cursor API")
+    };
     Some(format!(
-        "Connect error 429: ERROR_SAND_USER_RATE_LIMIT_EXCEEDED: Sand usage meter is {:.2}% and Cursor returned two consecutive empty END frames for {}; retry after {retry_after} seconds{reset}. [resource_exhausted]",
-        evidence.usage_percent, context.model_id
+        "Connect error 429: {error_code}: {allowance} usage meter is {:.2}% and Cursor returned two consecutive empty END frames for {}; retry after {retry_after} seconds{reset}. [resource_exhausted]",
+        usage_percent, context.model_id
     ))
 }
 
@@ -7959,6 +8000,7 @@ async fn drive_live_run(
                         token: &reconnect.token,
                         model_id: &reconnect.model_id,
                         client_type: &reconnect.identity.client_type,
+                        request_id: &reconnect.original_request_id,
                         fresh_run: segment_count == 1,
                         opened_at: initial_opened_at,
                     }),
@@ -8003,6 +8045,7 @@ async fn drive_live_run(
                         token: &reconnect.token,
                         model_id: &reconnect.model_id,
                         client_type: &reconnect.identity.client_type,
+                        request_id: &reconnect.original_request_id,
                         fresh_run: segment_count == 1,
                         opened_at: initial_opened_at,
                     },
@@ -13405,6 +13448,22 @@ mod tests {
             !is_retryable_live_transport_error(&rate_limit_with_connection),
             "429 mentioning connection must still not retry"
         );
+    }
+
+    #[test]
+    fn compact_agent_looping_error_requires_both_markers() {
+        assert!(live_error_is_agent_looping_detected(
+            "Connect error 400: ERROR_INTERNAL: Agent Looping Detected [failed_precondition]"
+        ));
+        assert!(live_error_is_agent_looping_detected(
+            "agent looping detected: upstream rejected replay [FAILED_PRECONDITION]"
+        ));
+        assert!(!live_error_is_agent_looping_detected(
+            "Connect error 400: Agent Looping Detected [invalid_argument]"
+        ));
+        assert!(!live_error_is_agent_looping_detected(
+            "Connect error 400: failed_precondition"
+        ));
     }
 
     #[test]
@@ -24209,6 +24268,7 @@ mod tests {
             token: &token,
             model_id: "gemini-3.1-pro",
             client_type: "sand",
+            request_id: "test-sand-quota",
             fresh_run: true,
             opened_at: Instant::now(),
         };
@@ -24223,6 +24283,34 @@ mod tests {
         assert!(crate::retry::is_policy_rate_limit(&error));
         assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 429);
         assert!(!live_error_is_same_request_retryable(&error));
+    }
+
+    #[test]
+    fn delayed_sand_quota_clean_end_is_still_classified() {
+        // Real model admission can take tens of seconds before Cursor emits
+        // its payload-less FLAG_END.  That delay must not turn a known 100%
+        // meter into the generic 502 empty-turn error.
+        let token = format!("sand-delayed-empty-quota-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(
+            &token,
+            100.0,
+            Some(true),
+            Some("2099-09-02T20:12:42Z"),
+        );
+        let context = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.1-pro",
+            client_type: "sand",
+            request_id: "test-sand-delayed-quota",
+            fresh_run: true,
+            opened_at: Instant::now() - Duration::from_secs(45),
+        };
+
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        let error = classify_sand_quota_empty_end(Some(context), false, "flag_end")
+            .expect("the delayed second clean END must become a typed policy limit");
+        assert!(error.contains("ERROR_SAND_USER_RATE_LIMIT_EXCEEDED"));
+        assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 429);
     }
 
     #[tokio::test]
@@ -24248,6 +24336,7 @@ mod tests {
                 token: &token,
                 model_id: "gemini-3.6-flash-high",
                 client_type: "sand",
+                request_id: "test-thinking-quota",
                 fresh_run: true,
                 opened_at: Instant::now(),
             };
@@ -24382,6 +24471,7 @@ mod tests {
             token: &token,
             model_id: "gemini-3.6-flash-high",
             client_type: "sand",
+            request_id: "test-nonqualifying-quota",
             fresh_run: true,
             opened_at: Instant::now(),
         };
@@ -24426,6 +24516,7 @@ mod tests {
             token: &under_token,
             model_id: "gemini-3.6-flash-high",
             client_type: "sand",
+            request_id: "test-boundaries-under",
             fresh_run: true,
             opened_at: Instant::now(),
         };
@@ -24443,6 +24534,7 @@ mod tests {
             token: &full_token,
             model_id: "gemini-3.6-flash-high",
             client_type: "cli",
+            request_id: "test-boundaries-cli",
             fresh_run: true,
             opened_at: Instant::now(),
         };
@@ -24479,6 +24571,62 @@ mod tests {
     }
 
     #[test]
+    fn sand_empty_end_classifier_does_not_cross_logical_request_boundaries() {
+        let token = format!("sand-empty-concurrent-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
+        let first = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.6-flash-high",
+            client_type: "sand",
+            request_id: "logical-request-a",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+        let second = SandEmptyEndContext {
+            request_id: "logical-request-b",
+            ..first
+        };
+
+        // Independent requests may complete their first hollow Run at the
+        // same time. Their observations must not combine into a false quota
+        // signal; each request needs two empty ENDs of its own.
+        assert!(classify_sand_quota_empty_end(Some(first), false, "flag_end").is_none());
+        assert!(classify_sand_quota_empty_end(Some(second), false, "flag_end").is_none());
+        assert!(classify_sand_quota_empty_end(Some(first), false, "flag_end").is_some());
+        assert!(classify_sand_quota_empty_end(Some(second), false, "flag_end").is_some());
+    }
+
+    #[test]
+    fn cli_empty_end_uses_api_meter_for_quota_classification() {
+        let token = format!("cli-api-empty-quota-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_api_usage_evidence_for_test(
+            &token,
+            100.0,
+            Some("2099-09-02T20:12:42Z"),
+        );
+        let context = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.1-pro",
+            client_type: "cli",
+            request_id: "test-cli-api-quota",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+
+        // A single empty END remains retryable. The second one, with a fresh
+        // API meter at 100%, is the typed Cursor allowance response.
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        let error = classify_sand_quota_empty_end(Some(context), false, "flag_end")
+            .expect("CLI API quota should classify the second empty END");
+        assert!(
+            error.contains("ERROR_CURSOR_API_RATE_LIMIT_EXCEEDED"),
+            "{error}"
+        );
+        assert!(crate::retry::is_policy_rate_limit(&error));
+        assert_eq!(crate::retry::classify_proxy_error_status(502, &error), 429);
+    }
+
+    #[test]
     fn sand_empty_end_sequence_survives_same_account_jwt_refresh() {
         let first_token = sand_test_jwt("sand-refresh-account", 4_102_444_800);
         let refreshed_token = sand_test_jwt("sand-refresh-account", 4_102_444_900);
@@ -24492,6 +24640,7 @@ mod tests {
             token: &first_token,
             model_id: "gemini-3.6-flash-high",
             client_type: "sand",
+            request_id: "test-jwt-refresh-quota",
             fresh_run: true,
             opened_at: Instant::now(),
         };
@@ -24514,6 +24663,7 @@ mod tests {
             token: &token,
             model_id: "gemini-3.1-pro",
             client_type: "sand",
+            request_id: "test-progress-quota",
             fresh_run: true,
             opened_at: Instant::now(),
         };

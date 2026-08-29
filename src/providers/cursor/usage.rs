@@ -44,19 +44,43 @@ pub(crate) struct SandUsageEvidence {
 
 impl SandUsageEvidence {
     pub(crate) fn retry_after_secs(&self) -> Option<u64> {
-        let reset = self.next_reset.as_deref()?;
-        let reset =
-            time::OffsetDateTime::parse(reset, &time::format_description::well_known::Rfc3339)
-                .ok()?;
-        Some(
-            (reset - time::OffsetDateTime::now_utc())
-                .whole_seconds()
-                .max(1) as u64,
-        )
+        retry_after_secs_for_reset(self.next_reset.as_deref())
     }
 }
 
 static SAND_USAGE_EVIDENCE: LazyLock<Mutex<HashMap<String, SandUsageEvidence>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Account-scoped evidence for Cursor's named-model/API allowance. Cursor can
+/// acknowledge an exhausted CLI Run with HTTP 200 and an empty `FLAG_END`, so
+/// the live transport needs a recent API meter to distinguish that policy
+/// response from a transient hollow turn. Keep this cache separate from the
+/// Sand meter because the two allowances have independent reset windows.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ApiUsageEvidence {
+    pub usage_percent: f64,
+    pub next_reset: Option<String>,
+    observed_at: Instant,
+}
+
+impl ApiUsageEvidence {
+    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+        retry_after_secs_for_reset(self.next_reset.as_deref())
+    }
+}
+
+fn retry_after_secs_for_reset(reset: Option<&str>) -> Option<u64> {
+    let reset = reset?;
+    let reset =
+        time::OffsetDateTime::parse(reset, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(
+        (reset - time::OffsetDateTime::now_utc())
+            .whole_seconds()
+            .max(1) as u64,
+    )
+}
+
+static API_USAGE_EVIDENCE: LazyLock<Mutex<HashMap<String, ApiUsageEvidence>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn sand_usage_account_key(token: &str) -> String {
@@ -105,12 +129,70 @@ fn store_sand_usage_evidence(auth: &CursorAuth, sand: Option<&Value>) {
     );
 }
 
+fn store_api_usage_evidence(auth: &CursorAuth, summary: Option<&Value>) {
+    let account_key = sand_usage_account_key(&auth.access_token);
+    let mut cache = API_USAGE_EVIDENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let now = Instant::now();
+    cache.retain(|_, evidence| {
+        now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL
+    });
+    let Some(summary) = summary else {
+        // Keep recent evidence across a single dashboard timeout. It expires
+        // naturally rather than turning an outage into a false quota signal.
+        return;
+    };
+    let Some(api_percent) = json_f64(summary.pointer("/individualUsage/plan/apiPercentUsed"))
+    else {
+        // A successful dashboard response without an API meter means this
+        // account/deployment does not expose the classifier signal.
+        cache.remove(&account_key);
+        return;
+    };
+    if cache.len() >= SAND_USAGE_EVIDENCE_MAX_ACCOUNTS && !cache.contains_key(&account_key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, evidence)| evidence.observed_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    let next_reset = summary
+        .get("billingCycleEnd")
+        .or_else(|| summary.get("billing_cycle_end"))
+        .and_then(|value| dashboard_timestamp(Some(value)));
+    cache.insert(
+        account_key,
+        ApiUsageEvidence {
+            usage_percent: api_percent,
+            next_reset,
+            observed_at: now,
+        },
+    );
+}
+
 /// Return recent Sand usage evidence only for the exact credential that was
 /// used to open the Run. This prevents a hot account switch from inheriting a
 /// previous login's exhausted meter.
 pub(crate) fn cached_sand_usage_evidence(token: &str) -> Option<SandUsageEvidence> {
     let account_key = sand_usage_account_key(token);
     let mut cache = SAND_USAGE_EVIDENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let now = Instant::now();
+    cache.retain(|_, evidence| {
+        now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL
+    });
+    cache.get(&account_key).cloned()
+}
+
+/// Return recent API allowance evidence for the exact credential used by a
+/// live Run. The cache key is the stable account digest, never the bearer.
+pub(crate) fn cached_api_usage_evidence(token: &str) -> Option<ApiUsageEvidence> {
+    let account_key = sand_usage_account_key(token);
+    let mut cache = API_USAGE_EVIDENCE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let now = Instant::now();
@@ -142,6 +224,30 @@ pub(crate) fn store_sand_usage_evidence_for_test(
         "nextResetTimestampUtc": next_reset,
     });
     store_sand_usage_evidence(&auth, Some(&sand));
+}
+
+#[cfg(test)]
+pub(crate) fn store_api_usage_evidence_for_test(
+    token: &str,
+    usage_percent: f64,
+    next_reset: Option<&str>,
+) {
+    let auth = CursorAuth {
+        access_token: token.to_string(),
+        refresh_token: None,
+        api_key: None,
+        expires: None,
+        user_id: None,
+        email: None,
+        source: "test".into(),
+    };
+    let summary = serde_json::json!({
+        "individualUsage": {
+            "plan": { "apiPercentUsed": usage_percent }
+        },
+        "billingCycleEnd": next_reset,
+    });
+    store_api_usage_evidence(&auth, Some(&summary));
 }
 
 pub fn fetch_account_usage_state() -> AccountUsageState {
@@ -194,15 +300,27 @@ fn refresh_sand_usage_evidence() -> anyhow::Result<()> {
     let Some(auth) = auth else {
         return Ok(());
     };
-    fetch_sand_usage_evidence(&auth)
-}
-
-fn fetch_sand_usage_evidence(auth: &CursorAuth) -> anyhow::Result<()> {
-    let cookie = workos_session_cookie(auth);
+    let cookie = workos_session_cookie(&auth);
     let client = reqwest::blocking::Client::builder()
-        .timeout(SAND_TIMEOUT)
+        .timeout(FETCH_TIMEOUT)
         .build()?;
-    fetch_sand_usage_evidence_with(auth, DASHBOARD_ORIGIN, &client, &cookie)
+    let sand_result = fetch_sand_usage_evidence_with(&auth, DASHBOARD_ORIGIN, &client, &cookie);
+    let summary_result = dashboard_get(
+        &client,
+        DASHBOARD_ORIGIN,
+        USAGE_SUMMARY_PATH,
+        &cookie,
+        FETCH_TIMEOUT,
+    );
+    if let Ok(summary) = summary_result.as_ref() {
+        store_api_usage_evidence(&auth, Some(summary));
+    }
+    match (sand_result, summary_result) {
+        (Ok(()), _) | (_, Ok(_)) => Ok(()),
+        (Err(sand), Err(summary)) => Err(anyhow::anyhow!(
+            "cursor usage evidence: sand: {sand}; api: {summary}"
+        )),
+    }
 }
 
 fn fetch_sand_usage_evidence_with(
@@ -240,6 +358,9 @@ fn fetch_account_usage_with(
     // for every account/dashboard deployment. Keep the independent identity
     // and Sand meters useful when that endpoint is absent.
     let summary_result = dashboard_get(client, origin, USAGE_SUMMARY_PATH, cookie, FETCH_TIMEOUT);
+    if let Ok(summary) = summary_result.as_ref() {
+        store_api_usage_evidence(auth, Some(summary));
+    }
     let me = dashboard_get(client, origin, AUTH_ME_PATH, cookie, FETCH_TIMEOUT).ok();
     let aggregated = dashboard_post(
         client,
@@ -691,6 +812,33 @@ mod tests {
         assert_eq!(evidence.has_available_usage, Some(true));
         assert!(evidence.retry_after_secs().is_some_and(|secs| secs > 0));
         assert!(cached_sand_usage_evidence(&token_b).is_none());
+    }
+
+    #[test]
+    fn api_usage_evidence_is_scoped_and_reads_plan_meter() {
+        let token_a = format!("api-usage-evidence-a-{}", uuid::Uuid::new_v4());
+        let token_b = format!("api-usage-evidence-b-{}", uuid::Uuid::new_v4());
+        store_api_usage_evidence_for_test(&token_a, 100.0, Some("2099-09-02T20:12:42Z"));
+
+        let evidence = cached_api_usage_evidence(&token_a).expect("account A API evidence");
+        assert_eq!(evidence.usage_percent, 100.0);
+        assert!(evidence.retry_after_secs().is_some_and(|secs| secs > 0));
+        assert!(cached_api_usage_evidence(&token_b).is_none());
+    }
+
+    #[test]
+    fn api_usage_evidence_without_meter_retires_old_value() {
+        let token = format!("api-usage-evidence-retire-{}", uuid::Uuid::new_v4());
+        store_api_usage_evidence_for_test(&token, 100.0, None);
+        assert!(cached_api_usage_evidence(&token).is_some());
+        let auth = auth("user", &token);
+        store_api_usage_evidence(
+            &auth,
+            Some(&serde_json::json!({
+                "individualUsage": { "plan": {} }
+            })),
+        );
+        assert!(cached_api_usage_evidence(&token).is_none());
     }
 
     #[test]

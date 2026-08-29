@@ -1123,13 +1123,21 @@ fn text_cell(value: impl Into<String>) -> Cell<'static> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
 }
 
-fn model_cell(provider: Option<&str>, value: Option<&str>, width: usize) -> Cell<'static> {
+fn model_cell_with_client_type(
+    provider: Option<&str>,
+    value: Option<&str>,
+    width: usize,
+    client_type_override: Option<&str>,
+) -> Cell<'static> {
     let model = value.unwrap_or("-");
     if provider != Some("cursor") || model == "-" {
         return text_cell(ellipsize(model, width));
     }
 
-    let client_type = config::cursor_client_type_for_model(model);
+    let client_type = client_type_override
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| config::cursor_client_type_for_model(model));
     let marker = format!(" [{}]", client_type);
     let marker_width = marker.chars().count();
     if width <= marker_width {
@@ -1138,7 +1146,11 @@ fn model_cell(provider: Option<&str>, value: Option<&str>, width: usize) -> Cell
 
     let model_width = width.saturating_sub(marker_width);
     let model_text = ellipsize(model, model_width);
-    let marker_color = if client_type == "sand" { TEAL } else { DIM };
+    let marker_color = if client_type.eq_ignore_ascii_case("sand") {
+        TEAL
+    } else {
+        DIM
+    };
     Cell::from(Line::from(vec![
         Span::styled(model_text, Style::default().fg(DIM_WHITE)),
         Span::styled(marker, Style::default().fg(marker_color)),
@@ -1204,6 +1216,10 @@ fn status_color(value: &str) -> Color {
         "completed" => GREEN,
         "streaming" => TEAL,
         "failed" => RED,
+        // A downstream cancellation is an expected lifecycle edge, not an
+        // upstream/API failure. Keep it visible in request details without
+        // making the dashboard read like an error storm.
+        "abandoned" => DIM,
         "upstream" => BLUE,
         "selected" | "started" => YELLOW,
         _ => DIM_WHITE,
@@ -1260,10 +1276,11 @@ fn detail_cell(value: &str) -> Cell<'static> {
 fn error_indicator(request: &CompletedRequest) -> &'static str {
     if request.status == crate::monitor::RequestStatus::Failed
         || request.http_status.is_some_and(|status| status >= 400)
-        || request
-            .error
-            .as_deref()
-            .is_some_and(|error| !error.is_empty())
+        || (request.status != crate::monitor::RequestStatus::Abandoned
+            && request
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty()))
     {
         "!"
     } else {
@@ -1356,11 +1373,19 @@ fn column_header<K>(columns: &[ColumnSpec<K>]) -> Row<'static> {
     )
 }
 
-fn target_cell(provider: Option<&str>, model: Option<&str>, width: usize) -> Cell<'static> {
+fn target_cell_with_client_type(
+    provider: Option<&str>,
+    model: Option<&str>,
+    width: usize,
+    client_type_override: Option<&str>,
+) -> Cell<'static> {
     let provider = provider.unwrap_or("-");
     let model = model.unwrap_or("-");
     let target = if provider == "cursor" && model != "-" {
-        let client_type = config::cursor_client_type_for_model(model);
+        let client_type = client_type_override
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| config::cursor_client_type_for_model(model));
         format!("{provider}/{model} [{client_type}]")
     } else {
         format!("{provider}/{model}")
@@ -1497,12 +1522,18 @@ fn render_sessions(
                         session.active_count, session.request_count, session.failure_count
                     )),
                     SessionColumn::Provider => provider_cell(session.provider.as_deref()),
-                    SessionColumn::Model => {
-                        model_cell(session.provider.as_deref(), session.model.as_deref(), width)
-                    }
-                    SessionColumn::Target => {
-                        target_cell(session.provider.as_deref(), session.model.as_deref(), width)
-                    }
+                    SessionColumn::Model => model_cell_with_client_type(
+                        session.provider.as_deref(),
+                        session.model.as_deref(),
+                        width,
+                        session.client_type.as_deref(),
+                    ),
+                    SessionColumn::Target => target_cell_with_client_type(
+                        session.provider.as_deref(),
+                        session.model.as_deref(),
+                        width,
+                        session.client_type.as_deref(),
+                    ),
                     SessionColumn::Effort => text_cell(session.effort.as_deref().unwrap_or("-")),
                     SessionColumn::Input => number_cell(compact_tokens(session.input_tokens)),
                     SessionColumn::Output => number_cell(compact_tokens(session.output_tokens)),
@@ -1636,12 +1667,18 @@ fn render_active(
                         text_cell(display_session_id(request.session_id.as_deref()))
                     }
                     ActiveColumn::Provider => provider_cell(request.provider.as_deref()),
-                    ActiveColumn::Model => {
-                        model_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
-                    ActiveColumn::Target => {
-                        target_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
+                    ActiveColumn::Model => model_cell_with_client_type(
+                        request.provider.as_deref(),
+                        request.model.as_deref(),
+                        width,
+                        request.client_type.as_deref(),
+                    ),
+                    ActiveColumn::Target => target_cell_with_client_type(
+                        request.provider.as_deref(),
+                        request.model.as_deref(),
+                        width,
+                        request.client_type.as_deref(),
+                    ),
                     ActiveColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     ActiveColumn::Endpoint => muted_cell(request.endpoint.label()),
                     ActiveColumn::Input => number_cell(token_value(request.input_tokens)),
@@ -1791,12 +1828,18 @@ fn render_recent(
                         text_cell(display_session_id(request.session_id.as_deref()))
                     }
                     RecentColumn::Provider => provider_cell(request.provider.as_deref()),
-                    RecentColumn::Model => {
-                        model_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
-                    RecentColumn::Target => {
-                        target_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
+                    RecentColumn::Model => model_cell_with_client_type(
+                        request.provider.as_deref(),
+                        request.model.as_deref(),
+                        width,
+                        request.client_type.as_deref(),
+                    ),
+                    RecentColumn::Target => target_cell_with_client_type(
+                        request.provider.as_deref(),
+                        request.model.as_deref(),
+                        width,
+                        request.client_type.as_deref(),
+                    ),
                     RecentColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     RecentColumn::Endpoint => muted_cell(request.endpoint.label()),
                     RecentColumn::Latency => number_cell(format_duration(request.latency)),
@@ -1880,7 +1923,8 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
         .filter(|request| {
             request.status == crate::monitor::RequestStatus::Failed
                 || request.http_status.is_some_and(|status| status >= 400)
-                || request.error.is_some()
+                || (request.status != crate::monitor::RequestStatus::Abandoned
+                    && request.error.is_some())
         })
         .take(12)
         .collect::<Vec<_>>();
@@ -1912,9 +1956,12 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                         text_cell(display_session_id(request.session_id.as_deref()))
                     }
                     EventColumn::Provider => provider_cell(request.provider.as_deref()),
-                    EventColumn::Model => {
-                        model_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
+                    EventColumn::Model => model_cell_with_client_type(
+                        request.provider.as_deref(),
+                        request.model.as_deref(),
+                        width,
+                        request.client_type.as_deref(),
+                    ),
                     EventColumn::Message => detail_cell(message),
                 }
             })
@@ -3711,6 +3758,29 @@ mod tests {
             !recent_text.contains("upstream unavailable"),
             "{recent_text}"
         );
+    }
+
+    #[test]
+    fn abandoned_request_is_not_rendered_as_an_error_event() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.request_abandoned(
+            "request-1",
+            "Client response stream disconnected before completion",
+        );
+        let state = monitor.snapshot();
+
+        let recent = draw(110, 8, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, true)
+        });
+        let recent_text = buffer_text(&recent);
+        assert_eq!(recent_text.matches('!').count(), 1, "{recent_text}");
+
+        let events = draw(100, 8, |frame| {
+            render_events(frame, frame.area(), &state.recent)
+        });
+        let events_text = buffer_text(&events);
+        assert!(events_text.contains("No events"), "{events_text}");
     }
 
     #[test]

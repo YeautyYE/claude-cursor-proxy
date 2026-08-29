@@ -565,6 +565,19 @@ fn load_auth_for_registry_raw() -> Option<CursorAuth> {
         })
 }
 
+/// Read only the proxy's local compatibility mirror. When `accounts.json`
+/// already contains profiles, an official CLI Keychain credential is not
+/// enough evidence that it belongs to that pool and must not be imported.
+fn load_local_auth_for_registry_raw() -> Option<CursorAuth> {
+    let store = file_store();
+    store
+        .load_stored_auth()
+        .ok()
+        .flatten()
+        .filter(|auth| !auth.access_token.trim().is_empty())
+        .map(|auth| enrich(auth, store.auth_path()))
+}
+
 fn sync_active_registry(stored: &mut StoredCursorAccounts, active: Option<CursorAuth>) {
     let Some(active) = active else {
         return;
@@ -727,14 +740,26 @@ pub fn list_cursor_accounts() -> anyhow::Result<Vec<CursorAccountProfile>> {
     } else {
         None
     };
+    let mut stored = load_stored_accounts()?;
     let active_auth = if env_auth.is_none() {
-        // Include official Cursor CLI keychain/file fallback credentials. An
-        // install with only Agent credentials must still appear in the TUI.
-        load_auth_for_registry_raw()
+        // An explicit account pool is authoritative. Only synchronize its
+        // active entry from the local compatibility mirror; importing an
+        // unrelated official CLI Keychain credential here would silently add
+        // a third account whenever both stores are present.
+        if stored
+            .as_ref()
+            .is_some_and(|pool| !pool.accounts.is_empty())
+        {
+            load_local_auth_for_registry_raw()
+        } else {
+            // Include official Cursor CLI keychain/file fallback credentials
+            // while migrating an install that has no account pool yet.
+            load_auth_for_registry_raw()
+        }
     } else {
         None
     };
-    let Some(mut stored) = load_stored_accounts()? else {
+    let Some(mut stored) = stored.take() else {
         return Ok(active_auth
             .map(|auth| vec![synthetic_account_profile(auth, true)])
             .or_else(|| env_auth.map(|auth| vec![auth]))

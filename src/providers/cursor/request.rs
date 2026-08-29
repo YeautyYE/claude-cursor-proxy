@@ -1223,18 +1223,28 @@ pub(crate) fn current_user_blocks(req: &MessagesRequest) -> Vec<&serde_json::Val
 ///
 /// Claude Code's `m0(... querySource: "compact", forkLabel: ... )` path is a
 /// normal Anthropic Messages request: unlike the server-side compaction
-/// extension it does not carry `context_management.edits`.  The only stable
-/// wire signal is the summary prompt appended as the latest user turn.  Keep
-/// this matcher intentionally strict so an ordinary user message such as
-/// `/compact` is never routed to the summary-only lane.
+/// extension it does not carry `context_management.edits`. Depending on the
+/// Claude Code release, the wire signal is either the summary prompt or the
+/// explicit `/compact` command metadata appended as the latest user turn. Keep
+/// both matchers strict so an ordinary user message such as `/compact` is never
+/// routed to the summary-only lane.
 pub(crate) fn is_reactive_compact_prompt(req: &MessagesRequest) -> bool {
     let current = current_user_messages(req);
-    let Some(message) = current.last() else {
-        return false;
-    };
-    let mut text = String::new();
-    collect_text_for_compaction(&message.content, &mut text);
-    is_compaction_summary_prompt(&text)
+    current.iter().any(|message| {
+        let mut text = String::new();
+        collect_text_for_compaction(&message.content, &mut text);
+        // Claude Code's manual `/compact` command is represented on the wire
+        // by these two command metadata tags.  It is a normal Messages
+        // request, so headers/querySource are not reliable signals. Require
+        // the pair rather than matching either tag independently; partial
+        // command transcripts and quoted single-tag fragments stay normal.
+        is_compact_command_marker(&text) || is_compaction_summary_prompt(&text)
+    })
+}
+
+fn is_compact_command_marker(text: &str) -> bool {
+    text.contains("<command-name>/compact</command-name>")
+        && text.contains("<command-message>compact</command-message>")
 }
 
 fn collect_text_for_compaction(value: &serde_json::Value, out: &mut String) {
@@ -2128,6 +2138,39 @@ mod tests {
         }))
         .expect("valid nested compact request");
         assert!(is_reactive_compact_prompt(&req));
+    }
+
+    #[test]
+    fn detects_claude_manual_compact_command_marker() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "<command-name>/compact</command-name>\n<command-message>compact</command-message>"},
+                {"type": "text", "text": "<command-args></command-args>"}
+            ]}]
+        }))
+        .expect("valid command-marker request");
+        assert!(is_reactive_compact_prompt(&req));
+    }
+
+    #[test]
+    fn compact_command_marker_requires_both_metadata_tags() {
+        for content in [
+            "<command-name>/compact</command-name>",
+            "<command-message>compact</command-message>",
+            "<command-name>/compact</command-name><command-message>other</command-message>",
+            "quoted <command-name>/compact</command-name> text",
+        ] {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "gemini-3.1-pro",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("valid ordinary request");
+            assert!(
+                !is_reactive_compact_prompt(&req),
+                "partial/quoted command metadata must stay in normal lane: {content}"
+            );
+        }
     }
 
     #[test]

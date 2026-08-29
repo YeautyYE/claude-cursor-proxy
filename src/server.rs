@@ -441,6 +441,12 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
     );
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.provider_selected(&req_id, provider.name(), &normalized_model, None);
+        if provider.name() == "cursor" {
+            monitor.client_type_resolved(
+                &req_id,
+                crate::config::cursor_client_type_for_model(&normalized_model),
+            );
+        }
     }
     let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
@@ -1065,6 +1071,12 @@ async fn dispatch_request(
             monitor.session_sequence_resolved(&req_id, current.seq);
         }
         monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
+        if provider.name() == "cursor" {
+            monitor.client_type_resolved(
+                &req_id,
+                crate::config::cursor_client_type_for_model(&normalized_model),
+            );
+        }
     }
 
     let traffic = create_traffic_capture(TrafficCaptureOptions {
@@ -1829,22 +1841,103 @@ fn set_mode(path: &Path, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_surface_model, claude_code_headers_from, derive_fallback_session_id,
-        enable_accepted_tcp_nodelay, header_text_all, parse_advertised_models,
-        resolve_responses_session_id, resolve_session_id, session_id_from_headers,
-        wrap_anthropic_as_responses,
+        RequestMonitorGuard, advertised_surface_model, claude_code_headers_from,
+        derive_fallback_session_id, enable_accepted_tcp_nodelay, header_text_all,
+        monitor_response_body, parse_advertised_models, resolve_responses_session_id,
+        resolve_session_id, session_id_from_headers, wrap_anthropic_as_responses,
     };
     use crate::anthropic::error::json_error;
     use crate::anthropic::schema::MessagesRequest;
+    use crate::monitor::{EndpointKind, MonitorHandle, RequestStatus};
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
+    use bytes::Bytes;
     use serde_json::json;
     use std::collections::HashSet;
+    use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
 
     static ERROR_CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn dropped_response_body_is_abandoned_not_failed() {
+        let monitor = MonitorHandle::new(10);
+        let request_id = "client-cancelled";
+        monitor.request_started(
+            request_id,
+            Some("session-client-cancelled".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        let pending = futures_util::stream::pending::<Result<Bytes, Infallible>>();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(pending))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            RequestMonitorGuard::new(Some(monitor.clone()), request_id.to_string()),
+        );
+
+        // Dropping a response body is how Hyper reports a downstream
+        // cancellation. The upstream Run may still complete and be replayed
+        // to a retry, so this must not be rendered as an HTTP/API failure.
+        drop(response);
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.recent[0].status, RequestStatus::Abandoned);
+        assert_eq!(state.recent[0].http_status, None);
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("Client response stream disconnected before completion")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_body_read_error_remains_failed_after_wrapper_drop() {
+        let monitor = MonitorHandle::new(10);
+        let request_id = "body-read-error";
+        monitor.request_started(
+            request_id,
+            Some("session-body-read-error".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        let stream = futures_util::stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("upstream body reset")),
+        ]);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            RequestMonitorGuard::new(Some(monitor.clone()), request_id.to_string()),
+        );
+
+        let error = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect_err("the injected body reset must reach the consumer");
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.recent[0].status, RequestStatus::Failed);
+        assert_eq!(state.recent[0].http_status, Some(200));
+        assert!(
+            state.recent[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("upstream body reset")),
+            "unexpected monitor error: {:?}; body error: {error}",
+            state.recent[0].error
+        );
+    }
 
     fn body_from(value: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(value).unwrap()
