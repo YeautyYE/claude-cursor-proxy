@@ -275,7 +275,36 @@ struct AccountUiState {
     usage_generation: u64,
     usage_cancel: Option<Arc<AtomicBool>>,
     usage_scope: Option<AccountUsageScope>,
+    /// Account id awaiting an explicit delete confirmation. Keeping the id
+    /// (rather than the row index) prevents a concurrent refresh from
+    /// deleting a different account than the one the user selected.
+    delete_confirm: Option<AccountDeleteRequest>,
     message: Option<String>,
+}
+
+fn selected_index_after_account_delete(
+    selected_index: usize,
+    remaining_len: usize,
+    replacement_active_index: Option<usize>,
+    was_active: bool,
+) -> usize {
+    if remaining_len == 0 {
+        return 0;
+    }
+    if was_active {
+        return replacement_active_index
+            .unwrap_or(selected_index.min(remaining_len - 1))
+            .min(remaining_len - 1);
+    }
+    selected_index.min(remaining_len - 1)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountDeleteRequest {
+    id: String,
+    display_name: String,
+    active: bool,
+    selected_index: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -603,6 +632,12 @@ fn open_accounts_view(app: &mut MonitorApp) {
     app.show_setup = false;
     app.show_sand_settings = false;
     app.show_help = false;
+    // A monitor instance can be reopened in the same process. Do not carry a
+    // stale confirmation from a previous account panel into the new view.
+    {
+        let mut ui = account_ui_lock();
+        ui.delete_confirm = None;
+    }
     refresh_account_list();
     // Prime the selected account only.  Fetching every account is available
     // with `U`, while opening the panel stays responsive even with a large
@@ -618,6 +653,7 @@ fn refresh_account_list() {
     let mut ui = account_ui_lock();
     match result {
         Ok(accounts) => {
+            let selected_index = ui.selected;
             let selected_id = ui
                 .accounts
                 .get(ui.selected)
@@ -625,8 +661,15 @@ fn refresh_account_list() {
             ui.accounts = accounts;
             ui.selected = selected_id
                 .and_then(|id| ui.accounts.iter().position(|account| account.id == id))
-                .unwrap_or(0)
+                .unwrap_or(selected_index)
                 .min(ui.accounts.len().saturating_sub(1));
+            if ui
+                .delete_confirm
+                .as_ref()
+                .is_some_and(|pending| !ui.accounts.iter().any(|account| account.id == pending.id))
+            {
+                ui.delete_confirm = None;
+            }
             let ids = ui
                 .accounts
                 .iter()
@@ -644,12 +687,28 @@ fn refresh_account_list() {
         Err(error) => {
             ui.accounts.clear();
             ui.selected = 0;
+            ui.delete_confirm = None;
             ui.message = Some(format!("Account list failed: {error}"));
         }
     }
 }
 
 fn handle_account_key(app: &mut MonitorApp, key: KeyCode) {
+    // Confirmation owns the account pane until it is resolved. In
+    // particular, navigation must not change the target between `d` and
+    // `y`.
+    if account_ui_lock().delete_confirm.is_some() {
+        match key {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                confirm_account_delete();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('d') => {
+                cancel_account_delete();
+            }
+            _ => {}
+        }
+        return;
+    }
     match key {
         KeyCode::Esc | KeyCode::Char('a') => {
             app.detail = None;
@@ -671,11 +730,107 @@ fn handle_account_key(app: &mut MonitorApp, key: KeyCode) {
         KeyCode::Enter => switch_selected_account(),
         KeyCode::Char('u') => request_account_usage(false),
         KeyCode::Char('U') => request_account_usage(true),
+        KeyCode::Char('d') | KeyCode::Char('D') => request_account_delete(),
         KeyCode::Char('r') => {
             refresh_account_list();
             request_account_usage_force(true);
         }
         _ => {}
+    }
+}
+
+fn request_account_delete() {
+    let mut ui = account_ui_lock();
+    // Clone the immutable row data before mutating the UI state below. This
+    // avoids holding an account-row borrow across `cancel_usage_locked` and
+    // keeps a concurrent usage cancellation from tripping the borrow checker.
+    let target = ui.accounts.get(ui.selected).map(|account| {
+        (
+            account.id.clone(),
+            account_name_for_display(account, account.email()),
+            account.active,
+        )
+    });
+    let Some((id, display_name, active)) = target else {
+        ui.message = Some("No Cursor accounts are available".to_string());
+        return;
+    };
+    let selected_index = ui.selected;
+    // Stop an in-flight usage fan-out before asking for confirmation. This
+    // keeps a deleted account from receiving a late usage result while the
+    // confirmation prompt is on screen.
+    cancel_usage_locked(&mut ui);
+    ui.message = None;
+    ui.delete_confirm = Some(AccountDeleteRequest {
+        id,
+        display_name,
+        active,
+        selected_index,
+    });
+}
+
+fn cancel_account_delete() {
+    let mut ui = account_ui_lock();
+    ui.delete_confirm = None;
+    ui.message = None;
+}
+
+fn confirm_account_delete() {
+    let target = {
+        let mut ui = account_ui_lock();
+        ui.delete_confirm.take()
+    };
+    let Some(target) = target else {
+        return;
+    };
+
+    match crate::providers::cursor::auth::remove_cursor_account(&target.id) {
+        Ok(replacement) => {
+            refresh_account_list();
+            {
+                let mut ui = account_ui_lock();
+                let replacement_index = replacement.as_ref().and_then(|replacement| {
+                    ui.accounts
+                        .iter()
+                        .position(|account| account.id == replacement.id)
+                });
+                // Keep the active replacement selected when the removed
+                // account was active; otherwise retain the nearest row so a
+                // delete in a large pool does not jump to the top.
+                ui.selected = selected_index_after_account_delete(
+                    target.selected_index,
+                    ui.accounts.len(),
+                    replacement_index,
+                    target.active,
+                );
+                ui.message = Some(if target.active {
+                    match replacement {
+                        Some(replacement) => format!(
+                            "Removed {}; active account: {}",
+                            target.display_name,
+                            replacement.display_name()
+                        ),
+                        None => format!(
+                            "Removed {}; no Cursor account is active",
+                            target.display_name
+                        ),
+                    }
+                } else {
+                    format!("Removed {}", target.display_name)
+                });
+            }
+            let has_accounts = {
+                let ui = account_ui_lock();
+                !ui.accounts.is_empty()
+            };
+            if has_accounts {
+                request_account_usage(false);
+            }
+        }
+        Err(error) => {
+            let mut ui = account_ui_lock();
+            ui.message = Some(format!("Account removal failed: {error}"));
+        }
     }
 }
 
@@ -951,6 +1106,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     }
     if app.show_help {
         render_help_overlay(frame, area);
+    }
+    if matches!(app.detail, Some(DetailView::Accounts)) {
+        render_account_delete_confirmation(frame, area);
     }
     match app.phase {
         MonitorPhase::Running => {}
@@ -2134,6 +2292,8 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Span::styled(" selected usage  ", Style::default().fg(DIM)),
         Span::styled("U", Style::default().fg(TEAL)),
         Span::styled(" all usage  ", Style::default().fg(DIM)),
+        Span::styled("d", Style::default().fg(TEAL)),
+        Span::styled(" delete  ", Style::default().fg(DIM)),
         Span::styled("r", Style::default().fg(TEAL)),
         Span::styled(" refresh  ", Style::default().fg(DIM)),
         Span::styled("Esc/a", Style::default().fg(TEAL)),
@@ -2230,6 +2390,65 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             .block(panel("Cursor accounts", true))
             .wrap(Wrap { trim: false }),
         area,
+    );
+}
+
+fn render_account_delete_confirmation(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let target = {
+        let ui = account_ui_lock();
+        ui.delete_confirm.clone()
+    };
+    let Some(target) = target else {
+        return;
+    };
+
+    // Keep the overlay fully inside very small terminals as well as the
+    // normal monitor layout. `min` is intentional here: `clamp(1, 72)` would
+    // expand a three-row terminal to a seven-row popup.
+    let width = 72.min(area.width);
+    let height = 7.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let name_width = usize::from(width.saturating_sub(8)).max(1);
+    let name = ellipsize(&target.display_name, name_width);
+    let prompt = if target.active {
+        format!("Delete active account {name}?")
+    } else {
+        format!("Delete account {name}?")
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Delete Cursor account",
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(prompt, Style::default().fg(DIM_WHITE))),
+            Line::from(Span::styled(
+                format!("id {}", ellipsize(&target.id, name_width)),
+                Style::default().fg(DIM),
+            )),
+            Line::from(vec![
+                Span::styled("y/Enter", Style::default().fg(TEAL)),
+                Span::styled(" confirm   ", Style::default().fg(DIM_WHITE)),
+                Span::styled("n/Esc", Style::default().fg(TEAL)),
+                Span::styled(" cancel", Style::default().fg(DIM_WHITE)),
+            ]),
+        ])
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(YELLOW))
+                .style(Style::default().bg(BG)),
+        )
+        .style(Style::default().bg(BG)),
+        popup,
     );
 }
 
@@ -2608,7 +2827,15 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
 
 fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let width = 48.min(area.width.saturating_sub(4)).max(24);
-    let height = 12.min(area.height.saturating_sub(2)).max(8);
+    // Keep every shortcut visible after adding account-management actions.
+    // Two rows are reserved for the border; narrow terminals still clamp to
+    // the available height.
+    let shortcut_rows = 12u16;
+    let height = if area.height >= 10 {
+        (shortcut_rows + 2).min(area.height.saturating_sub(2))
+    } else {
+        area.height.max(1)
+    };
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -2630,6 +2857,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("b", "toggle setup"),
         ("u", "show account usage"),
         ("a", "manage Cursor accounts"),
+        ("d", "delete selected Cursor account"),
         ("s", "configure Sand models"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
@@ -3660,6 +3888,65 @@ mod tests {
 
         let mut ui = account_ui_lock();
         *ui = AccountUiState::default();
+    }
+
+    #[test]
+    fn account_delete_confirmation_targets_selected_id_and_is_rendered() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let account = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-delete".to_string(),
+            label: Some("Delete me".to_string()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-delete".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: Some("user-delete".to_string()),
+                email: Some("delete@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: true,
+        };
+        let mut ui = account_ui_lock();
+        ui.accounts = vec![account];
+        ui.selected = 0;
+        ui.message = None;
+        ui.delete_confirm = None;
+        drop(ui);
+
+        request_account_delete();
+        let pending = account_ui_lock()
+            .delete_confirm
+            .clone()
+            .expect("delete confirmation should capture the selected row");
+        assert_eq!(pending.id, "account-delete");
+        assert_eq!(pending.display_name, "Delete me");
+        assert!(pending.active);
+
+        let rendered = draw(80, 12, |frame| {
+            render_account_delete_confirmation(frame, frame.area())
+        });
+        let text = buffer_text(&rendered);
+        assert!(text.contains("Delete Cursor account"), "{text}");
+        assert!(text.contains("Delete active account Delete me?"), "{text}");
+        assert!(text.contains("y/Enter"), "{text}");
+        assert!(text.contains("n/Esc"), "{text}");
+
+        cancel_account_delete();
+        assert!(account_ui_lock().delete_confirm.is_none());
+        let mut ui = account_ui_lock();
+        *ui = AccountUiState::default();
+    }
+
+    #[test]
+    fn account_delete_selection_stays_in_range_after_removal() {
+        assert_eq!(selected_index_after_account_delete(4, 0, None, true), 0);
+        assert_eq!(selected_index_after_account_delete(4, 3, Some(1), true), 1);
+        assert_eq!(selected_index_after_account_delete(4, 3, None, true), 2);
+        assert_eq!(selected_index_after_account_delete(4, 3, Some(1), false), 2);
+        assert_eq!(selected_index_after_account_delete(0, 2, None, false), 0);
     }
 
     #[test]

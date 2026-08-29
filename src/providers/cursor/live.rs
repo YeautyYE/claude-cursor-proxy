@@ -75,7 +75,17 @@ enum ClientOutbound {
     Http1(BidiAppendSession),
 }
 
-fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorError {
+/// A bounded channel send can time out while the request-body pump is briefly
+/// backpressured. Tokio guarantees that cancelling `Sender::send` does not
+/// enqueue the item, so retrying the exact same frame is safe for BiDi. Unary
+/// HTTP/1 BidiAppend has an ambiguous acceptance boundary and remains
+/// single-attempt regardless of these settings.
+const DEFAULT_BIDI_SEND_RETRIES: u64 = 2;
+const MAX_BIDI_SEND_RETRIES: u64 = 4;
+const DEFAULT_BIDI_SEND_RETRY_BACKOFF_MS: u64 = 100;
+const MAX_BIDI_SEND_RETRY_BACKOFF_MS: u64 = 2_000;
+
+pub(crate) fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorError {
     if is_pre_connect_failure(&error) {
         return error;
     }
@@ -110,20 +120,69 @@ fn ambiguous_http1_append_error(error: CursorError, operation: &str) -> CursorEr
 impl ClientOutbound {
     async fn send_connect_frame(&self, frame: Bytes) -> Result<(), CursorError> {
         let timeout = Duration::from_secs(env_u64("CCP_CURSOR_SEND_TIMEOUT_SECS", 5));
+        self.send_connect_frame_with_options(frame, timeout, 0, Duration::ZERO)
+            .await
+    }
+
+    /// Retry a response/control frame when a bounded BiDi body channel is
+    /// briefly full. Tool-result ResumeBatch sends intentionally use
+    /// [`send_connect_frame`] directly so cancellation can preempt the single
+    /// bounded wait; those frames have a separate acceptance/reconnect policy.
+    async fn send_connect_frame_with_retry(&self, frame: Bytes) -> Result<(), CursorError> {
+        let timeout = Duration::from_secs(env_u64("CCP_CURSOR_SEND_TIMEOUT_SECS", 5));
+        let retries = env_u64_allow_zero("CCP_CURSOR_SEND_RETRIES", DEFAULT_BIDI_SEND_RETRIES)
+            .min(MAX_BIDI_SEND_RETRIES) as u32;
+        let backoff = Duration::from_millis(
+            env_u64_allow_zero(
+                "CCP_CURSOR_SEND_RETRY_BACKOFF_MS",
+                DEFAULT_BIDI_SEND_RETRY_BACKOFF_MS,
+            )
+            .min(MAX_BIDI_SEND_RETRY_BACKOFF_MS),
+        );
+        self.send_connect_frame_with_options(frame, timeout, retries, backoff)
+            .await
+    }
+
+    async fn send_connect_frame_with_options(
+        &self,
+        frame: Bytes,
+        attempt_timeout: Duration,
+        max_retries: u32,
+        retry_backoff: Duration,
+    ) -> Result<(), CursorError> {
         match self {
-            Self::Bidi(tx) => match tokio::time::timeout(timeout, tx.send(Ok(frame))).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) => Err(CursorError::internal("Cursor BiDi request stream closed")),
-                // Tokio's bounded-channel send is cancellation-safe: if this
-                // times out, the frame was not queued and may be retried.
-                Err(_) => Err(CursorError::new(
-                    504,
-                    "Cursor BiDi request stream send timed out",
-                    None,
-                )),
-            },
+            Self::Bidi(tx) => {
+                let mut attempt = 0u32;
+                loop {
+                    match tokio::time::timeout(attempt_timeout, tx.send(Ok(frame.clone()))).await {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(_)) => {
+                            return Err(CursorError::internal("Cursor BiDi request stream closed"));
+                        }
+                        // Tokio's bounded-channel send is cancellation-safe:
+                        // if this times out, the frame was not queued and may
+                        // be retried without duplicating an upstream message.
+                        Err(_) if attempt < max_retries => {
+                            attempt += 1;
+                            let delay = retry_backoff.checked_mul(attempt).unwrap_or(retry_backoff);
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
+                        Err(_) => {
+                            return Err(CursorError::new(
+                                504,
+                                "Cursor BiDi request stream send timed out",
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
             Self::Http1(session) => {
-                match tokio::time::timeout(timeout, session.append_connect_or_raw(&frame)).await {
+                match tokio::time::timeout(attempt_timeout, session.append_connect_or_raw(&frame))
+                    .await
+                {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(error)) => Err(ambiguous_http1_append_error(error, "send")),
                     // Dropping a unary HTTP request future cannot prove that
@@ -4216,8 +4275,13 @@ impl CursorHttpClient {
                 let Ok(frame) = encode_client_heartbeat_frame() else {
                     break;
                 };
-                if heartbeat_tx.send(Ok(frame)).await.is_err() {
-                    break;
+                match heartbeat_tx.try_send(Ok(frame)) {
+                    Ok(()) => {}
+                    // Heartbeats are advisory. If the request body is
+                    // momentarily backpressured, dropping this tick keeps
+                    // the bounded queue available for KV/tool acknowledgements.
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -6022,7 +6086,7 @@ fn live_should_resume_after_drop(on_probation: bool, got_chunk_since_reconnect: 
 
 const CONVERSATION_RESET_RETRY_NOTE: &str =
     "stale Cursor conversation reset; retry this message to continue";
-const EMPTY_TURN_RETRY_NOTE: &str =
+pub(crate) const EMPTY_TURN_RETRY_NOTE: &str =
     "Cursor upstream finished this turn without text or tool calls; retry this turn";
 const EMPTY_TURN_CHECKPOINT_RETRY_NOTE: &str =
     "completed tool results retained in Cursor checkpoint; continue without replaying tools";
@@ -6281,13 +6345,17 @@ fn is_explicit_http1_required(err: &CursorError) -> bool {
     if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
         return false;
     }
+    let message = err.message.to_ascii_lowercase();
+    let detail = err
+        .detail
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     matches!(err.status, 421 | 464)
-        || err.message.contains("HTTP_1_1_REQUIRED")
-        || err.message.contains("FORCE_BIDI_DISABLED")
-        || err
-            .detail
-            .as_deref()
-            .is_some_and(|d| d.contains("HTTP_1_1_REQUIRED") || d.contains("FORCE_BIDI_DISABLED"))
+        || message.contains("http_1_1_required")
+        || message.contains("force_bidi_disabled")
+        || detail.contains("http_1_1_required")
+        || detail.contains("force_bidi_disabled")
 }
 
 #[cfg(test)]
@@ -6306,8 +6374,25 @@ fn live_send_failure_is_terminal(err: &CursorError) -> bool {
     {
         return false;
     }
+    let client_message = err.client_message();
+    let lower = client_message.to_ascii_lowercase();
+    // A timeout while enqueueing onto Tokio's bounded BiDi body channel does
+    // not enqueue the frame (the send future is cancellation-safe). Keep this
+    // path reconnectable/cancellation-preemptible; treating local backpressure
+    // as an accepted upstream operation makes an explicit cancel wait for an
+    // unnecessary 409 ambiguity tombstone.
+    if lower.contains("bidi request stream send timed out")
+        && !lower.contains("partially sent")
+        && !lower.contains("acceptance is ambiguous")
+    {
+        return false;
+    }
     cursor_error_is_missing_conversation_data(err)
-        || err.message.contains("acceptance is ambiguous")
+        // Ambiguity can be reported as either "acceptance is ambiguous" or
+        // "completion is ambiguous" (and as idle/no-progress variants). Use
+        // the shared classifier so a detail-only completion marker cannot be
+        // mistaken for a reconnect-safe transport failure.
+        || terminal_error_is_ambiguous_accept(&client_message)
         || !is_retryable_live_transport_error(err)
 }
 
@@ -6321,8 +6406,13 @@ fn live_reconnect_open_error_is_fatal(err: &CursorError) -> bool {
     {
         return false;
     }
+    // RunSSE/H2 errors frequently keep the useful recovery marker in
+    // `detail` while `message` is only "Cursor upstream HTTP <status>".
+    // Classify the assembled client text so detail-only ambiguous/fresh
+    // recovery markers cannot be lost at the reconnect boundary.
+    let client_message = err.client_message();
     cursor_error_is_missing_conversation_data(err)
-        || terminal_error_allows_fresh_retry(&err.message)
+        || terminal_error_allows_fresh_retry(&client_message)
         || live_send_failure_is_terminal(err)
         || is_response_less_send_error(err)
 }
@@ -6362,7 +6452,8 @@ fn is_initial_bidiappend_timeout(err: &CursorError) -> bool {
 }
 
 fn is_pre_connect_failure(err: &CursorError) -> bool {
-    let blob = format!("{}{}", err.message, err.detail.as_deref().unwrap_or(""));
+    let blob =
+        format!("{}{}", err.message, err.detail.as_deref().unwrap_or("")).to_ascii_lowercase();
     let lower = blob.to_ascii_lowercase();
     if lower.contains("connect failed") {
         return true;
@@ -6419,10 +6510,14 @@ pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
     {
         return false;
     }
-    if terminal_error_allows_fresh_retry(&err.message) {
+    // Structured HTTP errors put the Connect diagnostic in `detail`; using
+    // only `message` here allowed detail-only acceptance ambiguity to release
+    // the reservation and open a duplicate Run on the next retry.
+    let client_message = err.client_message();
+    if terminal_error_allows_fresh_retry(&client_message) {
         return false;
     }
-    if terminal_error_is_ambiguous_accept(&err.message) {
+    if terminal_error_is_ambiguous_accept(&client_message) {
         return true;
     }
     if matches!(err.status, 400 | 401 | 403 | 404 | 421 | 429 | 464) {
@@ -6441,7 +6536,17 @@ pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
     // fail-closed sealing is required to prevent duplicate execution. Plain
     // policy 429s contain none of these markers and never match.
     let lower = message.to_ascii_lowercase();
-    lower.contains("timed out")
+    if crate::retry::is_idle_no_progress(message)
+        && (lower.contains("connect failed")
+            || lower.contains("error sending request for url")
+            || lower.contains("connection refused"))
+    {
+        // The request never reached Cursor in these cases. Keep the ordinary
+        // transport retry path instead of sealing a live-run tombstone.
+        return false;
+    }
+    crate::retry::is_idle_no_progress(message)
+        || lower.contains("timed out")
         || lower.contains("no progress")
         || lower.contains("ambiguous")
         || lower.contains("had no body")
@@ -6499,10 +6604,11 @@ fn terminal_error_allows_fresh_retry(message: &str) -> bool {
 }
 
 fn live_error_is_resource_exhausted(message: &str) -> bool {
-    message.contains("[resource_exhausted]")
-        || message.contains("ERROR_RESOURCE_EXHAUSTED")
-        || message.contains("Connect error 429")
-        || message.contains("Cursor error 429")
+    let lower = message.to_ascii_lowercase();
+    lower.contains("[resource_exhausted]")
+        || lower.contains("error_resource_exhausted")
+        || lower.contains("connect error 429")
+        || lower.contains("cursor error 429")
 }
 
 fn terminal_error_clears_live_slot(message: &str) -> bool {
@@ -6527,11 +6633,23 @@ pub(crate) fn live_pending_must_supersede(pending: &[PendingCursorExec]) -> bool
 /// channel close). A 502 here becomes grok-build's "Retrying (attempt 1)"
 /// loop; the next POST must start a fresh run with tool_result history.
 pub(crate) fn live_resume_error_is_dead_driver(error: &CursorError) -> bool {
-    let message = error.message.as_str();
+    let message = error.client_message().to_ascii_lowercase();
     message.contains("acknowledgement dropped") || message.contains("already closed")
 }
 
 pub(crate) fn live_error_is_empty_turn_retry(message: &str) -> bool {
+    // Buffered/HTTP1 paths surface the same hollow generation with transport
+    // specific idle diagnostics instead of the canonical live marker. Treat
+    // those diagnostics as an empty-turn recovery signal so the late pump can
+    // spend its bounded fresh-conversation budget rather than forwarding a
+    // 502 that prompts Claude Code to open a duplicate Run.
+    if crate::retry::is_idle_no_progress(message) {
+        let lower = message.to_ascii_lowercase();
+        return !lower.contains("acceptance is ambiguous")
+            && !lower.contains("partially sent")
+            && !lower.contains("upstream transport remained live")
+            && !lower.contains("completion is ambiguous");
+    }
     message.contains(EMPTY_TURN_RETRY_NOTE)
 }
 
@@ -6559,6 +6677,21 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     // this helper.
     if live_error_is_kv_blob_overflow(message) {
         return live_error_is_kv_blob_overflow_replayable(message);
+    }
+    if crate::retry::is_idle_no_progress(message) {
+        let lower = message.to_ascii_lowercase();
+        // A partial/explicitly ambiguous operation may have crossed the
+        // acceptance boundary even though it also mentions an idle timeout.
+        // Keep those fail-closed; a hollow idle with no such marker gets one
+        // bounded fresh-conversation recovery.
+        if lower.contains("acceptance is ambiguous")
+            || lower.contains("partially sent")
+            || lower.contains("upstream transport remained live")
+            || lower.contains("completion is ambiguous")
+        {
+            return false;
+        }
+        return true;
     }
     if terminal_error_is_ambiguous_accept(message) {
         return false;
@@ -6610,9 +6743,9 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
         return false;
     }
     live_error_is_resource_exhausted(message)
-        || message.contains("Connect error 502")
-        || message.contains("Connect error 503")
-        || message.contains("Connect error 504")
+        || lower.contains("connect error 502")
+        || lower.contains("connect error 503")
+        || lower.contains("connect error 504")
         || lower.contains("unable to reach the model provider")
 }
 
@@ -6707,13 +6840,19 @@ pub(crate) fn is_retryable_live_transport_error(err: &CursorError) -> bool {
     if is_local_live_overload(err) {
         return false;
     }
+    let message = err.message.to_ascii_lowercase();
+    let detail = err
+        .detail
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     matches!(err.status, 0 | 408 | 421 | 464 | 502 | 503 | 504)
-        || err.message.contains("error sending request")
-        || err.message.contains("connection")
-        || is_h2_stream_reset(&err.message)
-        || err.detail.as_deref().is_some_and(|d| {
-            d.contains("HTTP_1_1_REQUIRED") || d.contains("bidi") || is_h2_stream_reset(d)
-        })
+        || message.contains("error sending request")
+        || message.contains("connection")
+        || is_h2_stream_reset(&message)
+        || detail.contains("http_1_1_required")
+        || detail.contains("bidi")
+        || is_h2_stream_reset(&detail)
 }
 
 /// Server keep-alives must not reset setup/stream idle clocks.
@@ -7293,9 +7432,10 @@ async fn try_live_reconnect(
                     return outcome;
                 }
                 if live_reconnect_open_error_is_fatal(&err) {
+                    let client_message = err.client_message();
                     let message = if is_response_less_send_error(&err)
                         && !cursor_error_is_missing_conversation_data(&err)
-                        && !terminal_error_allows_fresh_retry(&err.message)
+                        && !terminal_error_allows_fresh_retry(&client_message)
                     {
                         format!(
                             "{} (response-less ResumeAction send is ambiguous)",
@@ -7687,6 +7827,17 @@ struct SandEmptyEndSequence {
     last_seen: Instant,
 }
 
+/// Aggregate clean-END observations across independent logical requests for
+/// the same account/model/route. Cursor can return an empty `FLAG_END` to
+/// every request in a parallel wave when an allowance is exhausted; keeping
+/// only the request ids observed in the short window lets the second distinct
+/// request open the local breaker without allowing one retry to count twice.
+#[derive(Debug, Clone)]
+struct SandEmptyEndAggregate {
+    request_ids: HashSet<String>,
+    last_seen: Instant,
+}
+
 // A quota-sentinel FLAG_END is often delayed while Cursor warms a model or
 // waits for an admission slot.  The previous 15s cutoff let those delayed
 // sentinels fall through to the generic empty-turn path and eventually surface
@@ -7696,8 +7847,11 @@ struct SandEmptyEndSequence {
 const SAND_EMPTY_END_IMMEDIATE_MAX: Duration = Duration::from_secs(300);
 const SAND_EMPTY_END_SEQUENCE_WINDOW: Duration = Duration::from_secs(60);
 const SAND_EMPTY_END_SEQUENCE_MAX_KEYS: usize = 1024;
+const SAND_EMPTY_END_AGGREGATE_MAX_REQUESTS: usize = 16;
 
 static SAND_EMPTY_END_SEQUENCES: LazyLock<Mutex<HashMap<String, SandEmptyEndSequence>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SAND_EMPTY_END_AGGREGATES: LazyLock<Mutex<HashMap<String, SandEmptyEndAggregate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn sand_empty_end_sequence_key(context: SandEmptyEndContext<'_>) -> String {
@@ -7708,6 +7862,42 @@ fn sand_empty_end_sequence_key(context: SandEmptyEndContext<'_>) -> String {
         super::auth::cursor_account_digest(context.token),
         context.request_id.trim(),
     )
+}
+
+fn sand_empty_end_aggregate_key(context: SandEmptyEndContext<'_>) -> String {
+    let resolved_model = super::model::resolve_cursor_model(context.model_id)
+        .map(|resolved| resolved.model_id)
+        .unwrap_or_else(|_| context.model_id.trim().to_ascii_lowercase());
+    format!(
+        "{}:{}:{}",
+        context.client_type.trim().to_ascii_lowercase(),
+        resolved_model,
+        super::auth::cursor_account_digest(context.token),
+    )
+}
+
+fn clear_sand_empty_end_aggregate_request(context: SandEmptyEndContext<'_>) {
+    let request_id = context.request_id.trim();
+    if request_id.is_empty() {
+        return;
+    }
+    let key = sand_empty_end_aggregate_key(context);
+    let mut aggregates = SAND_EMPTY_END_AGGREGATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(aggregate) = aggregates.get_mut(&key) {
+        aggregate.request_ids.remove(request_id);
+        if aggregate.request_ids.is_empty() {
+            aggregates.remove(&key);
+        }
+    }
+}
+
+fn clear_sand_empty_end_aggregate(context: SandEmptyEndContext<'_>) {
+    SAND_EMPTY_END_AGGREGATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&sand_empty_end_aggregate_key(context));
 }
 
 fn clear_sand_empty_end_sequence(context: SandEmptyEndContext<'_>) {
@@ -7721,6 +7911,48 @@ fn clear_sand_empty_end_sequence(context: SandEmptyEndContext<'_>) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .remove(&sand_empty_end_sequence_key(context));
+    clear_sand_empty_end_aggregate_request(context);
+}
+
+fn record_sand_empty_end_aggregate(context: SandEmptyEndContext<'_>, now: Instant) -> u8 {
+    let request_id = context.request_id.trim();
+    if request_id.is_empty() {
+        // There is no way to distinguish independent requests without the
+        // logical id; the per-request sequence remains the fallback.
+        return 0;
+    }
+    let key = sand_empty_end_aggregate_key(context);
+    let mut aggregates = SAND_EMPTY_END_AGGREGATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    aggregates.retain(|_, aggregate| {
+        now.saturating_duration_since(aggregate.last_seen) < SAND_EMPTY_END_SEQUENCE_WINDOW
+    });
+    if aggregates.len() >= SAND_EMPTY_END_SEQUENCE_MAX_KEYS && !aggregates.contains_key(&key) {
+        if let Some(oldest) = aggregates
+            .iter()
+            .min_by_key(|(_, aggregate)| aggregate.last_seen)
+            .map(|(key, _)| key.clone())
+        {
+            aggregates.remove(&oldest);
+        }
+    }
+    let aggregate = aggregates
+        .entry(key)
+        .or_insert_with(|| SandEmptyEndAggregate {
+            request_ids: HashSet::new(),
+            last_seen: now,
+        });
+    if now.saturating_duration_since(aggregate.last_seen) >= SAND_EMPTY_END_SEQUENCE_WINDOW {
+        aggregate.request_ids.clear();
+    }
+    // Once two distinct request ids are present, retaining more ids cannot
+    // change classification. The cap only bounds memory during a large wave.
+    if aggregate.request_ids.len() < SAND_EMPTY_END_AGGREGATE_MAX_REQUESTS {
+        aggregate.request_ids.insert(request_id.to_string());
+    }
+    aggregate.last_seen = now;
+    aggregate.request_ids.len().min(u8::MAX as usize) as u8
 }
 
 /// Cursor can encode an exhausted allowance as HTTP 200 followed by an empty
@@ -7765,6 +7997,7 @@ fn classify_sand_quota_empty_end(
     };
     if usage_percent < 99.999 {
         clear_sand_empty_end_sequence(context);
+        clear_sand_empty_end_aggregate(context);
         return None;
     }
 
@@ -7797,11 +8030,16 @@ fn classify_sand_quota_empty_end(
         sequence.last_seen = now;
         sequence.count
     };
+    let aggregate_count = record_sand_empty_end_aggregate(context, now);
 
     let mut fields = serde_json::Map::new();
     fields.insert("model".into(), serde_json::json!(context.model_id));
     fields.insert("clientType".into(), serde_json::json!(context.client_type));
     fields.insert("emptyEnds".into(), serde_json::json!(count));
+    fields.insert(
+        "aggregateEmptyEnds".into(),
+        serde_json::json!(aggregate_count),
+    );
     fields.insert("quotaUsagePercent".into(), serde_json::json!(usage_percent));
     fields.insert(
         "quotaKind".into(),
@@ -7809,7 +8047,7 @@ fn classify_sand_quota_empty_end(
     );
     crate::logging::create_logger("cursor").warn("sand_empty_end_observed", Some(fields));
 
-    if count < 2 {
+    if count < 2 && aggregate_count < 2 {
         return None;
     }
 
@@ -7826,8 +8064,13 @@ fn classify_sand_quota_empty_end(
     } else {
         ("ERROR_CURSOR_API_RATE_LIMIT_EXCEEDED", "Cursor API")
     };
+    let evidence_shape = if count >= 2 {
+        "two consecutive empty END frames"
+    } else {
+        "two independent empty END observations"
+    };
     Some(format!(
-        "Connect error 429: {error_code}: {allowance} usage meter is {:.2}% and Cursor returned two consecutive empty END frames for {}; retry after {retry_after} seconds{reset}. [resource_exhausted]",
+        "Connect error 429: {error_code}: {allowance} usage meter is {:.2}% and Cursor returned {evidence_shape} for {}; retry after {retry_after} seconds{reset}. [resource_exhausted]",
         usage_percent, context.model_id
     ))
 }
@@ -10812,16 +11055,20 @@ async fn send_frame_or_fail(
     what: &str,
     session_id: &str,
 ) -> bool {
-    match outbound.send_connect_frame(frame).await {
+    match outbound.send_connect_frame_with_retry(frame).await {
         Ok(()) => true,
         Err(error) => {
             let error = annotate_live_cursor_error(session_id, error);
-            report_terminal_error(
-                sink,
-                terminal_error,
-                format!("Cursor {what} send failed: {error}"),
-            )
-            .await;
+            let mut message = format!("Cursor {what} send failed: {error}");
+            // A bounded BiDi body channel is fed after the Run has already
+            // been opened.  A closed channel or a timed-out send leaves the
+            // continuation state unresolved even when Tokio confirms that
+            // this particular frame was not queued.  Keep the operation
+            // fail-closed so the retry pump cannot open a duplicate Run.
+            if matches!(outbound, ClientOutbound::Bidi(_)) {
+                message = annotate_bidi_send_acceptance(message, &error);
+            }
+            report_terminal_error(sink, terminal_error, message).await;
             false
         }
     }
@@ -10845,20 +11092,56 @@ async fn send_kv_frame_or_fail(
     saw_text: bool,
     pending_nonempty: bool,
 ) -> bool {
-    match outbound.send_connect_frame(frame).await {
+    match outbound.send_connect_frame_with_retry(frame).await {
         Ok(()) => true,
         Err(error) => {
             let error = annotate_live_cursor_error(session_id, error);
-            let message = annotate_kv_overflow_acceptance_with_progress(
+            let mut message = annotate_kv_overflow_acceptance_with_progress(
                 format!("Cursor KV reply send failed: {}", error.client_message()),
                 user_prompt,
                 post_tool_checkpoint_submitted,
                 saw_text,
                 pending_nonempty,
             );
+            // Unlike a deterministic KV 413, a BiDi channel timeout/close
+            // has no response boundary.  The Run is already accepted, so a
+            // fresh POST could replay text or tool state; preserve an
+            // ambiguity marker for the late-retry classifier.
+            if matches!(outbound, ClientOutbound::Bidi(_)) {
+                message = annotate_bidi_send_acceptance(message, &error);
+            }
             report_terminal_error(sink, terminal_error, message).await;
             false
         }
+    }
+}
+
+/// Mark a response/control frame send as fail-closed when the BiDi request
+/// body has crossed the upstream acceptance boundary.  This helper is only
+/// called for [`ClientOutbound::Bidi`]; HTTP/1 sends use the more precise
+/// [`ambiguous_http1_append_error`] classification, including replay-safe KV
+/// overflow responses.
+fn annotate_bidi_send_acceptance(message: String, error: &CursorError) -> String {
+    // A failed TCP/TLS connect is before the Run acceptance boundary.  Keep
+    // that path retryable even if the underlying reqwest detail mentions a
+    // reset/closed socket.
+    if is_pre_connect_failure(error) {
+        return message;
+    }
+    let lower = error.client_message().to_ascii_lowercase();
+    let transport_boundary = lower.contains("request stream send timed out")
+        || lower.contains("request stream closed")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("partially sent");
+    let message_lower = message.to_ascii_lowercase();
+    if transport_boundary
+        && !lower.contains("acceptance is ambiguous")
+        && !message_lower.contains("acceptance is ambiguous")
+    {
+        format!("{message}; acceptance is ambiguous")
+    } else {
+        message
     }
 }
 
@@ -14072,6 +14355,32 @@ mod tests {
     }
 
     #[test]
+    fn idle_no_progress_is_an_empty_turn_recovery_signal() {
+        for message in [
+            "idle timeout after 45s with no useful progress (0 response bytes)",
+            "Stream idle timeout - no chunks received",
+            "idle timeout after 20s with thinking but no text yet",
+        ] {
+            assert!(live_error_is_empty_turn_retry(message), "{message}");
+            assert!(live_error_is_same_request_retryable(message), "{message}");
+            assert!(terminal_error_is_ambiguous_accept(message), "{message}");
+            assert!(live_probe_error_blocks_new_run(message), "{message}");
+        }
+        assert!(!live_error_is_empty_turn_retry(
+            "stream idle after useful text"
+        ));
+        assert!(!live_error_is_empty_turn_retry(
+            "idle timeout after 45s with no useful progress; completion is ambiguous"
+        ));
+        assert!(live_error_is_empty_turn_retry(
+            "idle timeout after 45s with no useful progress (error sending request for url)"
+        ));
+        assert!(!terminal_error_is_ambiguous_accept(
+            "idle timeout after 45s with no useful progress (error sending request for url)"
+        ));
+    }
+
+    #[test]
     fn h2_breaker_does_not_force_http1() {
         let mut ctx = test_reconnect_context();
         let now = Instant::now();
@@ -14186,6 +14495,36 @@ mod tests {
         assert!(
             !live_should_persist_continuation_message(Some(&annotated_missing.message)),
             "driver teardown must not re-bind the poisoned checkpoint after reset"
+        );
+        // RunSSE/H2 puts the useful diagnostic in `detail` while `message`
+        // contains only the HTTP status.  The acceptance marker must still
+        // seal the slot; otherwise a retry can open a duplicate Run.
+        let detail_only_ambiguous = CursorError::new(
+            502,
+            "Cursor upstream HTTP 502",
+            Some(
+                "Cursor stream produced no useful progress; upstream transport remained live, so completion is ambiguous"
+                    .into(),
+            ),
+        );
+        assert!(
+            live_start_error_seals_tombstone(&detail_only_ambiguous),
+            "detail-only completion ambiguity must fail closed"
+        );
+        assert!(
+            live_reconnect_open_error_is_fatal(&detail_only_ambiguous),
+            "detail-only completion ambiguity must stop ResumeAction retries"
+        );
+        let detail_only_reset = CursorError::new(
+            502,
+            "Cursor upstream HTTP 502",
+            Some(format!(
+                "Conversation data missing ({CONVERSATION_RESET_RETRY_NOTE})"
+            )),
+        );
+        assert!(
+            !live_start_error_seals_tombstone(&detail_only_reset),
+            "detail-only conversation reset remains fresh-history retryable"
         );
         assert!(live_should_persist_continuation_message(None));
         assert!(live_should_persist_continuation_message(Some(
@@ -14437,6 +14776,284 @@ mod tests {
             message.contains("connect failed") || message.contains("error sending request"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn bidi_send_timeout_retries_after_queue_drains() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"occupied")))
+            .await
+            .expect("seed bounded request channel");
+        let outbound = ClientOutbound::Bidi(tx);
+
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let occupied = rx
+                .recv()
+                .await
+                .expect("seeded frame should remain queued")
+                .expect("seeded frame should be valid");
+            (occupied, rx)
+        });
+
+        let result = outbound
+            .send_connect_frame_with_options(
+                Bytes::from_static(b"retry-me"),
+                Duration::from_millis(10),
+                4,
+                Duration::from_millis(1),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a transient full channel should recover: {result:?}"
+        );
+
+        let (occupied, mut rx) = drain.await.expect("drain task");
+        assert_eq!(occupied, Bytes::from_static(b"occupied"));
+        let retried = rx
+            .recv()
+            .await
+            .expect("retried frame should be queued once")
+            .expect("retried frame should be valid");
+        assert_eq!(retried, Bytes::from_static(b"retry-me"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a timeout must not duplicate the frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn bidi_send_timeout_stops_after_bounded_retries() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"occupied")))
+            .await
+            .expect("seed bounded request channel");
+        let outbound = ClientOutbound::Bidi(tx);
+        let started = Instant::now();
+        let error = outbound
+            .send_connect_frame_with_options(
+                Bytes::from_static(b"never-queued"),
+                Duration::from_millis(5),
+                2,
+                Duration::from_millis(1),
+            )
+            .await
+            .expect_err("a permanently full channel must fail after the retry budget");
+
+        assert_eq!(error.status, 504);
+        assert!(
+            error.message.contains("request stream send timed out"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded retries must not hold the live driver indefinitely"
+        );
+        let occupied = rx
+            .try_recv()
+            .expect("the seeded frame should be the only queued frame")
+            .expect("seeded frame should be valid");
+        assert_eq!(occupied, Bytes::from_static(b"occupied"));
+        assert!(
+            rx.try_recv().is_err(),
+            "failed sends must not enqueue a frame"
+        );
+    }
+
+    #[test]
+    fn bidi_send_transport_failures_are_fail_closed() {
+        let cases = [
+            CursorError::new(504, "Cursor BiDi request stream send timed out", None),
+            CursorError::internal("Cursor BiDi request stream closed"),
+        ];
+        for error in cases {
+            let message = annotate_bidi_send_acceptance(
+                format!("Cursor KV reply send failed: {}", error.client_message()),
+                &error,
+            );
+            assert!(
+                message.contains("acceptance is ambiguous"),
+                "transport failure must seal the operation: {message}"
+            );
+            assert!(terminal_error_is_ambiguous_accept(&message));
+            assert_eq!(
+                crate::retry::classify_proxy_error_status(error.status, &message),
+                409,
+                "a BiDi send failure must not be surfaced as replayable 5xx: {message}"
+            );
+            assert!(
+                !crate::retry::should_retry_upstream(error.status, &message),
+                "the downstream retry loop must stop after an ambiguous BiDi send: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn bidi_send_preconnect_failure_is_not_marked_ambiguous() {
+        for error in [
+            CursorError::new(
+                502,
+                "Cursor upstream connect failed",
+                Some("error sending request for url https://api2.cursor.sh".into()),
+            ),
+            CursorError::new(
+                502,
+                "Cursor upstream connect failed",
+                Some("connection reset by peer".into()),
+            ),
+        ] {
+            let message = annotate_bidi_send_acceptance(
+                format!(
+                    "Cursor interaction reply send failed: {}",
+                    error.client_message()
+                ),
+                &error,
+            );
+            assert!(
+                !message.contains("acceptance is ambiguous"),
+                "a connection that never reached Cursor remains retryable: {message}"
+            );
+            assert!(!terminal_error_is_ambiguous_accept(&message));
+            assert!(crate::retry::should_retry_upstream(error.status, &message));
+        }
+    }
+
+    #[test]
+    fn bidi_send_marker_is_idempotent() {
+        let error = CursorError::internal("Cursor BiDi request stream closed");
+        let original = "Cursor request_context reply send failed; acceptance is ambiguous";
+        assert_eq!(
+            annotate_bidi_send_acceptance(original.into(), &error),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn bidi_kv_send_failure_stashes_ambiguous_terminal_outcome() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let outbound = ClientOutbound::Bidi(tx);
+        let (event_tx, mut events) = mpsc::channel(1);
+        let mut sink = Some(event_tx);
+        let terminal_error = Arc::new(Mutex::new(None));
+
+        assert!(
+            !send_kv_frame_or_fail(
+                &outbound,
+                &mut sink,
+                &terminal_error,
+                Bytes::from_static(b"kv-reply"),
+                "sess-bidi-kv-closed",
+                Some("ordinary prompt"),
+                false,
+                false,
+                false,
+            )
+            .await
+        );
+        let message = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("terminal outcome");
+        assert!(message.contains("request stream closed"), "{message}");
+        assert!(message.contains("acceptance is ambiguous"), "{message}");
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            409
+        );
+        assert!(!crate::retry::should_retry_upstream(502, &message));
+        let downstream = events
+            .recv()
+            .await
+            .expect("terminal event should be delivered")
+            .expect_err("send failure is terminal");
+        assert_eq!(downstream, message);
+    }
+
+    #[tokio::test]
+    async fn bidi_control_send_failure_stashes_ambiguous_terminal_outcome() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let outbound = ClientOutbound::Bidi(tx);
+        let (event_tx, mut events) = mpsc::channel(1);
+        let mut sink = Some(event_tx);
+        let terminal_error = Arc::new(Mutex::new(None));
+
+        assert!(
+            !send_frame_or_fail(
+                &outbound,
+                &mut sink,
+                &terminal_error,
+                Bytes::from_static(b"control-reply"),
+                "request_context reply",
+                "sess-bidi-control-closed",
+            )
+            .await
+        );
+        let message = terminal_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|outcome| outcome.message.clone())
+            .expect("terminal outcome");
+        assert!(message.contains("acceptance is ambiguous"), "{message}");
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(502, &message),
+            409
+        );
+        let downstream = events
+            .recv()
+            .await
+            .expect("terminal event should be delivered")
+            .expect_err("send failure is terminal");
+        assert_eq!(downstream, message);
+    }
+
+    #[tokio::test]
+    async fn http1_append_timeout_does_not_replay() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled BidiAppend server");
+        let address = listener.local_addr().expect("server address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept BidiAppend");
+            server_attempts.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            std::future::pending::<()>().await;
+        });
+
+        let outbound = ClientOutbound::Http1(BidiAppendSession::new(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "token".into(),
+            "request-id".into(),
+            vec![],
+        ));
+        let error = outbound
+            .send_connect_frame_with_options(
+                Bytes::from_static(b"frame"),
+                Duration::from_millis(25),
+                4,
+                Duration::from_millis(1),
+            )
+            .await
+            .expect_err("a stalled HTTP/1 append must time out");
+        assert_eq!(error.status, 504);
+        assert!(error.message.contains("acceptance is ambiguous"), "{error}");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -24571,7 +25188,7 @@ mod tests {
     }
 
     #[test]
-    fn sand_empty_end_classifier_does_not_cross_logical_request_boundaries() {
+    fn sand_empty_end_classifier_aggregates_independent_logical_requests() {
         let token = format!("sand-empty-concurrent-{}", uuid::Uuid::new_v4());
         super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
         let first = SandEmptyEndContext {
@@ -24588,12 +25205,48 @@ mod tests {
         };
 
         // Independent requests may complete their first hollow Run at the
-        // same time. Their observations must not combine into a false quota
-        // signal; each request needs two empty ENDs of its own.
+        // same time. The aggregate account/model evidence should open the
+        // breaker on the second distinct request instead of allowing every
+        // request in the wave to spend its own fresh-conversation retry.
         assert!(classify_sand_quota_empty_end(Some(first), false, "flag_end").is_none());
-        assert!(classify_sand_quota_empty_end(Some(second), false, "flag_end").is_none());
-        assert!(classify_sand_quota_empty_end(Some(first), false, "flag_end").is_some());
-        assert!(classify_sand_quota_empty_end(Some(second), false, "flag_end").is_some());
+        let error = classify_sand_quota_empty_end(Some(second), false, "flag_end")
+            .expect("the second independent empty END should open the quota breaker");
+        assert!(
+            error.contains("two independent empty END observations"),
+            "{error}"
+        );
+        assert!(crate::retry::is_policy_rate_limit(&error));
+        // A single request's retry remains independently classified, so a
+        // later retry still receives the typed policy result even if the
+        // aggregate entry is retired by healthy progress from another run.
+        let first_error = classify_sand_quota_empty_end(Some(first), false, "flag_end")
+            .expect("the same request's consecutive empty ENDs remain policy evidence");
+        assert!(crate::retry::is_policy_rate_limit(&first_error));
+    }
+
+    #[test]
+    fn sand_empty_end_aggregate_does_not_count_the_same_request_twice() {
+        let token = format!("sand-empty-aggregate-dedupe-{}", uuid::Uuid::new_v4());
+        super::super::usage::store_sand_usage_evidence_for_test(&token, 100.0, Some(true), None);
+        let context = SandEmptyEndContext {
+            token: &token,
+            model_id: "gemini-3.6-flash-high",
+            client_type: "sand",
+            request_id: "same-logical-request",
+            fresh_run: true,
+            opened_at: Instant::now(),
+        };
+
+        assert!(classify_sand_quota_empty_end(Some(context), false, "flag_end").is_none());
+        // The per-request sequence still intentionally recognizes this as a
+        // consecutive retry, while the aggregate lane has only one distinct
+        // request id and therefore cannot produce an independent-wave signal.
+        let error = classify_sand_quota_empty_end(Some(context), false, "flag_end")
+            .expect("per-request evidence should remain available");
+        assert!(
+            error.contains("two consecutive empty END frames"),
+            "{error}"
+        );
     }
 
     #[test]

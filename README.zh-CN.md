@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.88 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.89 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -116,7 +116,7 @@ claude-cursor-proxy cursor auth usage --json          # JSON 输出
 `ACCOUNT_ID` 可以是 `list` 输出的 ID，也可以是唯一的邮箱或标签。账号池保存在
 `cursor/accounts.json`，当前账号仍会镜像到原有的 `cursor/auth.json`，旧版本也能继续
 读取。监控 TUI 中按 `a` 打开账号面板，按 `Enter` 切换，按 `u` 拉取选中账号用量，按
-`U` 并行拉取全部账号。添加和切换账号都不需要重启 `serve`。
+`U` 并行拉取全部账号。选中账号后按 `d`，再按 `y`/回车确认删除（`n`/`Esc` 取消）；删除当前账号后会立即切换到剩余账号。添加、切换或删除账号都不需要重启 `serve`。
 
 ### 3. 让 Claude Code 走本机代理（Fable 5）
 

@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.88 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.89 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -122,7 +122,10 @@ The pool is stored in `cursor/accounts.json`; the selected credential remains
 mirrored to the existing `cursor/auth.json` so older installations continue to
 work. In the monitor TUI, press `a` to open the account panel, `Enter` to
 switch, `u` to fetch the selected account, and `U` to fetch every account in
-parallel. Adding or switching accounts does not require restarting `serve`.
+parallel. Press `d` on a selected account, then `y`/`Enter` to confirm deletion
+(`n`/`Esc` cancels). Removing the active account immediately activates the next
+available account. Adding, switching, or removing accounts does not require
+restarting `serve`.
 
 ### Point Claude Code at the proxy (Fable 5)
 

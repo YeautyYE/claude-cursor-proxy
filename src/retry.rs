@@ -70,12 +70,17 @@ pub fn should_retry_upstream(status: u16, message: &str) -> bool {
 /// Cursor Connect often records `status: 502` while the message is still
 /// `Connect error 429`. grok-build maps 500/502 to "Server error (our side)".
 pub fn is_upstream_rate_limit(message: &str) -> bool {
+    // The same diagnostic is wrapped by Connect, Responses, and SSE paths;
+    // some of those lower-case the body before forwarding it.  Matching one
+    // normalized copy prevents a lowercase 429 from becoming a misleading
+    // 502 and entering the generic transport retry loop.
+    let lower = message.to_ascii_lowercase();
     is_billing_block(message)
-        || message.contains("[resource_exhausted]")
-        || message.contains("ERROR_RATE_LIMITED")
-        || message.contains("ERROR_RESOURCE_EXHAUSTED")
-        || message.contains("Connect error 429")
-        || message.contains("Cursor error 429")
+        || lower.contains("[resource_exhausted]")
+        || lower.contains("error_rate_limited")
+        || lower.contains("error_resource_exhausted")
+        || lower.contains("connect error 429")
+        || lower.contains("cursor error 429")
 }
 
 /// Model / provider geo fences. Cursor often wraps these as Connect 502
@@ -100,15 +105,25 @@ pub fn is_geo_policy_block(message: &str) -> bool {
 }
 
 fn embedded_connect_http_status(message: &str) -> Option<u16> {
+    // Error wrappers are not consistent about casing. `to_ascii_lowercase`
+    // preserves byte offsets for the ASCII labels below, so we can search the
+    // normalized view and still slice the original message for digits.
+    let normalized = message.to_ascii_lowercase();
     for label in [
-        "Connect error ",
-        "Cursor error ",
-        "Cursor upstream HTTP ",
-        "Cursor RunSSE HTTP ",
+        "connect error ",
+        "cursor error ",
+        "cursor upstream http ",
+        "cursor runsse http ",
+        // Some Responses/CLI wrappers discard the `Cursor error <code>`
+        // prefix and retain only the human-readable status phrase.
+        "request too large (",
+        "payload too large (",
     ] {
-        let mut rest = message;
-        while let Some(idx) = rest.find(label) {
-            rest = &rest[idx + label.len()..];
+        let mut offset = 0usize;
+        while let Some(relative) = normalized[offset..].find(label) {
+            let idx = offset + relative;
+            let end = idx + label.len();
+            let rest = &message[end..];
             let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
             if digits.len() == 3
                 && let Ok(status) = digits.parse::<u16>()
@@ -116,6 +131,7 @@ fn embedded_connect_http_status(message: &str) -> Option<u16> {
             {
                 return Some(status);
             }
+            offset = end;
         }
     }
     None
@@ -133,6 +149,37 @@ pub fn is_local_admission_backpressure(message: &str) -> bool {
         || lower.contains("already active for this session")
 }
 
+/// Detect an idle timeout where the upstream produced no client-visible
+/// progress. Cursor and the different transport paths use several slightly
+/// different diagnostics for this condition (for example
+/// `idle timeout after 45s with no useful progress` and
+/// `Stream idle timeout - no chunks received`).  These errors are different
+/// from a normal post-output idle completion: the request may already have
+/// been accepted by Cursor, so replaying it as a generic 5xx can create a
+/// second live Run and a 409/503 retry storm.
+pub fn is_idle_no_progress(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+
+    // Keep the matcher deliberately conjunctive.  `stream idle` by itself
+    // also appears in diagnostics after useful output and must remain a
+    // normal completion/transport signal rather than an acceptance ambiguity.
+    let idle = lower.contains("idle timeout")
+        || lower.contains("stream idle")
+        || lower.contains("setup idle")
+        || lower.contains("idle stall");
+    if !idle {
+        return false;
+    }
+    lower.contains("no useful progress")
+        || lower.contains("no chunks received")
+        || lower.contains("no response bytes")
+        || lower.contains("0 response bytes")
+        || lower.contains("no decodable text")
+        || lower.contains("no text yet")
+        || lower.contains("without text or tool calls")
+        || lower.contains("without useful output")
+}
+
 pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
     // Once Cursor may have accepted any part of an operation, replay safety
     // dominates a nested child status such as 429/503. Mapping the child first
@@ -146,26 +193,27 @@ pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
     if is_upstream_rate_limit(message) || status == 429 {
         return 429;
     }
+    let lower = message.to_ascii_lowercase();
     if is_geo_policy_block(message)
-        || message.contains("[permission_denied]")
-        || message.contains("Connect error 403")
-        || message.contains("Cursor error 403")
+        || lower.contains("[permission_denied]")
+        || lower.contains("connect error 403")
+        || lower.contains("cursor error 403")
     {
         return 403;
     }
-    if message.contains("[unauthenticated]")
-        || message.contains("Connect error 401")
-        || message.contains("Cursor error 401")
+    if lower.contains("[unauthenticated]")
+        || lower.contains("connect error 401")
+        || lower.contains("cursor error 401")
     {
         return 401;
     }
-    if message.contains("[not_found]") || message.contains("Connect error 404") {
+    if lower.contains("[not_found]") || lower.contains("connect error 404") {
         return 404;
     }
-    if message.contains("[invalid_argument]")
-        || message.contains("[failed_precondition]")
-        || message.contains("Connect error 400")
-        || message.contains("Cursor error 400")
+    if lower.contains("[invalid_argument]")
+        || lower.contains("[failed_precondition]")
+        || lower.contains("connect error 400")
+        || lower.contains("cursor error 400")
     {
         return 400;
     }
@@ -195,7 +243,8 @@ pub fn is_ambiguous_live_accept(message: &str) -> bool {
     {
         return false;
     }
-    lower.contains("live open timed out")
+    is_idle_no_progress(message)
+        || lower.contains("live open timed out")
         || lower.contains("response-less resumeaction")
         || lower.contains("acceptance is ambiguous")
         || lower.contains("completion is ambiguous")
@@ -227,7 +276,7 @@ pub fn responses_error_code(kind: Option<&str>, message: &str) -> &'static str {
         _ => match classify_proxy_error_status(502, message) {
             429 => "rate_limit",
             401 => "invalid_api_key",
-            400 | 403 | 404 | 409 => "invalid_request",
+            status if (400..500).contains(&status) => "invalid_request",
             _ => "server_error",
         },
     }
@@ -462,6 +511,38 @@ mod tests {
             anthropic_error_kind_for_status(502, "Cursor error 451: legal restriction"),
             "invalid_request_error"
         );
+
+        // Responses/SSE wrappers can normalize the diagnostic labels. Keep
+        // status and error-kind mapping stable regardless of that casing.
+        assert_eq!(
+            classify_proxy_error_status(502, "cursor upstream http 403"),
+            403
+        );
+        assert_eq!(
+            classify_proxy_error_status(502, "CURSOR RUNSSE HTTP 429"),
+            429
+        );
+        assert_eq!(
+            responses_error_code(
+                None,
+                "Request too large (413): Cursor KV blob store limit exceeded"
+            ),
+            "invalid_request",
+            "pre-output 413s must not be emitted as Responses server_error"
+        );
+    }
+
+    #[test]
+    fn rate_limit_wrappers_are_case_insensitive() {
+        for message in [
+            "connect error 429: error_resource_exhausted [resource_exhausted]",
+            "Cursor error 429: Error_Rate_Limited: quota window",
+            "CURSOR ERROR 429: [RESOURCE_EXHAUSTED]",
+        ] {
+            assert!(is_upstream_rate_limit(message), "{message}");
+            assert_eq!(classify_proxy_error_status(502, message), 429, "{message}");
+            assert!(should_retry_upstream(502, message), "{message}");
+        }
     }
 
     #[test]
@@ -554,6 +635,55 @@ mod tests {
             anthropic_error_kind_for_status(502, message),
             "invalid_request_error"
         );
+    }
+
+    #[test]
+    fn idle_no_progress_variants_are_ambiguous_without_replaying_the_run() {
+        let messages = [
+            "idle timeout after 45s with no useful progress (0 response bytes — check Surge node / auth)",
+            "Cursor error 502: idle timeout after 45s with no useful progress",
+            "Stream idle timeout - no chunks received",
+            "Cursor stream idle (no response bytes)",
+            "idle timeout after 20s with no useful progress (got 3 Connect frames / 69 bytes; no decodable text/thinking yet)",
+            "idle timeout after 12s with thinking but no text yet",
+        ];
+        for message in messages {
+            assert!(is_idle_no_progress(message), "{message}");
+            assert!(is_ambiguous_live_accept(message), "{message}");
+            assert_eq!(
+                classify_proxy_error_status(502, message),
+                409,
+                "an accepted-but-hollow idle run must not be exposed as retryable 5xx: {message}"
+            );
+            assert!(
+                !should_retry_upstream(502, message),
+                "the downstream client must not create another Run for {message}"
+            );
+        }
+        let pre_connect =
+            "idle timeout after 45s with no useful progress (error sending request for url)";
+        assert!(is_idle_no_progress(pre_connect));
+        assert!(
+            !is_ambiguous_live_accept(pre_connect),
+            "a pre-connect transport miss must stay retryable"
+        );
+        assert_eq!(classify_proxy_error_status(502, pre_connect), 502);
+        assert!(should_retry_upstream(502, pre_connect));
+    }
+
+    #[test]
+    fn idle_marker_without_no_progress_detail_is_not_misclassified() {
+        for message in [
+            "stream idle after useful text",
+            "idle timeout after 2s while completing a response",
+            "Cursor stream idle; 12 chunks received",
+        ] {
+            assert!(
+                !is_idle_no_progress(message),
+                "ordinary post-output idle must not become an acceptance ambiguity: {message}"
+            );
+            assert!(!is_ambiguous_live_accept(message), "{message}");
+        }
     }
 
     #[test]

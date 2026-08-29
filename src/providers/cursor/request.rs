@@ -448,20 +448,39 @@ const HIDDEN_MODEL_TOOL_LEAF_PREFIXES: &[&str] = &[
 /// Return false for tools that must never be offered to the model or routed
 /// back through the client-only bridge.
 pub(crate) fn is_model_visible_tool_name(name: &str) -> bool {
-    let leaf = name
+    if name.trim().is_empty() {
+        return false;
+    }
+    // Normalize every spelling before applying the hidden-hook policy.  In
+    // particular, `mcp_claude-local_<tool>` does not contain `__`, so a plain
+    // split on the MCP separator would leave the provider prefix attached and
+    // let an internal hook leak into the model catalog.
+    let leaf = strip_mcp_provider_prefix(name)
         .rsplit("__")
         .next()
         .unwrap_or(name)
         .rsplit(['/', ':'])
         .next()
         .unwrap_or(name);
+    let leaf_lower = leaf.to_ascii_lowercase();
+    // TaskOutput is a deprecated Claude Code control surface.  Keeping it in
+    // the model catalog makes newer clients see two overlapping ways to poll
+    // an agent (TaskOutput and AgentOutputTool) and, more importantly, lets a
+    // stale transcript re-introduce a tool that the current host no longer
+    // executes.  Historical tool_result blocks remain harmless: the bridge
+    // still recognizes the alias for replay, but it is never advertised.
+    if leaf_lower == "taskoutput" {
+        return false;
+    }
     !HIDDEN_MODEL_TOOL_LEAF_PREFIXES
         .iter()
-        .any(|prefix| leaf.starts_with(prefix))
+        .any(|prefix| leaf_lower.starts_with(prefix))
         // `lobster_reply_from_stop` is truncated to `lobster_repl` + a
         // seven-character hash. Do not hide the public `lobster_reply` tool,
         // which shares the same initial characters but has no hash suffix.
-        && !leaf.strip_prefix("lobster_repl").is_some_and(|suffix| {
+        && !leaf_lower
+            .strip_prefix("lobster_repl")
+            .is_some_and(|suffix| {
             suffix.len() == 7 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
 }
@@ -476,16 +495,12 @@ pub(crate) fn is_model_visible_tool_definition(tool: &serde_json::Value) -> bool
     let Some(name) = tool.get("name").and_then(|name| name.as_str()) else {
         return false;
     };
+    if name.trim().is_empty() {
+        return false;
+    }
     if !is_model_visible_tool_name(name) {
         return false;
     }
-    let leaf = name
-        .rsplit("__")
-        .next()
-        .unwrap_or(name)
-        .rsplit(['/', ':'])
-        .next()
-        .unwrap_or(name);
     let description = tool
         .get("description")
         .and_then(|description| description.as_str())
@@ -505,18 +520,29 @@ pub(crate) fn is_model_visible_tool_definition(tool: &serde_json::Value) -> bool
                 .next()
                 .is_some_and(|ch| !ch.is_ascii_alphanumeric())
     });
+    // Hook descriptions are not consistent about where they place the marker
+    // ("INTERNAL", "INTERNAL hook", and "hook (internal)" all occur in the
+    // wild).  Match marker-shaped contexts only; a normal description such as
+    // "Search internal references" must remain visible.
+    let internal_context = lower.contains("internal hook")
+        || lower.contains("hook (internal)")
+        || lower.contains("(internal)")
+        || lower.contains("[internal]")
+        || lower.ends_with(" internal");
     let deprecated_marker = lower.strip_prefix("deprecated").is_some_and(|rest| {
         rest.is_empty()
             || rest
                 .chars()
                 .next()
                 .is_some_and(|ch| !ch.is_ascii_alphanumeric())
-    });
-    // TaskOutput is deprecated in current Claude Code, but older clients still
-    // send it explicitly. Preserve that compatibility path while continuing
-    // to hide deprecated hook tools.
+    }) || lower.contains("deprecated hook")
+        || lower.contains("deprecated tool")
+        || lower.ends_with(" deprecated")
+        || lower.ends_with("(deprecated)")
+        || lower.ends_with("[deprecated]");
     !(internal_marker
-        || (deprecated_marker && leaf != "TaskOutput")
+        || internal_context
+        || deprecated_marker
         || (lower.contains("do not call") && lower.contains("model output"))
         || lower.contains("not for model output"))
 }
@@ -1102,7 +1128,16 @@ pub fn render_cursor_prompt_parts_with(
     let force_tools = env_flag("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
     let mcp_populated = claude_local_mcp_tools(req).is_some();
     let tools_block = if force_tools {
-        render_tools_block(req, ToolDumpMode::All)
+        // `mcp_tools` is the authoritative callable catalog.  The debug
+        // override may request native schemas, but must not re-inject MCP
+        // schemas under a second (often provider-prefixed) name: doing so
+        // creates two identities for one tool and can make Cursor emit the
+        // wrong name on the return path.
+        if mcp_populated {
+            render_tools_block(req, ToolDumpMode::NativeFullMcpCompact)
+        } else {
+            render_tools_block(req, ToolDumpMode::All)
+        }
     } else if mcp_populated {
         if !opts.omit_tools && !opts.delta_only {
             render_tools_block(req, ToolDumpMode::NativeFullMcpCompact)
@@ -1465,16 +1500,25 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
             }
             let local = is_claude_local_tool_name(name);
             let include = match mode {
-                ToolDumpMode::All => true,
+                // A text-only dump is still a callable contract.  Keep
+                // Cursor-native names and names that were actually accepted
+                // into `RunRequest.mcp_tools`; silently drop client aliases
+                // that have no execution route for this request.
+                ToolDumpMode::All => {
+                    !local
+                        || mcp_names
+                            .as_ref()
+                            .is_some_and(|names| names.contains_key(name))
+                        || (grok_build_request && grok_client_tool_uses_native_remap(name))
+                }
                 // MCP tools are already registered with full schemas in the
                 // composed Cursor catalog. Do not duplicate them in text;
                 // non-MCP client names are not callable and must not leak in.
                 ToolDumpMode::NativeFullMcpCompact => {
                     if grok_build_request {
                         !local
-                            || mcp_names
-                                .as_ref()
-                                .is_none_or(|names| !names.contains_key(name))
+                            || (is_grok_build_client_tool_name(name)
+                                && grok_client_tool_uses_native_remap(name))
                     } else {
                         !local
                     }
@@ -1486,6 +1530,7 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
                             // intentionally excluded from MCP; their exact
                             // wire names must remain in the text contract.
                             is_grok_build_client_tool_name(name)
+                                && grok_client_tool_uses_native_remap(name)
                         } else {
                             mcp_names
                                 .as_ref()
@@ -1498,9 +1543,8 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
                 ToolDumpMode::CompactClaudeLocal => {
                     if grok_build_request {
                         local
-                            && mcp_names
-                                .as_ref()
-                                .is_none_or(|names| !names.contains_key(name))
+                            && is_grok_build_client_tool_name(name)
+                            && grok_client_tool_uses_native_remap(name)
                     } else {
                         false
                     }
@@ -1561,16 +1605,10 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
         }
         ToolDumpMode::ClaudeLocalOnly => String::new(),
     };
-    // Claude Code's native Write has a client-side Read-before-Write guard.
-    // Cursor models do not see that local state, so a failed Write can be
-    // repeated indefinitely unless the contract is made explicit in the
-    // prompt. Keep this hint next to the advertised schemas in every dump
-    // mode, including the compact MCP path.
-    let write_hint = if has_write_tool_definition(tools) {
-        "Before calling Write (or write/write_file), call Read (or read_file) on the same path in an earlier tool turn; never write an unread file.\n"
-    } else {
-        ""
-    };
+    // Claude Code's native Write may be used for both existing and new files.
+    // Build this hint from the exact names in the request so it never teaches
+    // an alias that is absent from the callable catalog.
+    let write_hint = write_tool_hint(tools);
     let preface = format!("{write_hint}{preface}");
     if tool_lines.is_empty() && preface.is_empty() {
         None
@@ -1580,16 +1618,44 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
     }
 }
 
-fn has_write_tool_definition(tools: &[serde_json::Value]) -> bool {
-    tools.iter().any(|tool| {
-        let Some(name) = tool.get("name").and_then(|name| name.as_str()) else {
-            return false;
-        };
-        matches!(
-            name,
-            "Write" | "write" | "ReadWrite" | "write_file" | "WriteFile" | "Edit"
+fn write_tool_hint(tools: &[serde_json::Value]) -> String {
+    let visible_names = tools.iter().filter_map(|tool| {
+        if !is_model_visible_tool_definition(tool) {
+            return None;
+        }
+        tool.get("name").and_then(|name| name.as_str())
+    });
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for name in visible_names {
+        if matches!(name, "Read" | "read" | "read_file" | "ReadFile") {
+            reads.push(name);
+        }
+        if matches!(name, "Write" | "write" | "write_file" | "WriteFile") {
+            writes.push(name);
+        }
+    }
+    if writes.is_empty() {
+        return String::new();
+    }
+    let read_label = match reads.as_slice() {
+        [] => "read".to_string(),
+        [one] => (*one).to_string(),
+        many => many.join(" or "),
+    };
+    let write_label = match writes.as_slice() {
+        [one] => (*one).to_string(),
+        many => many.join(" or "),
+    };
+    if reads.is_empty() {
+        format!(
+            "For an existing file, read it before calling {write_label}; a new file may be created directly with {write_label}.\n"
         )
-    })
+    } else {
+        format!(
+            "For an existing file, call {read_label} first and then {write_label}; a new file may be created directly with {write_label}.\n"
+        )
+    }
 }
 
 /// Return the exact MCP catalog spelling for every original Anthropic tool
@@ -1633,14 +1699,82 @@ fn request_has_grok_build_client_tools(req: &MessagesRequest) -> bool {
 
 fn tools_dump_preface(req: &MessagesRequest, mcp_catalog: bool) -> String {
     if request_has_grok_build_client_tools(req) {
-        "Call run_terminal_command, read_file, list_dir, grep, write, search_replace, todo_write, web_search, web_fetch, and enter_plan_mode by those exact names; lifecycle tools stay under their registered catalog names.\n".to_string()
+        // Only mention names that this request actually advertised and that
+        // have a route (native remap or the MCP catalog). The old hard-coded
+        // list taught absent tools such as `web_fetch` on a read-only request,
+        // which produced deterministic "Tool not found" loops.
+        let mcp_names = claude_local_mcp_name_map(req);
+        const GROK_PROMPT_ORDER: &[&str] = &[
+            "run_terminal_command",
+            "run_terminal_cmd",
+            "read_file",
+            "list_dir",
+            "grep",
+            "write",
+            "search_replace",
+            "todo_write",
+            "web_search",
+            "web_fetch",
+            "ask_user_question",
+            "enter_plan_mode",
+            "exit_plan_mode",
+        ];
+        let tools = req
+            .extra
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut names = Vec::new();
+        for candidate in GROK_PROMPT_ORDER {
+            let Some(tool) = tools.iter().find(|tool| {
+                is_model_visible_tool_definition(tool)
+                    && tool.get("name").and_then(|value| value.as_str()) == Some(*candidate)
+            }) else {
+                continue;
+            };
+            let name = tool.get("name").and_then(|value| value.as_str()).unwrap();
+            let registered = grok_client_tool_uses_native_remap(name)
+                || mcp_names
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.contains_key(name));
+            if registered {
+                names.push(name);
+            }
+        }
+        if names.is_empty() {
+            "Use only the exact tool names advertised by this request; lifecycle tools stay under their registered catalog names.\n".to_string()
+        } else {
+            format!(
+                "Call {} by those exact names; lifecycle tools stay under their registered catalog names.\n",
+                names.join(", ")
+            )
+        }
     } else if mcp_catalog {
         // MCP names and schemas are supplied by Cursor's callable catalog.
         // Keep this wording independent of a synthetic prefix so it cannot
         // drift from the registered names or exceed Cursor's name limit.
-        "Use only the exact tool names registered in the callable catalog below; do not add a provider prefix. Prefer the registered Workflow tool for /deep-research or /workflows and the registered Skill tool for skills when those names are present.\n".to_string()
+        let catalog = claude_local_mcp_name_map(req);
+        let mut preferences = Vec::new();
+        if let Some(catalog) = catalog.as_ref() {
+            for preferred in ["Workflow", "Skill"] {
+                if let Some(name) = catalog.get(preferred) {
+                    preferences.push(name.clone());
+                }
+            }
+        }
+        let mut text =
+            "Use only the exact tool names registered in the callable catalog; do not add a provider prefix."
+                .to_string();
+        if !preferences.is_empty() {
+            text.push_str(" Prefer the registered ");
+            text.push_str(&preferences.join(" and "));
+            text.push_str(" tool when it matches the request.");
+        }
+        text.push('\n');
+        text
     } else {
-        "Prefer these Claude Code client tools when they match the user request (e.g. Workflow for /deep-research or /workflows; Skill for skills). Call the Workflow tool, not Bash.\n".to_string()
+        "Use only the exact Claude Code client tool names advertised in this request; do not invent aliases.\n".to_string()
     }
 }
 
@@ -2600,7 +2734,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_local_mcp_tools_hides_internal_hooks_and_keeps_legacy_task_output() {
+    fn claude_local_mcp_tools_hides_internal_and_deprecated_tools() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
             "messages": [{"role": "user", "content": "go"}],
@@ -2623,12 +2757,11 @@ mod tests {
             names,
             vec![
                 "Workflow",
-                "TaskOutput",
                 "mcp__plugin_lobster-channel_lobster-channel__lobster_reply"
             ]
         );
         assert!(is_model_visible_tool_name("Workflow"));
-        assert!(is_model_visible_tool_name("TaskOutput"));
+        assert!(!is_model_visible_tool_name("TaskOutput"));
         assert!(!is_model_visible_tool_name(
             "mcp__plugin_lobster-channel_lobster-channel__notify_messa00a7caa"
         ));
@@ -2639,8 +2772,10 @@ mod tests {
         for description in [
             "INTERNAL",
             "INTERNAL hook",
+            "hook (internal)",
             "DEPRECATED",
             "DEPRECATED hook",
+            "legacy entry; deprecated",
             "Do not call from model output",
             "This is not for model output",
         ] {
@@ -2666,6 +2801,223 @@ mod tests {
             "input_schema": {"type": "object"}
         });
         assert!(!is_model_visible_tool_definition(&truncated_internal));
+    }
+
+    #[test]
+    fn model_visible_definition_keeps_normal_internal_word_usage() {
+        for description in [
+            "Search internal references and generated files",
+            "Compatibility with a deprecated syntax marker",
+        ] {
+            let tool = serde_json::json!({
+                "name": "Grep",
+                "description": description,
+                "input_schema": {"type": "object"}
+            });
+            assert!(
+                is_model_visible_tool_definition(&tool),
+                "ordinary description must remain visible: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_hook_filter_normalizes_claude_local_underscore_names() {
+        for name in [
+            "mcp_claude-local_notify_post_tool_use",
+            "mcp_claude-local_lobster_reply_from_stop",
+            "mcp__claude-local__notify_post_tool_use",
+        ] {
+            assert!(
+                !is_model_visible_tool_name(name),
+                "internal hook must be hidden regardless of MCP spelling: {name}"
+            );
+        }
+        assert!(is_model_visible_tool_name("mcp_claude-local_lobster_reply"));
+    }
+
+    #[test]
+    fn grok_preface_lists_only_advertised_callable_names() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+            std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
+            std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok4.6",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{
+                "name": "read_file",
+                "description": "read",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: false,
+            },
+        );
+        assert!(
+            parts
+                .user_text
+                .contains("Call read_file by those exact names")
+        );
+        for absent in [
+            "run_terminal_command",
+            "list_dir",
+            "web_search",
+            "web_fetch",
+            "enter_plan_mode",
+        ] {
+            assert!(
+                !parts.user_text.contains(absent),
+                "unadvertised grok name leaked into preface: {absent}; {}",
+                parts.user_text
+            );
+        }
+    }
+
+    #[test]
+    fn all_tool_dump_does_not_emit_unregistered_client_alias() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "delegate"}],
+            "tools": [{
+                "name": "Agent",
+                "description": "start a subagent",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        assert!(claude_local_mcp_tools(&req).is_none());
+        assert!(render_tools_block(&req, ToolDumpMode::All).is_none());
+    }
+
+    #[test]
+    fn grok_compact_dump_does_not_emit_unknown_local_alias() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor-grok4.6",
+            "messages": [{"role": "user", "content": "delegate"}],
+            "tools": [
+                {
+                    "name": "read_file",
+                    "description": "read",
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "name": "Agent",
+                    "description": "start a subagent",
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "name": "Workflow",
+                    "description": "workflow",
+                    "input_schema": {"type": "object"}
+                }
+            ]
+        }))
+        .unwrap();
+        let dump = render_tools_block(&req, ToolDumpMode::CompactClaudeLocal)
+            .expect("native grok alias should remain");
+        assert!(dump.contains("read_file"));
+        assert!(!dump.contains("\"name\":\"Agent\""));
+        assert!(!dump.contains("\"name\":\"Workflow\""));
+    }
+
+    #[test]
+    fn write_hint_uses_only_names_present_in_request() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "write"}],
+            "tools": [{
+                "name": "write_file",
+                "description": "write",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        let dump = render_tools_block(&req, ToolDumpMode::All).expect("write dump");
+        assert!(dump.contains("write_file"));
+        assert!(!dump.contains("Read (or read_file)"));
+        assert!(!dump.contains("Write (or write/write_file)"));
+        assert!(dump.contains("calling write_file"));
+    }
+
+    #[test]
+    fn force_tool_dump_never_repeats_mcp_schemas_or_prefixes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT", "1");
+            std::env::remove_var("CCP_CURSOR_USE_CUSTOM_SYSTEM");
+            std::env::remove_var("CCP_CURSOR_EMBED_SYSTEM");
+        }
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "research"}],
+            "tools": [
+                {"name": "Read", "description": "read", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}},
+                {"name": "Workflow", "description": "run workflow", "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}},
+                {"name": "mcp__plugin__search", "description": "search", "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}
+            ]
+        }))
+        .unwrap();
+        let catalog = claude_local_mcp_tools(&req).expect("MCP catalog");
+        assert!(catalog.tools.iter().any(|tool| tool.name == "Workflow"));
+        assert!(
+            catalog
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__plugin__search")
+        );
+        let parts = render_cursor_prompt_parts_with(&req, CursorPromptOptions::default());
+        // Native schemas remain available for the explicit debug override.
+        assert!(parts.user_text.contains("\"name\":\"Read\""));
+        // MCP schemas and synthetic provider-prefixed aliases are single-sourced
+        // from RunRequest.mcp_tools and must never be repeated in user text.
+        assert!(!parts.user_text.contains("\"name\":\"Workflow\""));
+        assert!(!parts.user_text.contains("\"name\":\"mcp__plugin__search\""));
+        assert!(!parts.user_text.contains("mcp_claude-local_"));
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+        }
+    }
+
+    #[test]
+    fn mcp_catalog_and_prompt_map_share_exact_wire_names() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CCP_CURSOR_FORCE_TOOLS_IN_PROMPT");
+        }
+        let long_name =
+            "mcp__plugin_claude-mem_mcp-search__session_start_context_with_more_details";
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "continue"}],
+            "tools": [
+                {"name": "Workflow", "description": "workflow", "input_schema": {"type": "object"}},
+                {"name": long_name, "description": "long MCP", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+        let catalog = claude_local_mcp_tools(&req).expect("MCP catalog");
+        let map = claude_local_mcp_name_map(&req).expect("catalog name map");
+        for (original, wire) in map {
+            assert!(catalog.tools.iter().any(|tool| tool.name == wire));
+            assert_eq!(wire, cursor_mcp_wire_name(&original));
+        }
+        let parts = render_cursor_prompt_parts_with(
+            &req,
+            CursorPromptOptions {
+                omit_tools: true,
+                delta_only: false,
+            },
+        );
+        assert!(!parts.user_text.contains("<tools>"));
+        assert!(!parts.user_text.contains(long_name));
     }
 
     #[test]
@@ -2919,7 +3271,7 @@ mod tests {
         assert!(
             parts
                 .user_text
-                .contains("Call run_terminal_command, read_file")
+                .contains("Call read_file by those exact names")
         );
     }
 
@@ -3051,7 +3403,7 @@ mod tests {
     }
 
     #[test]
-    fn write_tool_dump_requires_a_prior_read() {
+    fn write_tool_dump_distinguishes_existing_and_new_files() {
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "fable",
             "messages": [{"role": "user", "content": "update the file"}],
@@ -3065,10 +3417,20 @@ mod tests {
         for mode in [ToolDumpMode::All, ToolDumpMode::CompactClaudeLocal] {
             let dump = render_tools_block(&req, mode).expect("write tools should be rendered");
             assert!(
-                dump.contains("Before calling Write")
-                    && dump.contains("call Read")
-                    && dump.contains("same path"),
-                "write dump must carry the Read-before-Write contract: {dump}"
+                dump.contains("For an existing file"),
+                "write dump must explain existing files: {dump}"
+            );
+            assert!(
+                dump.contains("call Read"),
+                "write dump must retain the read hint: {dump}"
+            );
+            assert!(
+                dump.contains("a new file may be created directly"),
+                "write dump must permit new files: {dump}"
+            );
+            assert!(
+                !dump.contains("never write an unread file"),
+                "write dump must not prohibit creating new files: {dump}"
             );
         }
     }

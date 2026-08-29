@@ -23,8 +23,10 @@ pub mod usage;
 use async_trait::async_trait;
 use axum::Json;
 use axum::response::{IntoResponse, Response};
+use futures_util::FutureExt;
 use http::StatusCode;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -36,8 +38,9 @@ use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::cursor::auth::{
-    clear_cursor_auth, cursor_account_digest, expired_auth_message, force_refresh_cursor_auth,
-    load_cursor_auth, missing_auth_message, run_cursor_login,
+    CursorAccountProfile, clear_cursor_auth, cursor_account_digest, expired_auth_message,
+    force_refresh_cursor_auth, list_cursor_accounts, load_cursor_auth, missing_auth_message,
+    run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::connect::cursor_connect_error_is_missing_image;
@@ -47,17 +50,17 @@ use crate::providers::cursor::hosted_web_search::{
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
 };
 use crate::providers::cursor::live::{
-    CursorLiveRunHandle, EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, LIVE_AMBIGUOUS_OPEN_TTL,
-    LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim, LiveRunEvent, LiveRunIdentity,
-    LiveRunProbe, LiveRunRegistry, LiveRunReservation, LiveSlotClaim, LiveStartRecovery,
-    cursor_error_is_kv_blob_overflow, cursor_start_error_is_same_request_retryable,
-    exhausted_live_start_error, finish_replacement_after_cancel,
-    live_error_is_agent_looping_detected, live_error_is_empty_turn_retry,
-    live_error_is_kv_blob_overflow_replayable, live_error_is_same_request_retryable,
-    live_error_needs_checkpoint_continue, live_pending_must_supersede,
-    live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
-    live_run_key_for, live_sse_response, live_start_error_seals_tombstone,
-    local_overload_retry_after, same_request_retry_wait_ms,
+    CursorLiveRunHandle, EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, EMPTY_TURN_RETRY_NOTE,
+    LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim,
+    LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveRunReservation,
+    LiveSlotClaim, LiveStartRecovery, cursor_error_is_kv_blob_overflow,
+    cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
+    finish_replacement_after_cancel, live_error_is_agent_looping_detected,
+    live_error_is_empty_turn_retry, live_error_is_kv_blob_overflow_replayable,
+    live_error_is_same_request_retryable, live_error_needs_checkpoint_continue,
+    live_pending_must_supersede, live_probe_error_blocks_new_run, live_request_fingerprint,
+    live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
+    live_start_error_seals_tombstone, local_overload_retry_after, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
 use crate::providers::cursor::request::{
@@ -177,10 +180,15 @@ struct PolicyRateLimitProbeLease {
     gate: Arc<PolicyRateLimitProbeGate>,
     epoch: u64,
     lease: u64,
+    started: Instant,
     active: bool,
 }
 
 impl PolicyRateLimitProbeLease {
+    fn remaining_until(&self, window: Duration) -> Duration {
+        window.saturating_sub(self.started.elapsed())
+    }
+
     fn mark_healthy(mut self) {
         let mut state = self
             .gate
@@ -329,7 +337,11 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
         policy_rate_limit_preflight(model, client_type, token)?;
         enum ProbeDecision {
             Healthy,
-            Acquire { epoch: u64, lease: u64 },
+            Acquire {
+                epoch: u64,
+                lease: u64,
+                started: Instant,
+            },
             Wait(Duration),
         }
         let decision = {
@@ -342,13 +354,12 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                 PolicyRateLimitProbeState::Unknown => {
                     let lease = POLICY_RATE_LIMIT_PROBE_SEQUENCE
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    state.phase = PolicyRateLimitProbeState::Probing {
-                        lease,
-                        started: Instant::now(),
-                    };
+                    let started = Instant::now();
+                    state.phase = PolicyRateLimitProbeState::Probing { lease, started };
                     ProbeDecision::Acquire {
                         epoch: state.epoch,
                         lease,
+                        started,
                     }
                 }
                 PolicyRateLimitProbeState::Probing { started, .. } => {
@@ -362,13 +373,12 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                         // Runs and may still prove health or open the breaker.
                         let lease = POLICY_RATE_LIMIT_PROBE_SEQUENCE
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        state.phase = PolicyRateLimitProbeState::Probing {
-                            lease,
-                            started: Instant::now(),
-                        };
+                        let started = Instant::now();
+                        state.phase = PolicyRateLimitProbeState::Probing { lease, started };
                         ProbeDecision::Acquire {
                             epoch: state.epoch,
                             lease,
+                            started,
                         }
                     } else {
                         ProbeDecision::Wait(probe_window - elapsed)
@@ -383,7 +393,11 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                 policy_rate_limit_preflight(model, client_type, token)?;
                 return Ok(PolicyRateLimitAdmission::KnownHealthy);
             }
-            ProbeDecision::Acquire { epoch, lease } => {
+            ProbeDecision::Acquire {
+                epoch,
+                lease,
+                started,
+            } => {
                 // A concurrent policy result may have won immediately after
                 // the first read. Do not let this newly acquired lease pass it.
                 if let Err(error) = policy_rate_limit_preflight(model, client_type, token) {
@@ -391,6 +405,7 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                         gate: Arc::clone(&gate),
                         epoch,
                         lease,
+                        started,
                         active: true,
                     });
                     return Err(error);
@@ -399,6 +414,7 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                     gate: Arc::clone(&gate),
                     epoch,
                     lease,
+                    started,
                     active: true,
                 }));
             }
@@ -1018,6 +1034,9 @@ struct LiveRetryStart {
     /// retries reuse it so quota-sentinel observations cannot merge with a
     /// different request for the same account/model.
     request_sequence_id: String,
+    /// Shared across the initial start and all late retries so account-pool
+    /// failover remains bounded for one logical request.
+    account_failover_state: SharedAccountFailoverState,
     /// Context compaction uses output-text framing even when Cursor emits
     /// reasoning deltas. Keep this bit stable across transport retries.
     compaction_mode: bool,
@@ -1123,6 +1142,20 @@ fn cached_image_recovery_snapshot(
         .clone()
 }
 
+/// Account failover creates a conversation in a different Cursor account.
+/// Image UUIDs are account-scoped in Cursor's asset index, so a wave cached
+/// for the exhausted account must not be reused by the replacement account.
+/// Replace the request-scoped cache atomically and use the new metadata for
+/// every subsequent retry in that account.
+fn fresh_image_recovery_images_for_account(
+    shared: &Arc<Mutex<Option<Vec<CursorSelectedImage>>>>,
+    reset_images: &[CursorSelectedImage],
+) -> Vec<CursorSelectedImage> {
+    let refreshed = refresh_image_uuids(reset_images);
+    *shared.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(refreshed.clone());
+    refreshed
+}
+
 /// Match image lookup failures across the structured Cursor error fields.
 /// Connect END errors often put the useful text in `detail`, while HTTP/SSE
 /// failures expose it through `client_message`; checking all three keeps the
@@ -1168,6 +1201,62 @@ impl LiveRetryStart {
         &self,
         error: &str,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        // A policy response can arrive after the initial live-open peek (for
+        // example Cursor accepts the Run, then emits a delayed Sand
+        // quota/error frame).  The normal late-retry classifier keeps this
+        // path terminal so it does not replay an already accepted operation,
+        // but no client-visible text/tool event has committed at this point.
+        // Move the logical request to one unused account and replay the full
+        // Anthropic history on a fresh account-scoped conversation.  The
+        // shared state bounds this to the same two swaps as initial-open
+        // failover, including retries started by the replacement itself.
+        if is_account_failover_policy_error(error) {
+            let current_token = self.effective_token();
+            let Some(replacement) = account_failover_replacement_token(
+                &current_token,
+                &self.model,
+                &self.client_type,
+                &self.account_failover_state,
+            ) else {
+                let mut terminal = CursorError::new(429, error, None);
+                terminal.retry_after =
+                    policy_rate_limit_breaker_state(&self.model, &self.client_type, &current_token)
+                        .map(|state| state.retry_after_secs.to_string());
+                return Err(terminal);
+            };
+            *self
+                .effective_token
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = replacement.clone();
+            let conversation_key =
+                live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+            conversation::reset(&conversation_key);
+            *self
+                .expected_conversation_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            // Image assets are account-scoped. Allow one bounded upload retry
+            // for the replacement account even when the exhausted account
+            // already consumed the request's image-recovery fence.
+            self.image_recovery_attempted
+                .store(false, Ordering::Release);
+            let images = fresh_image_recovery_images_for_account(
+                &self.image_recovery_images,
+                &self.reset_retry_images,
+            );
+            create_logger("cursor").warn(
+                "late_policy_account_failover",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(&self.session_id)),
+                    ("model".into(), serde_json::json!(&self.model)),
+                    ("clientType".into(), serde_json::json!(&self.client_type)),
+                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                ])),
+            );
+            return self
+                .start_with_user_text_and_images(&self.reset_user_text, &images, None)
+                .await;
+        }
         if self.compaction_mode && live_error_is_agent_looping_detected(error) {
             // Cursor's loop detector can leave the compact lane bound to a
             // poisoned checkpoint. Rotate that lane once and replay the
@@ -1337,6 +1426,7 @@ impl LiveRetryStart {
             Some(Arc::clone(&self.image_recovery_images)),
             Some(Arc::clone(&self.kv_recovery_attempted)),
             Some(Arc::clone(&self.compaction_recovery_attempted)),
+            Some(Arc::clone(&self.account_failover_state)),
             Some(Arc::clone(&opened_conversation_id)),
             LiveStartRecovery {
                 expected_conversation_id: expected_conversation_id.as_deref(),
@@ -1581,6 +1671,185 @@ fn live_ambiguous_accept_error() -> CursorError {
 /// old-account -> new-account case; a second tolerates a rapid double switch.
 const MAX_ACCOUNT_FAILOVER_SWAPS: u32 = 2;
 
+/// Only account-scoped allowance failures are candidates for pool failover.
+/// Billing blocks and generic policy responses apply to the subscription (or
+/// deployment), so rotating credentials cannot make them succeed and would
+/// needlessly fan one client error across every stored account.
+fn is_account_failover_policy_error(message: &str) -> bool {
+    if crate::retry::is_billing_block(message) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("user_rate_limit_exceeded")
+        || lower.contains("api_rate_limit_exceeded")
+        || lower.contains("error_rate_limited_changeable")
+}
+
+/// Account failover is state for one logical request, not one transport
+/// attempt. Late stream retries clone `LiveRetryStart`, so keeping this in an
+/// `Arc` prevents every reconnect from restarting at the first account and
+/// amplifying a Sand quota response into an account-rotation storm.
+#[derive(Debug, Default)]
+struct AccountFailoverState {
+    swaps: u32,
+    attempted_accounts: BTreeSet<String>,
+}
+
+impl AccountFailoverState {
+    fn new(current_token: &str) -> Self {
+        let mut state = Self::default();
+        state
+            .attempted_accounts
+            .insert(cursor_account_digest(current_token));
+        state
+    }
+}
+
+type SharedAccountFailoverState = Arc<Mutex<AccountFailoverState>>;
+
+/// Return deterministic account candidates for a policy/quota failure.
+///
+/// Account ids are stable across access-token rotation, so the breaker and
+/// request-local attempt set continue to identify the same account when its
+/// JWT changes. This helper is deliberately pure with respect to the account
+/// source, which keeps selection behavior unit-testable without touching the
+/// user's registry.
+fn account_failover_candidates_from_profiles(
+    profiles: &[CursorAccountProfile],
+    current_token: &str,
+    model: &str,
+    client_type: &str,
+    attempted_accounts: &BTreeSet<String>,
+) -> Vec<String> {
+    let current_digest = cursor_account_digest(current_token);
+    let mut candidates: Vec<(String, String)> = profiles
+        .iter()
+        .filter_map(|profile| {
+            let token = profile.auth.access_token.trim();
+            if token.is_empty() {
+                return None;
+            }
+            let digest = cursor_account_digest(token);
+            if digest == current_digest
+                || attempted_accounts.contains(&digest)
+                || attempted_accounts.contains(&profile.id)
+            {
+                return None;
+            }
+            if policy_rate_limit_breaker_state(model, client_type, token).is_some() {
+                return None;
+            }
+            Some((profile.id.clone(), token.to_string()))
+        })
+        .collect();
+    // Registry reads are normally sorted already, but sort again here so a
+    // concurrent account-management write cannot change failover order.
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().map(|(_, token)| token).collect()
+}
+
+/// Atomically reserve the next account for one logical request. Candidate
+/// selection happens outside the mutex because listing accounts may perform a
+/// filesystem read; the final check under the mutex prevents two concurrent
+/// late-retry paths sharing this state from selecting the same account.
+fn take_account_failover_candidate_from_profiles(
+    profiles: &[CursorAccountProfile],
+    current_token: &str,
+    model: &str,
+    client_type: &str,
+    state: &SharedAccountFailoverState,
+) -> Option<String> {
+    loop {
+        // Record the registry id for the current bearer as well as its digest.
+        // Opaque Cursor tokens can rotate without a stable JWT subject; the
+        // profile id still prevents that same account from re-entering the
+        // candidate set after a refresh.
+        if let Ok(mut state) = state.lock() {
+            for profile in profiles {
+                if profile.auth.access_token == current_token {
+                    state.attempted_accounts.insert(profile.id.clone());
+                }
+            }
+        }
+        let (swaps, attempted) = {
+            let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            (state.swaps, state.attempted_accounts.clone())
+        };
+        if swaps >= MAX_ACCOUNT_FAILOVER_SWAPS {
+            return None;
+        }
+        let candidates = account_failover_candidates_from_profiles(
+            profiles,
+            current_token,
+            model,
+            client_type,
+            &attempted,
+        );
+        let candidate = candidates.into_iter().next()?;
+        let digest = cursor_account_digest(&candidate);
+        let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        if state.swaps >= MAX_ACCOUNT_FAILOVER_SWAPS {
+            return None;
+        }
+        let profile_id = profiles
+            .iter()
+            .find(|profile| profile.auth.access_token == candidate)
+            .map(|profile| profile.id.clone());
+        if state.attempted_accounts.contains(&digest)
+            || profile_id
+                .as_deref()
+                .is_some_and(|id| state.attempted_accounts.contains(id))
+        {
+            // The digest may be new after an opaque token rotation, but the
+            // profile id can still reveal that it is an already-attempted
+            // account. Keep the existing markers intact and choose the next
+            // candidate under the same request-local budget.
+            continue;
+        }
+        state.attempted_accounts.insert(digest);
+        if let Some(profile_id) = profile_id {
+            state.attempted_accounts.insert(profile_id);
+        }
+        state.swaps += 1;
+        return Some(candidate);
+    }
+}
+
+/// Select an unused, non-cooled account from the persistent pool. A missing
+/// or malformed registry simply means there is no local failover candidate;
+/// the caller then returns the original policy error with its Retry-After.
+fn account_failover_replacement_token(
+    current_token: &str,
+    model: &str,
+    client_type: &str,
+    state: &SharedAccountFailoverState,
+) -> Option<String> {
+    let profiles = list_cursor_accounts().ok()?;
+    let replacement = take_account_failover_candidate_from_profiles(
+        &profiles,
+        current_token,
+        model,
+        client_type,
+        state,
+    );
+    if let Some(token) = replacement.as_deref() {
+        let email = profiles
+            .iter()
+            .find(|profile| profile.auth.access_token == token)
+            .and_then(|profile| profile.email())
+            .unwrap_or("unknown");
+        create_logger("cursor").info(
+            "live_account_failover",
+            Some(serde_json::Map::from_iter([
+                ("email".into(), serde_json::json!(email)),
+                ("model".into(), serde_json::json!(model)),
+                ("clientType".into(), serde_json::json!(client_type)),
+            ])),
+        );
+    }
+    replacement
+}
+
 /// 401-recovery refresh off the async workers: the refresh HTTP call is
 /// blocking (single-flighted in auth.rs), so run it on the blocking pool.
 async fn force_refresh_cursor_auth_async(
@@ -1592,26 +1861,6 @@ async fn force_refresh_cursor_auth_async(
         Ok(result) => result,
         Err(join) => Err(anyhow::anyhow!("Cursor auth refresh task failed: {join}")),
     }
-}
-
-/// After a hot account switch (`cursor auth login` while serve runs), a
-/// request that started on the previous login and hit an account-bound 429
-/// fails over to the newly stored credentials instead of surfacing the old
-/// account's limit. Returns the replacement token only when the store now
-/// holds a different one.
-fn account_switch_replacement_token(current_token: &str) -> Option<String> {
-    let auth = load_cursor_auth().ok().flatten()?;
-    if auth.access_token == current_token {
-        return None;
-    }
-    create_logger("cursor").info(
-        "live_account_failover",
-        Some(serde_json::Map::from_iter([(
-            "email".into(),
-            serde_json::json!(auth.email.as_deref().unwrap_or("unknown")),
-        )])),
-    );
-    Some(auth.access_token)
 }
 
 fn live_replacement_conflict_error(has_tool_results: bool) -> CursorError {
@@ -1668,6 +1917,7 @@ async fn start_live_events_with_retries(
         None,
         None,
         None,
+        None,
         LiveStartRecovery::default(),
     )
     .await
@@ -1699,6 +1949,7 @@ async fn start_live_events_with_retries_with_client_type(
     image_recovery_images: Option<Arc<Mutex<Option<Vec<CursorSelectedImage>>>>>,
     kv_recovery_attempted: Option<Arc<AtomicBool>>,
     compaction_recovery_attempted: Option<Arc<AtomicBool>>,
+    account_failover_state: Option<SharedAccountFailoverState>,
     // Receives the exact Cursor conversation binding used by the generation
     // that successfully opened.  This avoids re-reading the session map after
     // start, where a concurrent reset could make a different generation look
@@ -1722,6 +1973,18 @@ async fn start_live_events_with_retries_with_client_type(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let operation_fingerprint = live_request_fingerprint(&fingerprint);
     let mut transient_retries = 0_u32;
+    // `force_refresh_cursor_auth` refreshes the process-wide active account.
+    // Once this request moves to an inactive pool account, using that helper
+    // would silently switch the request back to the exhausted bearer. Keep
+    // refresh recovery enabled only for the account that opened the request.
+    let swapped_account = account_failover_state.as_ref().is_some_and(|state| {
+        state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .swaps
+            > 0
+    });
+    let mut can_refresh_current_account = has_refresh && !swapped_account;
     let image_recovery_attempted =
         image_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let image_recovery_images = image_recovery_images.unwrap_or_else(|| Arc::new(Mutex::new(None)));
@@ -1729,6 +1992,8 @@ async fn start_live_events_with_retries_with_client_type(
         kv_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let compaction_recovery_attempted =
         compaction_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let account_failover_state = account_failover_state
+        .unwrap_or_else(|| Arc::new(Mutex::new(AccountFailoverState::new(&token))));
     // Normally the original request slice is reused across transport retries.
     // A stale Cursor asset requires a new UUID and a fresh conversation; keep
     // that replacement owned by this start loop so both initial-open and
@@ -1753,7 +2018,6 @@ async fn start_live_events_with_retries_with_client_type(
     // internal retry instead of comparing against the stale caller snapshot.
     let mut expected_conversation_id = recovery.expected_conversation_id.map(str::to_owned);
     let mut retry_user_text: Option<String> = None;
-    let mut account_swaps = 0_u32;
     loop {
         // Local admission strictly precedes the session-slot claim. A start
         // that is only queued for local capacity must stay invisible to
@@ -2127,7 +2391,7 @@ async fn start_live_events_with_retries_with_client_type(
             .await
         {
             Ok(start) => Ok(start),
-            Err(error) if error.status == 401 && has_refresh => {
+            Err(error) if error.status == 401 && can_refresh_current_account => {
                 // Release this attempt's probe while refreshing. JWT rotation
                 // for the same subject intentionally resolves to the same
                 // stable account key; a genuine account switch resolves to a
@@ -2222,6 +2486,7 @@ async fn start_live_events_with_retries_with_client_type(
                                 model.to_string(),
                                 client_type.to_string(),
                                 token.clone(),
+                                policy_rate_limit_probe_window(),
                             ));
                         }
                         return Ok(events);
@@ -2325,16 +2590,36 @@ async fn start_live_events_with_retries_with_client_type(
                             );
                             continue;
                         }
-                        if policy_limited {
+                        if is_account_failover_policy_error(&error) {
                             // Account-bound 429: same-login retries cannot
                             // succeed. Fail over to newly stored credentials
                             // after a hot account switch, else pass through.
-                            if account_swaps < MAX_ACCOUNT_FAILOVER_SWAPS
-                                && let Some(replacement) = account_switch_replacement_token(&token)
-                            {
+                            if let Some(replacement) = account_failover_replacement_token(
+                                &token,
+                                model,
+                                client_type,
+                                &account_failover_state,
+                            ) {
                                 token = replacement;
                                 publish_effective_token(&token);
-                                account_swaps += 1;
+                                can_refresh_current_account = false;
+                                // Cursor conversation/checkpoint state is
+                                // account-scoped. A replacement bearer must
+                                // start from a fresh binding and replay the
+                                // complete logical request, otherwise the new
+                                // account can reject the old conversation id.
+                                let key = live_retry_conversation_key(
+                                    identity.session_id,
+                                    identity.agent_id,
+                                );
+                                conversation::reset(&key);
+                                expected_conversation_id = None;
+                                image_recovery_attempted.store(false, Ordering::Release);
+                                image_retry_images = Some(fresh_image_recovery_images_for_account(
+                                    &image_recovery_images,
+                                    reset_retry_images,
+                                ));
+                                retry_user_text = Some(reset_user_text.to_string());
                                 transient_retries = 0;
                                 continue;
                             }
@@ -2471,14 +2756,28 @@ async fn start_live_events_with_retries_with_client_type(
                 } else {
                     drop(probe_admission.take());
                 }
-                if policy_limited
-                    && account_swaps < MAX_ACCOUNT_FAILOVER_SWAPS
-                    && let Some(replacement) = account_switch_replacement_token(&token)
+                if (is_account_failover_policy_error(&error.client_message())
+                    || is_account_failover_policy_error(&error.message))
+                    && let Some(replacement) = account_failover_replacement_token(
+                        &token,
+                        model,
+                        client_type,
+                        &account_failover_state,
+                    )
                 {
                     reservation.release();
                     token = replacement;
                     publish_effective_token(&token);
-                    account_swaps += 1;
+                    can_refresh_current_account = false;
+                    let key = live_retry_conversation_key(identity.session_id, identity.agent_id);
+                    conversation::reset(&key);
+                    expected_conversation_id = None;
+                    image_recovery_attempted.store(false, Ordering::Release);
+                    image_retry_images = Some(fresh_image_recovery_images_for_account(
+                        &image_recovery_images,
+                        reset_retry_images,
+                    ));
+                    retry_user_text = Some(reset_user_text.to_string());
                     transient_retries = 0;
                     continue;
                 }
@@ -2543,6 +2842,7 @@ fn spawn_streaming_live_sse(
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
 ) -> Response {
     let sid_for_sse = sid.clone();
+    let account_failover_state = Arc::new(Mutex::new(AccountFailoverState::new(&token)));
     let rx = spawn_live_events_with_late_retries(
         LiveRetryStart {
             client,
@@ -2557,6 +2857,7 @@ fn spawn_streaming_live_sse(
             image_recovery_images: Arc::new(Mutex::new(None)),
             kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
             compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            account_failover_state,
             custom_system,
             session_id: sid,
             agent_id,
@@ -2640,12 +2941,53 @@ fn hold_policy_probe_until_decisive_event(
     model: String,
     client_type: String,
     token: String,
+    probe_window: Duration,
 ) -> mpsc::Receiver<LiveEventResult> {
     let (tx, rx) = mpsc::channel(512);
     tokio::spawn(async move {
         let mut lease = Some(lease);
+        let mut empty_turn_deadline: Option<Instant> = None;
         let mut forwarding = true;
-        while let Some(item) = events.recv().await {
+        loop {
+            // A hollow Cursor turn is not evidence that the account/model is
+            // healthy. Keep the single-flight lease through the original
+            // probe window even when the upstream closes or goes quiet, then
+            // let exactly one waiter start the next bounded probe.
+            let item = if let Some(deadline) = empty_turn_deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    drop(lease.take());
+                    empty_turn_deadline = None;
+                    continue;
+                }
+                tokio::select! {
+                    item = events.recv() => item,
+                    _ = tokio::time::sleep(remaining) => {
+                        drop(lease.take());
+                        empty_turn_deadline = None;
+                        continue;
+                    }
+                }
+            } else {
+                events.recv().await
+            };
+            let Some(item) = item else {
+                // The live pump synthesizes EMPTY_TURN_RETRY_NOTE when the
+                // upstream closes after metadata (or with no frames at all).
+                // Preserve the probe lease for the same bounded window here,
+                // otherwise an EOF-only hollow turn can reopen a retry wave
+                // before the downstream classifier gets a chance to observe
+                // it.
+                if let Some(probe_lease) = lease.as_ref() {
+                    let remaining = probe_lease.remaining_until(probe_window);
+                    if !remaining.is_zero() {
+                        empty_turn_deadline = Some(Instant::now() + remaining);
+                        tokio::time::sleep(remaining).await;
+                    }
+                }
+                break;
+            };
+
             if lease.is_some() {
                 match &item {
                     Ok(event) if live_event_commits_client_output(event) => {
@@ -2653,10 +2995,23 @@ fn hold_policy_probe_until_decisive_event(
                             .take()
                             .expect("policy probe lease is present")
                             .mark_healthy();
+                        empty_turn_deadline = None;
                     }
                     Err(error) if crate::retry::is_policy_rate_limit(error) => {
                         note_policy_rate_limit(&model, &client_type, &token, error, None);
                         drop(lease.take());
+                        empty_turn_deadline = None;
+                    }
+                    Err(error) if live_error_is_empty_turn_retry(error) => {
+                        if let Some(probe_lease) = lease.as_ref() {
+                            let remaining = probe_lease.remaining_until(probe_window);
+                            if remaining.is_zero() {
+                                drop(lease.take());
+                            } else {
+                                empty_turn_deadline
+                                    .get_or_insert_with(|| Instant::now() + remaining);
+                            }
+                        }
                     }
                     Err(_) => drop(lease.take()),
                     Ok(_) => {
@@ -2672,6 +3027,12 @@ fn hold_policy_probe_until_decisive_event(
             }
             if !forwarding && lease.is_none() {
                 return;
+            }
+        }
+        if let Some(deadline) = empty_turn_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() && lease.is_some() {
+                tokio::time::sleep(remaining).await;
             }
         }
         drop(lease.take());
@@ -3162,9 +3523,12 @@ async fn forward_live_events_with_retries_context<F, Fut>(
             LivePumpOutcome::PolicyLimited(error) => {
                 // A Sand clean-END may be reclassified by the live driver once
                 // dashboard quota evidence is available. Treat it exactly like
-                // an explicit Connect policy 429: open the account/model
-                // breaker and surface one terminal event, rather than burning
-                // the hollow-turn retry budget and creating another Run wave.
+                // an explicit Connect policy 429.  The late-start helper can
+                // safely fail over here because this branch is only selected
+                // before any client-visible text/tool event is committed.  It
+                // resets the account-scoped conversation and replays complete
+                // history; if the account pool is exhausted, the original
+                // typed policy error is surfaced with no retry amplification.
                 let token = context.effective_token();
                 if !token.is_empty() {
                     note_policy_rate_limit(
@@ -3175,8 +3539,24 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                         None,
                     );
                 }
-                let _ = tx.send(Err(error)).await;
-                return;
+                if is_account_failover_policy_error(&error) {
+                    let start = restart(error.clone());
+                    tokio::pin!(start);
+                    events = match tokio::select! {
+                        _ = tx.closed() => return,
+                        result = &mut start => result,
+                    } {
+                        Ok(events) => events,
+                        Err(error) => {
+                            let _ = tx.send(Err(error.client_message())).await;
+                            return;
+                        }
+                    };
+                    expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
+                } else {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
             }
             LivePumpOutcome::Done => return,
         }
@@ -3191,54 +3571,111 @@ fn spawn_live_events_with_late_retries(
     let (tx, rx) = mpsc::channel(512);
     let session_id = start.session_id.clone();
     let agent_id = start.agent_id.clone();
+    let panic_tx = tx.clone();
+    let panic_session_id = session_id.clone();
+    let panic_agent_id = agent_id.clone();
     tokio::spawn(async move {
-        let retry_context = LiveLateRetryContext {
-            model: start.model.clone(),
-            client_type: start.client_type.clone(),
-            effective_token: Arc::clone(&start.effective_token),
-            compaction_mode: start.compaction_mode,
-        };
-        let retry_policy =
-            LiveLateRetryPolicy::for_request(&retry_context.model, &retry_context.client_type);
-        let events = match initial_events {
-            Some(events) => events,
-            None => {
-                let first = start.start(initial_reservation);
-                tokio::pin!(first);
-                match tokio::select! {
-                    _ = tx.closed() => {
-                        // Disconnect while starting: dropping the start future
-                        // aborts a pre-accept open via the reservation's cancel
-                        // watch; an already-accepted Run stays owned by its
-                        // driver and the orphan path (attach/replay/supersede).
-                        return;
-                    }
-                    result = &mut first => result,
-                } {
-                    Ok(events) => events,
-                    Err(error) => {
-                        let _ = tx.send(Err(error.client_message())).await;
-                        return;
+        // A panic in the late-retry coordinator otherwise closes `rx` without
+        // an event. The SSE adapter then has no typed cause and manufactures a
+        // misleading bare 502. Keep client disconnects as ordinary early
+        // returns, but turn every coordinator panic into an explicit retryable
+        // terminal event so the client can recover instead of stalling.
+        let coordinator = async move {
+            let retry_context = LiveLateRetryContext {
+                model: start.model.clone(),
+                client_type: start.client_type.clone(),
+                effective_token: Arc::clone(&start.effective_token),
+                compaction_mode: start.compaction_mode,
+            };
+            let retry_policy =
+                LiveLateRetryPolicy::for_request(&retry_context.model, &retry_context.client_type);
+            let events = match initial_events {
+                Some(events) => events,
+                None => {
+                    let first = start.start(initial_reservation);
+                    tokio::pin!(first);
+                    match tokio::select! {
+                        _ = tx.closed() => {
+                            // Disconnect while starting: dropping the start
+                            // future aborts a pre-accept open; an accepted Run
+                            // stays owned by its driver/orphan path.
+                            return;
+                        }
+                        result = &mut first => result,
+                    } {
+                        Ok(events) => events,
+                        Err(error) => {
+                            let _ = tx.send(Err(error.client_message())).await;
+                            return;
+                        }
                     }
                 }
-            }
+            };
+            let retry_start = start.clone();
+            forward_live_events_with_retries_context(
+                &tx,
+                events,
+                &session_id,
+                agent_id.as_deref(),
+                move |error| {
+                    let retry_start = retry_start.clone();
+                    async move { retry_start.start_after_error(&error).await }
+                },
+                retry_policy,
+                &retry_context,
+            )
+            .await;
         };
-        let retry_start = start.clone();
-        forward_live_events_with_retries_context(
-            &tx,
-            events,
-            &session_id,
-            agent_id.as_deref(),
-            move |error| {
-                let retry_start = retry_start.clone();
-                async move { retry_start.start_after_error(&error).await }
-            },
-            retry_policy,
-            &retry_context,
+        run_live_retry_coordinator_with_panic_guard(
+            panic_tx,
+            panic_session_id,
+            panic_agent_id,
+            coordinator,
         )
         .await;
     });
     rx
+}
+
+/// Keep an unexpected coordinator exit observable to the downstream adapter.
+///
+/// A panic otherwise drops the event sender and is indistinguishable from an
+/// empty upstream stream, which is surfaced as a misleading bare 502. The
+/// empty-turn marker deliberately stays in this message so the normal bounded
+/// late-retry classifier can recover the request without exposing the panic.
+async fn run_live_retry_coordinator_with_panic_guard<F>(
+    tx: mpsc::Sender<LiveEventResult>,
+    session_id: String,
+    agent_id: Option<String>,
+    coordinator: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if AssertUnwindSafe(coordinator).catch_unwind().await.is_err() {
+        create_logger("cursor").error(
+            "live_retry_coordinator_panic",
+            Some(serde_json::Map::from_iter([
+                ("sessionId".into(), serde_json::json!(&session_id)),
+                (
+                    "agentId".into(),
+                    serde_json::json!(agent_id.as_deref().unwrap_or("")),
+                ),
+                ("recovery".into(), serde_json::json!("coordinator_panic")),
+            ])),
+        );
+        let message = format!(
+            "Cursor live retry coordinator failed unexpectedly; {EMPTY_TURN_RETRY_NOTE} (coordinator panic)"
+        );
+        let send = tx.send(Err(message));
+        let _ = tokio::time::timeout(
+            Duration::from_millis(env_u64_millis(
+                "CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_MS",
+                5_000,
+            )),
+            send,
+        )
+        .await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3360,12 +3797,23 @@ fn reset_session_usage_for_test() {
 #[cfg(test)]
 static SESSION_USAGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn log_live_start_claude_headers(ctx: &RequestContext, session_id: &str) {
+fn log_live_start_claude_headers(
+    ctx: &RequestContext,
+    session_id: &str,
+    model: &str,
+    client_type: &str,
+    compaction: bool,
+) {
     create_logger("cursor").info(
         "live_start_identity",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
             ("sessionId".to_string(), serde_json::json!(session_id)),
+            // Keep the effective route alongside the Claude headers. The
+            // incoming `app=cli` identifies Claude Code, not Sand versus CLI.
+            ("model".to_string(), serde_json::json!(model)),
+            ("clientType".to_string(), serde_json::json!(client_type)),
+            ("compaction".to_string(), serde_json::json!(compaction)),
             (
                 "agentId".to_string(),
                 serde_json::json!(&ctx.claude_code.agent_id),
@@ -4669,6 +5117,7 @@ impl Provider for CursorProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         let mut token = auth.access_token.clone();
+        let account_failover_state = Arc::new(Mutex::new(AccountFailoverState::new(&token)));
 
         if let Some(events) = resumed_live_events.take() {
             let sid = session_id.expect("a resumed live run requires a session id");
@@ -4693,6 +5142,7 @@ impl Provider for CursorProvider {
                 image_recovery_images: Arc::new(Mutex::new(None)),
                 kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                account_failover_state: Arc::clone(&account_failover_state),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4751,7 +5201,7 @@ impl Provider for CursorProvider {
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
             let identity = live_run_identity(sid, &ctx);
-            log_live_start_claude_headers(&ctx, sid);
+            log_live_start_claude_headers(&ctx, sid, model, &client_type, xai_compact);
             let allowed = request_allowed_tools.clone();
             let mcp_tools = request_mcp_tools.clone();
             let estimated_input = estimate_rendered_prompt_tokens(&parts);
@@ -4817,6 +5267,7 @@ impl Provider for CursorProvider {
                 image_recovery_images: Arc::new(Mutex::new(None)),
                 kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                account_failover_state: Arc::clone(&account_failover_state),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
@@ -4855,6 +5306,13 @@ impl Provider for CursorProvider {
         let mut refreshed_once = false;
         let mut image_recovery_attempted = false;
         let mut kv_recovery_attempted = false;
+        // A buffered Run can be accepted by Cursor while returning only an
+        // idle/no-progress diagnostic.  Retrying the same continuation then
+        // races that still-live Run and produces a 409 wave.  Rotate the
+        // conversation once, with the full Anthropic history, before exposing
+        // the ambiguity to the client.  The fence is intentionally local to
+        // this logical request so repeated 502s cannot create a restart loop.
+        let mut idle_recovery_attempted = false;
         // Keep the current continuation delta untouched for ordinary
         // transport retries.  A stale selected-image id is different: after
         // one bounded conversation reset, replay the original history with
@@ -4969,6 +5427,41 @@ impl Provider for CursorProvider {
                     drop(probe_admission);
                     return map_cursor_error_to_response(&e);
                 }
+                Err(e)
+                    if !idle_recovery_attempted
+                        && continuation_key.is_some()
+                        && crate::retry::is_idle_no_progress(&e.client_message())
+                        && live_error_is_empty_turn_retry(&e.client_message()) =>
+                {
+                    drop(probe_admission);
+                    idle_recovery_attempted = true;
+                    if let Some(key) = continuation_key.as_deref() {
+                        conversation::reset(key);
+                    }
+                    request_prompt = &reset_user_text;
+                    // A fresh conversation cannot consume checkpoint-delta
+                    // image ids.  Reuse the same full-history image set (and
+                    // any UUID wave already minted for image recovery) so a
+                    // transport stall does not create a second asset upload.
+                    request_images = kv_recovery_images(
+                        &request_images,
+                        &reset_retry_images,
+                        image_recovery_attempted,
+                    );
+                    binding_reset_images = request_images.clone();
+                    create_logger("cursor").warn(
+                        "idle_buffered_recovery",
+                        Some(serde_json::Map::from_iter([
+                            (
+                                "sessionId".into(),
+                                serde_json::json!(session_id.unwrap_or_default()),
+                            ),
+                            ("recovery".into(), serde_json::json!("fresh_conversation")),
+                            ("diagnostic".into(), serde_json::json!(e.client_message())),
+                        ])),
+                    );
+                    continue;
+                }
                 // A second missing-image response means the bounded
                 // re-upload did not repair the upstream asset lookup. Surface
                 // it directly instead of feeding it into the generic
@@ -5000,6 +5493,31 @@ impl Provider for CursorProvider {
                             &e.client_message(),
                             e.retry_after.as_deref(),
                         );
+                        if (is_account_failover_policy_error(&e.client_message())
+                            || is_account_failover_policy_error(&e.message))
+                            && let Some(replacement) = account_failover_replacement_token(
+                                &token,
+                                model,
+                                &client_type,
+                                &account_failover_state,
+                            )
+                        {
+                            token = replacement;
+                            // The refresh helper targets the active account;
+                            // this request now uses an inactive candidate.
+                            // Suppress a later 401 refresh that would switch
+                            // back to the exhausted active bearer.
+                            refreshed_once = true;
+                            if let Some(key) = continuation_key.as_deref() {
+                                conversation::reset(key);
+                            }
+                            image_recovery_attempted = false;
+                            request_images = refresh_image_uuids(&reset_retry_images);
+                            binding_reset_images = request_images.clone();
+                            request_prompt = &reset_user_text;
+                            transport_retries = 0;
+                            continue;
+                        }
                     } else {
                         drop(probe_admission);
                     }
@@ -5785,6 +6303,7 @@ mod tests {
             "gemini-3.6-flash-high".into(),
             "sand".into(),
             "late-policy-token".into(),
+            policy_rate_limit_probe_window(),
         );
 
         let waiter = tokio::spawn(async {
@@ -5834,6 +6353,128 @@ mod tests {
         reset_policy_rate_limit_breaker_for_test();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn policy_probe_holds_empty_turn_until_probe_window_expires() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let probe_window = Duration::from_millis(300);
+        let admission = policy_rate_limit_admit_fresh_open_with_window(
+            "grok-build",
+            "sand",
+            "empty-turn-token",
+            probe_window,
+        )
+        .await
+        .expect("the first request owns the cold probe");
+        let lease = admission.into_probe().expect("cold admission is a probe");
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let mut held = hold_policy_probe_until_decisive_event(
+            upstream_rx,
+            lease,
+            "grok-build".into(),
+            "sand".into(),
+            "empty-turn-token".into(),
+            probe_window,
+        );
+
+        upstream_tx
+            .send(Err(EMPTY_TURN_RETRY_NOTE.to_string()))
+            .await
+            .expect("deliver the hollow-turn result");
+        assert!(matches!(held.recv().await, Some(Err(error)) if error == EMPTY_TURN_RETRY_NOTE));
+
+        let waiter = tokio::spawn(async move {
+            policy_rate_limit_admit_fresh_open_with_window(
+                "grok-build",
+                "sand",
+                "empty-turn-token",
+                probe_window,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !waiter.is_finished(),
+            "an empty turn must retain the cold probe during its bounded window"
+        );
+
+        let next = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the next probe should be admitted after the window")
+            .expect("policy waiter task")
+            .expect("probe should not be blocked without a policy 429");
+        assert!(matches!(next, PolicyRateLimitAdmission::Probe(_)));
+
+        drop(next);
+        drop(held);
+        drop(upstream_tx);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn policy_probe_holds_metadata_only_eof_until_probe_window_expires() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let probe_window = Duration::from_millis(250);
+        let admission = policy_rate_limit_admit_fresh_open_with_window(
+            "grok-build",
+            "sand",
+            "metadata-eof-token",
+            probe_window,
+        )
+        .await
+        .expect("the first request owns the cold probe");
+        let lease = admission.into_probe().expect("cold admission is a probe");
+        let (upstream_tx, upstream_rx) = mpsc::channel(2);
+        let held = hold_policy_probe_until_decisive_event(
+            upstream_rx,
+            lease,
+            "grok-build".into(),
+            "sand".into(),
+            "metadata-eof-token".into(),
+            probe_window,
+        );
+        upstream_tx
+            .send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::Session {
+                session_id: "metadata-only".into(),
+            })))
+            .await
+            .expect("deliver metadata");
+        drop(upstream_tx);
+
+        let waiter = tokio::spawn(async move {
+            policy_rate_limit_admit_fresh_open_with_window(
+                "grok-build",
+                "sand",
+                "metadata-eof-token",
+                probe_window,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            !waiter.is_finished(),
+            "metadata-only EOF must retain the cold probe during its window"
+        );
+        let next = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the next probe should be admitted after the window")
+            .expect("policy waiter task")
+            .expect("probe should not be blocked without a policy 429");
+        assert!(matches!(next, PolicyRateLimitAdmission::Probe(_)));
+        drop(next);
+        drop(held);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
     #[test]
     fn policy_breaker_key_uses_the_resolved_model_id() {
         assert_eq!(
@@ -5845,6 +6486,203 @@ mod tests {
             policy_rate_limit_key("cursor", "cli", "token-a"),
             "Sand and CLI policy state must remain independent"
         );
+    }
+
+    fn failover_test_profile(id: &str, token: &str) -> CursorAccountProfile {
+        CursorAccountProfile {
+            id: id.into(),
+            label: Some(id.into()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: token.into(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: None,
+                email: Some(format!("{id}@example.test")),
+                source: "test".into(),
+            },
+            active: false,
+        }
+    }
+
+    #[test]
+    fn account_failover_candidates_skip_current_attempted_and_cooled_accounts() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let profiles = vec![
+            failover_test_profile("z-account", "token-z"),
+            failover_test_profile("a-account", "token-a"),
+            failover_test_profile("b-account", "token-b"),
+        ];
+        note_policy_rate_limit(
+            "gemini-3.6-flash-high",
+            "sand",
+            "token-b",
+            "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED",
+            Some("60"),
+        );
+        let mut attempted = BTreeSet::new();
+        attempted.insert(cursor_account_digest("token-z"));
+        let candidates = account_failover_candidates_from_profiles(
+            &profiles,
+            "token-current",
+            "gemini-3.6-flash-high",
+            "sand",
+            &attempted,
+        );
+        assert_eq!(candidates, vec!["token-a"]);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn account_failover_state_is_bounded_and_never_reuses_an_account() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let profiles = vec![
+            failover_test_profile("a-account", "token-a"),
+            failover_test_profile("b-account", "token-b"),
+            failover_test_profile("c-account", "token-c"),
+            failover_test_profile("d-account", "token-d"),
+        ];
+        let state = Arc::new(Mutex::new(AccountFailoverState::new("token-current")));
+        let first = take_account_failover_candidate_from_profiles(
+            &profiles,
+            "token-current",
+            "gemini-3.6-flash-high",
+            "sand",
+            &state,
+        );
+        let second = take_account_failover_candidate_from_profiles(
+            &profiles,
+            first.as_deref().unwrap_or("token-current"),
+            "gemini-3.6-flash-high",
+            "sand",
+            &state,
+        );
+        let third = take_account_failover_candidate_from_profiles(
+            &profiles,
+            second.as_deref().unwrap_or("token-current"),
+            "gemini-3.6-flash-high",
+            "sand",
+            &state,
+        );
+        assert_eq!(first.as_deref(), Some("token-a"));
+        assert_eq!(second.as_deref(), Some("token-b"));
+        assert!(third.is_none(), "the per-request swap budget is two");
+        let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(state.swaps, MAX_ACCOUNT_FAILOVER_SWAPS);
+        assert!(
+            state
+                .attempted_accounts
+                .contains(&cursor_account_digest("token-current"))
+        );
+        assert!(
+            state
+                .attempted_accounts
+                .contains(&cursor_account_digest("token-a"))
+        );
+        assert!(
+            state
+                .attempted_accounts
+                .contains(&cursor_account_digest("token-b"))
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn account_failover_returns_none_when_every_other_account_is_cooled() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let profiles = vec![
+            failover_test_profile("a-account", "token-a"),
+            failover_test_profile("b-account", "token-b"),
+        ];
+        for token in ["token-a", "token-b"] {
+            note_policy_rate_limit(
+                "gemini-3.6-flash-high",
+                "sand",
+                token,
+                "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED",
+                Some("60"),
+            );
+        }
+        let state = Arc::new(Mutex::new(AccountFailoverState::new("token-current")));
+        assert!(
+            take_account_failover_candidate_from_profiles(
+                &profiles,
+                "token-current",
+                "gemini-3.6-flash-high",
+                "sand",
+                &state,
+            )
+            .is_none()
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn concurrent_account_failover_claims_do_not_duplicate_candidates() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let profiles = Arc::new(vec![
+            failover_test_profile("a-account", "token-a"),
+            failover_test_profile("b-account", "token-b"),
+            failover_test_profile("c-account", "token-c"),
+        ]);
+        let state = Arc::new(Mutex::new(AccountFailoverState::new("token-current")));
+        let selected = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let profiles = Arc::clone(&profiles);
+                let state = Arc::clone(&state);
+                let selected = Arc::clone(&selected);
+                scope.spawn(move || {
+                    if let Some(token) = take_account_failover_candidate_from_profiles(
+                        &profiles,
+                        "token-current",
+                        "gemini-3.6-flash-high",
+                        "sand",
+                        &state,
+                    ) {
+                        selected
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .push(token);
+                    }
+                });
+            }
+        });
+        let selected = selected.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(selected.len(), MAX_ACCOUNT_FAILOVER_SWAPS as usize);
+        assert_ne!(selected[0], selected[1]);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn account_failover_policy_filter_excludes_subscription_wide_blocks() {
+        assert!(is_account_failover_policy_error(
+            "Connect error 429: ERROR_SAND_USER_RATE_LIMIT_EXCEEDED: usage meter is 100%"
+        ));
+        assert!(is_account_failover_policy_error(
+            "Connect error 429: ERROR_CURSOR_API_RATE_LIMIT_EXCEEDED: API usage meter is 100%"
+        ));
+        assert!(is_account_failover_policy_error(
+            "Connect error 429: ERROR_RATE_LIMITED_CHANGEABLE: Free plans can only use Auto"
+        ));
+        assert!(!is_account_failover_policy_error(
+            "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice"
+        ));
+        assert!(!is_account_failover_policy_error(
+            "Connect error 429: ERROR_RESOURCE_EXHAUSTED: High Load — switch models"
+        ));
     }
 
     #[test]
@@ -6973,6 +7811,7 @@ mod tests {
             image_recovery_images: Arc::new(Mutex::new(None)),
             kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
             compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            account_failover_state: Arc::new(Mutex::new(AccountFailoverState::default())),
             custom_system: None,
             session_id: session.clone(),
             agent_id: None,
@@ -7345,6 +8184,58 @@ mod tests {
             out_rx.try_recv().is_err(),
             "only the final failure may reach the client"
         );
+    }
+
+    #[tokio::test]
+    async fn late_policy_error_uses_the_account_failover_restart_before_surface() {
+        // A delayed policy frame arrives after the short live-open peek.  It
+        // is still pre-output, so the coordinator must give the request's
+        // restart closure one chance to move to another account instead of
+        // immediately exposing a terminal 429 to Claude Code.
+        let policy_error =
+            "Connect error 429: ERROR_PRO_USER_RATE_LIMIT_EXCEEDED: Rate limit exceeded";
+        let (first_tx, first_rx) = mpsc::channel(2);
+        first_tx.send(Err(policy_error.into())).await.unwrap();
+        drop(first_tx);
+
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let restart_count = Arc::clone(&restarts);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        forward_live_events_with_retries(
+            &out_tx,
+            first_rx,
+            "sess-late-policy-failover",
+            None,
+            move |_| {
+                restart_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (retry_tx, retry_rx) = mpsc::channel(2);
+                retry_tx
+                    .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+                        text: "recovered on alternate account".into(),
+                    })))
+                    .unwrap();
+                retry_tx
+                    .try_send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::End)))
+                    .unwrap();
+                drop(retry_tx);
+                std::future::ready(Ok::<_, CursorError>(retry_rx))
+            },
+            LiveLateRetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut recovered = false;
+        while let Ok(item) = out_rx.try_recv() {
+            match item {
+                Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                    recovered |= text == "recovered on alternate account";
+                }
+                Err(error) => panic!("late policy error leaked after failover: {error}"),
+                _ => {}
+            }
+        }
+        assert!(recovered, "alternate-account output must reach the client");
     }
 
     #[tokio::test]
@@ -8087,6 +8978,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("no useful progress"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn live_retry_coordinator_panic_is_explicit_retryable_event() {
+        let (tx, mut rx) = mpsc::channel::<LiveEventResult>(1);
+        let coordinator = async {
+            std::panic::resume_unwind(Box::new("test coordinator panic"));
+        };
+
+        run_live_retry_coordinator_with_panic_guard(tx, "panic-session".into(), None, coordinator)
+            .await;
+
+        let item = rx
+            .recv()
+            .await
+            .expect("coordinator panic must produce a terminal event");
+        let Err(error) = item else {
+            panic!("coordinator panic must be represented as an error: {item:?}");
+        };
+        assert!(live_error_is_empty_turn_retry(&error), "{error}");
+        assert!(live_error_is_same_request_retryable(&error), "{error}");
+        assert!(error.contains("coordinator panic"), "{error}");
+        assert!(
+            rx.recv().await.is_none(),
+            "the explicit error must be followed by normal channel closure"
+        );
     }
 
     #[tokio::test]

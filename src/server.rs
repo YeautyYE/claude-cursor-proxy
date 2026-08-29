@@ -742,11 +742,41 @@ async fn rewrite_classified_error_response(response: Response) -> Response {
 
 fn error_message_from_json_bytes(bytes: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
-    value
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    // Connect/Responses adapters do not agree on where the useful upstream
+    // diagnostic lives. The short `error.message` is often just
+    // "Cursor upstream HTTP 502", while the actionable 413/429/ambiguity
+    // marker is in `error.detail` or one of `error.details[]`. Combine the
+    // bounded text fields before status classification so detail-only errors
+    // cannot be rewritten as a misleading generic 502.
+    let mut parts = Vec::<String>::new();
+    let mut push = |value: Option<&Value>| {
+        let Some(text) = value
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        if !parts.iter().any(|existing| existing == text) {
+            parts.push(text.chars().take(16_384).collect());
+        }
+    };
+    push(value.pointer("/error/message"));
+    push(value.pointer("/error/detail"));
+    push(value.pointer("/message"));
+    push(value.pointer("/detail"));
+    if let Some(details) = value.pointer("/error/details").and_then(Value::as_array) {
+        for detail in details {
+            push(Some(detail));
+            for key in ["message", "detail", "debug", "description", "code"] {
+                push(detail.get(key));
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" ").chars().take(32_768).collect())
+    }
 }
 
 async fn dispatch_request(
@@ -2672,6 +2702,51 @@ mod tests {
                 .get(http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
             Some("5")
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_classifies_detail_only_cursor_error() {
+        let response = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"api_error","message":"Cursor upstream HTTP 502","detail":"Cursor error 429: ERROR_RESOURCE_EXHAUSTED: provider unavailable [resource_exhausted]"}}"#,
+            ))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(
+            wrapped.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "detail-only Cursor status must not remain a generic 502"
+        );
+        let bytes = axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("ERROR_RESOURCE_EXHAUSTED"),
+            "detail text must be preserved: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_classifies_detail_only_ambiguous_error_as_conflict() {
+        let response = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"api_error","message":"Cursor upstream HTTP 502","detail":"Cursor stream produced no useful progress; upstream transport remained live, so completion is ambiguous"}}"#,
+            ))
+            .unwrap();
+        let wrapped = wrap_anthropic_as_responses(response, "cursor-grok-4.5-high-fast").await;
+        assert_eq!(
+            wrapped.status(),
+            StatusCode::CONFLICT,
+            "detail-only acceptance ambiguity must become HTTP 409"
         );
     }
 

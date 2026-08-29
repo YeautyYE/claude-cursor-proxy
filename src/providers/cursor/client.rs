@@ -11,8 +11,12 @@ use crate::config;
 use crate::logging::create_logger;
 use crate::paths;
 use crate::providers::cursor::connect::{
-    ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP, encode_connect_frame,
-    parse_connect_error,
+    ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
+    cursor_connect_error_is_missing_conversation_data, cursor_connect_error_is_missing_image,
+    encode_connect_frame, parse_connect_error,
+};
+use crate::providers::cursor::live::{
+    ambiguous_http1_append_error, cursor_error_is_kv_blob_overflow,
 };
 use crate::providers::cursor::model::CursorModelResolution;
 use crate::providers::cursor::proto::{
@@ -465,7 +469,7 @@ impl CursorHttpClient {
             );
         let use_http1_sse = buffered_run_use_http1_sse(use_bidi, self.prefers_http1());
 
-        let (tx, body, url) = if use_http1_sse {
+        let (tx, h1_append, body, url, heartbeat_task) = if use_http1_sse {
             let run_url = format!(
                 "{}/agent.v1.AgentService/RunSSE",
                 self.base_url.trim_end_matches('/')
@@ -482,10 +486,17 @@ impl CursorHttpClient {
                     ("x-ghost-mode".into(), ghost_mode.to_string()),
                 ],
             );
-            append.append_message(&msg).await?;
+            // The append can be accepted by Cursor even when its HTTP response
+            // is lost.  Preserve the same ambiguity marker used by the live
+            // transport; otherwise the buffered caller treats a 502 as a safe
+            // same-request retry and may create a duplicate Run / 503 storm.
+            append
+                .append_message(&msg)
+                .await
+                .map_err(|error| ambiguous_http1_append_error(error, "initial Run"))?;
             let hb_append = append.clone();
             let heartbeat_secs = env_u64("CCP_CURSOR_HEARTBEAT_SECS", 5);
-            tokio::spawn(async move {
+            let heartbeat_task = tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
                 ticker.tick().await;
@@ -500,16 +511,25 @@ impl CursorHttpClient {
                     }
                 }
             });
-            (None, reqwest::Body::from(sse_body.to_vec()), run_url)
+            (
+                None,
+                Some(append),
+                reqwest::Body::from(sse_body.to_vec()),
+                run_url,
+                Some(heartbeat_task),
+            )
         } else if use_bidi {
-            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+            // Keep a little headroom for request_context/KV replies while the
+            // network body is briefly backpressured. Heartbeats are best
+            // effort and must never occupy all slots in this queue.
+            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
             tx.send(Ok(first_frame.clone()))
                 .await
                 .map_err(|_| CursorError::internal("cursor request channel closed"))?;
 
             let hb_tx = tx.clone();
             let heartbeat_secs = env_u64("CCP_CURSOR_HEARTBEAT_SECS", 5);
-            tokio::spawn(async move {
+            let heartbeat_task = tokio::spawn(async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
                 ticker.tick().await;
@@ -519,8 +539,14 @@ impl CursorHttpClient {
                         Ok(f) => f,
                         Err(_) => break,
                     };
-                    if hb_tx.send(Ok(frame)).await.is_err() {
-                        break;
+                    match hb_tx.try_send(Ok(frame)) {
+                        Ok(()) => {}
+                        // A full queue means the body pump is already
+                        // carrying useful frames. Drop this tick and let the
+                        // next interval try again; awaiting here can block
+                        // the producer forever and starve a KV reply.
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
             });
@@ -528,10 +554,23 @@ impl CursorHttpClient {
             let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
             });
-            (Some(tx), reqwest::Body::wrap_stream(body_stream), url)
+            (
+                Some(tx),
+                None,
+                reqwest::Body::wrap_stream(body_stream),
+                url,
+                Some(heartbeat_task),
+            )
         } else {
-            (None, reqwest::Body::from(first_frame.to_vec()), url)
+            (
+                None,
+                None,
+                reqwest::Body::from(first_frame.to_vec()),
+                url,
+                None,
+            )
         };
+        let mut heartbeat_task = AbortOnDrop::new(heartbeat_task);
 
         // Official CLI Agent interceptor (index.js):
         //   authorization, x-ghost-mode, x-cursor-client-version, x-cursor-client-type,
@@ -608,20 +647,31 @@ impl CursorHttpClient {
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                heartbeat_task.abort();
                 drop(tx);
-                return Err(CursorError::from_reqwest(e, self.timeout_secs));
+                return Err(buffered_open_reqwest_error(e, self.timeout_secs));
             }
             Err(_) => {
+                heartbeat_task.abort();
                 drop(tx);
                 return Err(CursorError::new(
                     504,
-                    format!("Cursor Agent open timed out after {}s", self.timeout_secs),
+                    format!(
+                        "Cursor Agent open timed out after {}s; acceptance is ambiguous",
+                        self.timeout_secs
+                    ),
                     None,
                 ));
             }
         };
 
         let status = resp.status().as_u16();
+        // Error responses cannot make progress on the accepted Run. Stop the
+        // heartbeat producer before draining the diagnostic body so it cannot
+        // keep issuing BidiAppend calls after the RunSSE/H2 open failed.
+        if status >= 400 {
+            heartbeat_task.abort();
+        }
         let headers = resp.headers().clone();
         let retry_after = retry_after_header(&headers);
         let error_detail = resp
@@ -807,12 +857,41 @@ impl CursorHttpClient {
                                 }
 
                                 // Auto-answer every request_context exec (may repeat).
-                                if use_bidi
-                                    && let Some(tx_ref) = tx.as_ref()
-                                    && class.wants_request_context
-                                    && let Ok(Some(reply)) = build_request_context_reply(&frame)
-                                {
-                                    let _ = tx_ref.send(Ok(reply)).await;
+                                if class.wants_request_context {
+                                    let reply = match build_request_context_reply(&frame) {
+                                        Ok(Some(reply)) => reply,
+                                        Ok(None) => continue,
+                                        Err(error) => {
+                                            heartbeat_task.abort();
+                                            drop(tx);
+                                            return Err(error);
+                                        }
+                                    };
+                                    let send_result = if let Some(tx_ref) = tx.as_ref() {
+                                        tx_ref.send(Ok(reply)).await.map_err(|_| {
+                                            CursorError::internal(
+                                                "Cursor BiDi request stream closed while replying to request_context",
+                                            )
+                                        })
+                                    } else if let Some(append) = h1_append.as_ref() {
+                                        append.append_connect_or_raw(&reply).await.map_err(
+                                            |error| {
+                                                ambiguous_http1_append_error(
+                                                    error,
+                                                    "request_context reply",
+                                                )
+                                            },
+                                        )
+                                    } else {
+                                        Err(CursorError::internal(
+                                            "Cursor request_context requires a live client channel",
+                                        ))
+                                    };
+                                    if let Err(error) = send_result {
+                                        heartbeat_task.abort();
+                                        drop(tx);
+                                        return Err(error);
+                                    }
                                     request_context_replies += 1;
                                     last_progress = Instant::now();
                                     cursor_debug_log(
@@ -885,6 +964,7 @@ impl CursorHttpClient {
 
         // Close client BiDi stream / stop heartbeats ASAP so the server can free
         // the run and we don't keep sending client_heartbeat into a closed call.
+        heartbeat_task.abort();
         drop(tx);
 
         // Always emit debug when requested — including error paths. TUI mode
@@ -933,12 +1013,10 @@ impl CursorHttpClient {
                         Some(msg),
                         frame_count,
                     );
-                    return Err(CursorError::new(
-                        status,
-                        format!("Cursor upstream HTTP {status}"),
-                        detail,
-                    )
-                    .with_retry_after(retry_after));
+                    let error =
+                        CursorError::new(status, format!("Cursor upstream HTTP {status}"), detail)
+                            .with_retry_after(retry_after);
+                    return Err(buffered_status_error(error, use_http1_sse));
                 }
                 let detail = if body_bytes.is_empty() {
                     run_agent_empty_body_detail(msg, frame_count)
@@ -954,6 +1032,7 @@ impl CursorHttpClient {
                     useful,
                     body_bytes.is_empty(),
                 ) {
+                    heartbeat_task.abort();
                     let mut fields = serde_json::Map::new();
                     fields.insert("finish".into(), json!(finish_reason));
                     fields.insert("frames".into(), json!(frame_count));
@@ -984,10 +1063,9 @@ impl CursorHttpClient {
                 None,
                 frame_count,
             );
-            return Err(
-                CursorError::new(status, format!("Cursor upstream HTTP {status}"), detail)
-                    .with_retry_after(retry_after),
-            );
+            let error = CursorError::new(status, format!("Cursor upstream HTTP {status}"), detail)
+                .with_retry_after(retry_after);
+            return Err(buffered_status_error(error, use_http1_sse));
         }
 
         if !buffered_finish_accepts_incomplete(finish_reason, saw_end, saw_turn_ended, saw_text) {
@@ -1059,6 +1137,49 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+/// Tokio detaches a task when its `JoinHandle` is dropped.  Buffered runs can
+/// be cancelled by a disconnected downstream before reaching one of the
+/// explicit return branches below, so heartbeat producers need cancellation
+/// tied to the request future itself rather than a bare handle.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: Option<tokio::task::JoinHandle<()>>) -> Self {
+        Self(handle)
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+/// A request-body error after the initial Run frame was handed to reqwest has
+/// an unknown acceptance boundary.  Only a definite connection-establishment
+/// failure is safe to replay; timeout/reset errors must fail closed so the
+/// caller does not create a second Cursor Run while the first is still alive.
+fn buffered_open_reqwest_error(error: reqwest::Error, timeout_secs: u64) -> CursorError {
+    let pre_connect = error.is_connect();
+    let mut converted = CursorError::from_reqwest(error, timeout_secs);
+    if !pre_connect
+        && converted.status >= 500
+        && !crate::retry::is_policy_rate_limit(&converted.client_message())
+    {
+        converted.message = format!(
+            "Cursor Agent open failed; acceptance is ambiguous: {}",
+            converted.message
+        );
+    }
+    converted
 }
 
 fn buffered_stream_complete_enough_to_accept(saw_end: bool, saw_turn_ended: bool) -> bool {
@@ -1684,6 +1805,27 @@ fn buffered_http_error_detail(
     }
 }
 
+/// In the buffered HTTP/1 transport the initial Run is submitted through
+/// `BidiAppend` before `RunSSE` is opened.  A 5xx response from that follow-up
+/// subscription therefore does not prove that the Run was rejected: replaying
+/// it can execute the same turn twice and provoke an active-session 503 wave.
+/// Preserve deterministic recovery diagnostics (KV/conversation/image/policy)
+/// and only annotate otherwise ambiguous server failures.
+fn buffered_status_error(error: CursorError, http1_sse: bool) -> CursorError {
+    if !http1_sse || error.status < 500 {
+        return error;
+    }
+    let message = error.client_message();
+    if cursor_error_is_kv_blob_overflow(&error)
+        || cursor_connect_error_is_missing_conversation_data(&message)
+        || cursor_connect_error_is_missing_image(&message)
+        || crate::retry::is_policy_rate_limit(&message)
+    {
+        return error;
+    }
+    ambiguous_http1_append_error(error, "RunSSE open")
+}
+
 fn parse_error_body(body_bytes: &[u8], _headers: &reqwest::header::HeaderMap) -> Option<String> {
     if body_bytes.len() < 5 {
         return None;
@@ -2030,6 +2172,74 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn buffered_open_timeout_is_fail_closed_as_ambiguous() {
+        let error = CursorError::new(
+            504,
+            "Cursor Agent open timed out after 30s; acceptance is ambiguous",
+            None,
+        );
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(error.status, &error.client_message()),
+            409,
+            "a response-less open must not be replayed as a fresh Run"
+        );
+        assert!(!crate::retry::should_retry_upstream(
+            error.status,
+            &error.client_message()
+        ));
+    }
+
+    #[test]
+    fn buffered_http1_initial_append_uses_ambiguity_marker() {
+        let error = ambiguous_http1_append_error(
+            CursorError::new(502, "BidiAppend failed with HTTP 502", None),
+            "initial Run",
+        );
+        assert!(error.message.contains("acceptance is ambiguous"));
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(error.status, &error.client_message()),
+            409
+        );
+    }
+
+    #[test]
+    fn buffered_http1_runsse_5xx_is_ambiguous_after_initial_append() {
+        let error = buffered_status_error(
+            CursorError::new(502, "Cursor upstream HTTP 502", None),
+            true,
+        );
+        assert!(error.message.contains("acceptance is ambiguous"));
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(error.status, &error.client_message()),
+            409
+        );
+    }
+
+    #[test]
+    fn buffered_http1_runsse_recovery_errors_keep_their_status() {
+        let kv = buffered_status_error(
+            CursorError::new(
+                413,
+                "Cursor upstream HTTP 413",
+                Some("Cursor KV blob store limit exceeded".into()),
+            ),
+            true,
+        );
+        assert!(!kv.message.contains("acceptance is ambiguous"));
+        assert_eq!(kv.status, 413);
+
+        let missing = buffered_status_error(
+            CursorError::new(
+                502,
+                "Cursor upstream HTTP 502",
+                Some("Conversation data missing".into()),
+            ),
+            true,
+        );
+        assert!(!missing.message.contains("acceptance is ambiguous"));
     }
 
     #[test]

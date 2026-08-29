@@ -2253,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_tool_names_filters_internal_hooks_and_keeps_compat_tools() {
+    fn advertised_tool_names_filters_internal_and_deprecated_tools() {
         let body: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2268,10 +2268,10 @@ mod tests {
         let names = advertised_tool_names(&body).expect("Read and public tool remain");
         assert!(names.contains("Read"));
         assert!(names.contains("mcp__plugin_lobster-channel_lobster-channel__lobster_reply"));
-        // Claude Code 2.1.193 still advertises TaskOutput. It is deprecated in
-        // newer clients, but keeping it in the allow-list preserves older
-        // transcripts and lets a pending result complete normally.
-        assert!(names.contains("TaskOutput"));
+        assert!(
+            !names.contains("TaskOutput"),
+            "deprecated TaskOutput must not be exposed to the model"
+        );
         assert!(
             !names.contains("mcp__plugin_lobster-channel_lobster-channel__notify_messa00a7caa")
         );
