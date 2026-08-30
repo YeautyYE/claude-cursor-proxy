@@ -28413,10 +28413,17 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(32);
         let completed = Arc::new(AtomicBool::new(false));
         let terminal_error = Arc::new(Mutex::new(None));
+        // `conversation::reset_for_test` intentionally serializes global
+        // store replacement. Hold the same guard across creation and pin so
+        // a parallel test cannot evict this fresh binding in between.
+        let _store_guard = super::super::conversation::STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let conversation = super::super::conversation::get_or_create(session);
         let conversation_lease =
             super::super::conversation::pin(session, &conversation.conversation_id)
                 .expect("pin test conversation");
+        drop(_store_guard);
         let mut reconnect = test_reconnect_context();
         reconnect.session_id = session.to_string();
         reconnect.conversation_id = Some(conversation.conversation_id);
