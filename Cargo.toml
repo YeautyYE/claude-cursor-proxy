@@ -1,6 +1,6 @@
 [package]
 name = "claude-cursor-proxy"
-version = "0.1.89"
+version = "0.1.90"
 description = "Local proxy so Claude Code and grok-build can use Cursor (Fable 5) and other providers"
 edition = "2024"
 rust-version = "1.85"

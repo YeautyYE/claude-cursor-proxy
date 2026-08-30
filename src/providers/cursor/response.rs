@@ -42,6 +42,248 @@ pub enum CursorStreamEvent {
     End,
 }
 
+/// Text markers emitted by a few Cursor model/tokenizer combinations when an
+/// end-of-sequence token is decoded as ordinary text.  They are transport
+/// sentinels, not user-visible model output. Keep this list deliberately
+/// narrow: stripping arbitrary XML-ish text would corrupt valid answers.
+const CURSOR_EOS_SENTINELS: &[&str] = &[
+    "◁eos▷",
+    "<|eos|>",
+    "<|endoftext|>",
+    "<|end_of_text|>",
+    "<|end_of_sequence|>",
+    "<|eot_id|>",
+    "<|end|>",
+    "</s>",
+];
+
+/// Result of normalizing one Cursor text delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormalizedCursorText<'a> {
+    /// The visible portion of the delta. `None` means the delta consisted
+    /// entirely of EOS marker(s) and whitespace.
+    pub text: Option<&'a str>,
+    /// Whether one or more EOS marker(s) were consumed.
+    pub eos: bool,
+}
+
+/// Remove a decoded EOS sentinel without touching ordinary answer text.
+///
+/// Cursor may send the marker alone, repeatedly (`◁eos▷ ◁eos▷`), or appended
+/// to the final answer. We only consume complete markers at the end of a
+/// delta (or when the complete delta is marker-only); a marker in the middle
+/// of prose remains visible so a model discussing token syntax is preserved.
+pub(crate) fn normalize_cursor_text_delta(raw: &str) -> NormalizedCursorText<'_> {
+    if raw.is_empty() {
+        return NormalizedCursorText {
+            text: None,
+            eos: false,
+        };
+    }
+
+    // Work from the right edge so repeated markers with arbitrary whitespace
+    // between them are consumed in one pass while preserving the caller's
+    // original slice and allocation-free ordinary deltas.
+    let mut content = raw;
+    let mut eos = false;
+    loop {
+        let trimmed = content.trim_end();
+        let marker = CURSOR_EOS_SENTINELS
+            .iter()
+            .copied()
+            .find(|candidate| trimmed.ends_with(candidate));
+        let Some(marker) = marker else {
+            break;
+        };
+
+        let marker_start = trimmed.len().saturating_sub(marker.len());
+        content = &trimmed[..marker_start];
+        eos = true;
+    }
+
+    if !eos {
+        return NormalizedCursorText {
+            text: Some(raw),
+            eos: false,
+        };
+    }
+
+    // A marker-only delta (including repeated markers and whitespace) should
+    // not become a blank Anthropic text chunk.
+    let content = content.trim_end();
+    let text = (!content.trim().is_empty()).then_some(content);
+    NormalizedCursorText { text, eos: true }
+}
+
+/// Stateful EOS filter for a stream of text deltas.
+///
+/// Protobuf message boundaries do not necessarily line up with tokenizer
+/// markers. Keep only a possible marker prefix between calls; ordinary text is
+/// emitted immediately, while a complete marker at the end of the stream is
+/// consumed and marks the stream finished. This prevents a split `◁` +
+/// `eos▷` from leaking into the client or the XML tool parser.
+#[derive(Debug, Default)]
+pub(crate) struct CursorEosFilter {
+    pending: String,
+    finished: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FilteredCursorText {
+    pub text: Option<String>,
+    pub eos: bool,
+}
+
+impl CursorEosFilter {
+    pub(crate) fn push(&mut self, raw: &str) -> FilteredCursorText {
+        if self.finished || raw.is_empty() {
+            return FilteredCursorText::default();
+        }
+        self.pending.push_str(raw);
+        self.drain(false)
+    }
+
+    /// Flush a non-terminal stream. An incomplete marker is ordinary text when
+    /// the upstream closes without ever completing it.
+    pub(crate) fn finish(&mut self) -> FilteredCursorText {
+        if self.finished {
+            return FilteredCursorText::default();
+        }
+        self.drain(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn finished(&self) -> bool {
+        self.finished
+    }
+
+    fn drain(&mut self, flush: bool) -> FilteredCursorText {
+        let mut visible = String::new();
+        if let Some((start, _end)) = terminal_marker_span(&self.pending) {
+            visible.push_str(&self.pending[..start]);
+            self.pending.clear();
+            self.finished = true;
+            let text = visible.trim_end();
+            return FilteredCursorText {
+                text: (!text.trim().is_empty()).then(|| text.to_string()),
+                eos: true,
+            };
+        }
+
+        if flush {
+            visible.push_str(&self.pending);
+            self.pending.clear();
+        } else {
+            // Keep trailing whitespace together with a possible marker prefix.
+            // A protobuf delta often ends in `"answer "`, followed by a
+            // separate delta containing `"◁eos▷"`; retaining that whitespace
+            // lets us remove the complete control suffix without leaking a
+            // blank before the terminal event. If the next delta is ordinary
+            // text, the retained bytes are emitted unchanged.
+            let trimmed_len = self.pending.trim_end().len();
+            let marker_prefix = longest_marker_prefix_suffix(&self.pending[..trimmed_len]);
+            let mut keep_start = if marker_prefix > 0 {
+                trimmed_len.saturating_sub(marker_prefix)
+            } else {
+                trailing_whitespace_start(&self.pending)
+            };
+            if marker_prefix > 0 {
+                while keep_start > 0 {
+                    let Some((at, ch)) = self.pending[..keep_start].char_indices().next_back()
+                    else {
+                        break;
+                    };
+                    if !ch.is_whitespace() {
+                        break;
+                    }
+                    keep_start = at;
+                }
+            }
+            let emit_len = keep_start;
+            if emit_len > 0 {
+                visible.push_str(&self.pending[..emit_len]);
+                self.pending.drain(..emit_len);
+            }
+        }
+
+        FilteredCursorText {
+            text: (!visible.is_empty()).then_some(visible),
+            eos: false,
+        }
+    }
+}
+
+/// Return a complete marker that terminates `value`, ignoring whitespace and
+/// repeated/incomplete control markers after it. A marker in the middle of
+/// ordinary prose is deliberately not considered terminal.
+fn terminal_marker_span(value: &str) -> Option<(usize, usize)> {
+    for marker in CURSOR_EOS_SENTINELS {
+        let mut search_from = 0;
+        while let Some(relative) = value[search_from..].find(marker) {
+            let start = search_from + relative;
+            let end = start + marker.len();
+            if control_tail_only(&value[end..]) {
+                return Some((start, end));
+            }
+            search_from = end;
+        }
+    }
+    None
+}
+
+fn control_tail_only(mut tail: &str) -> bool {
+    loop {
+        tail = tail.trim_start();
+        if tail.is_empty() {
+            return true;
+        }
+        if let Some(marker) = CURSOR_EOS_SENTINELS
+            .iter()
+            .copied()
+            .find(|marker| tail.starts_with(marker))
+        {
+            tail = &tail[marker.len()..];
+            continue;
+        }
+        // A duplicate marker may itself be split across deltas. Holding this
+        // suffix until the next call is preferable to leaking a control glyph.
+        return CURSOR_EOS_SENTINELS
+            .iter()
+            .any(|marker| marker.starts_with(tail));
+    }
+}
+
+fn longest_marker_prefix_suffix(value: &str) -> usize {
+    CURSOR_EOS_SENTINELS
+        .iter()
+        .map(|marker| trailing_marker_prefix_len(value, marker))
+        .max()
+        .unwrap_or(0)
+}
+
+fn trailing_marker_prefix_len(value: &str, marker: &str) -> usize {
+    marker
+        .char_indices()
+        .map(|(at, ch)| at + ch.len_utf8())
+        .filter(|&len| len < marker.len() && value.ends_with(&marker[..len]))
+        .max()
+        .unwrap_or(0)
+}
+
+fn trailing_whitespace_start(value: &str) -> usize {
+    let mut start = value.len();
+    while start > 0 {
+        let Some((at, ch)) = value[..start].char_indices().next_back() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        start = at;
+    }
+    start
+}
+
 #[derive(Debug, Clone)]
 pub enum CursorDecodeError {
     ConnectEnd(ConnectEndError),
@@ -95,16 +337,24 @@ fn decode_upstream_response_with_allowed_inner(
     let frames =
         decode_upstream_frames(body).map_err(|e| CursorDecodeError::Decode(e.to_string()))?;
     let mut events = Vec::new();
+    let mut eos_filters = (0..=super::proto::MAX_TASK_DELTA_NEST)
+        .map(|_| CursorEosFilter::default())
+        .collect::<Vec<_>>();
+    // A buffered response can carry both an InteractionUpdate terminal and a
+    // Connect FLAG_END frame.  Keep one response-scoped bit so synthetic EOS
+    // completion and transport completion cannot append duplicate End events.
+    let mut terminal_emitted = false;
 
     for frame in &frames {
         if frame.flags & FLAG_END != 0 {
+            flush_eos_filters(&mut eos_filters, &mut events, &mut terminal_emitted);
             // Check for Connect error in end frame
             if !frame.payload.is_empty()
                 && let Some(err) = parse_connect_error(&frame.payload)
             {
                 return Err(CursorDecodeError::ConnectEnd(err));
             }
-            events.push(CursorStreamEvent::End);
+            push_end_once(&mut events, &mut terminal_emitted);
             continue;
         }
 
@@ -113,8 +363,18 @@ fn decode_upstream_response_with_allowed_inner(
             Err(_) => continue,
         };
 
-        events_from_message_with_allowed(&msg, &mut events, allowed_tool_names);
+        events_from_message_with_allowed(
+            &msg,
+            &mut events,
+            allowed_tool_names,
+            &mut eos_filters,
+            &mut terminal_emitted,
+        );
     }
+
+    // Buffered bodies may omit a Connect END frame. Flush any ordinary text
+    // held while checking for a split marker before returning the events.
+    flush_eos_filters(&mut eos_filters, &mut events, &mut terminal_emitted);
 
     Ok(events)
 }
@@ -442,6 +702,8 @@ fn events_from_message_with_allowed(
     msg: &AgentServerMessage,
     events: &mut Vec<CursorStreamEvent>,
     allowed_tool_names: Option<&BTreeSet<String>>,
+    eos_filters: &mut [CursorEosFilter],
+    terminal_emitted: &mut bool,
 ) {
     if let Some(ref exec) = msg.exec_server_message {
         if let Some(ref sid) = exec.exec_id
@@ -496,7 +758,7 @@ fn events_from_message_with_allowed(
     }
 
     if let Some(ref update) = msg.interaction_update {
-        push_interaction_stream_events(update, events, 0);
+        push_interaction_stream_events(update, events, 0, eos_filters, terminal_emitted);
     }
 }
 
@@ -504,7 +766,10 @@ fn push_interaction_stream_events(
     update: &super::proto::InteractionUpdate,
     events: &mut Vec<CursorStreamEvent>,
     nest_depth: u8,
+    eos_filters: &mut [CursorEosFilter],
+    terminal_emitted: &mut bool,
 ) {
+    let mut eos_seen = false;
     if let Some(ref td) = update.thinking_delta
         && !td.text.is_empty()
     {
@@ -513,12 +778,17 @@ fn push_interaction_stream_events(
         });
     }
 
-    if let Some(ref td) = update.text_delta
-        && !td.text.is_empty()
-    {
-        events.push(CursorStreamEvent::TextDelta {
-            text: td.text.clone(),
-        });
+    if let Some(ref td) = update.text_delta {
+        let filtered = eos_filters
+            .get_mut(nest_depth as usize)
+            .map(|filter| filter.push(&td.text))
+            .unwrap_or_default();
+        if let Some(text) = filtered.text
+            && !text.is_empty()
+        {
+            events.push(CursorStreamEvent::TextDelta { text });
+        }
+        eos_seen = filtered.eos;
     }
 
     // tool_call_started/completed belong to Cursor's UI transcript. Local
@@ -533,12 +803,40 @@ fn push_interaction_stream_events(
             .as_ref()
             .and_then(super::proto::ToolCallDeltaUpdate::nested_task_update)
     {
-        push_interaction_stream_events(nested, events, nest_depth + 1);
+        push_interaction_stream_events(
+            nested,
+            events,
+            nest_depth + 1,
+            eos_filters,
+            terminal_emitted,
+        );
     }
 
     if nest_depth > 0 {
         // Nested turn_ended must not end the parent Task stream.
+        if update.turn_ended.is_some() {
+            flush_eos_filter_at_depth(eos_filters, events, nest_depth);
+        }
+        // A nested EOS/turn boundary closes only this child. Reset its filter
+        // so a later sibling Task can emit text instead of being suppressed
+        // by the previous child's finished state.
+        if update.turn_ended.is_some() || eos_seen {
+            if let Some(filter) = eos_filters.get_mut(nest_depth as usize) {
+                *filter = CursorEosFilter::default();
+            }
+        }
         return;
+    }
+
+    // `turn_ended` is terminal even when the final text delta arrived in a
+    // previous protobuf frame. Flush whitespace/partial-marker state before
+    // emitting Usage and End so no visible text is ordered after termination.
+    if update.turn_ended.is_some() || eos_seen {
+        // Flush nested state first as nested Task text belongs to this parent
+        // turn and must never be appended after its terminal event.
+        flush_nested_eos_filters(eos_filters, events);
+        let flushed = flush_eos_filter_at_depth(eos_filters, events, nest_depth);
+        eos_seen |= flushed;
     }
 
     // Token delta is an incremental output/thinking signal — never a full
@@ -563,8 +861,69 @@ fn push_interaction_stream_events(
             cache_read_tokens: te.cache_read_tokens.unwrap_or(0),
             cache_write_tokens: te.cache_write_tokens.unwrap_or(0),
         });
-        events.push(CursorStreamEvent::End);
+        push_end_once(events, terminal_emitted);
+    } else if eos_seen && nest_depth == 0 {
+        // A decoded EOS is authoritative for a buffered response when Cursor
+        // omitted its usual turn_ended update. The live path applies the same
+        // rule after it has flushed pending XML/native tools.
+        push_end_once(events, terminal_emitted);
     }
+}
+
+fn flush_eos_filter_at_depth(
+    eos_filters: &mut [CursorEosFilter],
+    events: &mut Vec<CursorStreamEvent>,
+    nest_depth: u8,
+) -> bool {
+    let Some(filter) = eos_filters.get_mut(nest_depth as usize) else {
+        return false;
+    };
+    let filtered = filter.finish();
+    if let Some(text) = filtered.text
+        && !text.is_empty()
+    {
+        events.push(CursorStreamEvent::TextDelta { text });
+    }
+    filtered.eos
+}
+
+fn flush_nested_eos_filters(
+    eos_filters: &mut [CursorEosFilter],
+    events: &mut Vec<CursorStreamEvent>,
+) {
+    for depth in 1..eos_filters.len() {
+        flush_eos_filter_at_depth(eos_filters, events, depth as u8);
+    }
+}
+
+fn flush_eos_filters(
+    eos_filters: &mut [CursorEosFilter],
+    events: &mut Vec<CursorStreamEvent>,
+    terminal_emitted: &mut bool,
+) {
+    flush_nested_eos_filters(eos_filters, events);
+    if flush_eos_filter_at_depth(eos_filters, events, 0) {
+        push_end_once(events, terminal_emitted);
+    }
+}
+
+fn push_end_once(events: &mut Vec<CursorStreamEvent>, terminal_emitted: &mut bool) {
+    if *terminal_emitted {
+        // A synthetic EOS can precede a late `turn_ended` usage snapshot. Keep
+        // the terminal event at the end so consumers that stop at End still
+        // observe the authoritative Usage event first.
+        if let Some(index) = events
+            .iter()
+            .position(|event| matches!(event, CursorStreamEvent::End))
+            && index + 1 < events.len()
+        {
+            let end = events.remove(index);
+            events.push(end);
+        }
+        return;
+    }
+    events.push(CursorStreamEvent::End);
+    *terminal_emitted = true;
 }
 
 /// Input-token estimate for `message_start` seeding.
@@ -611,12 +970,156 @@ mod tests {
         body.extend_from_slice(&test_frames::end_frame());
 
         let events = decode_upstream_response(&body).unwrap();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 4);
         assert!(matches!(events[0], CursorStreamEvent::TextDelta { .. }));
         assert!(matches!(events[1], CursorStreamEvent::TextDelta { .. }));
         assert!(matches!(events[2], CursorStreamEvent::Usage { .. }));
         assert!(matches!(events[3], CursorStreamEvent::End));
-        assert!(matches!(events[4], CursorStreamEvent::End));
+    }
+
+    #[test]
+    fn strips_cursor_eos_sentinel_from_text_deltas() {
+        let trailing = normalize_cursor_text_delta("answer ◁eos▷ ◁eos▷");
+        assert_eq!(trailing.text, Some("answer"));
+        assert!(trailing.eos);
+
+        let marker_only = normalize_cursor_text_delta(" ◁eos▷  ◁eos▷ ");
+        assert_eq!(marker_only.text, None);
+        assert!(marker_only.eos);
+
+        let ordinary = normalize_cursor_text_delta("the token ◁eos▷ is discussed here");
+        assert_eq!(ordinary.text, Some("the token ◁eos▷ is discussed here"));
+        assert!(!ordinary.eos);
+    }
+
+    #[test]
+    fn stateful_eos_filter_handles_split_marker_without_leaking_prefix() {
+        let mut filter = CursorEosFilter::default();
+        let first = filter.push("answer ◁");
+        assert_eq!(first.text.as_deref(), Some("answer"));
+        assert!(!first.eos);
+
+        let second = filter.push("eos▷");
+        assert_eq!(second.text, None);
+        assert!(second.eos);
+        assert!(filter.finished());
+
+        // Once a terminal marker has been consumed, later upstream text is
+        // stale and must not re-open the response.
+        assert_eq!(filter.push("stale text"), FilteredCursorText::default());
+    }
+
+    #[test]
+    fn stateful_eos_filter_preserves_prose_and_flushes_incomplete_marker() {
+        let mut prose = CursorEosFilter::default();
+        let visible = prose.push("the token ◁eos▷ is discussed here");
+        assert_eq!(
+            visible.text.as_deref(),
+            Some("the token ◁eos▷ is discussed here")
+        );
+        assert!(!visible.eos);
+
+        let mut incomplete = CursorEosFilter::default();
+        assert_eq!(
+            incomplete.push("literal ◁eo").text.as_deref(),
+            Some("literal")
+        );
+        let flushed = incomplete.finish();
+        assert_eq!(flushed.text.as_deref(), Some(" ◁eo"));
+        assert!(!flushed.eos);
+    }
+
+    #[test]
+    fn stateful_eos_filter_ignores_repeated_markers_and_marker_only_deltas() {
+        let mut filter = CursorEosFilter::default();
+        let first = filter.push(" ◁eos▷  ");
+        assert_eq!(first.text, None);
+        assert!(first.eos);
+        assert_eq!(filter.push("◁eos▷"), FilteredCursorText::default());
+
+        let mut split = CursorEosFilter::default();
+        assert_eq!(split.push("◁").text, None);
+        let done = split.push("eos▷ ◁eos▷");
+        assert_eq!(done.text, None);
+        assert!(done.eos);
+    }
+
+    #[test]
+    fn buffered_decode_filters_eos_split_across_protobuf_frames() {
+        let mut body = test_frames::text_frame("answer ◁");
+        body.extend_from_slice(&test_frames::text_frame("eos▷"));
+
+        let events = decode_upstream_response(&body).unwrap();
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, ["answer"]);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CursorStreamEvent::End))
+        );
+        assert!(!text.iter().any(|value| value.contains("eos")));
+    }
+
+    #[test]
+    fn eos_marker_completes_buffered_response_without_turn_ended() {
+        let mut body = test_frames::text_frame("answer ◁eos▷ ◁eos▷");
+        // No explicit usage/turn_ended frame: this is the shape observed on
+        // the Grok/Fable route when the tokenizer sentinel leaks into text.
+        let events = decode_upstream_response(&body).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["answer"]
+        );
+        assert!(matches!(events.last(), Some(CursorStreamEvent::End)));
+
+        body.extend_from_slice(&test_frames::end_frame());
+        let upstream = CursorUpstreamResponse {
+            status: 200,
+            body,
+            error_detail: None,
+        };
+        let json = decode_cursor_upstream(&upstream, "msg_eos", "claude-fable-5").unwrap();
+        assert_eq!(json["content"][0]["text"], "answer");
+        assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn buffered_eos_emits_one_end_across_turn_and_connect_boundaries() {
+        let mut body = test_frames::text_frame("answer ◁eos▷");
+        // Some routes report the tokenizer EOS in text and still send the
+        // usual usage/turn_ended update before the Connect FLAG_END frame.
+        body.extend_from_slice(&test_frames::usage_frame(10, 2));
+        body.extend_from_slice(&test_frames::end_frame());
+
+        let events = decode_upstream_response(&body).unwrap();
+        let end_count = events
+            .iter()
+            .filter(|event| matches!(event, CursorStreamEvent::End))
+            .count();
+        assert_eq!(end_count, 1);
+        assert!(matches!(events.last(), Some(CursorStreamEvent::End)));
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["answer"]
+        );
     }
 
     #[test]
@@ -1108,6 +1611,51 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CursorStreamEvent::End | CursorStreamEvent::Usage { .. })),
             "nested turn_ended must not end the parent: {events:?}"
+        );
+    }
+
+    #[test]
+    fn nested_eos_does_not_suppress_a_later_sibling_task() {
+        fn nested_frame(text: &str) -> Vec<u8> {
+            let msg = AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    tool_call_delta: Some(ToolCallDeltaUpdate {
+                        call_id: "task-parent".into(),
+                        model_call_id: "model-parent".into(),
+                        tool_call_delta: Some(ToolCallDelta {
+                            task_tool_call_delta: Some(TaskToolCallDelta {
+                                interaction_update: Some(Box::new(InteractionUpdate {
+                                    text_delta: Some(TextDelta { text: text.into() }),
+                                    ..Default::default()
+                                })),
+                            }),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut payload = Vec::new();
+            msg.encode(&mut payload).unwrap();
+            encode_connect_frame(&payload, 0).to_vec()
+        }
+
+        let mut body = nested_frame("child one ◁eos▷");
+        body.extend_from_slice(&nested_frame("child two"));
+        let events = decode_upstream_response(&body).unwrap();
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, ["child one", "child two"]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CursorStreamEvent::End))
         );
     }
 

@@ -812,47 +812,54 @@ impl CursorHttpClient {
                             frame_count += frames.len() as u32;
                             for frame in frames {
                                 let class = classify_frame(&frame);
+                                // A single InteractionUpdate can carry several
+                                // signals at once (for example reasoning text
+                                // plus turn_ended). Retain the wire frame once;
+                                // appending it from each classification branch
+                                // duplicates deltas when the buffered decoder
+                                // later folds the retained body.
+                                let retain_frame = class.is_end
+                                    || class.has_text
+                                    || class.has_thinking
+                                    || class.thinking_completed
+                                    || class.turn_ended
+                                    || class.has_tool_call
+                                    || class.wants_request_context;
 
                                 if class.is_end {
                                     saw_end = true;
                                     last_progress = Instant::now();
-                                    append_connect_frame(&mut body_bytes, &frame);
                                 }
                                 if class.has_text {
                                     saw_text = true;
                                     useful = true;
                                     last_progress = Instant::now();
-                                    append_connect_frame(&mut body_bytes, &frame);
                                 }
                                 if class.has_thinking {
                                     useful = true;
                                     last_progress = Instant::now();
-                                    append_connect_frame(&mut body_bytes, &frame);
                                 }
                                 if class.thinking_completed {
                                     saw_thinking_completed = true;
                                     // Completion marker for reasoning phase — progress,
                                     // but alone not enough to finish (wait for text).
                                     last_progress = Instant::now();
-                                    append_connect_frame(&mut body_bytes, &frame);
                                 }
                                 if class.turn_ended {
                                     saw_turn_ended = true;
                                     useful = true;
                                     last_progress = Instant::now();
-                                    append_connect_frame(&mut body_bytes, &frame);
                                 }
                                 if class.has_tool_call {
                                     saw_tool_call = true;
                                     useful = true;
                                     last_progress = Instant::now();
-                                    append_connect_frame(&mut body_bytes, &frame);
                                 }
                                 // Keep token_delta / other interaction updates that
                                 // classify as neither text nor thinking when they
                                 // carry usage — already covered by turn_ended.
                                 // Exec frames needed for session id + request_context.
-                                if class.wants_request_context {
+                                if retain_frame {
                                     append_connect_frame(&mut body_bytes, &frame);
                                 }
 

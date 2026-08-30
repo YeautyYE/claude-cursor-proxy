@@ -52,7 +52,8 @@ use super::proto::{
     GetBlobResult, InteractionApproved, InteractionQuery, InteractionRejected, InteractionResponse,
     InteractionUpdate, KvClientMessage, KvServerMessage, MAX_TASK_DELTA_NEST,
     McpAuthRequestResponse, RequestContext, RequestContextResult, RequestContextSuccess,
-    SetBlobResult, SwitchModeRequestResponse, WebFetchRequestResponse, WebSearchRequestResponse,
+    SetBlobResult, SwitchModeRequestResponse, TurnEnded, WebFetchRequestResponse,
+    WebSearchRequestResponse,
 };
 use super::request::{
     CLAUDE_LOCAL_MCP_PROVIDER, CursorSelectedImage, claude_tool_names_equivalent,
@@ -61,7 +62,9 @@ use super::request::{
     is_xml_client_only_native_tool_name, normalize_grok_build_lifecycle_name,
     preferred_text_editor_name, strip_mcp_provider_prefix,
 };
-use super::response::CursorStreamEvent;
+use super::response::{
+    CursorEosFilter, CursorStreamEvent, FilteredCursorText, normalize_cursor_text_delta,
+};
 use super::sse::{
     CursorSseEncoder, EVENT_ERROR, EVENT_MESSAGE_DELTA, EVENT_PING, format_sse_event_bytes,
 };
@@ -598,6 +601,14 @@ impl SegmentReplayLog {
             self.events.last(),
             Some(LiveRunEvent::Cursor(CursorStreamEvent::End))
         )
+    }
+
+    /// A Claude-local tool handoff deliberately closes the current Anthropic
+    /// segment after recording the tool batch.  It is not a completed model
+    /// turn yet: the live run remains resumable while Claude Code executes
+    /// the exposed tool and sends its `tool_result` on the next segment.
+    fn ends_with_native_tool_batch(&self) -> bool {
+        matches!(self.events.last(), Some(LiveRunEvent::NativeToolBatch(_)))
     }
 
     /// Hand the recorded segment to the Succeeded tombstone. `None` when
@@ -1440,6 +1451,11 @@ struct LogicalToolTracker {
     /// side table lets a second parallel operation with the same payload be
     /// distinguished from a replay of the first one.
     resolved_pi_edit_payload_ids: HashMap<String, HashSet<String>>,
+    /// Stateful tokenizer-EOS filters, one per nested Task depth.  Cursor may
+    /// split a sentinel across protobuf deltas; keeping these filters with the
+    /// per-run tracker lets reconnects preserve the partial marker while a
+    /// nested Task can be reset independently of its parent.
+    eos_filters: Vec<CursorEosFilter>,
 }
 
 /// How an incoming field-47 PiEdit relates to the field-63 transcript marker.
@@ -1474,6 +1490,36 @@ struct PendingPiEditFallback {
 }
 
 impl LogicalToolTracker {
+    fn eos_filter_mut(&mut self, depth: u8) -> &mut CursorEosFilter {
+        let index = depth as usize;
+        if self.eos_filters.len() <= index {
+            self.eos_filters
+                .resize_with(index + 1, CursorEosFilter::default);
+        }
+        &mut self.eos_filters[index]
+    }
+
+    fn filter_eos_text(&mut self, depth: u8, text: &str) -> FilteredCursorText {
+        self.eos_filter_mut(depth).push(text)
+    }
+
+    fn finish_eos_text(&mut self, depth: u8) -> FilteredCursorText {
+        self.eos_filters
+            .get_mut(depth as usize)
+            .map(CursorEosFilter::finish)
+            .unwrap_or_default()
+    }
+
+    fn reset_eos_depth(&mut self, depth: u8) {
+        if let Some(filter) = self.eos_filters.get_mut(depth as usize) {
+            *filter = CursorEosFilter::default();
+        }
+    }
+
+    fn reset_eos_filters(&mut self) {
+        self.eos_filters.clear();
+    }
+
     fn pi_edit_key(path: &str, edits: &[proto::PiEditReplacement]) -> String {
         let mut key = String::with_capacity(path.len() + edits.len() * 16);
         key.push_str(path);
@@ -2055,6 +2101,7 @@ impl LogicalToolTracker {
     /// after the old awaiting entry is completed.
     fn begin_new_segment(&mut self) {
         self.clear();
+        self.reset_eos_filters();
     }
 
     /// Finish the segment transition after tool-result frames were written.
@@ -2062,6 +2109,7 @@ impl LogicalToolTracker {
     /// continuation, so a later legitimate edit with the same payload must be
     /// accepted rather than hidden behind the old replay fence.
     fn finish_new_segment(&mut self) {
+        self.reset_eos_filters();
         self.resolved_pi_edit_keys.clear();
         self.promoted_pi_edit_keys.clear();
         self.resolved_pi_edit_ids.clear();
@@ -4642,6 +4690,35 @@ fn connect_frame_has_top_level_turn_ended(frame: &ConnectFrame) -> bool {
         .and_then(|message| message.interaction_update)
         .and_then(|update| update.turn_ended)
         .is_some()
+}
+
+/// A few Cursor model routes serialize the tokenizer EOS as a trailing
+/// `text_delta` instead of emitting `turn_ended`. Treat that marker as a
+/// candidate terminal only for completion bookkeeping; unlike
+/// `connect_frame_has_top_level_turn_ended`, do not hold the frame waiting for
+/// a later Connect END because the marker may be the only terminal signal.
+fn connect_frame_has_top_level_eos(frame: &ConnectFrame) -> bool {
+    if frame.flags & FLAG_END != 0 || frame.payload.is_empty() {
+        return false;
+    }
+    let decoded = if frame.flags & FLAG_GZIP != 0 {
+        match decode_gzip_frame(&frame.payload) {
+            Ok(bytes) => proto::AgentServerMessage::decode(bytes.as_slice()),
+            Err(_) => return false,
+        }
+    } else {
+        proto::AgentServerMessage::decode(frame.payload.as_ref())
+    };
+    decoded
+        .ok()
+        .and_then(|message| message.interaction_update)
+        .is_some_and(|update| {
+            update.turn_ended.is_none()
+                && update
+                    .text_delta
+                    .as_ref()
+                    .is_some_and(|delta| normalize_cursor_text_delta(&delta.text).eos)
+        })
 }
 
 fn server_message_resets_reconnect_budget(message: &proto::AgentServerMessage) -> bool {
@@ -8230,7 +8307,8 @@ async fn drive_live_run(
             let mut keep_running = true;
             for frame in $frames {
                 let frame_may_complete = frame.flags & FLAG_END != 0
-                    || connect_frame_has_top_level_turn_ended(&frame);
+                    || connect_frame_has_top_level_turn_ended(&frame)
+                    || connect_frame_has_top_level_eos(&frame);
                 let mut turn = LiveTurnCtx {
                     session_id: &session_id,
                     user_prompt: &user_prompt,
@@ -8307,10 +8385,24 @@ async fn drive_live_run(
                     // vanished consumer failed. Seal Succeeded with the replay
                     // (via cleanup) so an identical retry receives the turn,
                     // instead of tombstoning the session 90s as ambiguous.
-                    let completed_with_replay =
-                        frame_may_complete && segment_replay.ends_with_turn_end();
+                    // The EOS filter can complete a marker split across two
+                    // protobuf frames. In that case the second frame is not
+                    // independently recognizable by the stateless candidate
+                    // probe above, but the replay log still proves that an
+                    // Anthropic terminal event was emitted. Treat the replay
+                    // terminal as authoritative regardless of frame shape.
+                    let completed_with_replay = segment_replay.ends_with_turn_end();
+                    // Client-local tools intentionally close the current
+                    // Anthropic segment after publishing a NativeToolBatch.
+                    // The live run is still healthy and waits for Claude Code
+                    // to submit the matching tool_result on a new segment;
+                    // this is a handoff boundary, not an ambiguous terminal.
+                    let client_tool_handoff = sink.is_none()
+                        && pending.has_client_only_awaiting()
+                        && segment_replay.ends_with_native_tool_batch();
                     if missing_terminal
                         && !completed_with_replay
+                        && !client_tool_handoff
                         && (!frame_may_complete
                             || sink.as_ref().is_some_and(mpsc::Sender::is_closed))
                     {
@@ -9431,6 +9523,33 @@ async fn drive_live_run(
                             last_liveness = Instant::now();
                             continue 'driver;
                         }
+                        // No reconnect succeeded. Release any text held while
+                        // checking for a split EOS before the normal EOF/XML
+                        // recovery path; otherwise a valid trailing answer
+                        // fragment disappears silently.
+                        for depth in 0..=MAX_TASK_DELTA_NEST {
+                            if !flush_live_eos_filter(
+                                &mut logical_tools_waiting,
+                                depth,
+                                &mut sink,
+                                &mut deferred,
+                                &mut segment_replay,
+                                &mut pending,
+                                &pending_shared,
+                                allowed_tool_names.as_ref(),
+                                &mut saw_text,
+                                &mut useful,
+                                &mut last_progress,
+                                &mut xml_parser,
+                                reconnect.compaction_mode,
+                                true,
+                                None,
+                            )
+                            .await
+                            {
+                                break 'driver;
+                            }
+                        }
                         // Same empty-turn recovery as FLAG_END: flush trailing
                         // Workflow XML, then surface a note instead of Out:0.
                         flush_pi_edit_fallbacks(
@@ -9894,6 +10013,31 @@ async fn process_live_frame_impl(
             );
             report_terminal_error(sink, terminal_error, message).await;
             return false;
+        }
+        let compaction_mode = turn_ctx.as_ref().is_some_and(|ctx| ctx.compaction_mode);
+        let defer_client_only_exposure = turn_ctx.is_some();
+        for depth in 0..=MAX_TASK_DELTA_NEST {
+            if !flush_live_eos_filter(
+                logical_tools_waiting,
+                depth,
+                sink,
+                deferred,
+                replay,
+                pending,
+                pending_shared,
+                allowed_tool_names,
+                saw_text,
+                useful,
+                last_progress,
+                xml_parser,
+                compaction_mode,
+                defer_client_only_exposure,
+                turn_ctx.as_deref_mut(),
+            )
+            .await
+            {
+                return false;
+            }
         }
         // A PiEdit announcement may be the only edit signal on older Cursor
         // builds. Promote it before evaluating pending tools so the client
@@ -10413,6 +10557,143 @@ fn resolve_native_exec_advertised_name(
     }
 }
 
+/// Emit one already-filtered Cursor text delta. Keeping this path shared by
+/// ordinary pushes and EOS-filter flushes is important: trailing text can
+/// still contain XML tool calls or a compaction summary when the stream ends.
+#[allow(clippy::too_many_arguments)]
+async fn process_visible_cursor_text(
+    text: &str,
+    compaction_mode: bool,
+    defer_client_only_exposure: bool,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    saw_text: &mut bool,
+    useful: &mut bool,
+    last_progress: &mut Instant,
+    xml_parser: &mut CursorToolUseXmlParser,
+    turn_ctx: &mut Option<&mut LiveTurnCtx<'_>>,
+) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    *useful = true;
+    *last_progress = Instant::now();
+    if compaction_mode {
+        // Compaction summaries are plain model output. Do not run the normal
+        // XML tool-use parser: summaries may contain angle-bracket examples.
+        *saw_text = true;
+        return emit_live_delta(
+            sink,
+            deferred,
+            replay,
+            CursorStreamEvent::TextDelta {
+                text: text.to_string(),
+            },
+            turn_ctx.as_deref_mut(),
+        )
+        .await;
+    }
+
+    let recovered = xml_parser.push(text);
+    for evt in recovered {
+        match evt {
+            RecoveredCursorEvent::Text(t) if !t.is_empty() => {
+                *saw_text = true;
+                if !emit_live_delta(
+                    sink,
+                    deferred,
+                    replay,
+                    CursorStreamEvent::TextDelta { text: t },
+                    turn_ctx.as_deref_mut(),
+                )
+                .await
+                {
+                    return false;
+                }
+            }
+            RecoveredCursorEvent::Text(_) => {}
+            RecoveredCursorEvent::ToolUse(tool_use) => {
+                // Claude-local tools (Workflow/Skill/…) appear as XML in
+                // Fable text when advertised via `<tools>`. Native Read/Bash
+                // still come through ExecServerMessage.
+                if let Some(emit_name) = xml_client_only_anthropic_name(
+                    &tool_use.name,
+                    &tool_use.input,
+                    allowed_tool_names,
+                ) {
+                    let mut exec = client_only_pending_exec(&tool_use);
+                    exec.claude_name = emit_name.clone();
+                    exec.claude_input = adapt_client_tool_input(&emit_name, exec.claude_input);
+                    // The live driver defers exposure until turn_ended/END/EOF
+                    // so an authoritative trailing END error cannot be masked.
+                    pending.queue(exec, Duration::ZERO);
+                    if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await
+                    {
+                        return false;
+                    }
+                    if !defer_client_only_exposure
+                        && !expose_collected_tools(pending, pending_shared, sink, replay).await
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Flush text retained by the stateful EOS filter when a transport-level
+/// terminal boundary arrives without an InteractionUpdate `turn_ended`.
+/// `CursorEosFilter` deliberately holds a possible marker prefix (and the
+/// whitespace before it), so dropping that tail here would either lose valid
+/// output or leave the XML parser with an unterminated tool call.
+#[allow(clippy::too_many_arguments)]
+async fn flush_live_eos_filter(
+    logical_tools_waiting: &mut LogicalToolTracker,
+    depth: u8,
+    sink: &mut Option<mpsc::Sender<LiveEventResult>>,
+    deferred: &mut VecDeque<LiveEventResult>,
+    replay: &mut SegmentReplayLog,
+    pending: &mut PendingExecState,
+    pending_shared: &Arc<Mutex<Vec<PendingCursorExec>>>,
+    allowed_tool_names: Option<&BTreeSet<String>>,
+    saw_text: &mut bool,
+    useful: &mut bool,
+    last_progress: &mut Instant,
+    xml_parser: &mut CursorToolUseXmlParser,
+    compaction_mode: bool,
+    defer_client_only_exposure: bool,
+    turn_ctx: Option<&mut LiveTurnCtx<'_>>,
+) -> bool {
+    let filtered = logical_tools_waiting.finish_eos_text(depth);
+    let Some(text) = filtered.text else {
+        return true;
+    };
+    let mut turn_ctx = turn_ctx;
+    process_visible_cursor_text(
+        &text,
+        compaction_mode,
+        defer_client_only_exposure,
+        sink,
+        deferred,
+        replay,
+        pending,
+        pending_shared,
+        allowed_tool_names,
+        saw_text,
+        useful,
+        last_progress,
+        xml_parser,
+        &mut turn_ctx,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_interaction_update(
     update: InteractionUpdate,
@@ -10434,6 +10715,35 @@ async fn process_interaction_update(
     turn_ctx: &mut Option<&mut LiveTurnCtx<'_>>,
     task_nest_depth: u8,
 ) -> bool {
+    // Some Cursor model routes expose the tokenizer EOS as a literal text
+    // marker and omit `turn_ended`. Filter it through a per-depth state
+    // machine: protobuf boundaries may split the marker (`◁` + `eos▷`).
+    let filtered_text = update
+        .text_delta
+        .as_ref()
+        .map(|delta| logical_tools_waiting.filter_eos_text(task_nest_depth, &delta.text))
+        .unwrap_or_default();
+    let mut visible_text = filtered_text.text;
+    let mut eos_seen = filtered_text.eos;
+    let mut update = update;
+    // A real turn_ended (or a synthesized EOS completion) is the point at
+    // which any ordinary text held behind a possible split marker must be
+    // released. This also preserves a trailing space when the stream closes
+    // without ever completing a marker.
+    if update.turn_ended.is_some() || eos_seen {
+        let flushed = logical_tools_waiting.finish_eos_text(task_nest_depth);
+        eos_seen |= flushed.eos;
+        if let Some(text) = flushed.text {
+            if let Some(existing) = visible_text.as_mut() {
+                existing.push_str(&text);
+            } else {
+                visible_text = Some(text);
+            }
+        }
+    }
+    if eos_seen && task_nest_depth == 0 && update.turn_ended.is_none() {
+        update.turn_ended = Some(TurnEnded::default());
+    }
     let defer_client_only_exposure = turn_ctx.is_some();
     let compaction_mode = turn_ctx.as_ref().is_some_and(|ctx| ctx.compaction_mode);
     if let Some(partial) = update.partial_tool_call {
@@ -10698,83 +11008,26 @@ async fn process_interaction_update(
         // Server keep-alive during quiet thinking — do not refresh idle timers.
         record_server_heartbeat(last_progress);
     }
-    if let Some(text) = update.text_delta
-        && !text.text.is_empty()
-    {
-        *useful = true;
-        *last_progress = Instant::now();
-        if compaction_mode {
-            // Compaction summaries are plain model output. Do not run the
-            // normal XML tool-use parser: a summary can contain angle-bracket
-            // examples and must remain visible as output text.
-            *saw_text = true;
-            if !emit_live_delta(
-                sink,
-                deferred,
-                replay,
-                CursorStreamEvent::TextDelta { text: text.text },
-                turn_ctx.as_deref_mut(),
-            )
-            .await
-            {
-                return false;
-            }
-        } else {
-            let recovered = xml_parser.push(&text.text);
-            for evt in recovered {
-                match evt {
-                    RecoveredCursorEvent::Text(t) if !t.is_empty() => {
-                        *saw_text = true;
-                        if !emit_live_delta(
-                            sink,
-                            deferred,
-                            replay,
-                            CursorStreamEvent::TextDelta { text: t },
-                            turn_ctx.as_deref_mut(),
-                        )
-                        .await
-                        {
-                            return false;
-                        }
-                    }
-                    RecoveredCursorEvent::Text(_) => {}
-                    RecoveredCursorEvent::ToolUse(tool_use) => {
-                        // Claude-local tools (Workflow/Skill/…) appear as XML in
-                        // Fable text when advertised via `<tools>`. Native
-                        // Read/Bash still come through ExecServerMessage.
-                        if let Some(emit_name) = xml_client_only_anthropic_name(
-                            &tool_use.name,
-                            &tool_use.input,
-                            allowed_tool_names,
-                        ) {
-                            let mut exec = client_only_pending_exec(&tool_use);
-                            exec.claude_name = emit_name.clone();
-                            exec.claude_input =
-                                adapt_client_tool_input(&emit_name, exec.claude_input);
-                            // Direct frame tests expose immediately. The live
-                            // driver defers until turn_ended/END/EOF so a trailing
-                            // END error cannot be bypassed by closing the sink.
-                            pending.queue(exec, Duration::ZERO);
-                            if !flush_turn_coalescer(
-                                sink,
-                                deferred,
-                                replay,
-                                turn_ctx.as_deref_mut(),
-                            )
-                            .await
-                            {
-                                return false;
-                            }
-                            if !defer_client_only_exposure
-                                && !expose_collected_tools(pending, pending_shared, sink, replay)
-                                    .await
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
+    if let Some(text) = visible_text {
+        if !process_visible_cursor_text(
+            &text,
+            compaction_mode,
+            defer_client_only_exposure,
+            sink,
+            deferred,
+            replay,
+            pending,
+            pending_shared,
+            allowed_tool_names,
+            saw_text,
+            useful,
+            last_progress,
+            xml_parser,
+            turn_ctx,
+        )
+        .await
+        {
+            return false;
         }
     }
     if let Some(tokens) = update.token_delta
@@ -10800,6 +11053,10 @@ async fn process_interaction_update(
         if task_nest_depth > 0 {
             // Subagent finished; the parent Task call is still in flight.
             *last_progress = Instant::now();
+            // A parent stream may contain more than one nested Task. Reset
+            // only this depth so a completed child cannot suppress a later
+            // sibling's text after its filter reaches the terminal state.
+            logical_tools_waiting.reset_eos_depth(task_nest_depth);
             return true;
         }
         // Some Cursor protocol revisions omit ExecServerMessage.pi_edit_args
@@ -10912,6 +11169,11 @@ async fn process_interaction_update(
             .await;
         }
         return false;
+    }
+    if task_nest_depth > 0 && eos_seen {
+        // EOS can be the only child terminator on some routes. Treat it as a
+        // boundary for this nested depth while keeping the parent alive.
+        logical_tools_waiting.reset_eos_depth(task_nest_depth);
     }
     true
 }
@@ -16449,6 +16711,57 @@ mod tests {
     fn text_frames_reset_reconnect_budget() {
         let frames = decoded_frames(&super::super::test_frames::text_frame("hello"));
         assert!(live_reconnect_should_reset_budget(&frames));
+    }
+
+    #[test]
+    fn eos_text_frame_is_recognized_as_a_terminal_candidate() {
+        let frames = decoded_frames(&super::super::test_frames::text_frame("answer ◁eos▷ ◁eos▷"));
+        assert_eq!(frames.len(), 1);
+        assert!(connect_frame_has_top_level_eos(&frames[0]));
+        assert!(!connect_frame_has_top_level_turn_ended(&frames[0]));
+    }
+
+    #[tokio::test]
+    async fn eos_text_delta_finishes_live_segment_without_leaking_marker() {
+        let frame = decoded_frames(&super::super::test_frames::text_frame("answer ◁eos▷ ◁eos▷"))
+            .pop()
+            .expect("EOS frame");
+        let (continued, event, _) = drive_native_task_frame(frame, None, None).await;
+        assert!(
+            !continued,
+            "EOS must close a live segment when no turn_ended arrives"
+        );
+        match event.expect("text event") {
+            Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text })) => {
+                assert_eq!(text, "answer");
+            }
+            other => panic!("expected normalized text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_eos_across_live_frames_is_terminal_and_marker_free() {
+        let first = decoded_frames(&super::super::test_frames::text_frame("answer ◁"))
+            .pop()
+            .expect("first text frame");
+        let second = decoded_frames(&super::super::test_frames::text_frame("eos▷"))
+            .pop()
+            .expect("second text frame");
+        let events = drive_text_frames(vec![first, second]).await;
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "answer");
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event, LiveRunEvent::Cursor(CursorStreamEvent::End)) })
+        );
+        assert!(!text.contains("eos"));
     }
 
     #[test]
@@ -22090,6 +22403,57 @@ mod tests {
         .await;
         let event = event_rx.try_recv().ok();
         (cont, event, pending)
+    }
+
+    async fn drive_text_frames(
+        frames: Vec<super::super::connect::ConnectFrame>,
+    ) -> Vec<LiveRunEvent> {
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
+        for frame in frames {
+            let _ = process_live_frame(
+                frame,
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut segment_replay,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut latest_checkpoint,
+                &terminal_error,
+                None,
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::from_millis(50),
+                &mut xml_parser,
+                None,
+            )
+            .await;
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let Ok(event) = event {
+                events.push(event);
+            }
+        }
+        events
     }
 
     #[tokio::test]
@@ -28032,14 +28396,32 @@ mod tests {
         command_tx: mpsc::Sender<RunCommand>,
         event_rx: mpsc::Receiver<LiveEventResult>,
         completed: Arc<AtomicBool>,
+        terminal_error: Arc<Mutex<Option<TerminalOutcome>>>,
     }
 
     fn spawn_attach_replay_driver(session: &str) -> AttachReplayHarness {
+        spawn_attach_replay_driver_with_tools(session, BTreeSet::from(["Read".to_string()]))
+    }
+
+    fn spawn_attach_replay_driver_with_tools(
+        session: &str,
+        allowed_tool_names: BTreeSet<String>,
+    ) -> AttachReplayHarness {
         let (upstream_tx, upstream_rx) = mpsc::channel::<Result<Option<Bytes>, String>>(16);
         let (request_tx, _request_rx) = mpsc::channel(8);
         let (command_tx, command_rx) = mpsc::channel(4);
         let (event_tx, event_rx) = mpsc::channel(32);
         let completed = Arc::new(AtomicBool::new(false));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let conversation = super::super::conversation::get_or_create(session);
+        let conversation_lease =
+            super::super::conversation::pin(session, &conversation.conversation_id)
+                .expect("pin test conversation");
+        let mut reconnect = test_reconnect_context();
+        reconnect.session_id = session.to_string();
+        reconnect.conversation_id = Some(conversation.conversation_id);
+        let mut generation_permit = test_generation_permit();
+        generation_permit._conversation_lease = Some(conversation_lease);
         tokio::spawn(drive_live_run(
             upstream_rx,
             upstream_tx.clone(),
@@ -28048,23 +28430,24 @@ mod tests {
             command_rx,
             event_tx,
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(None)),
+            Arc::clone(&terminal_error),
             Arc::clone(&completed),
             Arc::new(AtomicBool::new(false)),
-            Some(BTreeSet::from(["Read".to_string()])),
+            Some(allowed_tool_names),
             session.into(),
             format!("{session}-run"),
             HashMap::new(),
             "attach replay prompt".into(),
             RequestContext::default(),
-            test_reconnect_context(),
-            test_generation_permit(),
+            reconnect,
+            generation_permit,
         ));
         AttachReplayHarness {
             upstream_tx,
             command_tx,
             event_rx,
             completed,
+            terminal_error,
         }
     }
 
@@ -28373,6 +28756,58 @@ mod tests {
         assert!(
             !harness.completed.load(Ordering::Acquire),
             "the run must stay resumable for tool results after an attach"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_does_not_mark_client_only_handoff_ambiguous() {
+        // Client-only MCP tools intentionally end the current Anthropic
+        // segment immediately after publishing their batch. The driver macro
+        // must recognize that boundary instead of appending a spurious
+        // "completion is ambiguous" terminal outcome (which otherwise leaves
+        // the session stuck behind repeated 503s before tool_result resume).
+        let session = format!("client-only-handoff-driver-{}", uuid::Uuid::new_v4());
+        let mut harness = spawn_attach_replay_driver_with_tools(
+            &session,
+            BTreeSet::from(["spawn_subagent".to_string()]),
+        );
+        // Native Cursor Task is stolen by the Claude-local
+        // `spawn_subagent` adapter and exposes immediately even while the
+        // live driver owns a turn context.
+        let frame = native_task_started_frame("driver-native-task", "run the child", Some(false));
+        let wire = super::super::connect::encode_connect_frame(frame.payload, frame.flags);
+        harness
+            .upstream_tx
+            .send(Ok(Some(wire)))
+            .await
+            .expect("send client-only frame");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("client-only batch was not exposed")
+            .expect("driver closed before exposing client-only batch")
+            .expect("client-only handoff must not emit an error");
+        assert!(matches!(
+            event,
+            LiveRunEvent::NativeToolBatch(tools)
+                if tools.len() == 1 && tools[0].name == "spawn_subagent"
+        ));
+
+        // Allow the frame-processing macro to run its post-return terminal
+        // check. A valid handoff must leave the run resumable and error-free.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let terminal = harness
+            .terminal_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert!(
+            terminal.is_none(),
+            "client-only segment handoff must not create a terminal ambiguity: {terminal:?}"
+        );
+        assert!(
+            harness.completed.load(Ordering::Acquire),
+            "client-only handoff is a completed downstream segment; the driver may seal cleanly"
         );
     }
 
