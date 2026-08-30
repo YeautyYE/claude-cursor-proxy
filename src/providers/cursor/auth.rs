@@ -406,6 +406,42 @@ pub fn cursor_accounts_path() -> PathBuf {
     accounts_path()
 }
 
+/// Run a short operation while holding the account-registry lock, but only
+/// when the requested persisted account still exists. Usage-cache writers use
+/// this to serialize deletion and persistence: a worker that observes a
+/// deleted account cannot write its late dashboard result back afterward.
+pub fn with_cursor_account_present<T>(
+    account_id: &str,
+    operation: impl FnOnce() -> T,
+) -> Option<T> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return None;
+    }
+    let _registry_lock = lock_account_registry().ok()?;
+    // A pre-registry install exposes its legacy `auth.json` credential as a
+    // synthetic profile.  There is no account row to match yet, so allow the
+    // operation while the registry file is absent.  Once `accounts.json`
+    // exists, it becomes authoritative: an id missing from that file was
+    // deleted and must not be recreated by a late usage worker.  The check and
+    // operation stay under the same lock, making deletion and persistence
+    // mutually exclusive.
+    match load_stored_accounts() {
+        Ok(Some(stored)) => {
+            if !stored
+                .accounts
+                .iter()
+                .any(|account| account.id == account_id)
+            {
+                return None;
+            }
+        }
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    Some(operation())
+}
+
 fn load_stored_accounts() -> anyhow::Result<Option<StoredCursorAccounts>> {
     let path = accounts_path();
     let raw = match fs::read_to_string(&path) {

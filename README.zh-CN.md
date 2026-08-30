@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.93 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.94 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -116,10 +116,12 @@ claude-cursor-proxy cursor auth usage --json          # JSON 输出
 `ACCOUNT_ID` 可以是 `list` 输出的 ID，也可以是唯一的邮箱或标签。账号池保存在
 `cursor/accounts.json`，当前账号仍会镜像到原有的 `cursor/auth.json`，旧版本也能继续
 读取。监控 TUI 中按 `a` 打开账号面板，按 `Enter` 切换，按 `u` 拉取选中账号用量，按
-`U` 并行拉取全部账号。选中账号后按 `d`，再按 `y`/回车确认删除（`n`/`Esc` 取消）；删除当前账号后会立即切换到剩余账号。添加、切换或删除账号都不需要重启 `serve`。
+`U` 并行拉取全部账号。每个账号都有独立的刷新 worker，切换到下一行不会取消刚才
+发起的账号刷新。成功快照会保存到 state 目录，下次打开 TUI 会先显示缓存；宽终端的
+`Updated` 列（窄终端的选中行详情）显示最近一次 Dashboard 拉取时间。按 `r` 可刷新账号列表和全部用量。选中账号后按 `d`，再按 `y`/回车确认删除（`n`/`Esc` 取消）；删除当前账号后会立即切换到剩余账号。添加、切换或删除账号都不需要重启 `serve`。
 
 需要把指定模型固定到某个已保存账号时，在 TUI 主界面或账号面板按 `m`。用
-`j`/`k` 选择模型，按回车/空格在各账号和 `automatic` 之间轮换；按 `x` 清除
+`j`/`k` 选择模型，按回车/空格选择某个账号或 `automatic`；按 `x` 清除
 绑定，按 `a` 输入列表里暂时没有的 catalog id。修改对新请求立即生效，不会改变
 当前活动账号。按模型绑定的 Live Run、conversation checkpoint、KV 状态和工具续传
 会按账号隔离，因此同一个 `serve` 进程可以并发使用不同账号。TUI 会保存稳定的账号
@@ -336,6 +338,10 @@ Bot 周期用量。按 `u` 打开多行用量详情，其中包含 Sand 周期�
 监控器会只读回退到 Cursor Desktop 的 `state.vscdb`。Dashboard 没提供的字段
 会留空，不会伪造数据。无界面的 `serve --no-monitor` 会每分钟只轻量请求一次
 Sand 用量，用于把额度耗尽后的空回合识别为 HTTP 429；用量展示仍以 TUI 为准。
+每个账号成功拉取的 Dashboard 快照会缓存到
+`~/.local/state/claude-cursor-proxy/cursor/account-usage.json`（Windows 使用
+平台对应的 state 目录）。缓存只保存用量和拉取时间，不保存 access/refresh token；
+文件损坏或超限时会按缓存未命中处理；已有旧快照会先显示，成功刷新后再替换。
 
 ```bash
 claude-cursor-proxy cursor auth status

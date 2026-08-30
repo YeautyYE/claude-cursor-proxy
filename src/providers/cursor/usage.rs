@@ -5,14 +5,22 @@
 //! `x-cursor-client-type`; Sand request routing is handled independently by the
 //! Cursor provider and never by the dashboard poller.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, OpenOptions};
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::monitor::{AccountUsageEvent, AccountUsageSnapshot, AccountUsageState};
-use crate::providers::cursor::auth::{CursorAuth, load_cursor_auth, load_cursor_desktop_auth};
+use crate::providers::cursor::auth::{
+    CursorAccountProfile, CursorAuth, load_cursor_auth, load_cursor_desktop_auth,
+};
 
 const DASHBOARD_ORIGIN: &str = "https://cursor.com";
 const USAGE_SUMMARY_PATH: &str = "/api/usage-summary";
@@ -29,6 +37,395 @@ const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// must not make a newly reset Sand period look exhausted.
 const SAND_USAGE_EVIDENCE_TTL: Duration = Duration::from_secs(180);
 const SAND_USAGE_EVIDENCE_MAX_ACCOUNTS: usize = 64;
+const ACCOUNT_USAGE_CACHE_VERSION: u64 = 1;
+const ACCOUNT_USAGE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const ACCOUNT_USAGE_CACHE_MAX_ACCOUNTS: usize = 64;
+const ACCOUNT_USAGE_CACHE_MAX_EVENTS: usize = 64;
+const ACCOUNT_USAGE_CACHE_MAX_STRING_CHARS: usize = 512;
+const ACCOUNT_USAGE_CACHE_MAX_ID_CHARS: usize = 512;
+
+static ACCOUNT_USAGE_CACHE_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CachedAccountUsageEvent {
+    timestamp: Option<String>,
+    model: Option<String>,
+    charged_usd: Option<f64>,
+    kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CachedAccountUsageSnapshot {
+    email: Option<String>,
+    membership: Option<String>,
+    auto_percent: Option<f64>,
+    api_percent: Option<f64>,
+    total_percent: Option<f64>,
+    plan_used_usd: Option<f64>,
+    plan_limit_usd: Option<f64>,
+    on_demand_used_usd: Option<f64>,
+    on_demand_limit_usd: Option<f64>,
+    grok_bot_percent: Option<f64>,
+    grok_bot_period_start: Option<String>,
+    grok_bot_reset: Option<String>,
+    total_cost_usd: Option<f64>,
+    usage_event_count: Option<u64>,
+    usage_events: Vec<CachedAccountUsageEvent>,
+    fetched_at_ms: Option<u64>,
+}
+
+impl CachedAccountUsageSnapshot {
+    fn from_snapshot(snapshot: &AccountUsageSnapshot) -> Self {
+        Self {
+            email: bounded_cache_string(snapshot.email.as_deref()),
+            membership: bounded_cache_string(snapshot.membership.as_deref()),
+            auto_percent: finite(snapshot.auto_percent),
+            api_percent: finite(snapshot.api_percent),
+            total_percent: finite(snapshot.total_percent),
+            plan_used_usd: finite(snapshot.plan_used_usd),
+            plan_limit_usd: finite(snapshot.plan_limit_usd),
+            on_demand_used_usd: finite(snapshot.on_demand_used_usd),
+            on_demand_limit_usd: finite(snapshot.on_demand_limit_usd),
+            grok_bot_percent: finite(snapshot.grok_bot_percent),
+            grok_bot_period_start: bounded_cache_string(snapshot.grok_bot_period_start.as_deref()),
+            grok_bot_reset: bounded_cache_string(snapshot.grok_bot_reset.as_deref()),
+            total_cost_usd: finite(snapshot.total_cost_usd),
+            usage_event_count: snapshot.usage_event_count,
+            usage_events: snapshot
+                .usage_events
+                .iter()
+                .take(ACCOUNT_USAGE_CACHE_MAX_EVENTS)
+                .map(|event| CachedAccountUsageEvent {
+                    timestamp: bounded_cache_string(event.timestamp.as_deref()),
+                    model: bounded_cache_string(event.model.as_deref()),
+                    charged_usd: finite(event.charged_usd),
+                    kind: bounded_cache_string(event.kind.as_deref()),
+                })
+                .collect(),
+            fetched_at_ms: Some(
+                snapshot
+                    .fetched_at
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+        }
+    }
+
+    fn into_snapshot(self) -> Option<AccountUsageSnapshot> {
+        let fetched_at = UNIX_EPOCH.checked_add(Duration::from_millis(self.fetched_at_ms?))?;
+        Some(AccountUsageSnapshot {
+            email: self.email,
+            membership: self.membership,
+            auto_percent: finite(self.auto_percent),
+            api_percent: finite(self.api_percent),
+            total_percent: finite(self.total_percent),
+            plan_used_usd: finite(self.plan_used_usd),
+            plan_limit_usd: finite(self.plan_limit_usd),
+            on_demand_used_usd: finite(self.on_demand_used_usd),
+            on_demand_limit_usd: finite(self.on_demand_limit_usd),
+            grok_bot_percent: finite(self.grok_bot_percent),
+            grok_bot_period_start: self.grok_bot_period_start,
+            grok_bot_reset: self.grok_bot_reset,
+            total_cost_usd: finite(self.total_cost_usd),
+            usage_event_count: self.usage_event_count,
+            usage_events: self
+                .usage_events
+                .into_iter()
+                .take(ACCOUNT_USAGE_CACHE_MAX_EVENTS)
+                .map(|event| AccountUsageEvent {
+                    timestamp: event.timestamp,
+                    model: event.model,
+                    charged_usd: finite(event.charged_usd),
+                    kind: event.kind,
+                })
+                .collect(),
+            fetched_at,
+        })
+    }
+}
+
+fn finite(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
+}
+
+fn bounded_cache_string(value: Option<&str>) -> Option<String> {
+    value.map(|value| {
+        let value = value.trim();
+        if value.chars().count() <= ACCOUNT_USAGE_CACHE_MAX_STRING_CHARS {
+            value.to_string()
+        } else {
+            value
+                .chars()
+                .take(ACCOUNT_USAGE_CACHE_MAX_STRING_CHARS)
+                .collect()
+        }
+    })
+}
+
+fn valid_cache_account_id(account_id: &str) -> bool {
+    !account_id.trim().is_empty() && account_id.chars().count() <= ACCOUNT_USAGE_CACHE_MAX_ID_CHARS
+}
+
+/// Load the last successful dashboard snapshot for each account. Cache
+/// corruption is treated as a miss; credentials and routing do not depend on
+/// this file.
+pub fn load_account_usage_cache() -> HashMap<String, AccountUsageSnapshot> {
+    let deps = crate::paths::DirResolverEnv::default();
+    load_account_usage_cache_from(
+        &crate::paths::cursor_usage_cache_file(&deps),
+        &crate::paths::cursor_usage_cache_lock_file(&deps),
+    )
+    .unwrap_or_default()
+}
+
+/// Persist one successful account snapshot without retaining any credential
+/// material. Updates are serialized across threads and processes so workers
+/// finishing out of order cannot replace another account's entry.
+pub fn persist_account_usage(
+    account_id: &str,
+    snapshot: &AccountUsageSnapshot,
+) -> anyhow::Result<()> {
+    let deps = crate::paths::DirResolverEnv::default();
+    persist_account_usage_to(
+        &crate::paths::cursor_usage_cache_file(&deps),
+        &crate::paths::cursor_usage_cache_lock_file(&deps),
+        account_id,
+        snapshot,
+    )
+}
+
+/// Persist usage for a profile after any credential refresh. Registry-backed
+/// profiles keep their stable configured id. A legacy single-account profile
+/// is synthetic and may be keyed by an opaque bearer digest, so migrate its
+/// cache row when refreshing the bearer changes that digest.
+pub fn persist_account_usage_for_profile(
+    profile: &CursorAccountProfile,
+    refreshed_auth: &CursorAuth,
+    snapshot: &AccountUsageSnapshot,
+) -> anyhow::Result<()> {
+    let registry_backed =
+        profile.auth.source == crate::providers::cursor::auth::cursor_accounts_location();
+    if registry_backed {
+        let Some(result) =
+            crate::providers::cursor::auth::with_cursor_account_present(&profile.id, || {
+                persist_account_usage(&profile.id, snapshot)
+            })
+        else {
+            // The account was deleted while this worker was fetching. Do not
+            // resurrect its cache row with a late successful response.
+            return Ok(());
+        };
+        result?;
+        return Ok(());
+    }
+    persist_account_usage(&profile.id, snapshot)?;
+    let refreshed_id =
+        crate::providers::cursor::auth::cursor_account_id_for_token(&refreshed_auth.access_token);
+    if refreshed_id == profile.id {
+        return Ok(());
+    }
+    persist_account_usage(&refreshed_id, snapshot)?;
+    remove_account_usage(&profile.id)
+}
+
+/// Remove a deleted account's durable usage snapshot. Credentials are stored
+/// separately, so cache cleanup is best effort and never affects account
+/// removal itself.
+pub fn remove_account_usage(account_id: &str) -> anyhow::Result<()> {
+    let deps = crate::paths::DirResolverEnv::default();
+    remove_account_usage_from(
+        &crate::paths::cursor_usage_cache_file(&deps),
+        &crate::paths::cursor_usage_cache_lock_file(&deps),
+        account_id,
+    )
+}
+
+fn load_account_usage_cache_from(
+    cache_path: &Path,
+    lock_path: &Path,
+) -> anyhow::Result<HashMap<String, AccountUsageSnapshot>> {
+    with_account_usage_cache_lock(lock_path, || read_account_usage_cache(cache_path))
+}
+
+fn persist_account_usage_to(
+    cache_path: &Path,
+    lock_path: &Path,
+    account_id: &str,
+    snapshot: &AccountUsageSnapshot,
+) -> anyhow::Result<()> {
+    if !valid_cache_account_id(account_id) {
+        anyhow::bail!("invalid Cursor account id for usage cache");
+    }
+    with_account_usage_cache_lock(lock_path, || {
+        let mut cache = read_cached_usage_entries(cache_path)?;
+        let next = CachedAccountUsageSnapshot::from_snapshot(snapshot);
+        let next_fetched_at = next.fetched_at_ms.unwrap_or_default();
+        let should_replace = cache
+            .get(account_id)
+            .is_none_or(|previous| previous.fetched_at_ms.unwrap_or_default() <= next_fetched_at);
+        if should_replace {
+            cache.insert(account_id.to_string(), next);
+        }
+        write_account_usage_cache(cache_path, account_id, cache)
+    })
+}
+
+fn remove_account_usage_from(
+    cache_path: &Path,
+    lock_path: &Path,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    if !valid_cache_account_id(account_id) {
+        anyhow::bail!("invalid Cursor account id for usage cache");
+    }
+    with_account_usage_cache_lock(lock_path, || {
+        let mut cache = read_cached_usage_entries(cache_path)?;
+        if cache.remove(account_id).is_some() {
+            write_account_usage_cache(cache_path, account_id, cache)?;
+        }
+        Ok(())
+    })
+}
+
+fn with_account_usage_cache_lock<T>(
+    lock_path: &Path,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _process_guard = ACCOUNT_USAGE_CACHE_IO
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let directory = lock_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid Cursor usage cache lock path"))?;
+    fs::create_dir_all(directory)?;
+    #[cfg(unix)]
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    #[cfg(unix)]
+    let lock_file = {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)?;
+        let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600));
+        file
+    };
+    #[cfg(not(unix))]
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+    let result = operation();
+    let unlock_result = fs2::FileExt::unlock(&lock_file);
+    match (result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+fn read_account_usage_cache(
+    cache_path: &Path,
+) -> anyhow::Result<HashMap<String, AccountUsageSnapshot>> {
+    let entries = read_cached_usage_entries(cache_path)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|(id, snapshot)| snapshot.into_snapshot().map(|snapshot| (id, snapshot)))
+        .collect())
+}
+
+fn read_cached_usage_entries(
+    cache_path: &Path,
+) -> anyhow::Result<HashMap<String, CachedAccountUsageSnapshot>> {
+    let metadata = match fs::metadata(cache_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > ACCOUNT_USAGE_CACHE_MAX_BYTES {
+        return Ok(HashMap::new());
+    }
+    let raw: Value = match serde_json::from_slice(&fs::read(cache_path)?) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    if raw.get("version").and_then(Value::as_u64) != Some(ACCOUNT_USAGE_CACHE_VERSION) {
+        return Ok(HashMap::new());
+    }
+    let Some(accounts) = raw.get("accounts").and_then(Value::as_object) else {
+        return Ok(HashMap::new());
+    };
+    let mut entries = accounts
+        .iter()
+        .filter(|(id, _)| valid_cache_account_id(id))
+        .filter_map(|(id, value)| {
+            serde_json::from_value::<CachedAccountUsageSnapshot>(value.clone())
+                .ok()
+                .filter(|snapshot| snapshot.fetched_at_ms.is_some_and(|value| value > 0))
+                .map(|snapshot| (id.clone(), snapshot))
+        })
+        .collect::<Vec<_>>();
+    entries
+        .sort_by_key(|(_, snapshot)| std::cmp::Reverse(snapshot.fetched_at_ms.unwrap_or_default()));
+    entries.truncate(ACCOUNT_USAGE_CACHE_MAX_ACCOUNTS);
+    Ok(entries.into_iter().collect())
+}
+
+fn write_account_usage_cache(
+    cache_path: &Path,
+    current_account_id: &str,
+    mut accounts: HashMap<String, CachedAccountUsageSnapshot>,
+) -> anyhow::Result<()> {
+    while accounts.len() > ACCOUNT_USAGE_CACHE_MAX_ACCOUNTS {
+        let oldest = accounts
+            .iter()
+            .filter(|(id, _)| id.as_str() != current_account_id)
+            .min_by_key(|(_, snapshot)| snapshot.fetched_at_ms.unwrap_or_default())
+            .map(|(id, _)| id.clone())
+            .or_else(|| accounts.keys().next().cloned());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        accounts.remove(&oldest);
+    }
+
+    loop {
+        let ordered = accounts
+            .iter()
+            .map(|(id, snapshot)| (id.clone(), snapshot.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let document = serde_json::json!({
+            "version": ACCOUNT_USAGE_CACHE_VERSION,
+            "accounts": ordered,
+        });
+        if serde_json::to_vec_pretty(&document)?.len() as u64 <= ACCOUNT_USAGE_CACHE_MAX_BYTES {
+            crate::auth::write_atomically(&cache_path.to_string_lossy(), &document)?;
+            #[cfg(unix)]
+            if let Some(directory) = cache_path.parent() {
+                fs::File::open(directory)?.sync_all()?;
+            }
+            return Ok(());
+        }
+        let oldest = accounts
+            .iter()
+            .filter(|(id, _)| id.as_str() != current_account_id)
+            .min_by_key(|(_, snapshot)| snapshot.fetched_at_ms.unwrap_or_default())
+            .map(|(id, _)| id.clone());
+        let Some(oldest) = oldest else {
+            anyhow::bail!("Cursor account usage snapshot exceeds cache size limit");
+        };
+        accounts.remove(&oldest);
+    }
+}
 
 /// Account-scoped dashboard evidence used only to disambiguate Cursor's
 /// otherwise-successful, payload-less Sand `FLAG_END`. Some exhausted Sand
@@ -261,10 +658,29 @@ pub fn fetch_account_usage_state() -> AccountUsageState {
     };
     match auth {
         Some(auth) => match fetch_account_usage(&auth) {
-            Ok(snapshot) => AccountUsageState::Ready(snapshot),
+            Ok(snapshot) => {
+                persist_snapshot_for_auth(&auth, &snapshot);
+                AccountUsageState::Ready(snapshot)
+            }
             Err(err) => AccountUsageState::Failed(truncate_error(&err.to_string())),
         },
         None => AccountUsageState::MissingAuth,
+    }
+}
+
+fn persist_snapshot_for_auth(auth: &CursorAuth, snapshot: &AccountUsageSnapshot) {
+    // The monitor poller receives only a credential, while the durable cache
+    // is keyed by the stable account id. Resolve that id from the registry and
+    // compare token digests so a desktop fallback cannot write another row's
+    // snapshot. Failure to discover the id is non-fatal for monitoring.
+    let Ok(accounts) = crate::providers::cursor::auth::list_cursor_accounts() else {
+        return;
+    };
+    let auth_digest = super::auth::cursor_account_digest(&auth.access_token);
+    if let Some(profile) = accounts.into_iter().find(|profile| {
+        super::auth::cursor_account_digest(&profile.auth.access_token) == auth_digest
+    }) {
+        let _ = persist_account_usage_for_profile(&profile, auth, snapshot);
     }
 }
 
@@ -1013,5 +1429,141 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("2025-08"))
         );
+    }
+
+    fn cache_snapshot(seed: u64) -> AccountUsageSnapshot {
+        AccountUsageSnapshot {
+            email: Some(format!("account-{seed}@example.com")),
+            membership: Some("ultra".into()),
+            auto_percent: Some(seed as f64),
+            api_percent: Some(2.0),
+            total_percent: Some(3.0),
+            plan_used_usd: Some(4.0),
+            plan_limit_usd: Some(5.0),
+            on_demand_used_usd: Some(6.0),
+            on_demand_limit_usd: Some(7.0),
+            grok_bot_percent: Some(8.0),
+            grok_bot_period_start: Some("2026-08-01T00:00:00Z".into()),
+            grok_bot_reset: Some("2026-09-01T00:00:00Z".into()),
+            total_cost_usd: Some(9.0),
+            usage_event_count: Some(seed),
+            usage_events: vec![AccountUsageEvent {
+                timestamp: Some("2026-08-30T00:00:00Z".into()),
+                model: Some("claude-fable-5".into()),
+                charged_usd: Some(0.1),
+                kind: Some("INCLUDED".into()),
+            }],
+            fetched_at: UNIX_EPOCH + Duration::from_millis(seed),
+        }
+    }
+
+    #[test]
+    fn account_usage_cache_round_trips_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        let snapshot = cache_snapshot(1234);
+        persist_account_usage_to(&cache, &lock, "account-a", &snapshot).unwrap();
+
+        let loaded = load_account_usage_cache_from(&cache, &lock).unwrap();
+        assert_eq!(loaded.get("account-a"), Some(&snapshot));
+        let raw = fs::read_to_string(cache).unwrap();
+        assert!(!raw.contains("access_token"));
+        assert!(!raw.contains("refresh_token"));
+    }
+
+    #[test]
+    fn account_usage_cache_does_not_replace_newer_snapshot_with_older_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        persist_account_usage_to(&cache, &lock, "account-a", &cache_snapshot(2000)).unwrap();
+        persist_account_usage_to(&cache, &lock, "account-a", &cache_snapshot(1000)).unwrap();
+
+        let loaded = load_account_usage_cache_from(&cache, &lock).unwrap();
+        assert_eq!(
+            loaded["account-a"].fetched_at,
+            UNIX_EPOCH + Duration::from_millis(2000)
+        );
+        assert_eq!(loaded["account-a"].usage_event_count, Some(2000));
+    }
+
+    #[test]
+    fn account_usage_cache_removes_deleted_account_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        persist_account_usage_to(&cache, &lock, "account-a", &cache_snapshot(1)).unwrap();
+        persist_account_usage_to(&cache, &lock, "account-b", &cache_snapshot(2)).unwrap();
+
+        remove_account_usage_from(&cache, &lock, "account-a").unwrap();
+
+        let loaded = load_account_usage_cache_from(&cache, &lock).unwrap();
+        assert!(!loaded.contains_key("account-a"));
+        assert!(loaded.contains_key("account-b"));
+    }
+
+    #[test]
+    fn account_usage_cache_read_ignores_bad_entries_and_unknown_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(
+            &cache,
+            serde_json::to_vec(&serde_json::json!({
+                "version": ACCOUNT_USAGE_CACHE_VERSION,
+                "accounts": {
+                    "good": serde_json::to_value(CachedAccountUsageSnapshot::from_snapshot(&cache_snapshot(7))).unwrap(),
+                    "bad": {"fetchedAtMs": "not-a-number"},
+                    "": serde_json::json!({})
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = load_account_usage_cache_from(&cache, &lock).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["good"].usage_event_count, Some(7));
+
+        fs::write(
+            &cache,
+            serde_json::to_vec(&serde_json::json!({"version": 99, "accounts": {}})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_account_usage_cache_from(&cache, &lock)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn account_usage_cache_concurrent_updates_keep_each_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        let mut threads = Vec::new();
+        for seed in 1..=8_u64 {
+            let cache = cache.clone();
+            let lock = lock.clone();
+            threads.push(std::thread::spawn(move || {
+                persist_account_usage_to(
+                    &cache,
+                    &lock,
+                    &format!("account-{seed}"),
+                    &cache_snapshot(seed),
+                )
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let loaded = load_account_usage_cache_from(&cache, &lock).unwrap();
+        assert_eq!(loaded.len(), 8);
+        for seed in 1..=8_u64 {
+            assert!(loaded.contains_key(&format!("account-{seed}")));
+        }
     }
 }

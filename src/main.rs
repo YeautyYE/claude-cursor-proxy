@@ -360,6 +360,10 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
         AuthCommand::Remove { account } => {
             let profile = resolve_cursor_account(&account)?;
             let replacement = cursor_auth::remove_cursor_account(&profile.id)?;
+            // Usage snapshots live outside the credential registry. A removed
+            // account must not leave stale quota data behind for a later TUI.
+            let _ =
+                claude_cursor_proxy::providers::cursor::usage::remove_account_usage(&profile.id);
             println!("Removed Cursor account: {}", profile.id);
             if let Some(replacement) = replacement {
                 println!(
@@ -391,16 +395,19 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
             let mut rows = Vec::with_capacity(usage_results.len());
             for (profile, usage) in usage_results {
                 match usage {
-                    Ok(snapshot) if json => rows.push(serde_json::json!({
-                        "id": profile.id,
-                        "label": profile.label,
-                        "email": profile.auth.email,
-                        "active": profile.active,
-                        "usage": usage_snapshot_json(&snapshot),
-                    })),
                     Ok(snapshot) => {
-                        let marker = if profile.active { '*' } else { ' ' };
-                        println!("{marker} {}  {}", profile.id, snapshot.header_line());
+                        if json {
+                            rows.push(serde_json::json!({
+                                "id": profile.id,
+                                "label": profile.label,
+                                "email": profile.auth.email,
+                                "active": profile.active,
+                                "usage": usage_snapshot_json(&snapshot),
+                            }));
+                        } else {
+                            let marker = if profile.active { '*' } else { ' ' };
+                            println!("{marker} {}  {}", profile.id, snapshot.header_line());
+                        }
                     }
                     Err(error) if json => rows.push(serde_json::json!({
                         "id": profile.id,
@@ -483,6 +490,16 @@ fn fetch_cursor_usage_bounded(
         auth.and_then(|auth| {
             claude_cursor_proxy::providers::cursor::usage::fetch_account_usage(&auth)
                 .map_err(|error| error.to_string())
+                .inspect(|snapshot| {
+                    // Keep CLI usage and the TUI on the same durable snapshot.
+                    // The helper also migrates a legacy synthetic id when a
+                    // token refresh changes its opaque bearer digest.
+                    let _ = claude_cursor_proxy::providers::cursor::usage::persist_account_usage_for_profile(
+                        profile,
+                        &auth,
+                        snapshot,
+                    );
+                })
         })
     });
     profiles.into_iter().zip(results).collect()

@@ -106,6 +106,24 @@ pub fn cursor_accounts_file(deps: &DirResolverEnv) -> PathBuf {
         .join("accounts.json")
 }
 
+/// Last successful dashboard usage snapshot for each saved Cursor account.
+/// This is state rather than configuration: it can be discarded and rebuilt
+/// without affecting credentials or routing.
+pub fn cursor_usage_cache_file(deps: &DirResolverEnv) -> PathBuf {
+    resolve_state_dir(deps)
+        .join("cursor")
+        .join("account-usage.json")
+}
+
+/// Cross-process coordinator for read-modify-write updates to the usage
+/// cache. Keeping it beside the cache makes the lock cover every process that
+/// resolves the same state directory.
+pub fn cursor_usage_cache_lock_file(deps: &DirResolverEnv) -> PathBuf {
+    resolve_state_dir(deps)
+        .join("cursor")
+        .join("account-usage.lock")
+}
+
 pub fn provider_accounts_file(provider: &str) -> PathBuf {
     let deps = DirResolverEnv::default();
     resolve_config_dir(&deps)

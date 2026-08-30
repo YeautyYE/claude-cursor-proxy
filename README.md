@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.93 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.94 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -122,14 +122,19 @@ The pool is stored in `cursor/accounts.json`; the selected credential remains
 mirrored to the existing `cursor/auth.json` so older installations continue to
 work. In the monitor TUI, press `a` to open the account panel, `Enter` to
 switch, `u` to fetch the selected account, and `U` to fetch every account in
-parallel. Press `d` on a selected account, then `y`/`Enter` to confirm deletion
+parallel. Each account has its own refresh worker, so moving to another row
+does not cancel the account that was just refreshed. Successful snapshots are
+cached under the state directory and shown again on the next TUI open; the
+`Updated` column (or the selected-row detail on narrow terminals) shows the
+last dashboard fetch time. Press `r` to refresh the account list and all usage.
+Press `d` on a selected account, then `y`/`Enter` to confirm deletion
 (`n`/`Esc` cancels). Removing the active account immediately activates the next
 available account. Adding, switching, or removing accounts does not require
 restarting `serve`.
 
 To reserve a saved account for particular models, press `m` from the main TUI
-or the account panel. Use `j`/`k` to select a model and `Enter`/`Space` to cycle
-between saved accounts and `automatic`; press `x` to clear an assignment or
+or the account panel. Use `j`/`k` to select a model and `Enter`/`Space` to choose
+a saved account or `automatic`; press `x` to clear an assignment or
 `a` to enter a catalog id that is not listed yet. Changes apply to new requests
 immediately without changing the active account. Model-bound live runs,
 conversation checkpoints, KV state, and tool continuations are partitioned by
@@ -360,6 +365,12 @@ fall back to Cursor Desktop's read-only `state.vscdb`; missing dashboard fields
 are omitted rather than invented. In headless `serve --no-monitor`, a lightweight
 poller requests only the Sand meter once per minute so an exhausted Sand turn
 can still be reported as HTTP 429; usage display remains a TUI feature.
+Successful per-account dashboard snapshots are cached at
+`~/.local/state/claude-cursor-proxy/cursor/account-usage.json` on macOS/Linux
+(or the platform state directory). The cache contains usage data and fetch
+timestamps only, never access or refresh tokens, and is rebuilt automatically
+when it is missing or corrupt; an older snapshot remains visible until a
+successful refresh replaces it.
 
 ```bash
 claude-cursor-proxy cursor auth status

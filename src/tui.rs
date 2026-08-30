@@ -8,7 +8,7 @@ use layout::{
 };
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Stdout},
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, LazyLock, Mutex, mpsc},
@@ -276,15 +276,31 @@ struct AccountUiState {
     selected: usize,
     usage: HashMap<String, crate::monitor::AccountUsageState>,
     usage_rx: Option<mpsc::Receiver<AccountUsageResult>>,
+    /// Sender/receiver stay shared while the account panel is open. Each
+    /// account still carries its own generation and cancellation token, so a
+    /// refresh for one row never invalidates another row's worker.
+    usage_tx: Option<mpsc::Sender<AccountUsageResult>>,
+    // Aggregate fields remain for compatibility with existing fixtures;
+    // runtime cancellation/generation is isolated in the maps below.
     usage_pending: usize,
     usage_generation: u64,
     usage_cancel: Option<Arc<AtomicBool>>,
     usage_scope: Option<AccountUsageScope>,
+    usage_loading: HashSet<String>,
+    usage_generations: HashMap<String, u64>,
+    usage_cancels: HashMap<String, Arc<AtomicBool>>,
+    usage_errors: HashMap<String, String>,
     /// Account id awaiting an explicit delete confirmation. Keeping the id
     /// (rather than the row index) prevents a concurrent refresh from
     /// deleting a different account than the one the user selected.
     delete_confirm: Option<AccountDeleteRequest>,
     message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AccountUsageScope {
+    Selected(String),
+    All,
 }
 
 fn selected_index_after_account_delete(
@@ -312,26 +328,34 @@ struct AccountDeleteRequest {
     selected_index: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AccountUsageScope {
-    Selected(String),
-    All,
-}
-
 struct AccountUsageResult {
     account_id: String,
     state: crate::monitor::AccountUsageState,
     generation: u64,
 }
 
-/// State for the model-to-account routing editor.  Like the account usage
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AccountRoutePane {
+    #[default]
+    Models,
+    Accounts,
+}
+
+/// State for the model-to-account routing editor. Like the account usage
 /// state, this stays outside `MonitorApp` so existing monitor fixtures and
 /// request snapshots remain unchanged while the overlay is open.
 #[derive(Default)]
 struct AccountRouteUiState {
     models: Vec<String>,
     policy: config::CursorAccountRoutingPolicy,
+    /// Selected model row. Kept as `selected` for compatibility with the
+    /// existing route tests and persisted UI state.
     selected: usize,
+    /// Account option row. `0` is the explicit `automatic` option; saved
+    /// accounts start at one. Keeping the automatic row in the index makes
+    /// clearing a route discoverable instead of an implicit side effect.
+    account_selected: usize,
+    pane: AccountRoutePane,
     input: Option<String>,
     message: Option<String>,
 }
@@ -637,20 +661,52 @@ fn account_ui_lock() -> std::sync::MutexGuard<'static, AccountUiState> {
 }
 
 fn cancel_usage_locked(ui: &mut AccountUiState) {
+    // Keep the aggregate cancellation fields working for older callers and
+    // fixtures; account-scoped workers use the map immediately below.
     if let Some(cancel) = ui.usage_cancel.take() {
         cancel.store(true, Ordering::Release);
     }
-    // Advance the generation so a worker racing the cancellation signal can
-    // never apply its result to a later request.
     ui.usage_generation = ui.usage_generation.wrapping_add(1);
     ui.usage_rx = None;
+    ui.usage_tx = None;
     ui.usage_pending = 0;
     ui.usage_scope = None;
+    for cancel in ui.usage_cancels.drain().map(|(_, cancel)| cancel) {
+        cancel.store(true, Ordering::Release);
+    }
+    for generation in ui.usage_generations.values_mut() {
+        *generation = generation.wrapping_add(1);
+    }
+    ui.usage_loading.clear();
 }
 
 fn cancel_account_usage_workers() {
     let mut ui = account_ui_lock();
     cancel_usage_locked(&mut ui);
+}
+
+fn cancel_account_usage_locked(ui: &mut AccountUiState, account_id: &str) {
+    if let Some(cancel) = ui.usage_cancels.remove(account_id) {
+        cancel.store(true, Ordering::Release);
+    }
+    let generation = ui
+        .usage_generations
+        .entry(account_id.to_string())
+        .or_default();
+    *generation = generation.wrapping_add(1);
+    ui.usage_loading.remove(account_id);
+}
+
+fn ensure_account_usage_channel_locked(
+    ui: &mut AccountUiState,
+) -> mpsc::Sender<AccountUsageResult> {
+    if let Some(tx) = ui.usage_tx.as_ref() {
+        return tx.clone();
+    }
+    let (tx, rx) = mpsc::channel();
+    ui.usage_tx = Some(tx.clone());
+    ui.usage_rx = Some(rx);
+    tx
 }
 
 fn open_accounts_view(app: &mut MonitorApp) {
@@ -684,16 +740,28 @@ fn open_account_routes(app: &mut MonitorApp) {
     models.extend(policy.routes().iter().map(|rule| rule.model.clone()));
     models.sort_unstable();
     models.dedup();
+    let accounts = account_ui_lock().accounts.clone();
     let mut ui = account_route_ui_lock();
     ui.models = models;
     ui.policy = policy;
     ui.selected = ui.selected.min(ui.models.len().saturating_sub(1));
+    ui.account_selected = ui
+        .models
+        .get(ui.selected)
+        .map(|model| account_route_account_index(&ui.policy, model, &accounts))
+        .unwrap_or(0);
+    ui.pane = AccountRoutePane::Models;
     ui.input = None;
     ui.message = None;
     app.show_setup = false;
     app.show_sand_settings = false;
     app.show_help = false;
     app.detail = Some(DetailView::AccountRoutes);
+    drop(ui);
+    // Usage is fetched for every account while this editor is open so the
+    // account chooser can make quota decisions from current data. The work
+    // runs on detached bounded workers and never blocks the TUI event loop.
+    request_account_usage(true);
 }
 
 fn close_account_routes(app: &mut MonitorApp) {
@@ -702,6 +770,8 @@ fn close_account_routes(app: &mut MonitorApp) {
     // switch accounts after editing a route.
     app.detail = Some(DetailView::Accounts);
     let mut ui = account_route_ui_lock();
+    ui.pane = AccountRoutePane::Models;
+    ui.account_selected = 0;
     ui.input = None;
     ui.message = None;
 }
@@ -716,20 +786,43 @@ fn handle_account_route_key(app: &mut MonitorApp, key: KeyCode) {
         handle_account_route_input_key(key);
         return;
     }
+    let pane = account_route_ui_lock().pane;
     match key {
-        KeyCode::Esc | KeyCode::Char('m') => close_account_routes(app),
-        KeyCode::Up | KeyCode::Char('k') => {
-            let mut ui = account_route_ui_lock();
-            ui.selected = ui.selected.saturating_sub(1);
+        KeyCode::Esc => {
+            close_account_routes(app);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Char('m') => close_account_routes(app),
+        KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
+            let (next_pane, model, policy) = {
+                let ui = account_route_ui_lock();
+                let next_pane = match (ui.pane, key) {
+                    (AccountRoutePane::Models, KeyCode::Tab | KeyCode::Right) => {
+                        AccountRoutePane::Accounts
+                    }
+                    (AccountRoutePane::Accounts, KeyCode::Tab | KeyCode::Left) => {
+                        AccountRoutePane::Models
+                    }
+                    (pane, _) => pane,
+                };
+                (
+                    next_pane,
+                    ui.models.get(ui.selected).cloned(),
+                    ui.policy.clone(),
+                )
+            };
+            let accounts = account_ui_lock().accounts.clone();
             let mut ui = account_route_ui_lock();
-            ui.selected = ui
-                .selected
-                .saturating_add(1)
-                .min(ui.models.len().saturating_sub(1));
+            ui.pane = next_pane;
+            if ui.pane == AccountRoutePane::Accounts {
+                ui.account_selected = model
+                    .as_deref()
+                    .map(|model| account_route_account_index(&policy, model, &accounts))
+                    .unwrap_or(0);
+            }
         }
-        KeyCode::Char('a') => {
+        KeyCode::Up | KeyCode::Char('k') => move_account_route_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => move_account_route_selection(1),
+        KeyCode::Char('a') if pane == AccountRoutePane::Models => {
             let mut ui = account_route_ui_lock();
             if account_routes_env_override_active() {
                 ui.message = Some(
@@ -752,13 +845,79 @@ fn handle_account_route_key(app: &mut MonitorApp, key: KeyCode) {
             ui.models.extend(route_models);
             ui.models.sort_unstable();
             ui.models.dedup();
+            ui.selected = ui.selected.min(ui.models.len().saturating_sub(1));
             ui.message = Some("Model-account routes reloaded".to_string());
+            drop(ui);
+            refresh_account_list();
+            request_account_usage_force(true);
+            // Account order can change after a refresh. Re-select the account
+            // matching the current model's persisted route rather than
+            // leaving the cursor on a stale row.
+            let (model, policy) = {
+                let ui = account_route_ui_lock();
+                (ui.models.get(ui.selected).cloned(), ui.policy.clone())
+            };
+            let accounts = account_ui_lock().accounts.clone();
+            if let Some(model) = model {
+                account_route_ui_lock().account_selected =
+                    account_route_account_index(&policy, &model, &accounts);
+            }
         }
+        KeyCode::Char('u') => request_route_selected_usage(),
+        KeyCode::Char('U') => request_account_usage(true),
         KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
             clear_selected_account_route();
+            account_route_ui_lock().pane = AccountRoutePane::Models;
         }
-        KeyCode::Enter | KeyCode::Char(' ') => cycle_selected_account_route(),
+        KeyCode::Enter | KeyCode::Char(' ') if pane == AccountRoutePane::Models => {
+            let (model, policy) = {
+                let ui = account_route_ui_lock();
+                (ui.models.get(ui.selected).cloned(), ui.policy.clone())
+            };
+            let accounts = account_ui_lock().accounts.clone();
+            let mut ui = account_route_ui_lock();
+            ui.pane = AccountRoutePane::Accounts;
+            ui.account_selected = model
+                .as_deref()
+                .map(|model| account_route_account_index(&policy, model, &accounts))
+                .unwrap_or(0);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if pane == AccountRoutePane::Accounts => {
+            assign_selected_account_route();
+        }
         _ => {}
+    }
+}
+
+fn request_route_selected_usage() {
+    let option = account_route_ui_lock().account_selected;
+    let account_index = option.checked_sub(1).or_else(|| {
+        let ui = account_ui_lock();
+        ui.accounts
+            .iter()
+            .position(|account| account.active)
+            .or((ui.selected < ui.accounts.len()).then_some(ui.selected))
+    });
+    let Some(account_index) = account_index else {
+        account_route_ui_lock().message = Some("No Cursor accounts are available".to_string());
+        return;
+    };
+    let available = {
+        let mut ui = account_ui_lock();
+        if account_index >= ui.accounts.len() {
+            false
+        } else {
+            // Reuse the existing usage worker and make the selected account
+            // in the account manager follow the row inspected here.
+            ui.selected = account_index;
+            true
+        }
+    };
+    if available {
+        request_account_usage(false);
+    } else {
+        account_route_ui_lock().message =
+            Some("Selected account is no longer available".to_string());
     }
 }
 
@@ -825,7 +984,81 @@ fn account_route_rules_with_assignment(
     policy.with_model_assignment(model, account)
 }
 
-fn cycle_selected_account_route() {
+/// Return the account option index for a model's currently persisted route.
+/// Index zero is always the explicit automatic option. A selector that is
+/// missing or resolves ambiguously intentionally falls back to automatic so
+/// the chooser never highlights an account that would not be used.
+fn account_route_account_index(
+    policy: &config::CursorAccountRoutingPolicy,
+    model: &str,
+    accounts: &[crate::providers::cursor::auth::CursorAccountProfile],
+) -> usize {
+    let Some(selector) = policy.account_for_model(model) else {
+        return 0;
+    };
+    let mut matches = accounts.iter().enumerate().filter(|(_, account)| {
+        config::account_selector_matches(
+            selector,
+            &account.id,
+            account.label.as_deref(),
+            account.email(),
+        )
+    });
+    let Some((index, _)) = matches.next() else {
+        return 0;
+    };
+    if matches.next().is_some() {
+        return 0;
+    }
+    index + 1
+}
+
+fn move_account_route_selection(delta: i8) {
+    let account_len = account_ui_lock().accounts.len().saturating_add(1);
+    let (pane, model_index, model_len, account_index, account_len) = {
+        let ui = account_route_ui_lock();
+        (
+            ui.pane,
+            ui.selected,
+            ui.models.len(),
+            ui.account_selected,
+            account_len,
+        )
+    };
+    let mut ui = account_route_ui_lock();
+    match pane {
+        AccountRoutePane::Models => {
+            ui.selected = if delta.is_negative() {
+                model_index.saturating_sub(delta.unsigned_abs() as usize)
+            } else {
+                model_index
+                    .saturating_add(delta as usize)
+                    .min(model_len.saturating_sub(1))
+            };
+            // Make the account pane immediately reflect the newly selected
+            // model when the user tabs across.
+            let model = ui.models.get(ui.selected).cloned();
+            let policy = ui.policy.clone();
+            drop(ui);
+            if let Some(model) = model {
+                let accounts = account_ui_lock().accounts.clone();
+                let index = account_route_account_index(&policy, &model, &accounts);
+                account_route_ui_lock().account_selected = index;
+            }
+        }
+        AccountRoutePane::Accounts => {
+            ui.account_selected = if delta.is_negative() {
+                account_index.saturating_sub(delta.unsigned_abs() as usize)
+            } else {
+                account_index
+                    .saturating_add(delta as usize)
+                    .min(account_len.saturating_sub(1))
+            };
+        }
+    }
+}
+
+fn assign_selected_account_route() {
     if account_routes_env_override_active() {
         account_route_ui_lock().message =
             Some("CCP_CURSOR_MODEL_ACCOUNTS is active; unset it to edit config.json".to_string());
@@ -835,41 +1068,35 @@ fn cycle_selected_account_route() {
         account_route_ui_lock().message = Some("No models are available".to_string());
         return;
     };
+    let (policy, selected) = {
+        let ui = account_route_ui_lock();
+        (ui.policy.clone(), ui.account_selected)
+    };
     let accounts = account_ui_lock().accounts.clone();
-    if accounts.is_empty() {
+    let selected_account = selected
+        .checked_sub(1)
+        .and_then(|index| accounts.get(index))
+        .map(|account| account.id.clone());
+    if selected > 0 && selected_account.is_none() {
         account_route_ui_lock().message =
-            Some("No Cursor accounts are saved; run `cursor auth add` first".to_string());
+            Some("Selected account is no longer available".to_string());
         return;
     }
-    let (policy, current) = {
-        let ui = account_route_ui_lock();
-        (
-            ui.policy.clone(),
-            ui.policy.account_for_model(&model).map(str::to_string),
-        )
-    };
-    let current_index = current.as_deref().and_then(|selector| {
-        accounts.iter().position(|account| {
-            config::account_selector_matches(
-                selector,
-                &account.id,
-                account.label.as_deref(),
-                account.email(),
-            )
-        })
-    });
-    let next_account = match current_index {
-        Some(index) if index + 1 < accounts.len() => Some(accounts[index + 1].id.clone()),
-        Some(_) => None,
-        None => Some(accounts[0].id.clone()),
-    };
-    let next_policy = account_route_rules_with_assignment(&policy, &model, next_account.as_deref());
+    let next_policy =
+        account_route_rules_with_assignment(&policy, &model, selected_account.as_deref());
     match config::persist_cursor_account_routes(&next_policy) {
         Ok(()) => {
             let mut ui = account_route_ui_lock();
             ui.policy = next_policy;
-            ui.message = Some(match next_account {
-                Some(account) => format!("{model} uses account {account}"),
+            ui.message = Some(match selected_account {
+                Some(account) => {
+                    let display = accounts
+                        .iter()
+                        .find(|candidate| candidate.id == account)
+                        .map(|candidate| candidate.display_name().to_string())
+                        .unwrap_or(account);
+                    format!("{model} uses account {display}")
+                }
                 None => format!("{model} uses automatic account selection"),
             });
         }
@@ -900,10 +1127,8 @@ fn clear_selected_account_route() {
 }
 
 fn refresh_account_list() {
-    // Invalidate snapshots before doing any potentially slow auth/file work.
-    // The next caller can explicitly start a fresh selected/all poll.
-    cancel_account_usage_workers();
     let result = crate::providers::cursor::auth::list_cursor_accounts();
+    let persisted = crate::providers::cursor::usage::load_account_usage_cache();
     let mut ui = account_ui_lock();
     match result {
         Ok(accounts) => {
@@ -930,6 +1155,44 @@ fn refresh_account_list() {
                 .map(|account| account.id.clone())
                 .collect::<std::collections::HashSet<_>>();
             ui.usage.retain(|id, _| ids.contains(id.as_str()));
+            ui.usage_errors.retain(|id, _| ids.contains(id.as_str()));
+            // A list refresh must not interrupt an account that is still
+            // present. Only workers for removed accounts are invalidated.
+            let removed = ui
+                .usage_cancels
+                .keys()
+                .chain(ui.usage_loading.iter())
+                .chain(ui.usage_generations.keys())
+                .filter(|id| !ids.contains(id.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>();
+            for id in removed {
+                cancel_account_usage_locked(&mut ui, &id);
+                ui.usage.remove(&id);
+                ui.usage_errors.remove(&id);
+            }
+            // Successful snapshots survive process restarts and are loaded
+            // before any fresh request starts. A live Ready value wins over a
+            // stale disk value so an in-flight refresh remains visible.
+            let account_ids = ui
+                .accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect::<Vec<_>>();
+            for account_id in account_ids {
+                let should_load_cached = match ui.usage.get(&account_id) {
+                    Some(crate::monitor::AccountUsageState::Ready(current)) => persisted
+                        .get(&account_id)
+                        .is_some_and(|cached| cached.fetched_at > current.fetched_at),
+                    _ => persisted.contains_key(&account_id),
+                };
+                if should_load_cached && let Some(snapshot) = persisted.get(&account_id) {
+                    ui.usage.insert(
+                        account_id,
+                        crate::monitor::AccountUsageState::Ready(snapshot.clone()),
+                    );
+                }
+            }
             if ui.accounts.is_empty() {
                 ui.message = Some(
                     "No Cursor accounts. Run `cursor auth login` or `cursor auth add`.".to_string(),
@@ -939,10 +1202,10 @@ fn refresh_account_list() {
             }
         }
         Err(error) => {
-            ui.accounts.clear();
-            ui.selected = 0;
-            ui.delete_confirm = None;
-            ui.message = Some(format!("Account list failed: {error}"));
+            // Keep the last account list and its cached meters visible when a
+            // transient registry read fails. A failed refresh must not make a
+            // usable account pool disappear from the TUI.
+            ui.message = Some(format!("Account list refresh failed: {error}"));
         }
     }
 }
@@ -1041,6 +1304,10 @@ fn confirm_account_delete() {
 
     match crate::providers::cursor::auth::remove_cursor_account(&target.id) {
         Ok(replacement) => {
+            // Usage snapshots are keyed separately from credentials. Remove
+            // this row even when the cache write is unavailable; account
+            // deletion itself has already succeeded and remains authoritative.
+            let _ = crate::providers::cursor::usage::remove_account_usage(&target.id);
             refresh_account_list();
             {
                 let mut ui = account_ui_lock();
@@ -1143,76 +1410,116 @@ fn request_account_usage_inner(all: bool, force: bool) {
         return;
     }
 
-    let scope = if all {
-        AccountUsageScope::All
-    } else {
-        AccountUsageScope::Selected(profiles[0].id.clone())
-    };
-
-    let (tx, rx) = mpsc::channel();
-    let (generation, cancel) = {
+    let mut jobs = Vec::new();
+    {
         let mut ui = account_ui_lock();
-        // Repeated `u`/`U` input should not create another wave of dashboard
-        // calls while the same request is still in flight. The refresh key
-        // cancels and replaces it through the explicit force helper below.
-        if !force && ui.usage_pending > 0 && ui.usage_scope.as_ref() == Some(&scope) {
-            return;
+        let mut skipped = 0usize;
+        for profile in profiles {
+            let account_id = profile.id.clone();
+            // Repeated `u`/`U` input is idempotent for an account that is
+            // already loading. Cancellation of a blocking dashboard request
+            // is cooperative, so starting a replacement here would create
+            // overlapping requests and defeat the per-account isolation.
+            if ui.usage_loading.contains(&account_id) {
+                skipped += 1;
+                continue;
+            }
+            let generation = ui
+                .usage_generations
+                .entry(account_id.clone())
+                .or_default()
+                .wrapping_add(1);
+            ui.usage_generations.insert(account_id.clone(), generation);
+            let cancel = Arc::new(AtomicBool::new(false));
+            ui.usage_cancels
+                .insert(account_id.clone(), Arc::clone(&cancel));
+            ui.usage_loading.insert(account_id.clone());
+            ui.usage_errors.remove(&account_id);
+            // Keep a previous Ready snapshot on screen while the network
+            // request is running. Unknown is used only for a true cache miss.
+            if !ui.usage.contains_key(&account_id) {
+                ui.usage.insert(
+                    account_id.clone(),
+                    crate::monitor::AccountUsageState::Unknown,
+                );
+            }
+            let tx = ensure_account_usage_channel_locked(&mut ui);
+            jobs.push((profile, generation, cancel, tx));
         }
-        cancel_usage_locked(&mut ui);
-        let generation = ui.usage_generation;
-        let cancel = Arc::new(AtomicBool::new(false));
-        ui.usage_pending = profiles.len();
-        ui.usage_rx = Some(rx);
-        ui.usage_cancel = Some(Arc::clone(&cancel));
-        ui.usage_scope = Some(scope);
-        ui.message = Some(if all {
-            format!("Fetching usage for {} account(s)...", profiles.len())
+        ui.usage_pending = ui.usage_loading.len();
+        ui.usage_scope = Some(if all {
+            AccountUsageScope::All
         } else {
-            "Fetching account usage...".to_string()
+            AccountUsageScope::Selected(
+                jobs.first()
+                    .map(|(profile, _, _, _)| profile.id.clone())
+                    .unwrap_or_default(),
+            )
         });
-        for profile in &profiles {
-            ui.usage.insert(
-                profile.id.clone(),
-                crate::monitor::AccountUsageState::Unknown,
-            );
+        if !jobs.is_empty() {
+            ui.message = Some(if all {
+                format!("Fetching usage for {} account(s)...", jobs.len())
+            } else {
+                "Fetching account usage...".to_string()
+            });
+        } else if skipped > 0 {
+            // Leave an existing status intact while the selected row is
+            // already being fetched.
+            ui.message = Some(if force {
+                "Account usage is already being fetched; keeping one request per account"
+                    .to_string()
+            } else {
+                "Account usage is already being fetched".to_string()
+            });
         }
-        (generation, cancel)
-    };
-    // Keep usage fan-out bounded.  Each account query performs several
-    // dashboard calls, so one OS thread per saved account could otherwise
-    // exhaust sockets when a large account pool is refreshed.
-    let profiles = Arc::new(profiles);
-    let worker_count = profiles.len().min(8);
+    }
+
+    if jobs.is_empty() {
+        return;
+    }
+
+    // Keep usage fan-out bounded within this refresh wave. Separate waves may
+    // coexist for different account ids; their generations isolate results.
+    let worker_count = jobs.len().min(8);
+    let jobs = Arc::new(jobs);
     for worker in 0..worker_count {
-        let profiles = Arc::clone(&profiles);
-        let tx = tx.clone();
-        let cancel = Arc::clone(&cancel);
+        let jobs = Arc::clone(&jobs);
         thread::spawn(move || {
-            for index in (worker..profiles.len()).step_by(worker_count) {
+            for index in (worker..jobs.len()).step_by(worker_count) {
+                let (profile, generation, cancel, tx) = &jobs[index];
                 if cancel.load(Ordering::Acquire) {
-                    break;
+                    continue;
                 }
-                let profile = &profiles[index];
-                let state =
-                    match crate::providers::cursor::auth::refresh_cursor_account_for_usage(profile)
-                    {
-                        Ok(auth) => {
-                            match crate::providers::cursor::usage::fetch_account_usage(&auth) {
-                                Ok(snapshot) => crate::monitor::AccountUsageState::Ready(snapshot),
-                                Err(error) => {
-                                    crate::monitor::AccountUsageState::Failed(error.to_string())
+                let state = match crate::providers::cursor::auth::refresh_cursor_account_for_usage(
+                    profile,
+                ) {
+                    Ok(auth) => {
+                        match crate::providers::cursor::usage::fetch_account_usage(&auth) {
+                            Ok(snapshot) => {
+                                // A refresh cancelled for account deletion
+                                // must not resurrect the deleted row in
+                                // the durable cache. Normal panel closes
+                                // still retain successful snapshots.
+                                if !cancel.load(Ordering::Acquire) {
+                                    let _ = crate::providers::cursor::usage::persist_account_usage_for_profile(
+                                            profile,
+                                            &auth,
+                                            &snapshot,
+                                        );
                                 }
+                                crate::monitor::AccountUsageState::Ready(snapshot)
+                            }
+                            Err(error) => {
+                                crate::monitor::AccountUsageState::Failed(error.to_string())
                             }
                         }
-                        Err(error) => crate::monitor::AccountUsageState::Failed(error.to_string()),
-                    };
-                if cancel.load(Ordering::Acquire) {
-                    break;
-                }
+                    }
+                    Err(error) => crate::monitor::AccountUsageState::Failed(error.to_string()),
+                };
                 let _ = tx.send(AccountUsageResult {
                     account_id: profile.id.clone(),
                     state,
-                    generation,
+                    generation: *generation,
                 });
             }
         });
@@ -1222,38 +1529,107 @@ fn request_account_usage_inner(all: bool, force: bool) {
 fn poll_account_usage_results() {
     let mut ui = account_ui_lock();
     let mut results = Vec::new();
-    let mut disconnected = false;
+    let mut channel_disconnected = false;
     if let Some(rx) = ui.usage_rx.as_ref() {
         loop {
             match rx.try_recv() {
                 Ok(result) => results.push(result),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
+                    channel_disconnected = true;
                     break;
                 }
             }
         }
     }
     for result in results {
-        if result.generation != ui.usage_generation {
-            continue;
-        }
-        ui.usage.insert(result.account_id, result.state);
-        ui.usage_pending = ui.usage_pending.saturating_sub(1);
+        apply_account_usage_result(&mut ui, result);
     }
-    if disconnected {
-        ui.usage_pending = 0;
-    }
-    if ui.usage_pending == 0 {
+    if channel_disconnected {
+        // A worker panic or an unexpected sender drop must not leave rows in
+        // a permanent "refreshing" state. Preserve any previous Ready value,
+        // but make the interrupted refresh visible and retryable.
         ui.usage_rx = None;
-        ui.usage_cancel = None;
+        ui.usage_tx = None;
+        let stranded = ui.usage_loading.iter().cloned().collect::<Vec<_>>();
+        for account_id in &stranded {
+            cancel_account_usage_locked(&mut ui, account_id);
+            ui.usage_errors
+                .insert(account_id.clone(), "usage worker stopped".to_string());
+            if !matches!(
+                ui.usage.get(account_id),
+                Some(crate::monitor::AccountUsageState::Ready(_))
+            ) {
+                ui.usage.insert(
+                    account_id.clone(),
+                    crate::monitor::AccountUsageState::Failed("usage worker stopped".into()),
+                );
+            }
+        }
+        if !stranded.is_empty() {
+            ui.message = Some("Account usage worker stopped; press u to retry".to_string());
+        }
+    }
+    ui.usage_pending = ui.usage_loading.len();
+    if ui.usage_pending == 0 {
         ui.usage_scope = None;
         if ui.message.as_deref().is_some_and(|message| {
             message.starts_with("Fetching account usage")
                 || message.starts_with("Fetching usage for ")
         }) {
             ui.message = Some("Usage updated".to_string());
+        }
+    }
+}
+
+fn apply_account_usage_result(ui: &mut AccountUiState, result: AccountUsageResult) {
+    let current_generation = ui
+        .usage_generations
+        .get(&result.account_id)
+        .copied()
+        .unwrap_or_default();
+    if result.generation != current_generation {
+        return;
+    }
+    ui.usage_loading.remove(&result.account_id);
+    ui.usage_cancels.remove(&result.account_id);
+    match result.state {
+        crate::monitor::AccountUsageState::Failed(error) => {
+            ui.usage_errors
+                .insert(result.account_id.clone(), error.clone());
+            let display_name = ui
+                .accounts
+                .iter()
+                .find(|account| account.id == result.account_id)
+                .map(|account| account.display_name().to_string())
+                .unwrap_or_else(|| short_account_id(&result.account_id));
+            ui.message = Some(format!(
+                "Usage refresh failed for {}: {}",
+                display_name,
+                ellipsize(&error, 120)
+            ));
+            if !matches!(
+                ui.usage.get(&result.account_id),
+                Some(crate::monitor::AccountUsageState::Ready(_))
+            ) {
+                ui.usage.insert(
+                    result.account_id,
+                    crate::monitor::AccountUsageState::Failed(error),
+                );
+            }
+        }
+        state => {
+            ui.usage_errors.remove(&result.account_id);
+            let should_apply = match (ui.usage.get(&result.account_id), &state) {
+                (
+                    Some(crate::monitor::AccountUsageState::Ready(current)),
+                    crate::monitor::AccountUsageState::Ready(next),
+                ) => next.fetched_at >= current.fetched_at,
+                _ => true,
+            };
+            if should_apply {
+                ui.usage.insert(result.account_id, state);
+            }
         }
     }
 }
@@ -2574,115 +2950,393 @@ fn account_route_display_name(
 }
 
 fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let (models, policy, selected, input, message) = {
+    let (models, policy, selected, account_selected, pane, input, route_message) = {
         let ui = account_route_ui_lock();
         (
             ui.models.clone(),
             ui.policy.clone(),
             ui.selected,
+            ui.account_selected,
+            ui.pane,
             ui.input.clone(),
             ui.message.clone(),
         )
     };
-    let accounts = account_ui_lock().accounts.clone();
-    let visible_rows = usize::from(area.height.saturating_sub(9)).max(1);
-    let mut lines = vec![Line::from(vec![
-        Span::raw("  "),
-        Span::styled("Enter/space", Style::default().fg(TEAL)),
-        Span::styled(" cycle account  ", Style::default().fg(DIM)),
-        Span::styled("x", Style::default().fg(TEAL)),
-        Span::styled(" clear  ", Style::default().fg(DIM)),
-        Span::styled("a", Style::default().fg(TEAL)),
-        Span::styled(" add model  ", Style::default().fg(DIM)),
-        Span::styled("Esc/m", Style::default().fg(TEAL)),
-        Span::styled(" close", Style::default().fg(DIM)),
-    ])];
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("Model", Style::default().fg(TEAL)),
-        Span::styled(
-            "                                      ",
-            Style::default().fg(DIM),
-        ),
-        Span::styled("Account", Style::default().fg(TEAL)),
-    ]));
-    if let Some(input) = input.as_deref() {
-        lines.push(Line::from(vec![
-            Span::styled("  model id: ", Style::default().fg(DIM)),
+    let (accounts, usage, usage_message) = {
+        let ui = account_ui_lock();
+        (ui.accounts.clone(), ui.usage.clone(), ui.message.clone())
+    };
+
+    // Keep instructions and status outside the panes so the two lists retain
+    // a stable height while usage workers update asynchronously.
+    let hint_height = if area.height >= 3 { 2 } else { 1 };
+    let status_height = if area.height >= 5 { 2 } else { 1 };
+    let sections = Layout::vertical([
+        Constraint::Length(hint_height),
+        Constraint::Min(1),
+        Constraint::Length(status_height),
+    ])
+    .split(area);
+    let hint_lines = if let Some(input) = input.as_deref() {
+        vec![Line::from(vec![
+            Span::styled(
+                " Model account routes  ",
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" model id: ", Style::default().fg(DIM)),
             Span::styled(format!("{input}_"), Style::default().fg(WHITE)),
-        ]));
-    }
+            Span::styled("   Enter save  Esc cancel", Style::default().fg(DIM)),
+        ])]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    " Model account routes  ",
+                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Tab/←→", Style::default().fg(TEAL)),
+                Span::styled(" pane  ", Style::default().fg(DIM)),
+                Span::styled("j/k", Style::default().fg(TEAL)),
+                Span::styled(" move  ", Style::default().fg(DIM)),
+                Span::styled("Enter/space", Style::default().fg(TEAL)),
+                Span::styled(" assign account  ", Style::default().fg(DIM)),
+                Span::styled("x", Style::default().fg(TEAL)),
+                Span::styled(" automatic  ", Style::default().fg(DIM)),
+                Span::styled("r", Style::default().fg(TEAL)),
+                Span::styled(" refresh  ", Style::default().fg(DIM)),
+                Span::styled("u/U", Style::default().fg(TEAL)),
+                Span::styled(" usage", Style::default().fg(DIM)),
+            ]),
+            Line::from(vec![
+                Span::styled(" *", Style::default().fg(TEAL)),
+                Span::styled(" active account  ", Style::default().fg(DIM)),
+                Span::styled("[bound]", Style::default().fg(TEAL)),
+                Span::styled(" model's current route  ", Style::default().fg(DIM)),
+                Span::styled("…", Style::default().fg(DIM_WHITE)),
+                Span::styled(" usage loading", Style::default().fg(DIM)),
+            ]),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(hint_lines)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let body = sections[1];
+    let panes = if body.width >= 100 {
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .spacing(1)
+            .split(body)
+    } else {
+        // A stacked layout keeps identity and quota columns legible on small
+        // terminals while retaining the same keyboard focus model.
+        Layout::vertical([Constraint::Percentage(44), Constraint::Percentage(56)])
+            .spacing(1)
+            .split(body)
+    };
+    render_account_route_models(
+        frame,
+        panes[0],
+        &models,
+        &policy,
+        &accounts,
+        selected,
+        pane == AccountRoutePane::Models,
+    );
+    let model = models.get(selected).map(String::as_str).unwrap_or("-");
+    render_account_route_accounts(
+        frame,
+        panes[1],
+        AccountRouteAccountsView {
+            model,
+            policy: &policy,
+            accounts: &accounts,
+            usage: &usage,
+            selected: account_selected,
+            focused: pane == AccountRoutePane::Accounts,
+        },
+    );
+
+    let status = match (route_message, usage_message) {
+        (Some(route), Some(usage)) => Some(format!("{route}  |  {usage}")),
+        (Some(message), None) | (None, Some(message)) => Some(message),
+        (None, None) => None,
+    };
+    let status_lines = status
+        .map(|message| {
+            vec![Line::from(Span::styled(
+                format!(" {message}"),
+                Style::default().fg(YELLOW),
+            ))]
+        })
+        .unwrap_or_else(|| {
+            vec![Line::from(Span::styled(
+                " Select a model, then choose an account or automatic.",
+                Style::default().fg(DIM),
+            ))]
+        });
+    frame.render_widget(
+        Paragraph::new(status_lines)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+}
+
+fn render_account_route_models(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    models: &[String],
+    policy: &config::CursorAccountRoutingPolicy,
+    accounts: &[crate::providers::cursor::auth::CursorAccountProfile],
+    selected: usize,
+    focused: bool,
+) {
+    let block = panel("Models", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = usize::from(inner.width);
+    let mut lines = Vec::new();
     if models.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No Cursor models are registered",
+            "No Cursor models are registered",
             Style::default().fg(DIM_WHITE),
         )));
     } else {
-        let start = selected.saturating_sub(visible_rows.saturating_sub(1) / 2);
-        let end = (start + visible_rows).min(models.len());
+        lines.push(Line::from(vec![
+            Span::styled("Model", Style::default().fg(TEAL)),
+            Span::styled("  route", Style::default().fg(DIM)),
+        ]));
+        let visible = usize::from(inner.height.saturating_sub(1)).max(1);
+        let start = selected.saturating_sub(visible.saturating_sub(1) / 2);
+        let end = (start + visible).min(models.len());
         if start > 0 {
             lines.push(Line::from(Span::styled(
-                "  ^ more models",
+                "^ more models",
                 Style::default().fg(DIM),
             )));
         }
-        for (index, model) in models
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(end.saturating_sub(start))
-        {
+        for (index, model) in models.iter().enumerate().skip(start).take(end - start) {
             let row_selected = index == selected;
             let style = if row_selected {
                 Style::default().fg(WHITE).bg(SELECTED_BG)
             } else {
                 Style::default().fg(DIM_WHITE)
             };
-            let route = account_route_display_name(policy.account_for_model(model), &accounts);
+            let route = account_route_display_name(policy.account_for_model(model), accounts);
+            let marker = if row_selected { "> " } else { "  " };
+            let model_width = width.saturating_sub(3 + 18).max(1);
+            let route_width = width.saturating_sub(3 + model_width).max(1);
             lines.push(Line::from(vec![
-                Span::styled(if row_selected { "  > " } else { "    " }, style),
-                Span::styled(format!("{:<38} ", ellipsize(model, 38)), style),
-                Span::styled(route, style),
+                Span::styled(marker, style),
+                Span::styled(ellipsize(model, model_width), style),
+                Span::styled("  ", style),
+                Span::styled(ellipsize(&route, route_width), style),
             ]));
         }
         if end < models.len() {
             lines.push(Line::from(Span::styled(
-                "  v more models",
+                "v more models",
                 Style::default().fg(DIM),
             )));
         }
     }
-    lines.push(Line::from(""));
-    if let Some(message) = message.as_deref() {
-        lines.push(Line::from(Span::styled(
-            format!("  {message}"),
-            Style::default().fg(YELLOW),
-        )));
-    }
-    if input.is_some() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Enter", Style::default().fg(TEAL)),
-            Span::styled(" save  ", Style::default().fg(DIM)),
-            Span::styled("Esc", Style::default().fg(TEAL)),
-            Span::styled(" cancel", Style::default().fg(DIM)),
-        ]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+struct AccountRouteAccountsView<'a> {
+    model: &'a str,
+    policy: &'a config::CursorAccountRoutingPolicy,
+    accounts: &'a [crate::providers::cursor::auth::CursorAccountProfile],
+    usage: &'a HashMap<String, crate::monitor::AccountUsageState>,
+    selected: usize,
+    focused: bool,
+}
+
+fn render_account_route_accounts(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    view: AccountRouteAccountsView<'_>,
+) {
+    let AccountRouteAccountsView {
+        model,
+        policy,
+        accounts,
+        usage,
+        selected,
+        focused,
+    } = view;
+    let block = panel("Accounts", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = usize::from(inner.width);
+    let current_index = account_route_account_index(policy, model, accounts);
+    let mut groups: Vec<Vec<Line<'static>>> = Vec::with_capacity(accounts.len() + 1);
+    let automatic_style = if selected == 0 && focused {
+        Style::default().fg(WHITE).bg(SELECTED_BG)
     } else {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("j/k", Style::default().fg(TEAL)),
-            Span::styled(" move  ", Style::default().fg(DIM)),
-            Span::styled("r", Style::default().fg(TEAL)),
-            Span::styled(" reload", Style::default().fg(DIM)),
-        ]));
+        Style::default().fg(DIM_WHITE)
+    };
+    let automatic_marker = if selected == 0 { "> " } else { "  " };
+    let automatic_current = if current_index == 0 && policy.account_for_model(model).is_none() {
+        "  [current]"
+    } else {
+        ""
+    };
+    let automatic_detail = if accounts.is_empty() {
+        "  no saved accounts — add one with cursor auth add"
+    } else {
+        "  active account + normal failover"
+    };
+    groups.push(vec![
+        Line::from(vec![
+            Span::styled(automatic_marker, automatic_style),
+            Span::styled("automatic", automatic_style),
+            Span::styled(automatic_current, Style::default().fg(TEAL)),
+        ]),
+        Line::from(Span::styled(automatic_detail, automatic_style)),
+    ]);
+
+    let bound_id = (current_index > 0)
+        .then(|| {
+            accounts
+                .get(current_index - 1)
+                .map(|account| account.id.as_str())
+        })
+        .flatten();
+    for (index, account) in accounts.iter().enumerate() {
+        let option_index = index + 1;
+        let row_selected = option_index == selected;
+        let style = if row_selected && focused {
+            Style::default().fg(WHITE).bg(SELECTED_BG)
+        } else {
+            Style::default().fg(DIM_WHITE)
+        };
+        let usage_state = usage.get(&account.id);
+        let snapshot = usage_state.and_then(|state| match state {
+            crate::monitor::AccountUsageState::Ready(snapshot) => Some(snapshot),
+            _ => None,
+        });
+        let email = snapshot
+            .and_then(|snapshot| snapshot.email.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| account.email().filter(|value| !value.trim().is_empty()));
+        let name = account_name_for_display(account, email);
+        let identity = email
+            .map(|email| {
+                format!(
+                    "{}{}  {} <{}>",
+                    if account.active { "* " } else { "  " },
+                    if bound_id == Some(account.id.as_str()) {
+                        "[bound] "
+                    } else {
+                        ""
+                    },
+                    name,
+                    email
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{}{}  {} [id {}]",
+                    if account.active { "* " } else { "  " },
+                    if bound_id == Some(account.id.as_str()) {
+                        "[bound] "
+                    } else {
+                        ""
+                    },
+                    name,
+                    short_account_id(&account.id),
+                )
+            });
+        let metrics = account_usage_metrics(usage_state, true);
+        let plan = snapshot
+            .and_then(|snapshot| snapshot.membership.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.replace('_', "-"))
+            .unwrap_or_else(|| "-".to_string());
+        let plan_spend = snapshot
+            .and_then(|snapshot| snapshot.plan_used_usd.zip(snapshot.plan_limit_usd))
+            .map(|(used, limit)| format!(" ${used:.0}/${limit:.0}"))
+            .unwrap_or_default();
+        let bot = if metrics[3] == "-" {
+            "-".to_string()
+        } else {
+            format!("{}/wk", metrics[3])
+        };
+        let updated = snapshot
+            .map(|snapshot| format_system_time(snapshot.fetched_at))
+            .unwrap_or_else(|| "-".to_string());
+        let quota = format!(
+            "  updated {updated}  {plan}{plan_spend}  total {}  auto {}  api {}  bot {bot}",
+            metrics[0], metrics[1], metrics[2]
+        );
+        // Keep both freshness and the quota meters visible in the picker on
+        // medium-width terminals. Seconds remain available in the account
+        // table/detail; the picker falls back to minute precision only when
+        // the full row would otherwise ellipsize its last meter.
+        let quota = if quota.chars().count() > width {
+            let compact_updated = snapshot
+                .map(|snapshot| format_system_time_short(snapshot.fetched_at))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "  updated {compact_updated}  {plan}{plan_spend}  total {}  auto {}  api {}  bot {bot}",
+                metrics[0], metrics[1], metrics[2]
+            )
+        } else {
+            quota
+        };
+        let identity = ellipsize(&identity, width.max(1));
+        let quota = ellipsize(&quota, width.max(1));
+        groups.push(vec![
+            Line::from(Span::styled(
+                format!("{}{}", if row_selected { "> " } else { "  " }, identity),
+                style,
+            )),
+            Line::from(Span::styled(quota, style)),
+        ]);
+    }
+
+    let option_capacity = (usize::from(inner.height) / 2).max(1);
+    let selected = selected.min(groups.len().saturating_sub(1));
+    let mut start = selected.saturating_sub(option_capacity.saturating_sub(1) / 2);
+    start = start.min(groups.len().saturating_sub(option_capacity));
+    let end = (start + option_capacity).min(groups.len());
+    let mut lines = Vec::new();
+    for group in groups.iter().skip(start).take(end - start) {
+        lines.extend(group.iter().cloned());
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No Cursor accounts saved",
+            Style::default().fg(DIM_WHITE),
+        )));
     }
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().bg(PANEL_BG))
-            .block(panel("Model account routes", true))
             .wrap(Wrap { trim: false }),
-        area,
+        inner,
     );
+}
+
+fn short_account_id(id: &str) -> String {
+    let chars = id.chars().collect::<Vec<_>>();
+    if chars.len() <= 14 {
+        return id.to_string();
+    }
+    chars[..6]
+        .iter()
+        .chain(['…'].iter())
+        .chain(chars[chars.len() - 5..].iter())
+        .collect()
 }
 
 fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -2763,6 +3417,17 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             if let Some(width) = columns.email_width {
                 push_account_cell(&mut row, email.unwrap_or("-"), width, selected_style);
             }
+            if let Some(width) = columns.updated_width {
+                let updated = usage_snapshot
+                    .map(|snapshot| format_system_time(snapshot.fetched_at))
+                    .or_else(|| {
+                        ui.usage_loading
+                            .contains(&account.id)
+                            .then(|| "...".to_string())
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                push_account_cell(&mut row, &updated, width, selected_style);
+            }
             for (metric, width) in metrics.iter().zip(columns.metric_widths) {
                 push_account_cell(&mut row, metric, width, selected_style);
             }
@@ -2774,6 +3439,32 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
                     Span::styled("     id ", Style::default().fg(DIM)),
                     Span::styled(account.id.clone(), Style::default().fg(DIM)),
                 ]));
+                if let Some(snapshot) = usage_snapshot {
+                    lines.push(Line::from(vec![
+                        Span::styled("     usage updated ", Style::default().fg(DIM)),
+                        Span::styled(
+                            format_system_time(snapshot.fetched_at),
+                            Style::default().fg(DIM),
+                        ),
+                    ]));
+                    if ui.usage_loading.contains(&account.id) {
+                        lines.push(Line::from(Span::styled(
+                            "     usage refreshing...",
+                            Style::default().fg(DIM),
+                        )));
+                    }
+                } else if ui.usage_loading.contains(&account.id) {
+                    lines.push(Line::from(Span::styled(
+                        "     usage refreshing...",
+                        Style::default().fg(DIM),
+                    )));
+                }
+                if let Some(error) = ui.usage_errors.get(&account.id) {
+                    lines.push(Line::from(Span::styled(
+                        format!("     last refresh error {}", ellipsize(error, 96)),
+                        Style::default().fg(DIM),
+                    )));
+                }
             }
         }
         if end < ui.accounts.len() {
@@ -2862,6 +3553,7 @@ fn render_account_delete_confirmation(frame: &mut ratatui::Frame<'_>, area: Rect
 struct AccountListColumns {
     name_width: usize,
     email_width: Option<usize>,
+    updated_width: Option<usize>,
     metric_widths: [usize; 4],
     compact: bool,
 }
@@ -2884,14 +3576,20 @@ fn account_list_columns(area_width: u16) -> AccountListColumns {
     } else {
         None
     };
+    // A short local-time column makes cached snapshots auditable without
+    // crowding narrow terminals. The selected-row detail below still shows
+    // the full status when this column is omitted.
+    let updated_width = (!compact && inner_width >= 115).then_some(12);
     let fixed_email = email_width.map_or(0, |width| width + 1);
+    let fixed_updated = updated_width.map_or(0, |width| width + 1);
     let name_width = inner_width
-        .saturating_sub(fixed_metrics + fixed_email)
+        .saturating_sub(fixed_metrics + fixed_email + fixed_updated)
         .max(1)
         .min(if email_width.is_some() { 24 } else { 32 });
     AccountListColumns {
         name_width,
         email_width,
+        updated_width,
         metric_widths,
         compact,
     }
@@ -2906,6 +3604,12 @@ fn account_list_header(columns: &AccountListColumns) -> Line<'static> {
     if let Some(width) = columns.email_width {
         spans.push(Span::styled(
             format!("{:<width$} ", "Email", width = width),
+            Style::default().fg(TEAL),
+        ));
+    }
+    if let Some(width) = columns.updated_width {
+        spans.push(Span::styled(
+            format!("{:<width$} ", "Updated", width = width),
             Style::default().fg(TEAL),
         ));
     }
@@ -3517,6 +4221,15 @@ fn format_duration(duration: Duration) -> String {
 
 fn format_system_time(time: SystemTime) -> String {
     format_system_time_in_zone(time, TimeZone::system())
+}
+
+fn format_system_time_short(time: SystemTime) -> String {
+    let Ok(timestamp) = Timestamp::try_from(time) else {
+        return "-".to_string();
+    };
+    Zoned::new(timestamp, TimeZone::system())
+        .strftime("%H:%M")
+        .to_string()
 }
 
 fn format_system_time_in_zone(time: SystemTime, time_zone: TimeZone) -> String {
@@ -4234,6 +4947,7 @@ mod tests {
         assert!(text.contains("Total"), "{text}");
         assert!(text.contains("Auto"), "{text}");
         assert!(text.contains("API"), "{text}");
+        assert!(text.contains("Updated"), "{text}");
         assert!(text.contains("Bot/wk"), "{text}");
         assert!(text.contains("*   Primary"), "{text}");
         assert!(text.contains("> secondary"), "{text}");
@@ -4358,7 +5072,7 @@ mod tests {
         assert!(text.contains("gemini-3.1-pro"), "{text}");
         assert!(text.contains("grok-*"), "{text}");
         assert!(text.contains("Work"), "{text}");
-        assert!(text.contains("cycle account"), "{text}");
+        assert!(text.contains("assign account"), "{text}");
         assert!(text.contains("automatic"), "{text}");
 
         *account_ui_lock() = AccountUiState::default();
@@ -4411,8 +5125,152 @@ mod tests {
         });
         let text = buffer_text(&buffer);
         assert!(text.contains("team* (ambiguous)"), "{text}");
-        assert!(!text.contains("Team Alpha"), "{text}");
-        assert!(!text.contains("Team Beta"), "{text}");
+        // The picker intentionally lists both matching accounts so the user
+        // can disambiguate the selector before saving a route.
+        assert!(text.contains("Team Alpha"), "{text}");
+        assert!(text.contains("Team Beta"), "{text}");
+
+        *account_ui_lock() = AccountUiState::default();
+        *account_route_ui_lock() = AccountRouteUiState::default();
+    }
+
+    #[test]
+    fn account_route_picker_shows_identity_plan_quota_and_bound_marker() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let account = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-primary-long-id".to_string(),
+            label: Some("Primary workspace".to_string()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-primary".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: Some("user-primary".to_string()),
+                email: Some("primary@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: true,
+        };
+        {
+            let mut ui = account_ui_lock();
+            ui.accounts = vec![account];
+            ui.usage.insert(
+                "account-primary-long-id".to_string(),
+                crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+                    email: Some("primary@example.com".to_string()),
+                    membership: Some("pro".to_string()),
+                    auto_percent: Some(10.0),
+                    api_percent: Some(7.5),
+                    total_percent: Some(42.0),
+                    plan_used_usd: Some(12.0),
+                    plan_limit_usd: Some(20.0),
+                    on_demand_used_usd: None,
+                    on_demand_limit_usd: None,
+                    grok_bot_percent: Some(3.2),
+                    grok_bot_period_start: None,
+                    grok_bot_reset: None,
+                    total_cost_usd: None,
+                    usage_event_count: None,
+                    usage_events: Vec::new(),
+                    fetched_at: SystemTime::now(),
+                }),
+            );
+            ui.message = None;
+        }
+        {
+            let mut routes = account_route_ui_lock();
+            routes.models = vec!["gemini-3.1-pro".to_string()];
+            routes.policy =
+                config::CursorAccountRoutingPolicy::new([config::CursorModelAccountRule::new(
+                    "gemini-3.1-pro",
+                    "account-primary-long-id",
+                )]);
+            routes.selected = 0;
+            routes.account_selected = 1;
+            routes.pane = AccountRoutePane::Accounts;
+            routes.input = None;
+            routes.message = None;
+        }
+
+        let buffer = draw(140, 20, |frame| {
+            render_account_routes_detail(frame, frame.area())
+        });
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Primary workspace"), "{text}");
+        assert!(text.contains("primary@example.com"), "{text}");
+        assert!(text.contains("pro $12/$20"), "{text}");
+        assert!(text.contains("total 42.0%"), "{text}");
+        assert!(text.contains("auto 10.0%"), "{text}");
+        assert!(text.contains("api 7.5%"), "{text}");
+        assert!(text.contains("bot 3.2%/wk"), "{text}");
+        assert!(text.contains("updated "), "{text}");
+        assert!(text.contains("[bound]"), "{text}");
+        assert!(text.contains("automatic"), "{text}");
+
+        *account_ui_lock() = AccountUiState::default();
+        *account_route_ui_lock() = AccountRouteUiState::default();
+    }
+
+    #[test]
+    fn account_route_selection_moves_independently_in_each_pane() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        {
+            let mut accounts = account_ui_lock();
+            accounts.accounts = vec![
+                crate::providers::cursor::auth::CursorAccountProfile {
+                    id: "account-a".to_string(),
+                    label: Some("A".to_string()),
+                    auth: crate::providers::cursor::auth::CursorAuth {
+                        access_token: "token-a".to_string(),
+                        refresh_token: None,
+                        api_key: None,
+                        expires: None,
+                        user_id: None,
+                        email: Some("a@example.com".to_string()),
+                        source: "test".to_string(),
+                    },
+                    active: true,
+                },
+                crate::providers::cursor::auth::CursorAccountProfile {
+                    id: "account-b".to_string(),
+                    label: Some("B".to_string()),
+                    auth: crate::providers::cursor::auth::CursorAuth {
+                        access_token: "token-b".to_string(),
+                        refresh_token: None,
+                        api_key: None,
+                        expires: None,
+                        user_id: None,
+                        email: Some("b@example.com".to_string()),
+                        source: "test".to_string(),
+                    },
+                    active: false,
+                },
+            ];
+        }
+        {
+            let mut routes = account_route_ui_lock();
+            routes.models = vec!["model-a".to_string(), "model-b".to_string()];
+            routes.policy = config::CursorAccountRoutingPolicy::default();
+            routes.selected = 0;
+            routes.account_selected = 0;
+            routes.pane = AccountRoutePane::Models;
+        }
+
+        move_account_route_selection(1);
+        assert_eq!(account_route_ui_lock().selected, 1);
+        account_route_ui_lock().pane = AccountRoutePane::Accounts;
+        move_account_route_selection(1);
+        assert_eq!(account_route_ui_lock().account_selected, 1);
+        move_account_route_selection(1);
+        assert_eq!(account_route_ui_lock().account_selected, 2);
+        move_account_route_selection(1);
+        assert_eq!(account_route_ui_lock().account_selected, 2);
+        move_account_route_selection(-1);
+        assert_eq!(account_route_ui_lock().account_selected, 1);
 
         *account_ui_lock() = AccountUiState::default();
         *account_route_ui_lock() = AccountRouteUiState::default();
@@ -4605,6 +5463,126 @@ mod tests {
         assert!(ui.usage_rx.is_none());
         assert!(ui.usage_cancel.is_none());
         assert!(ui.usage_scope.is_none());
+    }
+
+    #[test]
+    fn account_usage_refresh_isolated_per_account_and_keeps_ready_on_error() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut ui = AccountUiState::default();
+        ui.usage
+            .insert("account-a".into(), usage_state_with_sand_percent(20.0));
+        ui.usage
+            .insert("account-b".into(), usage_state_with_sand_percent(30.0));
+        ui.usage_generations.insert("account-a".into(), 1);
+        ui.usage_generations.insert("account-b".into(), 1);
+        ui.usage_loading
+            .extend(["account-a".into(), "account-b".into()]);
+        let cancel_a = Arc::new(AtomicBool::new(false));
+        let cancel_b = Arc::new(AtomicBool::new(false));
+        ui.usage_cancels
+            .insert("account-a".into(), Arc::clone(&cancel_a));
+        ui.usage_cancels
+            .insert("account-b".into(), Arc::clone(&cancel_b));
+
+        cancel_account_usage_locked(&mut ui, "account-a");
+        assert!(cancel_a.load(Ordering::Acquire));
+        assert!(!cancel_b.load(Ordering::Acquire));
+        assert!(!ui.usage_loading.contains("account-a"));
+        assert!(ui.usage_loading.contains("account-b"));
+        assert_eq!(ui.usage_generations["account-a"], 2);
+        assert_eq!(ui.usage_generations["account-b"], 1);
+
+        ui.usage_loading.insert("account-a".into());
+        apply_account_usage_result(
+            &mut ui,
+            AccountUsageResult {
+                account_id: "account-a".into(),
+                generation: 2,
+                state: crate::monitor::AccountUsageState::Failed("temporary outage".into()),
+            },
+        );
+        assert!(matches!(
+            ui.usage["account-a"],
+            crate::monitor::AccountUsageState::Ready(_)
+        ));
+
+        apply_account_usage_result(
+            &mut ui,
+            AccountUsageResult {
+                account_id: "account-b".into(),
+                generation: 1,
+                state: usage_state_with_sand_percent(40.0),
+            },
+        );
+        assert!(!ui.usage_loading.contains("account-b"));
+        assert!(matches!(
+            ui.usage["account-b"],
+            crate::monitor::AccountUsageState::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn account_usage_result_survives_selection_change() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut ui = AccountUiState {
+            accounts: vec![
+                crate::providers::cursor::auth::CursorAccountProfile {
+                    id: "account-a".into(),
+                    label: Some("A".into()),
+                    auth: crate::providers::cursor::auth::CursorAuth {
+                        access_token: "token-a".into(),
+                        refresh_token: None,
+                        api_key: None,
+                        expires: None,
+                        user_id: None,
+                        email: Some("a@example.com".into()),
+                        source: "test".into(),
+                    },
+                    active: true,
+                },
+                crate::providers::cursor::auth::CursorAccountProfile {
+                    id: "account-b".into(),
+                    label: Some("B".into()),
+                    auth: crate::providers::cursor::auth::CursorAuth {
+                        access_token: "token-b".into(),
+                        refresh_token: None,
+                        api_key: None,
+                        expires: None,
+                        user_id: None,
+                        email: Some("b@example.com".into()),
+                        source: "test".into(),
+                    },
+                    active: false,
+                },
+            ],
+            selected: 0,
+            ..AccountUiState::default()
+        };
+        ui.usage_generations.insert("account-a".into(), 1);
+        ui.usage_loading.insert("account-a".into());
+
+        // Navigation changes only the cursor. It must not cancel account A's
+        // worker or route its result to account B.
+        ui.selected = 1;
+        apply_account_usage_result(
+            &mut ui,
+            AccountUsageResult {
+                account_id: "account-a".into(),
+                generation: 1,
+                state: usage_state_with_sand_percent(12.5),
+            },
+        );
+        assert_eq!(ui.selected, 1);
+        assert!(!ui.usage_loading.contains("account-a"));
+        assert!(matches!(
+            ui.usage.get("account-a"),
+            Some(crate::monitor::AccountUsageState::Ready(_))
+        ));
+        assert!(!ui.usage.contains_key("account-b"));
     }
 
     #[test]
