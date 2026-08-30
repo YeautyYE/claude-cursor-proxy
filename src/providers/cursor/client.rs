@@ -24,7 +24,9 @@ use crate::providers::cursor::proto::{
     RequestContextResult, RequestContextSuccess, RunRequest,
 };
 use crate::providers::cursor::request::CursorSelectedImage;
-use crate::providers::cursor::response::{CursorStreamEvent, decode_upstream_response};
+use crate::providers::cursor::response::{
+    CursorStreamEvent, decode_upstream_response, normalize_cursor_text_delta,
+};
 
 /// Upstream response from the Cursor API.
 ///
@@ -715,6 +717,7 @@ impl CursorHttpClient {
         let mut decoder = ConnectFrameDecoder::new();
         let mut saw_end = false;
         let mut saw_turn_ended = false;
+        let mut saw_eos = false;
         let mut saw_text = false;
         let mut saw_thinking_completed = false;
         let mut saw_tool_call = false;
@@ -735,7 +738,7 @@ impl CursorHttpClient {
             // Adaptive idle: once we have assistant text (and no open tool wait),
             // only wait complete_idle_ms of silence (heartbeats ignored).
             // If we already saw a tool call, finish immediately (Claude must run it).
-            let idle_limit = if saw_turn_ended || saw_end || saw_tool_call {
+            let idle_limit = if saw_turn_ended || saw_end || saw_eos || saw_tool_call {
                 Duration::from_millis(50)
             } else if saw_text {
                 Duration::from_millis(complete_idle_ms)
@@ -752,7 +755,7 @@ impl CursorHttpClient {
                 }
                 // Silence after progress → treat as successful completion when we
                 // already have text (or any useful content for partial path).
-                if saw_text || saw_turn_ended {
+                if saw_text || saw_turn_ended || saw_eos {
                     finish_reason = if saw_text {
                         "complete_idle_after_text"
                     } else {
@@ -778,7 +781,7 @@ impl CursorHttpClient {
                         finish_reason = "tool_call_ready";
                         break None;
                     }
-                    if saw_text || saw_turn_ended {
+                    if saw_text || saw_turn_ended || saw_eos {
                         finish_reason = if saw_text {
                             "complete_idle_after_text"
                         } else {
@@ -847,6 +850,11 @@ impl CursorHttpClient {
                                 }
                                 if class.turn_ended {
                                     saw_turn_ended = true;
+                                    useful = true;
+                                    last_progress = Instant::now();
+                                }
+                                if class.has_eos {
+                                    saw_eos = true;
                                     useful = true;
                                     last_progress = Instant::now();
                                 }
@@ -948,6 +956,13 @@ impl CursorHttpClient {
                         finish_reason = "turn_ended";
                         break None;
                     }
+                    // EOS may be serialized as ordinary text without a
+                    // separate turn_ended/Connect END frame. Complete the
+                    // buffered request as soon as the marker is observed.
+                    if saw_eos {
+                        finish_reason = "cursor_eos";
+                        break None;
+                    }
                     // Fast path: text already arrived and silence already exceeded
                     // complete idle — but never if a tool call is pending handoff.
                     if saw_text
@@ -979,9 +994,13 @@ impl CursorHttpClient {
         let model_id = resolved.model_id.as_str();
         let body_len = body_bytes.len();
         let elapsed_ms = started.elapsed().as_millis();
+        // The buffered decoder has the stateful EOS filter needed for markers
+        // split across protobuf frames. Use its top-level End event as a
+        // completion signal even when the transport omitted turn_ended/END.
+        let decoded_terminal = body_has_terminal_end(&body_bytes);
         cursor_debug_log(
             &format!(
-                "profile={profile} type={client_type} ver={client_version} model={model_id} bidi={use_bidi} status={status} body_len={body_len} frames={frame_count} saw_end={saw_end} saw_text={saw_text} saw_tool={saw_tool_call} saw_turn_ended={saw_turn_ended} think_done={saw_thinking_completed} useful={useful} finish={finish_reason} elapsed_ms={elapsed_ms} rc_replies={request_context_replies} complete_idle_ms={complete_idle_ms} read_err={read_err:?} grpc_message={error_detail:?}"
+                "profile={profile} type={client_type} ver={client_version} model={model_id} bidi={use_bidi} status={status} body_len={body_len} frames={frame_count} saw_end={saw_end} saw_text={saw_text} saw_tool={saw_tool_call} saw_turn_ended={saw_turn_ended} saw_eos={saw_eos} decoded_terminal={decoded_terminal} think_done={saw_thinking_completed} useful={useful} finish={finish_reason} elapsed_ms={elapsed_ms} rc_replies={request_context_replies} complete_idle_ms={complete_idle_ms} read_err={read_err:?} grpc_message={error_detail:?}"
             ),
             &body_bytes,
         );
@@ -996,7 +1015,11 @@ impl CursorHttpClient {
         // Claude Code sees a successful end_turn and stops retrying.
         if let Some(ref msg) = read_err {
             if status < 400
-                && buffered_stream_complete_enough_to_accept(saw_end, saw_turn_ended)
+                && buffered_stream_complete_enough_to_accept(
+                    saw_end,
+                    saw_turn_ended,
+                    saw_eos || decoded_terminal,
+                )
                 && (useful || body_has_useful_content(&body_bytes))
             {
                 cursor_debug_log(
@@ -1075,7 +1098,13 @@ impl CursorHttpClient {
             return Err(buffered_status_error(error, use_http1_sse));
         }
 
-        if !buffered_finish_accepts_incomplete(finish_reason, saw_end, saw_turn_ended, saw_text) {
+        if !buffered_finish_accepts_incomplete(
+            finish_reason,
+            saw_end,
+            saw_turn_ended,
+            saw_eos || decoded_terminal,
+            saw_text,
+        ) {
             return Err(CursorError::new(
                 502,
                 "Cursor stream ended without turn_ended",
@@ -1189,17 +1218,22 @@ fn buffered_open_reqwest_error(error: reqwest::Error, timeout_secs: u64) -> Curs
     converted
 }
 
-fn buffered_stream_complete_enough_to_accept(saw_end: bool, saw_turn_ended: bool) -> bool {
-    saw_end || saw_turn_ended
+fn buffered_stream_complete_enough_to_accept(
+    saw_end: bool,
+    saw_turn_ended: bool,
+    decoded_terminal: bool,
+) -> bool {
+    saw_end || saw_turn_ended || decoded_terminal
 }
 
 fn buffered_finish_accepts_incomplete(
     finish_reason: &str,
     saw_end: bool,
     saw_turn_ended: bool,
+    decoded_terminal: bool,
     saw_text: bool,
 ) -> bool {
-    if buffered_stream_complete_enough_to_accept(saw_end, saw_turn_ended) {
+    if buffered_stream_complete_enough_to_accept(saw_end, saw_turn_ended, decoded_terminal) {
         return true;
     }
     if finish_reason == "tool_call_ready" {
@@ -1241,6 +1275,7 @@ fn frame_payload_bytes(frame: &ConnectFrame) -> Option<bytes::Bytes> {
 struct FrameClass {
     is_end: bool,
     has_text: bool,
+    has_eos: bool,
     has_thinking: bool,
     thinking_completed: bool,
     turn_ended: bool,
@@ -1267,6 +1302,10 @@ fn classify_frame(frame: &ConnectFrame) -> FrameClass {
             .text_delta
             .as_ref()
             .is_some_and(|t| !t.text.is_empty());
+        class.has_eos = update
+            .text_delta
+            .as_ref()
+            .is_some_and(|t| normalize_cursor_text_delta(&t.text).eos);
         class.has_thinking = update
             .thinking_delta
             .as_ref()
@@ -1302,6 +1341,14 @@ fn body_has_useful_content(body: &[u8]) -> bool {
         }),
         Err(_) => false,
     }
+}
+
+fn body_has_terminal_end(body: &[u8]) -> bool {
+    decode_upstream_response(body).ok().is_some_and(|events| {
+        events
+            .iter()
+            .any(|event| matches!(event, CursorStreamEvent::End))
+    })
 }
 
 /// Shared identity headers for AgentService unary + BiDi calls (CLI/IDE profile).
@@ -2118,16 +2165,26 @@ mod tests {
 
     #[test]
     fn buffered_run_rejects_useful_stream_without_turn_ended() {
-        assert!(!buffered_stream_complete_enough_to_accept(false, false));
-        assert!(buffered_stream_complete_enough_to_accept(true, false));
-        assert!(buffered_stream_complete_enough_to_accept(false, true));
+        assert!(!buffered_stream_complete_enough_to_accept(
+            false, false, false
+        ));
+        assert!(buffered_stream_complete_enough_to_accept(
+            true, false, false
+        ));
+        assert!(buffered_stream_complete_enough_to_accept(
+            false, true, false
+        ));
+        assert!(buffered_stream_complete_enough_to_accept(
+            false, false, true
+        ));
         assert!(
-            !buffered_finish_accepts_incomplete("stream_closed", false, false, false),
+            !buffered_finish_accepts_incomplete("stream_closed", false, false, false, false),
             "clean EOF without turn_ended must not become end_turn"
         );
         assert!(buffered_finish_accepts_incomplete(
             "stream_closed",
             true,
+            false,
             false,
             false
         ));
@@ -2135,22 +2192,56 @@ mod tests {
             "turn_ended",
             false,
             true,
+            false,
             false
         ));
         assert!(
-            !buffered_finish_accepts_incomplete("complete_idle_after_text", false, false, false),
+            buffered_finish_accepts_incomplete("stream_closed", false, false, true, true),
+            "a stateful EOS terminal is a complete turn even without Connect END"
+        );
+        assert!(
+            !buffered_finish_accepts_incomplete(
+                "complete_idle_after_text",
+                false,
+                false,
+                false,
+                false
+            ),
             "idle without text is not a complete turn"
         );
         assert!(
-            buffered_finish_accepts_incomplete("complete_idle_after_text", false, false, true),
+            buffered_finish_accepts_incomplete(
+                "complete_idle_after_text",
+                false,
+                false,
+                false,
+                true
+            ),
             "idle after text must return the turn; 502 makes grok-build retry the same monologue"
         );
         assert!(buffered_finish_accepts_incomplete(
             "tool_call_ready",
             false,
             false,
+            false,
             false
         ));
+    }
+
+    #[test]
+    fn classify_frame_recognizes_complete_cursor_eos_text() {
+        let frames = super::super::test_frames::text_frame("answer ◁eos▷ ◁eos▷");
+        let decoded = ConnectFrameDecoder::new()
+            .push(&frames)
+            .expect("decode EOS frame")
+            .pop()
+            .expect("one frame");
+        let class = classify_frame(&decoded);
+        assert!(class.has_text);
+        assert!(class.has_eos);
+        // The response decoder owns split-marker state; this helper ensures a
+        // complete marker in one frame still has a terminal event available.
+        assert!(body_has_terminal_end(&frames));
     }
 
     #[test]
