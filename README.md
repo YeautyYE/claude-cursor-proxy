@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.94 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.95 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -371,6 +371,10 @@ Successful per-account dashboard snapshots are cached at
 timestamps only, never access or refresh tokens, and is rebuilt automatically
 when it is missing or corrupt; an older snapshot remains visible until a
 successful refresh replaces it.
+If a worker panics or exceeds its watchdog, the last successful snapshot stays
+visible and the row leaves its stuck refreshing state. Once the detached
+request exits, `u` can retry it; a late network result is accepted only for the
+account credentials that produced it.
 
 ```bash
 claude-cursor-proxy cursor auth status

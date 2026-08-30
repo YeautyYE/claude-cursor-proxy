@@ -9,11 +9,12 @@ use layout::{
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     io::{self, Stdout},
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, LazyLock, Mutex, mpsc},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crossterm::{
@@ -56,6 +57,9 @@ const BLUE: Color = Color::Rgb(120, 170, 230);
 const DIM: Color = Color::Rgb(100, 104, 114);
 const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
 const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
+/// A dashboard call normally completes within a few seconds. This watchdog
+/// bounds the UI state even if a worker gets stuck outside the HTTP timeout.
+const ACCOUNT_USAGE_JOB_WATCHDOG: Duration = Duration::from_secs(60);
 
 pub struct MonitorUiConfig<'a> {
     pub listen_url: String,
@@ -275,11 +279,11 @@ struct AccountUiState {
     accounts: Vec<crate::providers::cursor::auth::CursorAccountProfile>,
     selected: usize,
     usage: HashMap<String, crate::monitor::AccountUsageState>,
-    usage_rx: Option<mpsc::Receiver<AccountUsageResult>>,
+    usage_rx: Option<mpsc::Receiver<AccountUsageEvent>>,
     /// Sender/receiver stay shared while the account panel is open. Each
     /// account still carries its own generation and cancellation token, so a
     /// refresh for one row never invalidates another row's worker.
-    usage_tx: Option<mpsc::Sender<AccountUsageResult>>,
+    usage_tx: Option<mpsc::Sender<AccountUsageEvent>>,
     // Aggregate fields remain for compatibility with existing fixtures;
     // runtime cancellation/generation is isolated in the maps below.
     usage_pending: usize,
@@ -289,6 +293,16 @@ struct AccountUiState {
     usage_loading: HashSet<String>,
     usage_generations: HashMap<String, u64>,
     usage_cancels: HashMap<String, Arc<AtomicBool>>,
+    /// Network work can outlive its UI loading state after the watchdog fires.
+    /// Keep the account leased until its result or worker completion arrives so
+    /// retry input cannot create a second request for the same account.
+    usage_in_flight: HashMap<String, AccountUsageLease>,
+    usage_waves: HashMap<u64, AccountUsageWave>,
+    usage_next_wave: u64,
+    /// Usage status messages are owned by the wave that started them. This
+    /// prevents a late error from an older wave replacing a newer wave's
+    /// fetching/success message.
+    usage_message_wave: Option<u64>,
     usage_errors: HashMap<String, String>,
     /// Account id awaiting an explicit delete confirmation. Keeping the id
     /// (rather than the row index) prevents a concurrent refresh from
@@ -332,6 +346,54 @@ struct AccountUsageResult {
     account_id: String,
     state: crate::monitor::AccountUsageState,
     generation: u64,
+}
+
+enum AccountUsageEvent {
+    Result {
+        result: Box<AccountUsageResult>,
+        wave_id: u64,
+        source_credential_fingerprint: u64,
+        credential_fingerprint: u64,
+    },
+    WaveComplete {
+        wave_id: u64,
+    },
+}
+
+struct AccountUsageWave {
+    expected_workers: usize,
+    completed_workers: usize,
+    accounts: Vec<AccountUsageWaveAccount>,
+    deadline: Instant,
+}
+
+#[derive(Clone)]
+struct AccountUsageWaveAccount {
+    account_id: String,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountUsageLease {
+    wave_id: u64,
+    generation: u64,
+}
+
+/// Every fan-out worker owns one guard. A panic unwinds through `Drop`, so a
+/// retained UI sender can no longer strand the corresponding wave in loading.
+struct AccountUsageWorkerGuard {
+    tx: mpsc::Sender<AccountUsageEvent>,
+    wave_id: u64,
+    account_ids: Vec<String>,
+}
+
+impl Drop for AccountUsageWorkerGuard {
+    fn drop(&mut self) {
+        release_account_usage_leases(&self.account_ids, self.wave_id);
+        let _ = self.tx.send(AccountUsageEvent::WaveComplete {
+            wave_id: self.wave_id,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -660,6 +722,34 @@ fn account_ui_lock() -> std::sync::MutexGuard<'static, AccountUiState> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+fn release_account_usage_leases(account_ids: &[String], wave_id: u64) {
+    let mut ui = account_ui_lock();
+    for account_id in account_ids {
+        if ui
+            .usage_in_flight
+            .get(account_id)
+            .is_some_and(|lease| lease.wave_id == wave_id)
+        {
+            ui.usage_in_flight.remove(account_id);
+        }
+    }
+}
+
+fn release_account_usage_lease_locked(
+    ui: &mut AccountUiState,
+    account_id: &str,
+    wave_id: u64,
+    generation: u64,
+) {
+    if ui
+        .usage_in_flight
+        .get(account_id)
+        .is_some_and(|lease| lease.wave_id == wave_id && lease.generation == generation)
+    {
+        ui.usage_in_flight.remove(account_id);
+    }
+}
+
 fn cancel_usage_locked(ui: &mut AccountUiState) {
     // Keep the aggregate cancellation fields working for older callers and
     // fixtures; account-scoped workers use the map immediately below.
@@ -671,12 +761,20 @@ fn cancel_usage_locked(ui: &mut AccountUiState) {
     ui.usage_tx = None;
     ui.usage_pending = 0;
     ui.usage_scope = None;
+    ui.usage_message_wave = None;
     for cancel in ui.usage_cancels.drain().map(|(_, cancel)| cancel) {
         cancel.store(true, Ordering::Release);
     }
     for generation in ui.usage_generations.values_mut() {
         *generation = generation.wrapping_add(1);
     }
+    ui.usage_waves.clear();
+    // The receiver is discarded above, so late events from these cancelled
+    // workers are intentionally unreachable. Drop their leases as well;
+    // otherwise a worker that never returns could block a later panel open
+    // forever. Wave ids are monotonic, so a late guard cannot clear a newer
+    // lease after this reset.
+    ui.usage_in_flight.clear();
     ui.usage_loading.clear();
 }
 
@@ -697,9 +795,7 @@ fn cancel_account_usage_locked(ui: &mut AccountUiState, account_id: &str) {
     ui.usage_loading.remove(account_id);
 }
 
-fn ensure_account_usage_channel_locked(
-    ui: &mut AccountUiState,
-) -> mpsc::Sender<AccountUsageResult> {
+fn ensure_account_usage_channel_locked(ui: &mut AccountUiState) -> mpsc::Sender<AccountUsageEvent> {
     if let Some(tx) = ui.usage_tx.as_ref() {
         return tx.clone();
     }
@@ -1163,11 +1259,17 @@ fn refresh_account_list() {
                 .keys()
                 .chain(ui.usage_loading.iter())
                 .chain(ui.usage_generations.keys())
+                .chain(ui.usage_in_flight.keys())
                 .filter(|id| !ids.contains(id.as_str()))
                 .cloned()
                 .collect::<HashSet<_>>();
             for id in removed {
                 cancel_account_usage_locked(&mut ui, &id);
+                // The row no longer exists, so no future refresh can be
+                // admitted for this id. Drop its detached-worker lease as
+                // part of pruning state; a late guard is keyed by wave id
+                // and cannot affect a different account row.
+                ui.usage_in_flight.remove(&id);
                 ui.usage.remove(&id);
                 ui.usage_errors.remove(&id);
             }
@@ -1411,6 +1513,8 @@ fn request_account_usage_inner(all: bool, force: bool) {
     }
 
     let mut jobs = Vec::new();
+    let mut wave_id = None;
+    let mut wave_tx = None;
     {
         let mut ui = account_ui_lock();
         let mut skipped = 0usize;
@@ -1420,7 +1524,9 @@ fn request_account_usage_inner(all: bool, force: bool) {
             // already loading. Cancellation of a blocking dashboard request
             // is cooperative, so starting a replacement here would create
             // overlapping requests and defeat the per-account isolation.
-            if ui.usage_loading.contains(&account_id) {
+            if ui.usage_loading.contains(&account_id)
+                || ui.usage_in_flight.contains_key(&account_id)
+            {
                 skipped += 1;
                 continue;
             }
@@ -1443,8 +1549,7 @@ fn request_account_usage_inner(all: bool, force: bool) {
                     crate::monitor::AccountUsageState::Unknown,
                 );
             }
-            let tx = ensure_account_usage_channel_locked(&mut ui);
-            jobs.push((profile, generation, cancel, tx));
+            jobs.push((profile, generation, cancel));
         }
         ui.usage_pending = ui.usage_loading.len();
         ui.usage_scope = Some(if all {
@@ -1452,11 +1557,44 @@ fn request_account_usage_inner(all: bool, force: bool) {
         } else {
             AccountUsageScope::Selected(
                 jobs.first()
-                    .map(|(profile, _, _, _)| profile.id.clone())
+                    .map(|(profile, _, _)| profile.id.clone())
                     .unwrap_or_default(),
             )
         });
         if !jobs.is_empty() {
+            let next_wave = ui.usage_next_wave.wrapping_add(1);
+            ui.usage_next_wave = next_wave;
+            let worker_count = jobs.len().min(8);
+            let jobs_per_worker = jobs.len().div_ceil(worker_count);
+            ui.usage_waves.insert(
+                next_wave,
+                AccountUsageWave {
+                    expected_workers: worker_count,
+                    completed_workers: 0,
+                    accounts: jobs
+                        .iter()
+                        .map(|(profile, generation, _)| AccountUsageWaveAccount {
+                            account_id: profile.id.clone(),
+                            generation: *generation,
+                        })
+                        .collect(),
+                    deadline: Instant::now()
+                        + ACCOUNT_USAGE_JOB_WATCHDOG
+                            .saturating_mul(u32::try_from(jobs_per_worker).unwrap_or(u32::MAX)),
+                },
+            );
+            for (profile, generation, _) in &jobs {
+                ui.usage_in_flight.insert(
+                    profile.id.clone(),
+                    AccountUsageLease {
+                        wave_id: next_wave,
+                        generation: *generation,
+                    },
+                );
+            }
+            wave_id = Some(next_wave);
+            wave_tx = Some(ensure_account_usage_channel_locked(&mut ui));
+            ui.usage_message_wave = Some(next_wave);
             ui.message = Some(if all {
                 format!("Fetching usage for {} account(s)...", jobs.len())
             } else {
@@ -1481,59 +1619,296 @@ fn request_account_usage_inner(all: bool, force: bool) {
     // Keep usage fan-out bounded within this refresh wave. Separate waves may
     // coexist for different account ids; their generations isolate results.
     let worker_count = jobs.len().min(8);
+    let wave_id = wave_id.expect("usage wave is assigned when jobs are present");
+    let tx = wave_tx.expect("usage channel is assigned when jobs are present");
     let jobs = Arc::new(jobs);
     for worker in 0..worker_count {
         let jobs = Arc::clone(&jobs);
-        thread::spawn(move || {
-            for index in (worker..jobs.len()).step_by(worker_count) {
-                let (profile, generation, cancel, tx) = &jobs[index];
-                if cancel.load(Ordering::Acquire) {
-                    continue;
+        let tx = tx.clone();
+        let spawn_failure_tx = tx.clone();
+        let worker_account_ids = jobs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % worker_count == worker)
+            .map(|(_, (profile, _, _))| profile.id.clone())
+            .collect::<Vec<_>>();
+        let spawn_failure_account_ids = worker_account_ids.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!("cursor-usage-{wave_id}-{worker}"))
+            .spawn(move || {
+                let _guard = AccountUsageWorkerGuard {
+                    tx: tx.clone(),
+                    wave_id,
+                    account_ids: worker_account_ids,
+                };
+                for index in (worker..jobs.len()).step_by(worker_count) {
+                    let (profile, generation, cancel) = &jobs[index];
+                    if cancel.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let (result, source_credential_fingerprint, credential_fingerprint) =
+                        fetch_account_usage_result(profile, *generation);
+                    let _ = tx.send(AccountUsageEvent::Result {
+                        result: result.into(),
+                        wave_id,
+                        source_credential_fingerprint,
+                        credential_fingerprint,
+                    });
                 }
-                let state = match crate::providers::cursor::auth::refresh_cursor_account_for_usage(
-                    profile,
-                ) {
-                    Ok(auth) => {
-                        match crate::providers::cursor::usage::fetch_account_usage(&auth) {
-                            Ok(snapshot) => {
-                                // A refresh cancelled for account deletion
-                                // must not resurrect the deleted row in
-                                // the durable cache. Normal panel closes
-                                // still retain successful snapshots.
-                                if !cancel.load(Ordering::Acquire) {
-                                    let _ = crate::providers::cursor::usage::persist_account_usage_for_profile(
-                                            profile,
-                                            &auth,
-                                            &snapshot,
-                                        );
-                                }
-                                crate::monitor::AccountUsageState::Ready(snapshot)
-                            }
-                            Err(error) => {
-                                crate::monitor::AccountUsageState::Failed(error.to_string())
-                            }
-                        }
+            });
+        // Thread creation is the one failure mode that cannot run the guard;
+        // account for it as an immediately completed worker so loading is
+        // still cleared and the user can retry.
+        if spawn_result.is_err() {
+            release_account_usage_leases(&spawn_failure_account_ids, wave_id);
+            let _ = spawn_failure_tx.send(AccountUsageEvent::WaveComplete { wave_id });
+        }
+    }
+}
+
+fn fetch_account_usage_result(
+    profile: &crate::providers::cursor::auth::CursorAccountProfile,
+    generation: u64,
+) -> (AccountUsageResult, u64, u64) {
+    let source_credential_fingerprint = account_credential_fingerprint(profile);
+    let (state, credential_fingerprint) =
+        match crate::providers::cursor::auth::refresh_cursor_account_for_usage(profile) {
+            Ok(auth) => {
+                let credential_fingerprint = account_auth_credential_fingerprint(&auth);
+                let state = match crate::providers::cursor::usage::fetch_account_usage(&auth) {
+                    Ok(snapshot) => {
+                        // Keep a successful snapshot even when the panel closed while
+                        // the request was in flight. Cache persistence checks account
+                        // existence under the registry lock, so a late result cannot
+                        // resurrect a row deleted concurrently.
+                        let _ = crate::providers::cursor::usage::persist_account_usage_for_profile(
+                            profile, &auth, &snapshot,
+                        );
+                        crate::monitor::AccountUsageState::Ready(snapshot)
                     }
                     Err(error) => crate::monitor::AccountUsageState::Failed(error.to_string()),
                 };
-                let _ = tx.send(AccountUsageResult {
-                    account_id: profile.id.clone(),
-                    state,
-                    generation: *generation,
-                });
+                (state, credential_fingerprint)
             }
-        });
+            Err(error) => (
+                crate::monitor::AccountUsageState::Failed(error.to_string()),
+                source_credential_fingerprint,
+            ),
+        };
+    (
+        AccountUsageResult {
+            account_id: profile.id.clone(),
+            state,
+            generation,
+        },
+        source_credential_fingerprint,
+        credential_fingerprint,
+    )
+}
+
+fn account_credential_fingerprint(
+    profile: &crate::providers::cursor::auth::CursorAccountProfile,
+) -> u64 {
+    account_auth_credential_fingerprint(&profile.auth)
+}
+
+fn account_auth_credential_fingerprint(auth: &crate::providers::cursor::auth::CursorAuth) -> u64 {
+    // This is an in-process equality token only. Never persist or display it;
+    // hashing avoids putting bearer/refresh material into the event queue.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    auth.access_token.hash(&mut hasher);
+    auth.refresh_token.hash(&mut hasher);
+    auth.api_key.hash(&mut hasher);
+    auth.user_id.hash(&mut hasher);
+    auth.email.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn mark_usage_account_failed(ui: &mut AccountUiState, account_id: &str, error: &str) {
+    ui.usage_errors
+        .insert(account_id.to_string(), error.to_string());
+    if !matches!(
+        ui.usage.get(account_id),
+        Some(crate::monitor::AccountUsageState::Ready(_))
+    ) {
+        ui.usage.insert(
+            account_id.to_string(),
+            crate::monitor::AccountUsageState::Failed(error.to_string()),
+        );
+    }
+}
+
+/// Finish a wave and clear only the rows owned by that wave. A later wave for
+/// another account (or a replacement generation for the same account) is left
+/// untouched.
+fn finish_account_usage_wave(
+    ui: &mut AccountUiState,
+    wave_id: u64,
+    error: &str,
+    invalidate_generation: bool,
+) {
+    let Some(wave) = ui.usage_waves.remove(&wave_id) else {
+        return;
+    };
+    let mut stranded = false;
+    for account in wave.accounts {
+        let current_generation = ui
+            .usage_generations
+            .get(&account.account_id)
+            .copied()
+            .unwrap_or_default();
+        if current_generation != account.generation
+            || !ui.usage_loading.contains(&account.account_id)
+        {
+            continue;
+        }
+        if invalidate_generation {
+            cancel_account_usage_locked(ui, &account.account_id);
+        } else {
+            ui.usage_loading.remove(&account.account_id);
+            ui.usage_cancels.remove(&account.account_id);
+        }
+        mark_usage_account_failed(ui, &account.account_id, error);
+        stranded = true;
+    }
+    if stranded
+        && ui.usage_message_wave == Some(wave_id)
+        && ui.message.as_deref().is_some_and(is_usage_fetching_message)
+    {
+        ui.message = Some(format!("{error}; press u to retry"));
+    }
+}
+
+fn is_usage_fetching_message(message: &str) -> bool {
+    message.starts_with("Fetching account usage") || message.starts_with("Fetching usage for ")
+}
+
+fn complete_account_usage_wave(ui: &mut AccountUiState, wave_id: u64) {
+    let complete = if let Some(wave) = ui.usage_waves.get_mut(&wave_id) {
+        wave.completed_workers = wave.completed_workers.saturating_add(1);
+        wave.completed_workers >= wave.expected_workers
+    } else {
+        false
+    };
+    if complete {
+        // A worker guard sends this marker after all of that worker's results,
+        // so once every marker is observed no result from this wave is still
+        // in flight on the channel.
+        finish_account_usage_wave(ui, wave_id, "Account usage worker stopped", false);
+    }
+}
+
+fn expire_account_usage_waves(ui: &mut AccountUiState) {
+    let now = Instant::now();
+    let expired = ui
+        .usage_waves
+        .iter()
+        .filter(|(_, wave)| wave.deadline <= now)
+        .map(|(wave_id, _)| *wave_id)
+        .collect::<Vec<_>>();
+    for wave_id in expired {
+        finish_account_usage_wave(ui, wave_id, "Account usage refresh timed out", true);
+    }
+}
+
+#[cfg(test)]
+fn apply_account_usage_event_result(
+    ui: &mut AccountUiState,
+    result: AccountUsageResult,
+    credential_fingerprint: u64,
+) {
+    apply_account_usage_event_result_for_wave(
+        ui,
+        result,
+        credential_fingerprint,
+        credential_fingerprint,
+        None,
+    );
+}
+
+fn apply_account_usage_event_result_for_wave(
+    ui: &mut AccountUiState,
+    result: AccountUsageResult,
+    source_credential_fingerprint: u64,
+    credential_fingerprint: u64,
+    wave_id: Option<u64>,
+) {
+    // Release the exact lease before any generation or credential checks. A
+    // stale result still represents completion of its detached request; if
+    // this is deferred until the current-generation branch, a timed-out wave
+    // can keep an account blocked forever.
+    if let Some(wave_id) = wave_id {
+        release_account_usage_lease_locked(ui, &result.account_id, wave_id, result.generation);
+    }
+    let current_credential_fingerprint = ui
+        .accounts
+        .iter()
+        .find(|account| account.id == result.account_id)
+        .map(account_credential_fingerprint);
+    if current_credential_fingerprint.is_some_and(|current| {
+        current != source_credential_fingerprint && current != credential_fingerprint
+    }) {
+        // The account id can remain stable while a login replaces its bearer.
+        // Do not let a response captured before that replacement overwrite the
+        // new account's meter.
+        if ui.usage_generations.get(&result.account_id).copied() == Some(result.generation) {
+            cancel_account_usage_locked(ui, &result.account_id);
+            mark_usage_account_failed(
+                ui,
+                &result.account_id,
+                "Account credentials changed; press u to retry",
+            );
+            if wave_id.is_none_or(|wave_id| {
+                ui.usage_message_wave == Some(wave_id)
+                    && ui.message.as_deref().is_some_and(is_usage_fetching_message)
+            }) {
+                ui.message = Some("Account credentials changed; press u to retry".to_string());
+            }
+        }
+        return;
+    }
+    apply_account_usage_result_for_wave(ui, result, wave_id);
+}
+
+fn apply_account_usage_event_locked(ui: &mut AccountUiState, event: AccountUsageEvent) {
+    match event {
+        AccountUsageEvent::Result {
+            result,
+            source_credential_fingerprint,
+            credential_fingerprint,
+            wave_id,
+        } => {
+            // A retired wave cannot update UI state, but its result still
+            // completes the exact detached request lease.
+            if ui.usage_waves.contains_key(&wave_id) {
+                apply_account_usage_event_result_for_wave(
+                    ui,
+                    *result,
+                    source_credential_fingerprint,
+                    credential_fingerprint,
+                    Some(wave_id),
+                );
+            } else {
+                release_account_usage_lease_locked(
+                    ui,
+                    &result.account_id,
+                    wave_id,
+                    result.generation,
+                );
+            }
+        }
+        AccountUsageEvent::WaveComplete { wave_id } => complete_account_usage_wave(ui, wave_id),
     }
 }
 
 fn poll_account_usage_results() {
     let mut ui = account_ui_lock();
-    let mut results = Vec::new();
+    let mut events = Vec::new();
     let mut channel_disconnected = false;
     if let Some(rx) = ui.usage_rx.as_ref() {
         loop {
             match rx.try_recv() {
-                Ok(result) => results.push(result),
+                Ok(event) => events.push(event),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     channel_disconnected = true;
@@ -1542,47 +1917,47 @@ fn poll_account_usage_results() {
             }
         }
     }
-    for result in results {
-        apply_account_usage_result(&mut ui, result);
+    for event in events {
+        apply_account_usage_event_locked(&mut ui, event);
     }
     if channel_disconnected {
-        // A worker panic or an unexpected sender drop must not leave rows in
-        // a permanent "refreshing" state. Preserve any previous Ready value,
-        // but make the interrupted refresh visible and retryable.
+        // This remains a fallback for an externally dropped receiver. Normal
+        // worker panic/exit is handled by the per-worker completion guard.
         ui.usage_rx = None;
         ui.usage_tx = None;
         let stranded = ui.usage_loading.iter().cloned().collect::<Vec<_>>();
+        ui.usage_waves.clear();
         for account_id in &stranded {
             cancel_account_usage_locked(&mut ui, account_id);
-            ui.usage_errors
-                .insert(account_id.clone(), "usage worker stopped".to_string());
-            if !matches!(
-                ui.usage.get(account_id),
-                Some(crate::monitor::AccountUsageState::Ready(_))
-            ) {
-                ui.usage.insert(
-                    account_id.clone(),
-                    crate::monitor::AccountUsageState::Failed("usage worker stopped".into()),
-                );
-            }
+            mark_usage_account_failed(&mut ui, account_id, "usage worker stopped");
         }
         if !stranded.is_empty() {
             ui.message = Some("Account usage worker stopped; press u to retry".to_string());
         }
     }
+    expire_account_usage_waves(&mut ui);
     ui.usage_pending = ui.usage_loading.len();
     if ui.usage_pending == 0 {
         ui.usage_scope = None;
-        if ui.message.as_deref().is_some_and(|message| {
-            message.starts_with("Fetching account usage")
-                || message.starts_with("Fetching usage for ")
-        }) {
+        if ui.message.as_deref().is_some_and(is_usage_fetching_message) {
             ui.message = Some("Usage updated".to_string());
         }
     }
 }
 
+#[cfg(test)]
 fn apply_account_usage_result(ui: &mut AccountUiState, result: AccountUsageResult) {
+    apply_account_usage_result_for_wave(ui, result, None);
+}
+
+/// Apply a result only while its account generation is current. `wave_id`
+/// scopes status-message ownership so a late failure from an older fan-out
+/// cannot replace the message posted by a newer wave.
+fn apply_account_usage_result_for_wave(
+    ui: &mut AccountUiState,
+    result: AccountUsageResult,
+    wave_id: Option<u64>,
+) {
     let current_generation = ui
         .usage_generations
         .get(&result.account_id)
@@ -1603,11 +1978,17 @@ fn apply_account_usage_result(ui: &mut AccountUiState, result: AccountUsageResul
                 .find(|account| account.id == result.account_id)
                 .map(|account| account.display_name().to_string())
                 .unwrap_or_else(|| short_account_id(&result.account_id));
-            ui.message = Some(format!(
+            let message = format!(
                 "Usage refresh failed for {}: {}",
                 display_name,
                 ellipsize(&error, 120)
-            ));
+            );
+            // A wave owns the global usage message only until another wave
+            // starts. Legacy/unit-test calls without a wave retain the
+            // historical behavior and always publish the failure.
+            if wave_id.is_none_or(|wave_id| ui.usage_message_wave == Some(wave_id)) {
+                ui.message = Some(message);
+            }
             if !matches!(
                 ui.usage.get(&result.account_id),
                 Some(crate::monitor::AccountUsageState::Ready(_))
@@ -5463,6 +5844,299 @@ mod tests {
         assert!(ui.usage_rx.is_none());
         assert!(ui.usage_cancel.is_none());
         assert!(ui.usage_scope.is_none());
+        assert!(ui.usage_in_flight.is_empty());
+    }
+
+    #[test]
+    fn account_usage_wave_completion_clears_missing_result_and_keeps_ready() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut ui = AccountUiState::default();
+        ui.usage
+            .insert("account-a".into(), usage_state_with_sand_percent(22.0));
+        ui.usage_generations.insert("account-a".into(), 1);
+        ui.usage_loading.insert("account-a".into());
+        ui.usage_cancels
+            .insert("account-a".into(), Arc::new(AtomicBool::new(false)));
+        ui.usage_waves.insert(
+            7,
+            AccountUsageWave {
+                expected_workers: 2,
+                completed_workers: 0,
+                accounts: vec![AccountUsageWaveAccount {
+                    account_id: "account-a".into(),
+                    generation: 1,
+                }],
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        );
+
+        complete_account_usage_wave(&mut ui, 7);
+        assert!(ui.usage_loading.contains("account-a"));
+        complete_account_usage_wave(&mut ui, 7);
+
+        assert!(!ui.usage_loading.contains("account-a"));
+        assert!(!ui.usage_waves.contains_key(&7));
+        assert!(matches!(
+            ui.usage.get("account-a"),
+            Some(crate::monitor::AccountUsageState::Ready(_))
+        ));
+        assert_eq!(
+            ui.usage_errors.get("account-a").map(String::as_str),
+            Some("Account usage worker stopped")
+        );
+    }
+
+    #[test]
+    fn account_usage_wave_watchdog_keeps_lease_until_late_result() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut ui = AccountUiState::default();
+        ui.usage_generations.insert("account-stuck".into(), 3);
+        ui.usage_loading.insert("account-stuck".into());
+        ui.usage.insert(
+            "account-stuck".into(),
+            crate::monitor::AccountUsageState::Unknown,
+        );
+        ui.usage_cancels
+            .insert("account-stuck".into(), Arc::new(AtomicBool::new(false)));
+        ui.usage_in_flight.insert(
+            "account-stuck".into(),
+            AccountUsageLease {
+                wave_id: 9,
+                generation: 3,
+            },
+        );
+        ui.usage_waves.insert(
+            9,
+            AccountUsageWave {
+                expected_workers: 1,
+                completed_workers: 0,
+                accounts: vec![AccountUsageWaveAccount {
+                    account_id: "account-stuck".into(),
+                    generation: 3,
+                }],
+                deadline: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        expire_account_usage_waves(&mut ui);
+
+        assert!(!ui.usage_loading.contains("account-stuck"));
+        assert!(!ui.usage_waves.contains_key(&9));
+        assert!(matches!(
+            ui.usage.get("account-stuck"),
+            Some(crate::monitor::AccountUsageState::Failed(message))
+                if message == "Account usage refresh timed out"
+        ));
+        assert_eq!(ui.usage_generations["account-stuck"], 4);
+        assert_eq!(
+            ui.usage_in_flight.get("account-stuck"),
+            Some(&AccountUsageLease {
+                wave_id: 9,
+                generation: 3,
+            }),
+            "the timed-out request remains leased while its worker is running"
+        );
+
+        apply_account_usage_event_locked(
+            &mut ui,
+            AccountUsageEvent::Result {
+                result: Box::new(AccountUsageResult {
+                    account_id: "account-stuck".into(),
+                    state: usage_state_with_sand_percent(99.0),
+                    generation: 3,
+                }),
+                wave_id: 9,
+                source_credential_fingerprint: 1,
+                credential_fingerprint: 1,
+            },
+        );
+
+        assert!(!ui.usage_in_flight.contains_key("account-stuck"));
+        assert!(matches!(
+            ui.usage.get("account-stuck"),
+            Some(crate::monitor::AccountUsageState::Failed(message))
+                if message == "Account usage refresh timed out"
+        ));
+    }
+
+    #[test]
+    fn account_usage_worker_guard_reports_panic_completion() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (tx, rx) = mpsc::channel();
+        let panic_result = std::panic::catch_unwind(|| {
+            let _guard = AccountUsageWorkerGuard {
+                tx,
+                wave_id: 11,
+                account_ids: Vec::new(),
+            };
+            panic!("simulated usage worker panic");
+        });
+        assert!(panic_result.is_err());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AccountUsageEvent::WaveComplete { wave_id: 11 })
+        ));
+    }
+
+    #[test]
+    fn account_usage_failure_from_old_wave_keeps_new_wave_message() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut ui = AccountUiState {
+            usage_message_wave: Some(22),
+            message: Some("Fetching account usage...".into()),
+            ..AccountUiState::default()
+        };
+        ui.usage_generations.insert("account-old".into(), 4);
+        ui.usage_loading.insert("account-old".into());
+        ui.usage_waves.insert(
+            21,
+            AccountUsageWave {
+                expected_workers: 1,
+                completed_workers: 0,
+                accounts: vec![AccountUsageWaveAccount {
+                    account_id: "account-old".into(),
+                    generation: 4,
+                }],
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        );
+
+        apply_account_usage_event_locked(
+            &mut ui,
+            AccountUsageEvent::Result {
+                result: Box::new(AccountUsageResult {
+                    account_id: "account-old".into(),
+                    state: crate::monitor::AccountUsageState::Failed("old failure".into()),
+                    generation: 4,
+                }),
+                wave_id: 21,
+                source_credential_fingerprint: 1,
+                credential_fingerprint: 1,
+            },
+        );
+
+        assert_eq!(ui.message.as_deref(), Some("Fetching account usage..."));
+        assert_eq!(
+            ui.usage_errors.get("account-old").map(String::as_str),
+            Some("old failure")
+        );
+    }
+
+    #[test]
+    fn account_usage_result_accepts_refreshed_credential_fingerprint() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let auth =
+            |access_token: &str, refresh_token: &str| crate::providers::cursor::auth::CursorAuth {
+                access_token: access_token.into(),
+                refresh_token: Some(refresh_token.into()),
+                api_key: None,
+                expires: None,
+                user_id: Some("user".into()),
+                email: Some("user@example.com".into()),
+                source: "test".into(),
+            };
+        let source_auth = auth("old-access", "old-refresh");
+        let refreshed_auth = auth("new-access", "new-refresh");
+        let source_fingerprint = account_auth_credential_fingerprint(&source_auth);
+        let refreshed_fingerprint = account_auth_credential_fingerprint(&refreshed_auth);
+        assert_ne!(source_fingerprint, refreshed_fingerprint);
+
+        let mut ui = AccountUiState {
+            accounts: vec![crate::providers::cursor::auth::CursorAccountProfile {
+                id: "stable-id".into(),
+                label: Some("Work".into()),
+                auth: refreshed_auth,
+                active: false,
+            }],
+            ..AccountUiState::default()
+        };
+        ui.usage_generations.insert("stable-id".into(), 1);
+        ui.usage_loading.insert("stable-id".into());
+
+        apply_account_usage_event_result_for_wave(
+            &mut ui,
+            AccountUsageResult {
+                account_id: "stable-id".into(),
+                state: usage_state_with_sand_percent(99.0),
+                generation: 1,
+            },
+            source_fingerprint,
+            refreshed_fingerprint,
+            None,
+        );
+
+        assert_eq!(ui.usage_generations["stable-id"], 1);
+        assert!(!ui.usage_loading.contains("stable-id"));
+        assert!(!ui.usage_errors.contains_key("stable-id"));
+        assert!(matches!(
+            ui.usage.get("stable-id"),
+            Some(crate::monitor::AccountUsageState::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn account_usage_result_from_replaced_credentials_is_ignored() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let old_auth = crate::providers::cursor::auth::CursorAuth {
+            access_token: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            api_key: None,
+            expires: None,
+            user_id: Some("user".into()),
+            email: Some("user@example.com".into()),
+            source: "test".into(),
+        };
+        let mut ui = AccountUiState {
+            accounts: vec![crate::providers::cursor::auth::CursorAccountProfile {
+                id: "stable-id".into(),
+                label: Some("Work".into()),
+                auth: old_auth.clone(),
+                active: false,
+            }],
+            ..AccountUiState::default()
+        };
+        ui.usage
+            .insert("stable-id".into(), usage_state_with_sand_percent(18.0));
+        ui.usage_generations.insert("stable-id".into(), 1);
+        ui.usage_loading.insert("stable-id".into());
+        ui.usage_cancels
+            .insert("stable-id".into(), Arc::new(AtomicBool::new(false)));
+
+        let old_profile = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "stable-id".into(),
+            label: Some("Work".into()),
+            auth: old_auth,
+            active: false,
+        };
+        ui.accounts[0].auth.access_token = "new-access".into();
+        apply_account_usage_event_result(
+            &mut ui,
+            AccountUsageResult {
+                account_id: "stable-id".into(),
+                state: usage_state_with_sand_percent(99.0),
+                generation: 1,
+            },
+            account_credential_fingerprint(&old_profile),
+        );
+
+        assert!(!ui.usage_loading.contains("stable-id"));
+        assert!(matches!(
+            ui.usage.get("stable-id"),
+            Some(crate::monitor::AccountUsageState::Ready(_))
+        ));
+        assert_eq!(ui.usage_generations["stable-id"], 2);
     }
 
     #[test]

@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.94 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.95 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -342,6 +342,8 @@ Sand 用量，用于把额度耗尽后的空回合识别为 HTTP 429；用量展
 `~/.local/state/claude-cursor-proxy/cursor/account-usage.json`（Windows 使用
 平台对应的 state 目录）。缓存只保存用量和拉取时间，不保存 access/refresh token；
 文件损坏或超限时会按缓存未命中处理；已有旧快照会先显示，成功刷新后再替换。
+如果 worker 异常退出或超过 watchdog，旧快照仍会保留，界面不会一直卡在刷新中；旧请求
+退出后可再次按 `u` 刷新。迟到结果只有在凭据仍属于该账号时才会写回。
 
 ```bash
 claude-cursor-proxy cursor auth status

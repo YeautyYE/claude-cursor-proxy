@@ -207,29 +207,53 @@ pub fn persist_account_usage_for_profile(
     refreshed_auth: &CursorAuth,
     snapshot: &AccountUsageSnapshot,
 ) -> anyhow::Result<()> {
+    if profile.auth.source == "environment" {
+        // Environment credentials are not represented in accounts.json, but
+        // the variable can still be changed while a dashboard request is in
+        // flight. Do not leave a snapshot keyed by the previous token.
+        let current = std::env::var("CCP_CURSOR_AUTH_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                std::env::var("CURSOR_AUTH_TOKEN")
+                    .ok()
+                    .filter(|token| !token.trim().is_empty())
+            });
+        if current.as_deref() != Some(refreshed_auth.access_token.as_str()) {
+            return Ok(());
+        }
+        return persist_account_usage(&profile.id, snapshot);
+    }
     let registry_backed =
         profile.auth.source == crate::providers::cursor::auth::cursor_accounts_location();
-    if registry_backed {
-        let Some(result) =
-            crate::providers::cursor::auth::with_cursor_account_present(&profile.id, || {
-                persist_account_usage(&profile.id, snapshot)
-            })
-        else {
-            // The account was deleted while this worker was fetching. Do not
-            // resurrect its cache row with a late successful response.
-            return Ok(());
-        };
-        result?;
+    // Keep the registry-presence check around the complete write, including
+    // legacy single-account profiles. A panel close may let an in-flight
+    // worker finish, while account deletion can create the registry only
+    // after that worker started; checking under the same lock prevents a late
+    // result from recreating a deleted cache row.
+    let Some(result) = crate::providers::cursor::auth::with_cursor_account_credential_present(
+        &profile.id,
+        &refreshed_auth.access_token,
+        || {
+            if registry_backed {
+                return persist_account_usage(&profile.id, snapshot);
+            }
+            persist_account_usage(&profile.id, snapshot)?;
+            let refreshed_id = crate::providers::cursor::auth::cursor_account_id_for_token(
+                &refreshed_auth.access_token,
+            );
+            if refreshed_id == profile.id {
+                return Ok(());
+            }
+            persist_account_usage(&refreshed_id, snapshot)?;
+            remove_account_usage(&profile.id)
+        },
+    ) else {
+        // The account was deleted or replaced while this worker was fetching.
+        // Do not resurrect or overwrite its cache row with a late response.
         return Ok(());
-    }
-    persist_account_usage(&profile.id, snapshot)?;
-    let refreshed_id =
-        crate::providers::cursor::auth::cursor_account_id_for_token(&refreshed_auth.access_token);
-    if refreshed_id == profile.id {
-        return Ok(());
-    }
-    persist_account_usage(&refreshed_id, snapshot)?;
-    remove_account_usage(&profile.id)
+    };
+    result
 }
 
 /// Remove a deleted account's durable usage snapshot. Credentials are stored

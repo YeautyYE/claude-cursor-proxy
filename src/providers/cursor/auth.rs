@@ -442,6 +442,46 @@ pub fn with_cursor_account_present<T>(
     Some(operation())
 }
 
+/// Run an operation while holding the account-registry lock only when the
+/// persisted account still owns `access_token`. This closes the small window
+/// between a dashboard request and its cache write: a late response from a
+/// credential that has since rotated must not overwrite the newer account
+/// snapshot under the same stable id.
+pub fn with_cursor_account_credential_present<T>(
+    account_id: &str,
+    access_token: &str,
+    operation: impl FnOnce() -> T,
+) -> Option<T> {
+    let account_id = account_id.trim();
+    let access_token = access_token.trim();
+    if account_id.is_empty() || access_token.is_empty() {
+        return None;
+    }
+    let _registry_lock = lock_account_registry().ok()?;
+    match load_stored_accounts() {
+        Ok(Some(stored)) => {
+            let account = stored
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)?;
+            if account.auth.access_token != access_token {
+                return None;
+            }
+        }
+        // A legacy install has no registry row yet. Its active auth mirror is
+        // still the source of truth, so reject a response from credentials
+        // that were replaced while the dashboard request was in flight.
+        Ok(None) => {
+            let auth = load_auth_for_registry_raw()?;
+            if auth.access_token != access_token {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
+    Some(operation())
+}
+
 fn load_stored_accounts() -> anyhow::Result<Option<StoredCursorAccounts>> {
     let path = accounts_path();
     let raw = match fs::read_to_string(&path) {
