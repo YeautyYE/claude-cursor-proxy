@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.92 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.93 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -117,6 +117,13 @@ claude-cursor-proxy cursor auth usage --json          # JSON 输出
 `cursor/accounts.json`，当前账号仍会镜像到原有的 `cursor/auth.json`，旧版本也能继续
 读取。监控 TUI 中按 `a` 打开账号面板，按 `Enter` 切换，按 `u` 拉取选中账号用量，按
 `U` 并行拉取全部账号。选中账号后按 `d`，再按 `y`/回车确认删除（`n`/`Esc` 取消）；删除当前账号后会立即切换到剩余账号。添加、切换或删除账号都不需要重启 `serve`。
+
+需要把指定模型固定到某个已保存账号时，在 TUI 主界面或账号面板按 `m`。用
+`j`/`k` 选择模型，按回车/空格在各账号和 `automatic` 之间轮换；按 `x` 清除
+绑定，按 `a` 输入列表里暂时没有的 catalog id。修改对新请求立即生效，不会改变
+当前活动账号。按模型绑定的 Live Run、conversation checkpoint、KV 状态和工具续传
+会按账号隔离，因此同一个 `serve` 进程可以并发使用不同账号。TUI 会保存稳定的账号
+ID；无界面配置也可以用唯一标签或邮箱作为选择器。
 
 ### 3. 让 Claude Code 走本机代理（Fable 5）
 
@@ -240,6 +247,9 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 `claude-cursor-proxy serve` 进程完成，不需要再启动第二个 Sand 二进制。
 这套规则只作用于最终路由到 Cursor 的请求；Codex、Kimi、Grok 路由不受影响。
 
+Sand 选择和账号选择相互独立。例如，可以先按 `s` 把 `gemini-3.1-pro` 设为
+`[sand]`，再按 `m` 指定它使用某个 Cursor 账号，两项设置会同时应用到请求。
+
 > **推荐优先使用监控 TUI 配置 Sand。** 保持一个 `serve` 进程运行，使用
 > 下面的快捷键即可，不需要手动编辑配置文件，而且请求当前走 `[sand]` 还是
 > `[cli]` 会直接显示出来。
@@ -252,6 +262,7 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 | `a` | 手动添加精确模型 id（例如 `claude-fable-5`） |
 | `u` | 打开账号用量详情 |
 | `a`（主界面） | 打开 Cursor 账号面板 |
+| `m`（主界面） | 为 Cursor 模型指定已保存账号 |
 | `Esc` / `s` | 关闭 Sand 编辑器 |
 
 ### 最快配置
@@ -346,9 +357,9 @@ claude-cursor-proxy cursor auth status
 
 ## 配置
 
-交互式配置 Sand 和查看用量时，推荐使用监控 TUI：按 `s` 选择 Sand 模型，按
-`a` 添加精确模型 id，按 `u` 打开账号用量。下面的文件和环境变量主要用于无
-界面或自动化部署。
+交互式配置路由和查看用量时，推荐使用监控 TUI：按 `s` 选择 Sand 模型，按
+`m` 为模型指定 Cursor 账号，按 `a` 管理账号，按 `u` 打开账号用量。下面的
+文件和环境变量主要用于无界面或自动化部署。
 
 优先级：**环境变量 > `config.json` > 内置默认值**。
 
@@ -369,6 +380,7 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API 地址 |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头 |
 | `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |
+| `CCP_CURSOR_MODEL_ACCOUNTS` | 未设置 | JSON 对象或 `模型=账号` 列表；把 Cursor 模型规则绑定到账号 ID、唯一标签或邮箱，支持 `*` 和 `?` |
 | `CCP_CURSOR_STATE_DB` | macOS 默认使用 Cursor Desktop 状态路径 | TUI 用量回退读取的 `state.vscdb` 路径 |
 | `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Anthropic `haiku` 别名和桌面端小模型探针实际使用的 Cursor 模型 id |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | 开 | 设 `0` / `false` 可关闭 Keychain 回退 |
@@ -418,14 +430,25 @@ claude-cursor-proxy cursor auth status
   "bindAddress": "127.0.0.1",
   "port": 18765,
   "cursor": {
-    "sandModels": ["claude-fable-5"]
+    "sandModels": ["claude-fable-5"],
+    "modelAccounts": {
+      "claude-fable-5": "work",
+      "gemini-3.1-pro": "ACCOUNT_ID"
+    }
   },
   "log": { "stderr": false, "verbose": false }
 }
 ```
 
-上面就是 TUI 写入的配置形状；手动编辑主要用于自动化场景。完整的路由、
-TUI、模型发现和用量说明见 [Sand 模式](#sand-模式)。
+上面就是 TUI 写入的配置形状；手动编辑主要用于自动化场景。账号值可以是
+`cursor auth list` 输出的 ID、唯一标签或唯一邮箱。模型规则不区分大小写，支持
+`*` 和 `?`，精确模型规则优先于通配规则。纯环境变量部署可写为：
+
+```bash
+export CCP_CURSOR_MODEL_ACCOUNTS='{"claude-fable-5":"work","gemini-*":"ACCOUNT_ID"}'
+```
+
+完整的路由、TUI、模型发现和用量说明见 [Sand 模式](#sand-模式)。
 
 ---
 

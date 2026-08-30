@@ -79,6 +79,17 @@ pub struct CursorAccountProfile {
     pub active: bool,
 }
 
+/// Request-scoped Cursor credential selection.  `active` records whether the
+/// selected profile is the process-wide compatibility account; inactive model
+/// routes must never use the global refresh/switch helpers because that would
+/// leak one model's account into concurrent requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorAuthSelection {
+    pub auth: CursorAuth,
+    pub account_id: Option<String>,
+    pub active: bool,
+}
+
 impl CursorAccountProfile {
     pub fn email(&self) -> Option<&str> {
         self.auth.email.as_deref()
@@ -809,6 +820,119 @@ pub fn current_cursor_account() -> anyhow::Result<Option<CursorAccountProfile>> 
         .find(|profile| profile.active))
 }
 
+/// Load the credential selected for one model without changing the global
+/// compatibility mirror.  A `cursor.modelAccounts` rule wins over the active
+/// account and is resolved by stable id, label, or email.  This keeps requests
+/// for different models isolated when they run concurrently.
+pub fn load_cursor_auth_for_model(model: &str) -> anyhow::Result<Option<CursorAuthSelection>> {
+    // Environment credentials intentionally shadow the persistent account
+    // pool.  There is no account to switch or refresh in this mode.
+    if let Some(token) = env_cursor_token() {
+        let auth = enrich(
+            StoredCursorAuth {
+                access_token: token,
+                refresh_token: None,
+                api_key: None,
+            },
+            "environment".to_string(),
+        );
+        return Ok(Some(CursorAuthSelection {
+            auth,
+            account_id: None,
+            active: true,
+        }));
+    }
+
+    let policy = config::cursor_account_routing_policy();
+    let Some(selector) = policy.account_for_model(model) else {
+        let profiles = list_cursor_accounts()?;
+        if let Some(profile) = profiles.iter().find(|profile| profile.active) {
+            // When an account pool exists, use the active profile from the
+            // same snapshot as its id. This avoids pairing a bearer loaded
+            // before a hot switch with the newly active profile. Refreshing
+            // through the account-aware helper keeps the compatibility
+            // `auth.json` mirror untouched for inactive profiles.
+            let auth = if profile
+                .auth
+                .expires
+                .is_some_and(|expires| expires <= now_ms() + REFRESH_EXPIRY_SKEW_MS)
+            {
+                refresh_cursor_account_for_usage(profile)?
+            } else {
+                profile.auth.clone()
+            };
+            return Ok(Some(CursorAuthSelection {
+                auth,
+                account_id: Some(profile.id.clone()),
+                active: true,
+            }));
+        }
+
+        // No registry profile exists (for example an upgrade install using
+        // the official Cursor keychain). Preserve the historical loader and
+        // leave the account id unset; the caller falls back to a bearer digest.
+        let auth = load_cursor_auth()?;
+        let Some(auth) = auth else {
+            return Ok(None);
+        };
+        return Ok(Some(CursorAuthSelection {
+            auth,
+            account_id: None,
+            active: true,
+        }));
+    };
+
+    let profiles = list_cursor_accounts()?;
+    let matches: Vec<_> = profiles
+        .iter()
+        .filter(|profile| {
+            config::account_selector_matches(
+                selector,
+                &profile.id,
+                profile.label.as_deref(),
+                profile.auth.email.as_deref(),
+            )
+        })
+        .collect();
+    let profile = match matches.as_slice() {
+        [] => {
+            anyhow::bail!(
+                "Cursor model account mapping for {model:?} refers to unknown account {selector:?}"
+            );
+        }
+        [profile] => *profile,
+        _ => {
+            let ids = matches
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Cursor model account mapping for {model:?} is ambiguous for {selector:?}: {ids}"
+            );
+        }
+    };
+
+    // Refresh this profile in place when its JWT is near expiry.  The helper
+    // performs a CAS against accounts.json and only updates auth.json when
+    // this profile is active, so an inactive model route never hot-switches
+    // the process-wide account.
+    let auth = if profile
+        .auth
+        .expires
+        .is_some_and(|expires| expires <= now_ms() + REFRESH_EXPIRY_SKEW_MS)
+    {
+        refresh_cursor_account_for_usage(profile)?
+    } else {
+        profile.auth.clone()
+    };
+    Ok(Some(CursorAuthSelection {
+        auth,
+        account_id: Some(profile.id.clone()),
+        active: profile.active,
+    }))
+}
+
 /// Return the active id without exposing the credential.  This is useful for
 /// TUI selection state and for diagnostics.
 pub fn active_cursor_account_id() -> anyhow::Result<Option<String>> {
@@ -1112,9 +1236,46 @@ pub fn remove_cursor_account(id: &str) -> anyhow::Result<Option<CursorAccountPro
     let active = load_auth_for_registry_raw();
     sync_active_registry(&mut stored, active);
     let before = stored.accounts.len();
+    let removed_account = stored
+        .accounts
+        .iter()
+        .find(|account| account.id == id)
+        .cloned();
     stored.accounts.retain(|account| account.id != id);
     if stored.accounts.len() == before {
         anyhow::bail!("Cursor account not found: {id}");
+    }
+    if let Some(account) = removed_account.as_ref() {
+        // Remove stale model-account selectors before committing the account
+        // deletion.  If config persistence fails, the account registry is
+        // left untouched and the caller can retry the complete operation.
+        // A broad selector may also match an account that remains after this
+        // deletion; preserve that rule so a now-unique route keeps working.
+        let registry_source = accounts_path().to_string_lossy().into_owned();
+        let account_auth = enrich(account.auth.clone(), registry_source.clone());
+        let remaining_identities = stored
+            .accounts
+            .iter()
+            .map(|remaining| {
+                let auth = enrich(remaining.auth.clone(), registry_source.clone());
+                (remaining.id.clone(), remaining.label.clone(), auth.email)
+            })
+            .collect::<Vec<_>>();
+        config::remove_cursor_model_account_routes_for_account_with_remaining(
+            &account.id,
+            account.label.as_deref(),
+            account_auth.email.as_deref(),
+            |selector| {
+                remaining_identities.iter().any(|(id, label, email)| {
+                    config::account_selector_matches(
+                        selector,
+                        id,
+                        label.as_deref(),
+                        email.as_deref(),
+                    )
+                })
+            },
+        )?;
     }
     let was_active = stored.active_id.as_deref() == Some(id);
     let mut active_account = stored
@@ -1490,6 +1651,36 @@ pub fn force_refresh_cursor_auth(
             "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-proxy cursor auth login`, or supply a fresh token."
         );
     }
+    // A model-specific route may be using an inactive account.  Refresh that
+    // registry entry in place instead of rotating whichever account happens
+    // to be mirrored by auth.json.  Matching the failed bearer also protects
+    // against a concurrent account switch or refresh race.
+    if let Some(failed) = failed_access_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Ok(profiles) = list_cursor_accounts() {
+            let registry_source = accounts_path().to_string_lossy().into_owned();
+            let failed_digest = cursor_account_digest(failed);
+            if let Some(profile) = profiles.iter().find(|profile| {
+                profile.auth.source == registry_source
+                    && (profile.auth.access_token == failed
+                        || cursor_account_digest(&profile.auth.access_token) == failed_digest)
+            }) {
+                return force_refresh_cursor_account(&profile.id, Some(failed));
+            }
+            // When a persistent pool exists but the failed bearer belongs to
+            // no current profile, falling back to auth.json could refresh the
+            // process-wide active account for an inactive model route. Keep
+            // the 401 scoped to the original request instead.
+            if profiles
+                .iter()
+                .any(|profile| profile.auth.source == registry_source)
+            {
+                return Ok(None);
+            }
+        }
+    }
     let result = file_store().force_refresh(failed_access_token);
     match &result {
         Ok(Some(auth)) => {
@@ -1499,6 +1690,106 @@ pub fn force_refresh_cursor_auth(
         Err(_) => {}
     }
     result
+}
+
+/// Force-refresh one persisted account without changing the active account.
+/// This is used by request retries after a 401 on a model pinned to an
+/// inactive profile.  The registry lock spans the refresh and compare-and-set
+/// commit because Cursor refresh tokens may be single-use.
+pub fn force_refresh_cursor_account(
+    account_id: &str,
+    failed_access_token: Option<&str>,
+) -> anyhow::Result<Option<CursorAuth>> {
+    if env_cursor_token().is_some() {
+        anyhow::bail!(
+            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN before refreshing an account"
+        );
+    }
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        anyhow::bail!("Cursor account id is required");
+    }
+    let _flight = refresh_single_flight();
+    let _registry_lock = lock_account_registry()?;
+    let stored = load_stored_accounts()?.unwrap_or_default();
+    let Some(index) = stored
+        .accounts
+        .iter()
+        .position(|account| account.id == account_id)
+    else {
+        anyhow::bail!("Cursor account not found: {account_id}");
+    };
+    let old = stored.accounts[index].auth.clone();
+    if failed_access_token
+        .map(str::trim)
+        .is_some_and(|failed| !failed.is_empty() && failed != old.access_token)
+    {
+        // Another worker already rotated this profile; return the freshest
+        // stored credential and avoid spending a second refresh token.
+        return Ok(Some(enrich(
+            old,
+            accounts_path().to_string_lossy().into_owned(),
+        )));
+    }
+    let Some(refresh_token) = old.refresh_token.as_deref() else {
+        return Ok(Some(enrich(
+            old,
+            accounts_path().to_string_lossy().into_owned(),
+        )));
+    };
+    let refreshed = match refresh_cursor_auth(refresh_token) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return Ok(Some(enrich(
+                old,
+                accounts_path().to_string_lossy().into_owned(),
+            )));
+        }
+        Err(error) => return Err(error).context("Cursor account refresh failed"),
+    };
+    let next = StoredCursorAuth {
+        access_token: refreshed.access_token,
+        refresh_token: if refreshed.refresh_token.is_empty() {
+            old.refresh_token.clone()
+        } else {
+            Some(refreshed.refresh_token)
+        },
+        api_key: old.api_key.clone(),
+    };
+    if (cursor_token_has_stable_identity(&old.access_token)
+        || cursor_token_has_stable_identity(&next.access_token))
+        && cursor_account_digest(&old.access_token) != cursor_account_digest(&next.access_token)
+    {
+        anyhow::bail!("Cursor account refresh returned a different account identity");
+    }
+    // Re-read under the same lock before commit to make the failed-token CAS
+    // explicit even if the registry was edited by another process between
+    // the initial load and the upstream response.
+    let mut latest = load_stored_accounts()?.unwrap_or_default();
+    let Some(account) = latest
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+    else {
+        anyhow::bail!("Cursor account no longer exists: {account_id}");
+    };
+    if account.auth.access_token != old.access_token {
+        return Ok(Some(enrich(
+            account.auth.clone(),
+            accounts_path().to_string_lossy().into_owned(),
+        )));
+    }
+    account.auth = next.clone();
+    let active = latest.active_id.as_deref() == Some(account_id);
+    if active {
+        file_store().save_auth(next.clone())?;
+    }
+    save_stored_accounts(&latest)?;
+    let saved = enrich(next, accounts_path().to_string_lossy().into_owned());
+    if active {
+        crate::providers::cursor::model::observe_live_usable_models_account(&saved.access_token);
+    }
+    Ok(Some(saved))
 }
 
 /// Refresh one account without switching the process-wide active account.

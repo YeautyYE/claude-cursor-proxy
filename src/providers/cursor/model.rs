@@ -197,6 +197,18 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
                 });
             }
 
+            // A model-account rule is an explicit request to route this id to
+            // Cursor, including ids introduced by a server-side catalog that
+            // has not been fetched into this process yet.  Keep the check
+            // direct/non-recursive: `account_for_model` itself consults this
+            // resolver while walking aliases.
+            if crate::config::cursor_model_account_route_matches(other) {
+                return Ok(CursorModelResolution {
+                    model_id: other.to_string(),
+                    mode: CursorAgentMode::Agent,
+                });
+            }
+
             // Keep known catalog families usable before the live catalog has
             // been fetched (startup/offline fallback).
             if other.starts_with("claude-")

@@ -177,6 +177,9 @@ fn run_monitor_events(
                     }
                     _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
                     _ if app.show_sand_settings => app.handle_sand_key(key.code),
+                    _ if app.detail == Some(DetailView::AccountRoutes) => {
+                        handle_account_route_key(app, key.code)
+                    }
                     _ if app.detail == Some(DetailView::Accounts) => {
                         handle_account_key(app, key.code)
                     }
@@ -190,6 +193,7 @@ fn run_monitor_events(
                         app.show_help = false;
                     }
                     KeyCode::Char('a') => open_accounts_view(app),
+                    KeyCode::Char('m') => open_account_routes(app),
                     KeyCode::Char('s') => {
                         app.refresh_sand_models();
                         app.show_sand_settings = true;
@@ -259,6 +263,7 @@ enum DetailView {
     Request,
     Usage,
     Accounts,
+    AccountRoutes,
 }
 
 /// State for the account manager overlay.  It is kept outside `MonitorApp` so
@@ -317,6 +322,27 @@ struct AccountUsageResult {
     account_id: String,
     state: crate::monitor::AccountUsageState,
     generation: u64,
+}
+
+/// State for the model-to-account routing editor.  Like the account usage
+/// state, this stays outside `MonitorApp` so existing monitor fixtures and
+/// request snapshots remain unchanged while the overlay is open.
+#[derive(Default)]
+struct AccountRouteUiState {
+    models: Vec<String>,
+    policy: config::CursorAccountRoutingPolicy,
+    selected: usize,
+    input: Option<String>,
+    message: Option<String>,
+}
+
+static ACCOUNT_ROUTE_UI: LazyLock<Mutex<AccountRouteUiState>> =
+    LazyLock::new(|| Mutex::new(AccountRouteUiState::default()));
+
+fn account_route_ui_lock() -> std::sync::MutexGuard<'static, AccountRouteUiState> {
+    ACCOUNT_ROUTE_UI
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 static ACCOUNT_UI: LazyLock<Mutex<AccountUiState>> =
@@ -645,6 +671,234 @@ fn open_accounts_view(app: &mut MonitorApp) {
     request_account_usage(false);
 }
 
+/// Open the model-to-account editor from the account view.  Models already
+/// known by the Sand selector are reused so a user can configure an account
+/// for a live catalog model without typing its id; persisted route patterns
+/// are merged as well to keep hand-authored rules visible.
+fn open_account_routes(app: &mut MonitorApp) {
+    if account_ui_lock().accounts.is_empty() {
+        refresh_account_list();
+    }
+    let policy = config::cursor_account_routing_policy();
+    let mut models = app.sand_models.clone();
+    models.extend(policy.routes().iter().map(|rule| rule.model.clone()));
+    models.sort_unstable();
+    models.dedup();
+    let mut ui = account_route_ui_lock();
+    ui.models = models;
+    ui.policy = policy;
+    ui.selected = ui.selected.min(ui.models.len().saturating_sub(1));
+    ui.input = None;
+    ui.message = None;
+    app.show_setup = false;
+    app.show_sand_settings = false;
+    app.show_help = false;
+    app.detail = Some(DetailView::AccountRoutes);
+}
+
+fn close_account_routes(app: &mut MonitorApp) {
+    // Keep the account pane as the parent view so Esc/m behaves like the
+    // other nested TUI details and the user can immediately inspect usage or
+    // switch accounts after editing a route.
+    app.detail = Some(DetailView::Accounts);
+    let mut ui = account_route_ui_lock();
+    ui.input = None;
+    ui.message = None;
+}
+
+fn account_routes_env_override_active() -> bool {
+    std::env::var_os("CCP_CURSOR_MODEL_ACCOUNTS").is_some()
+}
+
+fn handle_account_route_key(app: &mut MonitorApp, key: KeyCode) {
+    let input_active = account_route_ui_lock().input.is_some();
+    if input_active {
+        handle_account_route_input_key(key);
+        return;
+    }
+    match key {
+        KeyCode::Esc | KeyCode::Char('m') => close_account_routes(app),
+        KeyCode::Up | KeyCode::Char('k') => {
+            let mut ui = account_route_ui_lock();
+            ui.selected = ui.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let mut ui = account_route_ui_lock();
+            ui.selected = ui
+                .selected
+                .saturating_add(1)
+                .min(ui.models.len().saturating_sub(1));
+        }
+        KeyCode::Char('a') => {
+            let mut ui = account_route_ui_lock();
+            if account_routes_env_override_active() {
+                ui.message = Some(
+                    "CCP_CURSOR_MODEL_ACCOUNTS is active; unset it to edit config.json".to_string(),
+                );
+            } else {
+                ui.input = Some(String::new());
+                ui.message = None;
+            }
+        }
+        KeyCode::Char('r') => {
+            let mut ui = account_route_ui_lock();
+            ui.policy = config::cursor_account_routing_policy();
+            let route_models = ui
+                .policy
+                .routes()
+                .iter()
+                .map(|rule| rule.model.clone())
+                .collect::<Vec<_>>();
+            ui.models.extend(route_models);
+            ui.models.sort_unstable();
+            ui.models.dedup();
+            ui.message = Some("Model-account routes reloaded".to_string());
+        }
+        KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+            clear_selected_account_route();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => cycle_selected_account_route(),
+        _ => {}
+    }
+}
+
+fn handle_account_route_input_key(key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            let mut ui = account_route_ui_lock();
+            ui.input = None;
+        }
+        KeyCode::Enter => save_custom_account_route_model(),
+        KeyCode::Backspace => {
+            let mut ui = account_route_ui_lock();
+            if let Some(input) = ui.input.as_mut() {
+                input.pop();
+            }
+        }
+        KeyCode::Char(value) if !value.is_control() => {
+            let mut ui = account_route_ui_lock();
+            if let Some(input) = ui.input.as_mut()
+                && input.len() < 160
+            {
+                input.push(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn save_custom_account_route_model() {
+    let raw = account_route_ui_lock().input.clone().unwrap_or_default();
+    let model = config::normalize_sand_model(&raw);
+    if model.is_empty() {
+        account_route_ui_lock().message = Some("Model id cannot be empty".to_string());
+        return;
+    }
+    if model.chars().any(char::is_whitespace) {
+        account_route_ui_lock().message = Some("Model id cannot contain whitespace".to_string());
+        return;
+    }
+    let mut ui = account_route_ui_lock();
+    ui.input = None;
+    if !ui.models.iter().any(|candidate| candidate == &model) {
+        ui.models.push(model.clone());
+        ui.models.sort_unstable();
+    }
+    ui.selected = ui
+        .models
+        .iter()
+        .position(|candidate| candidate == &model)
+        .unwrap_or(0);
+    ui.message = Some("Model added; press Enter to choose an account".to_string());
+}
+
+fn selected_account_route_model() -> Option<String> {
+    let ui = account_route_ui_lock();
+    ui.models.get(ui.selected).cloned()
+}
+
+fn account_route_rules_with_assignment(
+    policy: &config::CursorAccountRoutingPolicy,
+    model: &str,
+    account: Option<&str>,
+) -> config::CursorAccountRoutingPolicy {
+    policy.with_model_assignment(model, account)
+}
+
+fn cycle_selected_account_route() {
+    if account_routes_env_override_active() {
+        account_route_ui_lock().message =
+            Some("CCP_CURSOR_MODEL_ACCOUNTS is active; unset it to edit config.json".to_string());
+        return;
+    }
+    let Some(model) = selected_account_route_model() else {
+        account_route_ui_lock().message = Some("No models are available".to_string());
+        return;
+    };
+    let accounts = account_ui_lock().accounts.clone();
+    if accounts.is_empty() {
+        account_route_ui_lock().message =
+            Some("No Cursor accounts are saved; run `cursor auth add` first".to_string());
+        return;
+    }
+    let (policy, current) = {
+        let ui = account_route_ui_lock();
+        (
+            ui.policy.clone(),
+            ui.policy.account_for_model(&model).map(str::to_string),
+        )
+    };
+    let current_index = current.as_deref().and_then(|selector| {
+        accounts.iter().position(|account| {
+            config::account_selector_matches(
+                selector,
+                &account.id,
+                account.label.as_deref(),
+                account.email(),
+            )
+        })
+    });
+    let next_account = match current_index {
+        Some(index) if index + 1 < accounts.len() => Some(accounts[index + 1].id.clone()),
+        Some(_) => None,
+        None => Some(accounts[0].id.clone()),
+    };
+    let next_policy = account_route_rules_with_assignment(&policy, &model, next_account.as_deref());
+    match config::persist_cursor_account_routes(&next_policy) {
+        Ok(()) => {
+            let mut ui = account_route_ui_lock();
+            ui.policy = next_policy;
+            ui.message = Some(match next_account {
+                Some(account) => format!("{model} uses account {account}"),
+                None => format!("{model} uses automatic account selection"),
+            });
+        }
+        Err(error) => account_route_ui_lock().message = Some(format!("Save failed: {error}")),
+    }
+}
+
+fn clear_selected_account_route() {
+    if account_routes_env_override_active() {
+        account_route_ui_lock().message =
+            Some("CCP_CURSOR_MODEL_ACCOUNTS is active; unset it to edit config.json".to_string());
+        return;
+    }
+    let Some(model) = selected_account_route_model() else {
+        account_route_ui_lock().message = Some("No models are available".to_string());
+        return;
+    };
+    let policy = account_route_ui_lock().policy.clone();
+    let next_policy = account_route_rules_with_assignment(&policy, &model, None);
+    match config::persist_cursor_account_routes(&next_policy) {
+        Ok(()) => {
+            let mut ui = account_route_ui_lock();
+            ui.policy = next_policy;
+            ui.message = Some(format!("{model} uses automatic account selection"));
+        }
+        Err(error) => account_route_ui_lock().message = Some(format!("Save failed: {error}")),
+    }
+}
+
 fn refresh_account_list() {
     // Invalidate snapshots before doing any potentially slow auth/file work.
     // The next caller can explicitly start a fresh selected/all poll.
@@ -735,6 +989,7 @@ fn handle_account_key(app: &mut MonitorApp, key: KeyCode) {
             refresh_account_list();
             request_account_usage_force(true);
         }
+        KeyCode::Char('m') => open_account_routes(app),
         _ => {}
     }
 }
@@ -1052,14 +1307,21 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         .split(area);
 
     render_header(frame, root[0], app, state);
-    if matches!(app.detail, Some(DetailView::Accounts)) {
+    if matches!(
+        app.detail,
+        Some(DetailView::Accounts | DetailView::AccountRoutes)
+    ) {
         let accounts_area = Rect {
             x: root[1].x,
             y: root[1].y,
             width: root[1].width,
             height: root[4].y + root[4].height - root[1].y,
         };
-        render_accounts_detail(frame, accounts_area);
+        if app.detail == Some(DetailView::AccountRoutes) {
+            render_account_routes_detail(frame, accounts_area);
+        } else {
+            render_accounts_detail(frame, accounts_area);
+        }
     } else if matches!(app.detail, Some(DetailView::Usage)) {
         // Usage is a full-height detail view so period, cost, and event rows
         // remain visible on ordinary 24-row terminals.
@@ -1078,6 +1340,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
             }
             Some(DetailView::Usage) => unreachable!("usage detail handled above"),
             Some(DetailView::Accounts) => unreachable!("accounts detail handled above"),
+            Some(DetailView::AccountRoutes) => unreachable!("account routes handled above"),
             None => render_sessions(
                 frame,
                 root[1],
@@ -2281,6 +2544,147 @@ fn render_request_detail(
     );
 }
 
+fn account_route_display_name(
+    selector: Option<&str>,
+    accounts: &[crate::providers::cursor::auth::CursorAccountProfile],
+) -> String {
+    let Some(selector) = selector else {
+        return "automatic".to_string();
+    };
+    let mut matches = accounts.iter().filter(|account| {
+        config::account_selector_matches(
+            selector,
+            &account.id,
+            account.label.as_deref(),
+            account.email(),
+        )
+    });
+    let Some(account) = matches.next() else {
+        // Keep an invalid selector visible instead of presenting it as
+        // automatic; the request path rejects the same mapping clearly.
+        return selector.to_string();
+    };
+    if matches.next().is_some() {
+        // The request path rejects a selector that resolves to multiple
+        // accounts. Showing the first match here would falsely imply that the
+        // route is valid and deterministic.
+        return format!("{selector} (ambiguous)");
+    }
+    account.display_name().to_string()
+}
+
+fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let (models, policy, selected, input, message) = {
+        let ui = account_route_ui_lock();
+        (
+            ui.models.clone(),
+            ui.policy.clone(),
+            ui.selected,
+            ui.input.clone(),
+            ui.message.clone(),
+        )
+    };
+    let accounts = account_ui_lock().accounts.clone();
+    let visible_rows = usize::from(area.height.saturating_sub(9)).max(1);
+    let mut lines = vec![Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Enter/space", Style::default().fg(TEAL)),
+        Span::styled(" cycle account  ", Style::default().fg(DIM)),
+        Span::styled("x", Style::default().fg(TEAL)),
+        Span::styled(" clear  ", Style::default().fg(DIM)),
+        Span::styled("a", Style::default().fg(TEAL)),
+        Span::styled(" add model  ", Style::default().fg(DIM)),
+        Span::styled("Esc/m", Style::default().fg(TEAL)),
+        Span::styled(" close", Style::default().fg(DIM)),
+    ])];
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Model", Style::default().fg(TEAL)),
+        Span::styled(
+            "                                      ",
+            Style::default().fg(DIM),
+        ),
+        Span::styled("Account", Style::default().fg(TEAL)),
+    ]));
+    if let Some(input) = input.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("  model id: ", Style::default().fg(DIM)),
+            Span::styled(format!("{input}_"), Style::default().fg(WHITE)),
+        ]));
+    }
+    if models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No Cursor models are registered",
+            Style::default().fg(DIM_WHITE),
+        )));
+    } else {
+        let start = selected.saturating_sub(visible_rows.saturating_sub(1) / 2);
+        let end = (start + visible_rows).min(models.len());
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                "  ^ more models",
+                Style::default().fg(DIM),
+            )));
+        }
+        for (index, model) in models
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
+        {
+            let row_selected = index == selected;
+            let style = if row_selected {
+                Style::default().fg(WHITE).bg(SELECTED_BG)
+            } else {
+                Style::default().fg(DIM_WHITE)
+            };
+            let route = account_route_display_name(policy.account_for_model(model), &accounts);
+            lines.push(Line::from(vec![
+                Span::styled(if row_selected { "  > " } else { "    " }, style),
+                Span::styled(format!("{:<38} ", ellipsize(model, 38)), style),
+                Span::styled(route, style),
+            ]));
+        }
+        if end < models.len() {
+            lines.push(Line::from(Span::styled(
+                "  v more models",
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    if let Some(message) = message.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(YELLOW),
+        )));
+    }
+    if input.is_some() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(TEAL)),
+            Span::styled(" save  ", Style::default().fg(DIM)),
+            Span::styled("Esc", Style::default().fg(TEAL)),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("j/k", Style::default().fg(TEAL)),
+            Span::styled(" move  ", Style::default().fg(DIM)),
+            Span::styled("r", Style::default().fg(TEAL)),
+            Span::styled(" reload", Style::default().fg(DIM)),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .block(panel("Model account routes", true))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let ui = account_ui_lock();
     let columns = account_list_columns(area.width);
@@ -2296,6 +2700,8 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Span::styled(" delete  ", Style::default().fg(DIM)),
         Span::styled("r", Style::default().fg(TEAL)),
         Span::styled(" refresh  ", Style::default().fg(DIM)),
+        Span::styled("m", Style::default().fg(TEAL)),
+        Span::styled(" model accounts  ", Style::default().fg(DIM)),
         Span::styled("Esc/a", Style::default().fg(TEAL)),
         Span::styled(" close", Style::default().fg(DIM)),
     ])];
@@ -2737,6 +3143,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" usage  ", Style::default().fg(DIM)),
         Span::styled("a", Style::default().fg(TEAL)),
         Span::styled(" accounts  ", Style::default().fg(DIM)),
+        Span::styled("m", Style::default().fg(TEAL)),
+        Span::styled(" model accounts  ", Style::default().fg(DIM)),
         Span::styled("s", Style::default().fg(TEAL)),
         Span::styled(" sand models  ", Style::default().fg(DIM)),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
@@ -2858,6 +3266,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("u", "show account usage"),
         ("a", "manage Cursor accounts"),
         ("d", "delete selected Cursor account"),
+        ("m", "assign models to accounts"),
         ("s", "configure Sand models"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
@@ -3065,11 +3474,22 @@ pub fn setup_text(port: u16, registry: &Registry) -> String {
     } else {
         sand_patterns
     };
+    let account_routes = config::cursor_account_routing_policy()
+        .routes()
+        .iter()
+        .map(|rule| format!("{}={}", rule.model, rule.account))
+        .collect::<Vec<_>>();
+    let account_route_summary = if account_routes.is_empty() {
+        "none".to_string()
+    } else {
+        account_routes.join(", ")
+    };
     let mut lines = vec![
         format!("Logs: {}", paths::log_file().display()),
         format!("Config: {}", paths::config_dir().display()),
         format!("Providers: {model_summary}"),
         format!("Sand models: {sand_summary}"),
+        format!("Model accounts: {account_route_summary}"),
     ];
     lines.push(format!(
         "export ANTHROPIC_BASE_URL=\"http://localhost:{port}\""
@@ -3888,6 +4308,186 @@ mod tests {
 
         let mut ui = account_ui_lock();
         *ui = AccountUiState::default();
+    }
+
+    #[test]
+    fn account_routes_view_renders_model_assignment_and_controls() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let account = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "account-work".to_string(),
+            label: Some("Work".to_string()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "token-work".to_string(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: None,
+                email: Some("work@example.com".to_string()),
+                source: "test".to_string(),
+            },
+            active: true,
+        };
+        {
+            let mut accounts = account_ui_lock();
+            accounts.accounts = vec![account];
+        }
+        {
+            let mut routes = account_route_ui_lock();
+            routes.models = vec![
+                "claude-fable-5".to_string(),
+                "gemini-3.1-pro".to_string(),
+                "grok-*".to_string(),
+                "gpt-5.4".to_string(),
+            ];
+            routes.policy = config::CursorAccountRoutingPolicy::new([
+                config::CursorModelAccountRule::new("gemini-3.1-pro", "account-work"),
+                config::CursorModelAccountRule::new("grok-*", "account-work"),
+            ]);
+            routes.selected = 0;
+            routes.input = None;
+            routes.message = None;
+        }
+
+        let buffer = draw(120, 18, |frame| {
+            render_account_routes_detail(frame, frame.area())
+        });
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Model account routes"), "{text}");
+        assert!(text.contains("gemini-3.1-pro"), "{text}");
+        assert!(text.contains("grok-*"), "{text}");
+        assert!(text.contains("Work"), "{text}");
+        assert!(text.contains("cycle account"), "{text}");
+        assert!(text.contains("automatic"), "{text}");
+
+        *account_ui_lock() = AccountUiState::default();
+        *account_route_ui_lock() = AccountRouteUiState::default();
+    }
+
+    #[test]
+    fn account_routes_view_marks_ambiguous_selector_instead_of_first_account() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let account = |id: &str, label: &str, email: &str| {
+            crate::providers::cursor::auth::CursorAccountProfile {
+                id: id.to_string(),
+                label: Some(label.to_string()),
+                auth: crate::providers::cursor::auth::CursorAuth {
+                    access_token: format!("token-{id}"),
+                    refresh_token: None,
+                    api_key: None,
+                    expires: None,
+                    user_id: None,
+                    email: Some(email.to_string()),
+                    source: "test".to_string(),
+                },
+                active: id == "account-a",
+            }
+        };
+        {
+            let mut accounts = account_ui_lock();
+            accounts.accounts = vec![
+                account("account-a", "Team Alpha", "alpha@example.com"),
+                account("account-b", "Team Beta", "beta@example.com"),
+            ];
+        }
+        {
+            let mut routes = account_route_ui_lock();
+            routes.models = vec!["gemini-3.1-pro".to_string()];
+            routes.policy =
+                config::CursorAccountRoutingPolicy::new([config::CursorModelAccountRule::new(
+                    "gemini-3.1-pro",
+                    "team*",
+                )]);
+            routes.selected = 0;
+            routes.input = None;
+            routes.message = None;
+        }
+
+        let buffer = draw(120, 12, |frame| {
+            render_account_routes_detail(frame, frame.area())
+        });
+        let text = buffer_text(&buffer);
+        assert!(text.contains("team* (ambiguous)"), "{text}");
+        assert!(!text.contains("Team Alpha"), "{text}");
+        assert!(!text.contains("Team Beta"), "{text}");
+
+        *account_ui_lock() = AccountUiState::default();
+        *account_route_ui_lock() = AccountRouteUiState::default();
+    }
+
+    #[test]
+    fn account_route_assignment_replaces_exact_rule_without_dropping_wildcards() {
+        let policy = config::CursorAccountRoutingPolicy::new([
+            config::CursorModelAccountRule::new("*", "fallback"),
+            config::CursorModelAccountRule::new("gemini-3.1-pro", "old"),
+        ]);
+        let next =
+            account_route_rules_with_assignment(&policy, "gemini-3.1-pro", Some("new-account"));
+        assert_eq!(
+            next.account_for_model("gemini-3.1-pro"),
+            Some("new-account")
+        );
+        assert_eq!(next.account_for_model("grok-4.6"), Some("fallback"));
+
+        let cleared = account_route_rules_with_assignment(&next, "gemini-3.1-pro", None);
+        assert_eq!(
+            cleared.account_for_model("gemini-3.1-pro"),
+            Some("fallback")
+        );
+    }
+
+    #[test]
+    fn account_route_cycle_clears_fable_alias_and_concrete_rules_together() {
+        let policy = config::CursorAccountRoutingPolicy::new([
+            config::CursorModelAccountRule::new("*", "fallback"),
+            config::CursorModelAccountRule::new("fable", "old-alias"),
+            config::CursorModelAccountRule::new("claude-fable-5-thinking-max", "old-concrete"),
+            config::CursorModelAccountRule::new("claude-fable-5-preview", "old-preview"),
+        ]);
+
+        // This is the sequence used by Enter/space: choose the next account,
+        // then eventually cycle to automatic.  Each step must remove stale
+        // exact aliases before inserting the newly selected assignment.
+        let account_a =
+            account_route_rules_with_assignment(&policy, "claude-fable-5", Some("account-a"));
+        assert_eq!(
+            account_a.account_for_model("claude-fable-5-thinking-max"),
+            Some("account-a")
+        );
+        assert_eq!(
+            account_a
+                .routes()
+                .iter()
+                .filter(|rule| !rule.model.contains('*') && !rule.model.contains('?'))
+                .count(),
+            1,
+            "only the newly assigned literal should remain; wildcard fallback is retained"
+        );
+
+        let account_b = account_route_rules_with_assignment(
+            &account_a,
+            "claude-fable-5-thinking-max",
+            Some("account-b"),
+        );
+        assert_eq!(
+            account_b.account_for_model("fable"),
+            Some("account-b"),
+            "rotating from a concrete Fable row must replace the alias assignment too"
+        );
+
+        let automatic = account_route_rules_with_assignment(&account_b, "fable-preview", None);
+        assert_eq!(
+            automatic.account_for_model("claude-fable-5"),
+            Some("fallback")
+        );
+        assert!(automatic.routes().iter().all(|rule| {
+            rule.model == "*"
+                || rule.model == "gemini-*"
+                || (!rule.model.contains("fable") && !rule.model.contains("preview"))
+        }));
     }
 
     #[test]

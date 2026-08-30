@@ -39,8 +39,8 @@ use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::cursor::auth::{
     CursorAccountProfile, clear_cursor_auth, cursor_account_digest, expired_auth_message,
-    force_refresh_cursor_auth, list_cursor_accounts, load_cursor_auth, missing_auth_message,
-    run_cursor_login,
+    force_refresh_cursor_auth, list_cursor_accounts, load_cursor_auth, load_cursor_auth_for_model,
+    missing_auth_message, run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::connect::cursor_connect_error_is_missing_image;
@@ -53,7 +53,7 @@ use crate::providers::cursor::live::{
     CursorLiveRunHandle, EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT, EMPTY_TURN_RETRY_NOTE,
     LIVE_AMBIGUOUS_OPEN_TTL, LIVE_H2_OPEN_ATTEMPT, LiveEventResult, LiveReplacementClaim,
     LiveRunEvent, LiveRunIdentity, LiveRunProbe, LiveRunRegistry, LiveRunReservation,
-    LiveSlotClaim, LiveStartRecovery, cursor_error_is_kv_blob_overflow,
+    LiveSlotClaim, LiveStartRecovery, account_scoped_agent_id, cursor_error_is_kv_blob_overflow,
     cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
     finish_replacement_after_cancel, live_error_is_agent_looping_detected,
     live_error_is_empty_turn_retry, live_error_is_kv_blob_overflow_replayable,
@@ -743,12 +743,24 @@ struct LiveLateRetryContext {
     model: String,
     client_type: String,
     effective_token: Arc<Mutex<String>>,
+    /// Stable account partition for registry/conversation state.  This is
+    /// shared with the retry starter so an account-pool failover can move the
+    /// late-retry observer to the replacement account without reusing the
+    /// exhausted account's pending generation.
+    account_key: Arc<Mutex<String>>,
     compaction_mode: bool,
 }
 
 impl LiveLateRetryContext {
     fn effective_token(&self) -> String {
         self.effective_token
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    fn account_key(&self) -> String {
+        self.account_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
@@ -1016,6 +1028,10 @@ struct LiveRetryStart {
     session_id: String,
     agent_id: Option<String>,
     parent_agent_id: Option<String>,
+    /// Stable account partition shared by the initial opener and all late
+    /// retries.  The value is updated when bounded account failover swaps the
+    /// effective bearer so state keys follow the replacement account.
+    account_key: Arc<Mutex<String>>,
     allowed: Option<BTreeSet<String>>,
     mcp_tools: Option<crate::providers::cursor::proto::McpTools>,
     request_context: crate::providers::cursor::proto::RequestContext,
@@ -1050,12 +1066,38 @@ fn live_retry_user_text<'a>(original: &'a str, error: &str) -> &'a str {
     }
 }
 
-fn prepare_live_retry_conversation(session_id: &str, error: &str) -> bool {
+fn prepare_live_retry_conversation_for_account(
+    session_id: &str,
+    agent_id: Option<&str>,
+    account_key: Option<&str>,
+    error: &str,
+) -> bool {
     if live_error_is_empty_turn_retry(error)
         && !live_error_needs_checkpoint_continue(error)
         // `recover_empty_turn_if_needed` already reset this conversation when
         // it appended the stale-reset note. Avoid replacing it a second time,
         // which would unnecessarily discard a just-created binding.
+        && !error.contains("stale Cursor conversation reset")
+    {
+        let key = live_retry_conversation_key_for_account(session_id, agent_id, account_key);
+        conversation::reset(&key);
+        true
+    } else {
+        false
+    }
+}
+
+/// Compatibility wrapper for callers that predate account-partitioned
+/// conversation state. New request paths should use the account-aware helper
+/// above so retries cannot cross account lanes.
+#[cfg(test)]
+fn prepare_live_retry_conversation(session_id: &str, error: &str) -> bool {
+    // Legacy unit-test callers pass the already-composed conversation key.
+    // Keep this compatibility shim byte-for-byte equivalent to the old
+    // unpartitioned helper; production request paths use the account-aware
+    // variant above.
+    if live_error_is_empty_turn_retry(error)
+        && !live_error_needs_checkpoint_continue(error)
         && !error.contains("stale Cursor conversation reset")
     {
         conversation::reset(session_id);
@@ -1065,12 +1107,22 @@ fn prepare_live_retry_conversation(session_id: &str, error: &str) -> bool {
     }
 }
 
-fn live_retry_conversation_key(session_id: &str, agent_id: Option<&str>) -> String {
+fn live_retry_conversation_key_for_account(
+    session_id: &str,
+    agent_id: Option<&str>,
+    account_key: Option<&str>,
+) -> String {
     live_run_key_for(LiveRunIdentity {
         session_id,
         agent_id,
         parent_agent_id: None,
+        account_key,
     })
+}
+
+#[cfg(test)]
+fn live_retry_conversation_key(session_id: &str, agent_id: Option<&str>) -> String {
+    live_retry_conversation_key_for_account(session_id, agent_id, None)
 }
 
 fn live_retry_needs_fresh_history(error: &str) -> bool {
@@ -1185,6 +1237,13 @@ impl LiveRetryStart {
             .clone()
     }
 
+    fn account_key(&self) -> String {
+        self.account_key
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
     fn retry_user_text(&self, error: &str) -> &str {
         live_retry_user_text(&self.user_text, error)
     }
@@ -1201,6 +1260,7 @@ impl LiveRetryStart {
         &self,
         error: &str,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
+        let mut account_key = self.account_key();
         // A policy response can arrive after the initial live-open peek (for
         // example Cursor accepts the Run, then emits a delayed Sand
         // quota/error frame).  The normal late-retry classifier keeps this
@@ -1228,8 +1288,16 @@ impl LiveRetryStart {
                 .effective_token
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) = replacement.clone();
-            let conversation_key =
-                live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+            account_key = cursor_account_key_for_token(&replacement);
+            *self
+                .account_key
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = account_key.clone();
+            let conversation_key = live_retry_conversation_key_for_account(
+                &self.session_id,
+                self.agent_id.as_deref(),
+                Some(&account_key),
+            );
             conversation::reset(&conversation_key);
             *self
                 .expected_conversation_id
@@ -1269,8 +1337,11 @@ impl LiveRetryStart {
             {
                 return Err(CursorError::new(400, error, None));
             }
-            let conversation_key =
-                live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+            let conversation_key = live_retry_conversation_key_for_account(
+                &self.session_id,
+                self.agent_id.as_deref(),
+                Some(&account_key),
+            );
             conversation::reset(&conversation_key);
             create_logger("cursor").warn(
                 "compact_loop_recovery",
@@ -1293,8 +1364,11 @@ impl LiveRetryStart {
         // conversation even if an unusual upstream termination path failed to
         // perform the driver's normal empty-turn reset. A post-tool checkpoint
         // continuation is different: clearing it could replay completed tools.
-        let conversation_key =
-            live_retry_conversation_key(&self.session_id, self.agent_id.as_deref());
+        let conversation_key = live_retry_conversation_key_for_account(
+            &self.session_id,
+            self.agent_id.as_deref(),
+            Some(&account_key),
+        );
         if live_error_is_kv_blob_overflow_replayable(error) {
             // Cursor's KV store is append-only for the lifetime of a remote
             // conversation. Replaying the delta against the same id cannot
@@ -1355,7 +1429,12 @@ impl LiveRetryStart {
             self.start_with_user_text_and_images(&self.reset_user_text, &images, None)
                 .await
         } else {
-            prepare_live_retry_conversation(&conversation_key, error);
+            prepare_live_retry_conversation_for_account(
+                &self.session_id,
+                self.agent_id.as_deref(),
+                Some(&account_key),
+                error,
+            );
             let cached_images = cached_image_recovery_snapshot(&self.image_recovery_images);
             let images = if live_retry_needs_fresh_history(error) {
                 cached_images.as_deref().unwrap_or(&self.reset_retry_images)
@@ -1392,6 +1471,7 @@ impl LiveRetryStart {
         // open succeeds; publishing from a post-await map lookup would then
         // associate this generation with that unrelated replacement.
         let opened_conversation_id = Arc::new(Mutex::new(None));
+        let account_key = self.account_key();
         let result = start_live_events_with_retries_with_client_type(
             self.client.clone(),
             self.effective_token(),
@@ -1410,6 +1490,7 @@ impl LiveRetryStart {
                 session_id: &self.session_id,
                 agent_id: self.agent_id.as_deref(),
                 parent_agent_id: self.parent_agent_id.as_deref(),
+                account_key: Some(&account_key),
             },
             self.allowed.clone(),
             self.mcp_tools.clone(),
@@ -1722,6 +1803,10 @@ fn account_failover_candidates_from_profiles(
     attempted_accounts: &BTreeSet<String>,
 ) -> Vec<String> {
     let current_digest = cursor_account_digest(current_token);
+    // A model pinned to one account must not silently consume another
+    // account's unrelated allowance during automatic policy failover. With
+    // no explicit route the historical pool-wide failover behavior remains.
+    let pinned_account = crate::config::cursor_account_for_model(model);
     let mut candidates: Vec<(String, String)> = profiles
         .iter()
         .filter_map(|profile| {
@@ -1733,6 +1818,16 @@ fn account_failover_candidates_from_profiles(
             if digest == current_digest
                 || attempted_accounts.contains(&digest)
                 || attempted_accounts.contains(&profile.id)
+            {
+                return None;
+            }
+            if let Some(selector) = pinned_account.as_deref()
+                && !crate::config::account_selector_matches(
+                    selector,
+                    &profile.id,
+                    profile.label.as_deref(),
+                    profile.auth.email.as_deref(),
+                )
             {
                 return None;
             }
@@ -1848,6 +1943,22 @@ fn account_failover_replacement_token(
         );
     }
     replacement
+}
+
+/// Resolve the stable registry id for a bearer selected from the account pool.
+/// Access tokens may rotate while an account keeps the same profile id; use
+/// that id whenever the registry can be read and fall back to the digest for
+/// environment/legacy credentials that have no persisted profile.
+fn cursor_account_key_for_token(token: &str) -> String {
+    list_cursor_accounts()
+        .ok()
+        .and_then(|profiles| {
+            profiles
+                .into_iter()
+                .find(|profile| profile.auth.access_token == token)
+                .map(|profile| profile.id)
+        })
+        .unwrap_or_else(|| cursor_account_digest(token))
 }
 
 /// 401-recovery refresh off the async workers: the refresh HTTP call is
@@ -1994,6 +2105,21 @@ async fn start_live_events_with_retries_with_client_type(
         compaction_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let account_failover_state = account_failover_state
         .unwrap_or_else(|| Arc::new(Mutex::new(AccountFailoverState::new(&token))));
+    // Keep registry/conversation state account-scoped even when callers use
+    // the legacy `(session_id, agent_id)` registry API.  The effective bearer
+    // is the source of truth for retries and account-pool failover; a stable
+    // JWT subject/email digest remains unchanged across token refreshes.
+    // An explicit account key is required for account-partitioned state. Keep
+    // legacy callers that omit it on the historical `(session, agent)` lane;
+    // production request handlers always provide the selected profile id (or
+    // a bearer digest for environment-backed credentials).
+    let mut account_key = identity.account_key.map(str::to_owned);
+    // Keep the caller-supplied agent component separate from the scoped
+    // `identity` value built at the top of each retry iteration.  Recovery
+    // paths can swap accounts in the middle of an iteration; using the
+    // already-scoped agent there would reset the old account's checkpoint and
+    // leave the replacement account attached to stale conversation state.
+    let base_agent_id = identity.agent_id;
     // Normally the original request slice is reused across transport retries.
     // A stale Cursor asset requires a new UUID and a fresh conversation; keep
     // that replacement owned by this start loop so both initial-open and
@@ -2019,6 +2145,17 @@ async fn start_live_events_with_retries_with_client_type(
     let mut expected_conversation_id = recovery.expected_conversation_id.map(str::to_owned);
     let mut retry_user_text: Option<String> = None;
     loop {
+        // Fold the current account into the agent component for all registry
+        // calls in this iteration.  On failover the next iteration rebuilds
+        // this value from the replacement bearer, so no late retry can attach
+        // to the exhausted account's generation.
+        let scoped_agent_id = account_scoped_agent_id(account_key.as_deref(), base_agent_id);
+        let identity = LiveRunIdentity {
+            session_id: identity.session_id,
+            agent_id: scoped_agent_id.as_deref(),
+            parent_agent_id: identity.parent_agent_id,
+            account_key: None,
+        };
         // Local admission strictly precedes the session-slot claim. A start
         // that is only queued for local capacity must stay invisible to
         // concurrent duplicates; otherwise a 15s admission queue turns into
@@ -2512,8 +2649,11 @@ async fn start_live_events_with_retries_with_client_type(
                             {
                                 return Err(CursorError::new(400, error, None));
                             }
-                            let key =
-                                live_retry_conversation_key(identity.session_id, identity.agent_id);
+                            let key = live_retry_conversation_key_for_account(
+                                identity.session_id,
+                                base_agent_id,
+                                account_key.as_deref(),
+                            );
                             conversation::reset(&key);
                             retry_user_text = Some(reset_user_text.to_string());
                             image_retry_images = Some(cached_image_recovery_images(
@@ -2537,8 +2677,11 @@ async fn start_live_events_with_retries_with_client_type(
                             {
                                 return Err(CursorError::new(413, error, None));
                             }
-                            let key =
-                                live_retry_conversation_key(identity.session_id, identity.agent_id);
+                            let key = live_retry_conversation_key_for_account(
+                                identity.session_id,
+                                base_agent_id,
+                                account_key.as_deref(),
+                            );
                             conversation::reset(&key);
                             // A checkpoint delta only carries images from the
                             // current turn. A fresh conversation needs the
@@ -2567,8 +2710,11 @@ async fn start_live_events_with_retries_with_client_type(
                             {
                                 return Err(CursorError::new(502, error, None));
                             }
-                            let key =
-                                live_retry_conversation_key(identity.session_id, identity.agent_id);
+                            let key = live_retry_conversation_key_for_account(
+                                identity.session_id,
+                                base_agent_id,
+                                account_key.as_deref(),
+                            );
                             conversation::reset(&key);
                             image_retry_images = Some(cached_image_recovery_images(
                                 &image_recovery_images,
@@ -2601,6 +2747,7 @@ async fn start_live_events_with_retries_with_client_type(
                                 &account_failover_state,
                             ) {
                                 token = replacement;
+                                account_key = Some(cursor_account_key_for_token(&token));
                                 publish_effective_token(&token);
                                 can_refresh_current_account = false;
                                 // Cursor conversation/checkpoint state is
@@ -2608,9 +2755,10 @@ async fn start_live_events_with_retries_with_client_type(
                                 // start from a fresh binding and replay the
                                 // complete logical request, otherwise the new
                                 // account can reject the old conversation id.
-                                let key = live_retry_conversation_key(
+                                let key = live_retry_conversation_key_for_account(
                                     identity.session_id,
-                                    identity.agent_id,
+                                    base_agent_id,
+                                    account_key.as_deref(),
                                 );
                                 conversation::reset(&key);
                                 expected_conversation_id = None;
@@ -2649,8 +2797,11 @@ async fn start_live_events_with_retries_with_client_type(
                     {
                         drop(probe_admission.take());
                         reservation.release();
-                        let key =
-                            live_retry_conversation_key(identity.session_id, identity.agent_id);
+                        let key = live_retry_conversation_key_for_account(
+                            identity.session_id,
+                            base_agent_id,
+                            account_key.as_deref(),
+                        );
                         conversation::reset(&key);
                         image_retry_images = Some(cached_image_recovery_images(
                             &image_recovery_images,
@@ -2685,8 +2836,11 @@ async fn start_live_events_with_retries_with_client_type(
                     {
                         drop(probe_admission.take());
                         reservation.release();
-                        let key =
-                            live_retry_conversation_key(identity.session_id, identity.agent_id);
+                        let key = live_retry_conversation_key_for_account(
+                            identity.session_id,
+                            base_agent_id,
+                            account_key.as_deref(),
+                        );
                         conversation::reset(&key);
                         image_retry_images = Some(cached_image_recovery_images(
                             &image_recovery_images,
@@ -2720,7 +2874,11 @@ async fn start_live_events_with_retries_with_client_type(
                 {
                     drop(probe_admission.take());
                     reservation.release();
-                    let key = live_retry_conversation_key(identity.session_id, identity.agent_id);
+                    let key = live_retry_conversation_key_for_account(
+                        identity.session_id,
+                        base_agent_id,
+                        account_key.as_deref(),
+                    );
                     conversation::reset(&key);
                     image_retry_images = Some(cached_image_recovery_images(
                         &image_recovery_images,
@@ -2767,9 +2925,14 @@ async fn start_live_events_with_retries_with_client_type(
                 {
                     reservation.release();
                     token = replacement;
+                    account_key = Some(cursor_account_key_for_token(&token));
                     publish_effective_token(&token);
                     can_refresh_current_account = false;
-                    let key = live_retry_conversation_key(identity.session_id, identity.agent_id);
+                    let key = live_retry_conversation_key_for_account(
+                        identity.session_id,
+                        base_agent_id,
+                        account_key.as_deref(),
+                    );
                     conversation::reset(&key);
                     expected_conversation_id = None;
                     image_recovery_attempted.store(false, Ordering::Release);
@@ -2825,6 +2988,7 @@ fn spawn_streaming_live_sse(
     reset_retry_images: Vec<CursorSelectedImage>,
     custom_system: Option<String>,
     sid: String,
+    account_key: String,
     agent_id: Option<String>,
     parent_agent_id: Option<String>,
     allowed: Option<BTreeSet<String>>,
@@ -2862,6 +3026,7 @@ fn spawn_streaming_live_sse(
             session_id: sid,
             agent_id,
             parent_agent_id,
+            account_key: Arc::new(Mutex::new(account_key)),
             allowed,
             mcp_tools,
             request_context,
@@ -3265,6 +3430,7 @@ async fn forward_live_events_with_retries<F, Fut>(
         model: "unknown".into(),
         client_type: "unknown".into(),
         effective_token: Arc::new(Mutex::new(String::new())),
+        account_key: Arc::new(Mutex::new(String::new())),
         compaction_mode: false,
     };
     forward_live_events_with_retries_context(
@@ -3295,7 +3461,9 @@ async fn forward_live_events_with_retries_context<F, Fut>(
     // Event receivers do not carry their owning Run id. Capture the current
     // generation and refresh it after each internal restart so deadline
     // cancellation remains generation-bound.
-    let mut expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
+    let mut registry_agent_id = account_scoped_agent_id(Some(&context.account_key()), agent_id);
+    let mut expected_run_id =
+        LiveRunRegistry::running_generation(session_id, registry_agent_id.as_deref());
     loop {
         let pump =
             pump_live_events_until_commit_or_retry_with_mode(tx, events, context.compaction_mode);
@@ -3315,7 +3483,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                 forward_empty_turn_deadline(
                     tx,
                     session_id,
-                    agent_id,
+                    registry_agent_id.as_deref(),
                     expected_run_id.as_deref(),
                     last_empty_turn_error
                         .as_deref()
@@ -3385,7 +3553,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                         forward_empty_turn_deadline(
                             tx,
                             session_id,
-                            agent_id,
+                            registry_agent_id.as_deref(),
                             expected_run_id.as_deref(),
                             last_empty_turn_error.as_deref().unwrap_or(&error),
                         )
@@ -3395,7 +3563,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                 }
                 let slot_deadline = Instant::now() + LIVE_H2_OPEN_ATTEMPT;
                 loop {
-                    match LiveRunRegistry::probe_run(session_id, agent_id) {
+                    match LiveRunRegistry::probe_run(session_id, registry_agent_id.as_deref()) {
                         LiveRunProbe::Free => break,
                         LiveRunProbe::TerminalError(terminal)
                             if live_probe_error_blocks_new_run_for_mode(
@@ -3417,7 +3585,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                                     forward_empty_turn_deadline(
                                         tx,
                                         session_id,
-                                        agent_id,
+                                        registry_agent_id.as_deref(),
                                         expected_run_id.as_deref(),
                                         last_empty_turn_error
                                             .as_deref()
@@ -3445,7 +3613,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                         forward_empty_turn_deadline(
                             tx,
                             session_id,
-                            agent_id,
+                            registry_agent_id.as_deref(),
                             expected_run_id.as_deref(),
                             last_empty_turn_error.as_deref().unwrap_or(&error),
                         )
@@ -3498,7 +3666,7 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                         forward_empty_turn_deadline(
                             tx,
                             session_id,
-                            agent_id,
+                            registry_agent_id.as_deref(),
                             expected_run_id.as_deref(),
                             last_empty_turn_error
                                 .as_deref()
@@ -3518,7 +3686,9 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                 // `start_after_error` publishes the new handle before it
                 // returns its receiver. Fence future deadline cancellation to
                 // that newly accepted generation.
-                expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
+                registry_agent_id = account_scoped_agent_id(Some(&context.account_key()), agent_id);
+                expected_run_id =
+                    LiveRunRegistry::running_generation(session_id, registry_agent_id.as_deref());
             }
             LivePumpOutcome::PolicyLimited(error) => {
                 // A Sand clean-END may be reclassified by the live driver once
@@ -3552,7 +3722,12 @@ async fn forward_live_events_with_retries_context<F, Fut>(
                             return;
                         }
                     };
-                    expected_run_id = LiveRunRegistry::running_generation(session_id, agent_id);
+                    registry_agent_id =
+                        account_scoped_agent_id(Some(&context.account_key()), agent_id);
+                    expected_run_id = LiveRunRegistry::running_generation(
+                        session_id,
+                        registry_agent_id.as_deref(),
+                    );
                 } else {
                     let _ = tx.send(Err(error)).await;
                     return;
@@ -3585,6 +3760,7 @@ fn spawn_live_events_with_late_retries(
                 model: start.model.clone(),
                 client_type: start.client_type.clone(),
                 effective_token: Arc::clone(&start.effective_token),
+                account_key: Arc::clone(&start.account_key),
                 compaction_mode: start.compaction_mode,
             };
             let retry_policy =
@@ -3835,7 +4011,16 @@ fn claude_agent_id(ctx: &RequestContext) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+#[cfg(test)]
 fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRunIdentity<'a> {
+    live_run_identity_with_account(session_id, ctx, None)
+}
+
+fn live_run_identity_with_account<'a>(
+    session_id: &'a str,
+    ctx: &'a RequestContext,
+    account_key: Option<&'a str>,
+) -> LiveRunIdentity<'a> {
     LiveRunIdentity {
         session_id,
         agent_id: claude_agent_id(ctx),
@@ -3845,6 +4030,7 @@ fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRu
             .as_deref()
             .map(str::trim)
             .filter(|id| !id.is_empty()),
+        account_key,
     }
 }
 
@@ -3852,9 +4038,21 @@ fn live_run_identity<'a>(session_id: &'a str, ctx: &'a RequestContext) -> LiveRu
 /// conversation checkpoints. Claude Code nested agents reuse the parent
 /// `X-Claude-Code-Session-Id`, so the raw session id alone is not an isolation
 /// boundary.
-fn bridge_registry_key(ctx: &RequestContext) -> Option<String> {
+fn bridge_registry_key_for_account(
+    ctx: &RequestContext,
+    account_key: Option<&str>,
+) -> Option<String> {
     let session_id = ctx.session_id.as_deref().filter(|id| !id.is_empty())?;
-    Some(live_run_key_for(live_run_identity(session_id, ctx)))
+    Some(live_run_key_for(live_run_identity_with_account(
+        session_id,
+        ctx,
+        account_key,
+    )))
+}
+
+#[cfg(test)]
+fn bridge_registry_key(ctx: &RequestContext) -> Option<String> {
+    bridge_registry_key_for_account(ctx, None)
 }
 
 fn live_operation_fingerprint_payload(
@@ -3877,15 +4075,24 @@ fn live_operation_fingerprint_payload(
 /// `X-Claude-Code-Session-Id` with the parent; using the raw session id here
 /// would compact the nested prompt against the parent's checkpoint while the
 /// nested Run is a fresh conversation.
-fn continuation_for_request(
+fn continuation_for_request_for_account(
     session_id: Option<&str>,
     ctx: &RequestContext,
+    account_key: Option<&str>,
 ) -> crate::providers::cursor::conversation::RunContinuation {
     let Some(sid) = session_id.filter(|s| !s.is_empty()) else {
         return crate::providers::cursor::conversation::continuation_for(None);
     };
-    let key = live_run_key_for(live_run_identity(sid, ctx));
+    let key = live_run_key_for(live_run_identity_with_account(sid, ctx, account_key));
     crate::providers::cursor::conversation::continuation_for(Some(&key))
+}
+
+#[cfg(test)]
+fn continuation_for_request(
+    session_id: Option<&str>,
+    ctx: &RequestContext,
+) -> crate::providers::cursor::conversation::RunContinuation {
+    continuation_for_request_for_account(session_id, ctx, None)
 }
 
 enum LiveResumeOutcome {
@@ -4556,7 +4763,11 @@ fn request_has_current_tool_result(body: &MessagesRequest) -> bool {
 /// still attach to a Run that is already accepted upstream; rejecting those
 /// here would strand native tools or turn a recoverable dropped SSE into a
 /// new client retry storm without reducing Cursor load.
-fn policy_preflight_can_attach_existing_run(body: &MessagesRequest, ctx: &RequestContext) -> bool {
+fn policy_preflight_can_attach_existing_run_for_account(
+    body: &MessagesRequest,
+    ctx: &RequestContext,
+    account_key: Option<&str>,
+) -> bool {
     if request_has_current_tool_result(body) {
         // Route tool results through the registry first. A matching accepted
         // Run can resume even while its account/model breaker is open; a stale
@@ -4571,10 +4782,16 @@ fn policy_preflight_can_attach_existing_run(body: &MessagesRequest, ctx: &Reques
         body,
         ctx.client_request_id.as_deref(),
     ));
-    let agent_id = claude_agent_id(ctx);
-    LiveRunRegistry::get_run(session_id, agent_id)
+    let agent_id = account_scoped_agent_id(account_key, claude_agent_id(ctx));
+    LiveRunRegistry::get_run(session_id, agent_id.as_deref())
         .is_some_and(|run| run.request_fingerprint() == fingerprint)
-        || LiveRunRegistry::completed_replay_for(session_id, agent_id, fingerprint).is_some()
+        || LiveRunRegistry::completed_replay_for(session_id, agent_id.as_deref(), fingerprint)
+            .is_some()
+}
+
+#[cfg(test)]
+fn policy_preflight_can_attach_existing_run(body: &MessagesRequest, ctx: &RequestContext) -> bool {
+    policy_preflight_can_attach_existing_run_for_account(body, ctx, None)
 }
 
 #[cfg(test)]
@@ -4690,8 +4907,8 @@ impl Provider for CursorProvider {
         // breaker can return a real HTTP 429. If this check runs after
         // `live_sse_response`, Claude Code sees HTTP 200 plus an error event
         // and immediately fans out another retry wave.
-        let mut auth = match load_cursor_auth() {
-            Ok(Some(auth)) => auth,
+        let auth_selection = match load_cursor_auth_for_model(model) {
+            Ok(Some(selection)) => selection,
             Ok(None) => {
                 return json_error(
                     StatusCode::UNAUTHORIZED,
@@ -4707,10 +4924,24 @@ impl Provider for CursorProvider {
                 );
             }
         };
+        let selected_account_is_active = auth_selection.active;
+        // Prefer the persisted profile id so labels/email aliases and JWT
+        // refreshes remain in the same state partition. Environment-backed
+        // credentials have no profile id; their stable bearer digest is the
+        // appropriate fallback.
+        let account_key = auth_selection
+            .account_id
+            .clone()
+            .unwrap_or_else(|| cursor_account_digest(&auth_selection.auth.access_token));
+        let mut auth = auth_selection.auth;
 
         // Near expiry: refresh first. A rotated token represents a fresh
-        // account credential and must not inherit the old token's breaker.
-        if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
+        // account credential and must not inherit the old token's breaker. A
+        // model-pinned inactive account was refreshed by the selector above;
+        // only the active compatibility account can use this global helper.
+        if selected_account_is_active
+            && matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000)
+        {
             match force_refresh_cursor_auth_async(auth.access_token.clone()).await {
                 Ok(Some(refreshed)) => auth = refreshed,
                 Ok(None) | Err(_) => {
@@ -4723,7 +4954,7 @@ impl Provider for CursorProvider {
             }
         }
         let has_tool_results = request_has_current_tool_result(&body);
-        if !policy_preflight_can_attach_existing_run(&body, &ctx)
+        if !policy_preflight_can_attach_existing_run_for_account(&body, &ctx, Some(&account_key))
             && let Err(error) = policy_rate_limit_preflight(model, &client_type, &auth.access_token)
         {
             return map_cursor_error_to_response(&error);
@@ -4748,7 +4979,13 @@ impl Provider for CursorProvider {
         // tool_result needs the exact bounded resume probe.
         let skip_resume_probe = fresh_stream_can_skip_resume_probe(want_stream, has_tool_results);
         if !xai_compact && let Some(session_id) = ctx.session_id.as_deref() {
-            let agent_id = claude_agent_id(&ctx);
+            // Registry keys must include the selected account. Claude Code
+            // reuses a session/agent id across account switches; using the
+            // raw agent here would attach a retry to the prior account's
+            // generation.
+            let registry_agent_id =
+                account_scoped_agent_id(Some(&account_key), claude_agent_id(&ctx));
+            let agent_id = registry_agent_id.as_deref();
             let fingerprint_payload =
                 live_operation_fingerprint_payload(&body, ctx.client_request_id.as_deref());
             let fingerprint = live_request_fingerprint(&fingerprint_payload);
@@ -4965,7 +5202,7 @@ impl Provider for CursorProvider {
         // not an empty resume of leftover Cursor frames. Clear bridge pending and
         // fall through to run_agent with the complete Anthropic conversation.
         if !xai_compact
-            && let Some(bridge_key) = bridge_registry_key(&ctx)
+            && let Some(bridge_key) = bridge_registry_key_for_account(&ctx, Some(&account_key))
             && let Some(pending) = BridgeRegistry::pending_tool(&bridge_key)
             && find_tool_result(&body, pending.tool_use_id()).is_some()
         {
@@ -5003,7 +5240,11 @@ impl Provider for CursorProvider {
         // real HTTP 429. A resumed/attached stream is already accepted work
         // and deliberately bypasses this new-dispatch guard.
         if resumed_live_events.is_none()
-            && !policy_preflight_can_attach_existing_run(&body, &ctx)
+            && !policy_preflight_can_attach_existing_run_for_account(
+                &body,
+                &ctx,
+                Some(&account_key),
+            )
             && let Err(error) = policy_rate_limit_preflight(model, &client_type, &auth.access_token)
         {
             if let Some(reservation) = preclaimed_live_reservation.take() {
@@ -5051,11 +5292,16 @@ impl Provider for CursorProvider {
         } else {
             claude_local_mcp_tools(&body)
         };
-        let bridge_key = bridge_registry_key(&ctx);
-        let continuation_key = session_id
-            .filter(|s| !s.is_empty())
-            .map(|sid| live_run_key_for(live_run_identity(sid, &ctx)));
-        let continuation = continuation_for_request(session_id, &ctx);
+        let mut bridge_key = bridge_registry_key_for_account(&ctx, Some(&account_key));
+        let mut continuation_key = session_id.filter(|s| !s.is_empty()).map(|sid| {
+            live_run_key_for(live_run_identity_with_account(
+                sid,
+                &ctx,
+                Some(&account_key),
+            ))
+        });
+        let continuation =
+            continuation_for_request_for_account(session_id, &ctx, Some(&account_key));
         let tool_result_only_turn = latest_user_is_only_tool_results(&body);
         let client_only_continuation =
             request_has_client_only_tool_results(&body) || tool_result_only_turn;
@@ -5117,11 +5363,15 @@ impl Provider for CursorProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         let mut token = auth.access_token.clone();
+        // Keep the selected profile id (when present) as the stable state
+        // partition. It survives bearer refreshes and is updated below only
+        // when bounded account failover selects a replacement credential.
+        let mut account_key = account_key;
         let account_failover_state = Arc::new(Mutex::new(AccountFailoverState::new(&token)));
 
         if let Some(events) = resumed_live_events.take() {
             let sid = session_id.expect("a resumed live run requires a session id");
-            let identity = live_run_identity(sid, &ctx);
+            let identity = live_run_identity_with_account(sid, &ctx, Some(&account_key));
             let estimated_input = estimate_rendered_prompt_tokens(&parts);
             let monitor = ctx
                 .monitor
@@ -5129,7 +5379,7 @@ impl Provider for CursorProvider {
                 .map(|handle| (handle, ctx.req_id.clone()));
             let retry_start = LiveRetryStart {
                 client: client.clone(),
-                effective_token: Arc::new(Mutex::new(token)),
+                effective_token: Arc::new(Mutex::new(token.clone())),
                 user_text: user_text.to_string(),
                 reset_user_text: reset_user_text.clone(),
                 expected_conversation_id: Arc::new(Mutex::new(
@@ -5147,6 +5397,7 @@ impl Provider for CursorProvider {
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
                 parent_agent_id: identity.parent_agent_id.map(str::to_string),
+                account_key: Arc::new(Mutex::new(account_key.clone())),
                 allowed: request_allowed_tools.clone(),
                 mcp_tools: request_mcp_tools.clone(),
                 request_context: cursor_request_context(&body),
@@ -5200,7 +5451,7 @@ impl Provider for CursorProvider {
         }
         if live_eligible {
             let sid = session_id.expect("live eligibility requires session id");
-            let identity = live_run_identity(sid, &ctx);
+            let identity = live_run_identity_with_account(sid, &ctx, Some(&account_key));
             log_live_start_claude_headers(&ctx, sid, model, &client_type, xai_compact);
             let allowed = request_allowed_tools.clone();
             let mcp_tools = request_mcp_tools.clone();
@@ -5235,6 +5486,7 @@ impl Provider for CursorProvider {
                     reset_retry_images,
                     custom_system.map(str::to_string),
                     sid.to_string(),
+                    account_key.clone(),
                     identity.agent_id.map(str::to_string),
                     identity.parent_agent_id.map(str::to_string),
                     allowed,
@@ -5254,7 +5506,7 @@ impl Provider for CursorProvider {
             }
             let retry_start = LiveRetryStart {
                 client: client.clone(),
-                effective_token: Arc::new(Mutex::new(token)),
+                effective_token: Arc::new(Mutex::new(token.clone())),
                 user_text: user_text.to_string(),
                 reset_user_text,
                 expected_conversation_id: Arc::new(Mutex::new(
@@ -5272,6 +5524,7 @@ impl Provider for CursorProvider {
                 session_id: sid.to_string(),
                 agent_id: identity.agent_id.map(str::to_string),
                 parent_agent_id: identity.parent_agent_id.map(str::to_string),
+                account_key: Arc::new(Mutex::new(account_key.clone())),
                 allowed,
                 mcp_tools,
                 request_context,
@@ -5503,6 +5756,15 @@ impl Provider for CursorProvider {
                             )
                         {
                             token = replacement;
+                            account_key = cursor_account_key_for_token(&token);
+                            bridge_key = bridge_registry_key_for_account(&ctx, Some(&account_key));
+                            continuation_key = session_id.map(|sid| {
+                                live_run_key_for(live_run_identity_with_account(
+                                    sid,
+                                    &ctx,
+                                    Some(&account_key),
+                                ))
+                            });
                             // The refresh helper targets the active account;
                             // this request now uses an inactive candidate.
                             // Suppress a later 401 refresh that would switch
@@ -7666,6 +7928,7 @@ mod tests {
                 session_id: session,
                 agent_id: Some(agent),
                 parent_agent_id: Some("parent-agent"),
+                account_key: None,
             })
         );
         let parent_before = conversation::get_or_create(&parent_key).conversation_id;
@@ -7816,6 +8079,7 @@ mod tests {
             session_id: session.clone(),
             agent_id: None,
             parent_agent_id: None,
+            account_key: Arc::new(Mutex::new(String::new())),
             allowed: None,
             mcp_tools: None,
             request_context: crate::providers::cursor::proto::RequestContext::default(),

@@ -85,6 +85,8 @@ struct CursorConfig {
     pub agent_bundle: Option<String>,
     #[serde(rename = "sandModels")]
     pub sand_models: Option<SandModelsConfig>,
+    #[serde(rename = "modelAccounts")]
+    pub model_accounts: Option<ModelAccountsConfig>,
 }
 
 /// The persisted form accepts either a JSON array or a comma/newline-separated
@@ -104,6 +106,509 @@ impl SandModelsConfig {
             Self::Text(value) => split_sand_models(&value),
         }
     }
+}
+
+/// Persisted model-to-account assignments.  The object form is the canonical
+/// representation (`{"model-pattern":"account-id"}`), while the list form
+/// is accepted for callers that prefer an explicit editable shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ModelAccountsConfig {
+    Map(std::collections::BTreeMap<String, String>),
+    List(Vec<CursorModelAccountRule>),
+}
+
+impl ModelAccountsConfig {
+    fn into_rules(self) -> Vec<CursorModelAccountRule> {
+        match self {
+            Self::Map(values) => values
+                .into_iter()
+                .map(|(model, account)| CursorModelAccountRule { model, account })
+                .collect(),
+            Self::List(values) => values,
+        }
+    }
+}
+
+/// One model pattern assigned to one Cursor account selector.  `account` can
+/// be the stable account id printed by `cursor auth list`, or a unique account
+/// label/email.  Model patterns use the same case-insensitive glob syntax as
+/// `cursor.sandModels`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorModelAccountRule {
+    pub model: String,
+    pub account: String,
+}
+
+impl CursorModelAccountRule {
+    pub fn new(model: impl Into<String>, account: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            account: account.into(),
+        }
+    }
+}
+
+/// Model-to-account routing policy.  Rules are evaluated in their persisted
+/// order; duplicate normalized model patterns are replaced by the last value.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct CursorAccountRoutingPolicy {
+    routes: Vec<CursorModelAccountRule>,
+}
+
+impl CursorAccountRoutingPolicy {
+    pub fn new<I>(rules: I) -> Self
+    where
+        I: IntoIterator<Item = CursorModelAccountRule>,
+    {
+        let mut routes: Vec<CursorModelAccountRule> = Vec::new();
+        for rule in rules {
+            let model = normalize_sand_model(&rule.model);
+            let account = rule.account.trim();
+            if model.is_empty() || account.is_empty() {
+                continue;
+            }
+            let normalized = CursorModelAccountRule {
+                model,
+                account: account.to_string(),
+            };
+            if let Some(existing) = routes
+                .iter_mut()
+                .find(|item| item.model == normalized.model)
+            {
+                *existing = normalized;
+            } else {
+                routes.push(normalized);
+            }
+        }
+        Self { routes }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn routes(&self) -> &[CursorModelAccountRule] {
+        &self.routes
+    }
+
+    pub fn into_routes(self) -> Vec<CursorModelAccountRule> {
+        self.routes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Return whether a model has a direct model-account route.
+    ///
+    /// This deliberately does not resolve Cursor aliases or consult the live
+    /// catalog.  The registry uses it as an explicit opt-in signal for a
+    /// custom model id, and calling [`account_for_model`] here would recurse
+    /// through model resolution for unknown ids.
+    pub fn matches_direct(&self, model: &str) -> bool {
+        let normalized = normalize_sand_model(model);
+        !normalized.is_empty()
+            && self
+                .routes
+                .iter()
+                .any(|rule| sand_pattern_matches(&rule.model, &normalized))
+    }
+
+    /// Return the concrete model spellings that represent the same logical
+    /// request as `model` for account-route editing.  Cursor/Anthropic clients
+    /// commonly alternate between a public alias and a concrete Fable tier,
+    /// and some catalog responses append `-preview`; treating those spellings
+    /// as one edit target prevents a stale exact rule from resurfacing after a
+    /// TUI assignment is rotated or cleared.
+    ///
+    /// Wildcard patterns are deliberately not returned here.  Callers can use
+    /// this set to remove equivalent *literal* rules while retaining broad
+    /// fallback rules such as `*` or `gemini-*`.
+    pub fn equivalent_model_candidates(model: &str) -> Vec<String> {
+        let mut candidates = Self::resolved_model_candidates(model);
+        if candidates.is_empty() {
+            return candidates;
+        }
+
+        // A preview suffix is a catalog/display variant, not a separate
+        // account target.  Add both directions so editing either spelling
+        // cleans up the other exact rule as well.
+        let originals = candidates.clone();
+        for candidate in originals {
+            let base = candidate.strip_suffix("-preview").unwrap_or(&candidate);
+            push_unique_candidate(&mut candidates, base.to_string());
+            push_unique_candidate(&mut candidates, format!("{base}-preview"));
+        }
+        candidates
+    }
+
+    /// Return a copy of this policy with the selected model assigned to (or
+    /// cleared from) one account.  Assignment edits remove only semantically
+    /// equivalent literal rules; wildcard fallbacks remain in place and still
+    /// apply when the exact mapping is cleared.
+    pub fn with_model_assignment(&self, model: &str, account: Option<&str>) -> Self {
+        let normalized = normalize_sand_model(model);
+        if normalized.is_empty() {
+            return self.clone();
+        }
+        let candidates = Self::equivalent_model_candidates(&normalized);
+        let selected_is_wildcard = model_pattern_has_wildcards(&normalized);
+        let mut routes = self
+            .routes
+            .iter()
+            .filter(|rule| {
+                let rule_is_wildcard = model_pattern_has_wildcards(&rule.model);
+                if selected_is_wildcard {
+                    // A wildcard row is edited as that exact row.  For a
+                    // concrete row, broad rules are always retained.
+                    rule.model != normalized
+                } else {
+                    rule_is_wildcard || !candidates.iter().any(|candidate| candidate == &rule.model)
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if let Some(account) = account.map(str::trim).filter(|value| !value.is_empty()) {
+            // Keep exact assignments ahead of a hand-authored wildcard.  The
+            // resolver also scores literals first, but this ordering makes the
+            // persisted file deterministic and easy to inspect.
+            routes.insert(
+                0,
+                CursorModelAccountRule::new(normalized, account.to_string()),
+            );
+        }
+        Self::new(routes)
+    }
+
+    /// Build the alias/resolution chain used by account lookup.  This is kept
+    /// separate from [`equivalent_model_candidates`] because runtime matching
+    /// should retain its existing one-way `-preview` semantics, while the TUI
+    /// editor needs symmetric cleanup of preview spellings.
+    fn resolved_model_candidates(model: &str) -> Vec<String> {
+        let normalized_model = normalize_sand_model(model);
+        if normalized_model.is_empty() {
+            return Vec::new();
+        }
+        let mut candidates = vec![normalized_model.clone()];
+        // Resolve a preview spelling through its base id as well.  The model
+        // resolver knows `fable`/`claude-fable-5`, but not every catalog's
+        // `-preview` display suffix; retaining both forms keeps Fable alias
+        // cleanup symmetric when the selected TUI row is `fable-preview`.
+        let mut candidate = normalized_model
+            .strip_suffix("-preview")
+            .map(str::to_string)
+            .unwrap_or(normalized_model);
+        push_unique_candidate(&mut candidates, candidate.clone());
+        for _ in 0..2 {
+            let Some(resolved) =
+                crate::providers::cursor::model::resolve_cursor_model(&candidate).ok()
+            else {
+                break;
+            };
+            if resolved.model_id == candidate {
+                break;
+            }
+            candidate = resolved.model_id;
+            push_unique_candidate(&mut candidates, candidate.clone());
+        }
+        // Bare Fable aliases resolve to a concrete thinking tier upstream,
+        // while users commonly configure the public `fable`/`claude-fable-5`
+        // name. Include both aliases so either form edits one target.
+        if candidates
+            .iter()
+            .any(|candidate| is_fable_sand_family(candidate))
+        {
+            for alias in ["claude-fable-5", "fable"] {
+                push_unique_candidate(&mut candidates, alias.to_string());
+            }
+        }
+        candidates
+    }
+
+    /// Return the configured account selector for a model, if any.
+    pub fn account_for_model(&self, model: &str) -> Option<&str> {
+        let candidates = Self::resolved_model_candidates(model);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Prefer an exact rule over a wildcard regardless of JSON/object
+        // ordering. This keeps a TUI assignment deterministic even when a
+        // hand-authored `*` fallback appears before it in config.json.
+        let mut best: Option<(usize, usize, usize, usize, usize)> = None;
+        for (index, rule) in self.routes.iter().enumerate() {
+            let Some(candidate_index) = candidates
+                .iter()
+                .position(|candidate| sand_pattern_matches(&rule.model, candidate))
+            else {
+                continue;
+            };
+            let wildcard_count = rule
+                .model
+                .chars()
+                .filter(|ch| matches!(ch, '*' | '?'))
+                .count();
+            let exact_rank = usize::from(wildcard_count == 0);
+            // A literal rule for the model string the caller actually sent is
+            // the strongest signal.  This must outrank a longer literal that
+            // only matches after alias resolution (for example
+            // `claude-fable-5` versus `claude-fable-5-thinking-max`).
+            let direct_exact = usize::from(
+                candidate_index == 0 && wildcard_count == 0 && rule.model == candidates[0],
+            );
+            // When no direct rule exists, prefer a literal alias/catalog match
+            // over a wildcard, then prefer an earlier candidate in the alias
+            // chain, and finally use pattern length/insertion order as stable
+            // tie breakers.
+            let candidate_rank = candidates.len().saturating_sub(candidate_index);
+            let score = (
+                direct_exact,
+                exact_rank,
+                candidate_rank,
+                rule.model.len(),
+                usize::MAX - index,
+            );
+            if best.is_none_or(|current| score > current) {
+                best = Some(score);
+            }
+            // A literal match on the original normalized model cannot be
+            // improved by any later alias or wildcard rule.  A rule that only
+            // matches because the incoming id has a `-preview` suffix must
+            // keep scanning: a later `*-preview`-specific literal is more
+            // precise and should win.
+            if direct_exact == 1 {
+                break;
+            }
+        }
+        best.map(|(_, _, _, _, encoded_index)| {
+            let index = usize::MAX - encoded_index;
+            self.routes[index].account.as_str()
+        })
+    }
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn model_pattern_has_wildcards(pattern: &str) -> bool {
+    pattern.chars().any(|ch| matches!(ch, '*' | '?'))
+}
+
+/// Parse the environment representation of model/account routes.  JSON is
+/// preferred (`{"grok-build":"work"}`); a compact `model=account` list is
+/// also accepted for shell usage.
+fn parse_model_accounts_env(raw: &str) -> Vec<CursorModelAccountRule> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(values) =
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(trimmed)
+        {
+            return ModelAccountsConfig::Map(values).into_rules();
+        }
+    }
+    if trimmed.starts_with('[')
+        && let Ok(values) = serde_json::from_str::<Vec<CursorModelAccountRule>>(trimmed)
+    {
+        return values;
+    }
+    trimmed
+        .split([',', '\n', '\r'])
+        .filter_map(|entry| {
+            let (model, account) = entry.split_once('=')?;
+            Some(CursorModelAccountRule::new(model.trim(), account.trim()))
+        })
+        .collect()
+}
+
+/// Resolve model-to-account assignments.  An explicitly present environment
+/// variable, including an empty value, overrides the file configuration.
+pub fn cursor_account_routing_policy() -> CursorAccountRoutingPolicy {
+    if let Some(raw) = std::env::var_os("CCP_CURSOR_MODEL_ACCOUNTS") {
+        return CursorAccountRoutingPolicy::new(parse_model_accounts_env(&raw.to_string_lossy()));
+    }
+    let configured = read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.model_accounts)
+        .map(ModelAccountsConfig::into_rules)
+        .unwrap_or_default();
+    CursorAccountRoutingPolicy::new(configured)
+}
+
+/// Alias used by request-routing call sites.
+pub fn cursor_model_account_routes() -> CursorAccountRoutingPolicy {
+    cursor_account_routing_policy()
+}
+
+/// Return the account selector configured for a model, if one exists.
+pub fn cursor_account_for_model(model: &str) -> Option<String> {
+    cursor_account_routing_policy()
+        .account_for_model(model)
+        .map(str::to_string)
+}
+
+/// Return whether `model` is explicitly covered by a model-account route.
+/// Unlike [`cursor_account_for_model`], this performs only direct glob
+/// matching and therefore remains safe to call from Cursor model resolution
+/// for an otherwise unknown custom id.
+pub fn cursor_model_account_route_matches(model: &str) -> bool {
+    cursor_account_routing_policy().matches_direct(model)
+}
+
+/// Persist only `cursor.modelAccounts`, preserving unrelated configuration
+/// keys.  The same-directory temporary file and rename make TUI edits atomic.
+pub fn persist_cursor_account_routes(policy: &CursorAccountRoutingPolicy) -> io::Result<()> {
+    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("config write lock poisoned"))?;
+
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut root = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid config JSON: {err}"),
+            )
+        })?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(err) => return Err(err),
+    };
+    if !root.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config root must be a JSON object",
+        ));
+    }
+    let cursor = root
+        .as_object_mut()
+        .expect("checked object above")
+        .entry("cursor")
+        .or_insert_with(|| serde_json::json!({}));
+    if !cursor.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config cursor must be a JSON object",
+        ));
+    }
+    let mut map = serde_json::Map::new();
+    for rule in policy.routes() {
+        map.insert(
+            rule.model.clone(),
+            serde_json::Value::String(rule.account.clone()),
+        );
+    }
+    cursor
+        .as_object_mut()
+        .expect("checked object above")
+        .insert("modelAccounts".to_string(), serde_json::Value::Object(map));
+
+    let encoded = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+/// Convenience wrapper for TUI callers editing a route list.
+pub fn save_cursor_model_accounts<I>(rules: I) -> io::Result<()>
+where
+    I: IntoIterator<Item = CursorModelAccountRule>,
+{
+    persist_cursor_account_routes(&CursorAccountRoutingPolicy::new(rules))
+}
+
+/// Match an account selector against id, label, or email.  This is public so
+/// request routing and the TUI account editor share exactly the same lookup
+/// semantics, including case-insensitive globs.
+pub fn account_selector_matches(
+    selector: &str,
+    id: &str,
+    label: Option<&str>,
+    email: Option<&str>,
+) -> bool {
+    let selector = selector.trim().to_ascii_lowercase();
+    if selector.is_empty() {
+        return false;
+    }
+    [Some(id), label, email].into_iter().flatten().any(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !value.is_empty() && glob_matches(&selector, &value)
+    })
+}
+
+/// Remove model-account rules that select one account.  Selectors may use the
+/// account id, label, email, or a glob over any of those fields.  This legacy
+/// convenience wrapper assumes the account is the only known identity; account
+/// deletion should prefer [`remove_cursor_model_account_routes_for_account_with_remaining`]
+/// so a broad selector is retained when it still matches another account.
+pub fn remove_cursor_model_account_routes_for_account(
+    id: &str,
+    label: Option<&str>,
+    email: Option<&str>,
+) -> io::Result<bool> {
+    remove_cursor_model_account_routes_for_account_with_remaining(id, label, email, |_| false)
+}
+
+/// Remove model-account rules that select a deleted account unless the same
+/// selector still matches one of the accounts that remains in the registry.
+/// The callback receives the rule's account selector and should return true
+/// when that selector remains valid for another account.  Keeping this check
+/// at the config layer ensures TUI/CLI deletion paths apply identical glob
+/// semantics without coupling the config module to account-storage structs.
+/// Environment overrides are authoritative and are never rewritten here.
+pub fn remove_cursor_model_account_routes_for_account_with_remaining<F>(
+    id: &str,
+    label: Option<&str>,
+    email: Option<&str>,
+    selector_matches_remaining: F,
+) -> io::Result<bool>
+where
+    F: Fn(&str) -> bool,
+{
+    if std::env::var_os("CCP_CURSOR_MODEL_ACCOUNTS").is_some() {
+        return Ok(false);
+    }
+    let policy = cursor_account_routing_policy();
+    let filtered = policy
+        .routes()
+        .iter()
+        .filter(|rule| {
+            !account_selector_matches(&rule.account, id, label, email)
+                || selector_matches_remaining(&rule.account)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.len() == policy.routes().len() {
+        return Ok(false);
+    }
+    persist_cursor_account_routes(&CursorAccountRoutingPolicy::new(filtered))?;
+    Ok(true)
 }
 
 #[derive(Deserialize, Clone)]
@@ -249,8 +754,11 @@ fn is_fable_sand_family(model: &str) -> bool {
 /// Normalize a model id for Sand policy matching.
 pub fn normalize_sand_model(model: &str) -> String {
     let mut normalized = model.trim().to_ascii_lowercase();
-    if normalized.ends_with("[1m]") {
-        normalized.truncate(normalized.len().saturating_sub(4));
+    for suffix in ["[1m]", "[2m]", "[1M]", "[2M]"] {
+        if normalized.ends_with(&suffix.to_ascii_lowercase()) {
+            normalized.truncate(normalized.len().saturating_sub(suffix.len()));
+            break;
+        }
     }
     for prefix in ["cursor-plan:", "cursor-ask:", "cursor-agent:", "cursor:"] {
         if let Some(rest) = normalized.strip_prefix(prefix) {
@@ -576,6 +1084,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CURSOR_SAND_MODELS") {
         out.push("cursor.sandModels (env)".to_string());
     }
+    if env.contains_key("CCP_CURSOR_MODEL_ACCOUNTS") {
+        out.push("cursor.modelAccounts (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_USER_AGENT") {
         out.push("kimi.userAgent (env)".to_string());
     }
@@ -615,11 +1126,17 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         {
             out.push("codex.reasoningSummary (config)".to_string());
         }
-        if let Some(cursor) = file_cfg.cursor
-            && let Some(models) = cursor.sand_models
-            && !models.into_patterns().is_empty()
+        if let Some(ref cursor) = file_cfg.cursor
+            && let Some(models) = cursor.sand_models.as_ref()
+            && !models.clone().into_patterns().is_empty()
         {
             out.push("cursor.sandModels (config)".to_string());
+        }
+        if let Some(ref cursor) = file_cfg.cursor
+            && let Some(routes) = cursor.model_accounts.as_ref()
+            && !routes.clone().into_rules().is_empty()
+        {
+            out.push("cursor.modelAccounts (config)".to_string());
         }
     }
     out
@@ -1151,6 +1668,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CURSOR_SAND_MODELS");
+            std::env::remove_var("CCP_CURSOR_MODEL_ACCOUNTS");
             std::env::remove_var("CCP_CURSOR_CLIENT_TYPE");
         }
     }
@@ -1395,6 +1913,322 @@ mod tests {
         let from_env = cursor_sand_policy();
         assert!(from_env.matches("grok-4.5"));
         assert!(!from_env.matches("claude-fable-5"));
+    }
+
+    #[test]
+    fn account_policy_normalizes_models_and_replaces_duplicate_rules() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("*", "fallback"),
+            CursorModelAccountRule::new(" Gemini-3.1-Pro[1m] ", "work"),
+            CursorModelAccountRule::new("gemini-3.1-pro", "updated"),
+            CursorModelAccountRule::new("claude-fable-*", "fable-account"),
+            CursorModelAccountRule::new("claude-fable-5", "fable-exact"),
+        ]);
+        assert_eq!(policy.routes().len(), 4);
+        assert_eq!(
+            policy.account_for_model("gemini-3.1-pro-preview"),
+            Some("updated")
+        );
+        assert_eq!(
+            policy.account_for_model("gemini-3.1-pro[2m]"),
+            Some("updated")
+        );
+        assert_eq!(
+            policy.account_for_model("cursor:claude-fable-5[1m]"),
+            Some("fable-exact")
+        );
+        assert_eq!(policy.account_for_model("grok-4.6"), Some("fallback"));
+    }
+
+    #[test]
+    fn account_policy_prefers_direct_alias_over_resolved_catalog_id() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("claude-fable-5-thinking-max", "catalog-account"),
+            CursorModelAccountRule::new("claude-fable-5", "alias-account"),
+        ]);
+        assert_eq!(
+            policy.account_for_model("claude-fable-5"),
+            Some("alias-account")
+        );
+        assert_eq!(
+            policy.account_for_model("claude-fable-5-thinking-max"),
+            Some("catalog-account")
+        );
+    }
+
+    #[test]
+    fn account_policy_edit_removes_alias_equivalent_literals_but_keeps_wildcards() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("*", "fallback"),
+            CursorModelAccountRule::new("gemini-*", "gemini-fallback"),
+            CursorModelAccountRule::new("fable", "old-alias"),
+            CursorModelAccountRule::new("claude-fable-5-thinking-max", "old-concrete"),
+            CursorModelAccountRule::new("claude-fable-5-preview", "old-preview"),
+        ]);
+
+        let assigned = policy.with_model_assignment("claude-fable-5", Some("new-account"));
+        assert_eq!(
+            assigned.account_for_model("claude-fable-5"),
+            Some("new-account")
+        );
+        assert!(assigned.routes().iter().any(|rule| rule.model == "*"));
+        assert!(
+            assigned
+                .routes()
+                .iter()
+                .any(|rule| rule.model == "gemini-*")
+        );
+        assert!(!assigned.routes().iter().any(|rule| {
+            matches!(
+                rule.model.as_str(),
+                "fable"
+                    | "claude-fable-5"
+                    | "claude-fable-5-thinking-max"
+                    | "claude-fable-5-preview"
+            ) && rule.account != "new-account"
+        }));
+
+        let cleared = assigned.with_model_assignment("claude-fable-5", None);
+        assert_eq!(
+            cleared.account_for_model("claude-fable-5"),
+            Some("fallback")
+        );
+        assert!(cleared.routes().iter().any(|rule| rule.model == "*"));
+        assert!(cleared.routes().iter().any(|rule| rule.model == "gemini-*"));
+        assert!(!cleared.routes().iter().any(|rule| {
+            matches!(
+                rule.model.as_str(),
+                "fable"
+                    | "claude-fable-5"
+                    | "claude-fable-5-thinking-max"
+                    | "claude-fable-5-preview"
+            )
+        }));
+    }
+
+    #[test]
+    fn account_policy_edit_treats_preview_and_base_as_one_literal_target() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("*", "fallback"),
+            CursorModelAccountRule::new("gemini-3.1-pro-preview", "preview-account"),
+        ]);
+
+        let assigned = policy.with_model_assignment("gemini-3.1-pro", Some("base-account"));
+        assert_eq!(
+            assigned.account_for_model("gemini-3.1-pro-preview"),
+            Some("base-account")
+        );
+        assert!(
+            !assigned
+                .routes()
+                .iter()
+                .any(|rule| rule.model == "gemini-3.1-pro-preview")
+        );
+        assert!(assigned.routes().iter().any(|rule| rule.model == "*"));
+
+        let cleared = assigned.with_model_assignment("gemini-3.1-pro-preview", None);
+        assert_eq!(
+            cleared.account_for_model("gemini-3.1-pro"),
+            Some("fallback")
+        );
+        assert!(cleared.routes().iter().any(|rule| rule.model == "*"));
+    }
+
+    #[test]
+    fn account_policy_direct_match_accepts_unresolved_custom_ids() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("frontier-account-model", "work"),
+            CursorModelAccountRule::new("vendor-*", "backup"),
+        ]);
+        assert!(policy.matches_direct("frontier-account-model"));
+        assert!(policy.matches_direct("vendor-preview"));
+        assert!(!policy.matches_direct("other-model"));
+    }
+
+    #[test]
+    fn configured_custom_account_route_is_accepted_by_cursor_model_resolution() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"modelAccounts":{"frontier-account-model":"work"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let resolved =
+            crate::providers::cursor::model::resolve_cursor_model("frontier-account-model")
+                .expect("an explicitly routed custom id should reach Cursor");
+        assert_eq!(resolved.model_id, "frontier-account-model");
+    }
+
+    #[test]
+    fn account_policy_reads_config_and_environment_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"modelAccounts":{"gemini-3.1-pro":"work","grok-*":"backup"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let from_file = cursor_account_routing_policy();
+        assert_eq!(from_file.account_for_model("gemini-3.1-pro"), Some("work"));
+        assert_eq!(from_file.account_for_model("grok-4.6"), Some("backup"));
+
+        let _route_env = EnvGuard::set("CCP_CURSOR_MODEL_ACCOUNTS", "{\"grok-4.6\":\"env\"}");
+        let from_env = cursor_account_routing_policy();
+        assert_eq!(from_env.account_for_model("grok-4.6"), Some("env"));
+        assert_eq!(from_env.account_for_model("gemini-3.1-pro"), None);
+    }
+
+    #[test]
+    fn persist_account_routes_preserves_existing_cursor_settings() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"port":18765,"cursor":{"sandModels":["gemini-3.1-pro"],"clientType":"cli"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        persist_cursor_account_routes(&CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("grok-4.6", "backup"),
+        ]))
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["port"], 18765);
+        assert_eq!(value["cursor"]["clientType"], "cli");
+        assert_eq!(value["cursor"]["sandModels"][0], "gemini-3.1-pro");
+        assert_eq!(value["cursor"]["modelAccounts"]["grok-4.6"], "backup");
+    }
+
+    #[test]
+    fn remove_account_routes_matches_id_label_email_and_preserves_other_rules() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"modelAccounts":{"grok-*":"work","gemini-*":"backup","fable":"other"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(
+            remove_cursor_model_account_routes_for_account(
+                "account-work",
+                Some("Work"),
+                Some("work@example.com"),
+            )
+            .unwrap()
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(value["cursor"]["modelAccounts"].get("grok-*").is_none());
+        assert_eq!(value["cursor"]["modelAccounts"]["gemini-*"], "backup");
+        assert_eq!(value["cursor"]["modelAccounts"]["fable"], "other");
+    }
+
+    #[test]
+    fn remove_account_routes_keeps_selector_that_still_matches_remaining_account() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"modelAccounts":{"grok-*":"team*","gemini-*":"account-a"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let remaining = [(
+            "account-b".to_string(),
+            Some("Team Beta".to_string()),
+            Some("beta@example.com".to_string()),
+        )];
+
+        assert!(
+            remove_cursor_model_account_routes_for_account_with_remaining(
+                "account-a",
+                Some("Team Alpha"),
+                Some("alpha@example.com"),
+                |selector| remaining.iter().any(|(id, label, email)| {
+                    account_selector_matches(selector, id, label.as_deref(), email.as_deref())
+                }),
+            )
+            .unwrap(),
+            "the direct account-a selector should be removed"
+        );
+
+        let policy = cursor_account_routing_policy();
+        assert_eq!(policy.account_for_model("grok-4.6"), Some("team*"));
+        assert_eq!(policy.account_for_model("gemini-3.1-pro"), None);
+    }
+
+    #[test]
+    fn remove_account_routes_clears_selector_when_no_remaining_account_matches() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"modelAccounts":{"grok-*":"team*","gemini-*":"account-a"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let remaining = [(
+            "account-b".to_string(),
+            Some("Other Team".to_string()),
+            Some("beta@example.com".to_string()),
+        )];
+
+        assert!(
+            remove_cursor_model_account_routes_for_account_with_remaining(
+                "account-a",
+                Some("Team Alpha"),
+                Some("alpha@example.com"),
+                |selector| remaining.iter().any(|(id, label, email)| {
+                    account_selector_matches(selector, id, label.as_deref(), email.as_deref())
+                }),
+            )
+            .unwrap()
+        );
+
+        let policy = cursor_account_routing_policy();
+        assert_eq!(policy.account_for_model("grok-4.6"), None);
+        assert_eq!(policy.account_for_model("gemini-3.1-pro"), None);
+    }
+
+    #[test]
+    fn remove_account_routes_does_not_write_when_environment_override_is_active() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        let original = r#"{"cursor":{"modelAccounts":{"grok-*":"work"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _route_env = EnvGuard::set("CCP_CURSOR_MODEL_ACCOUNTS", "grok-*=work");
+
+        assert!(
+            !remove_cursor_model_account_routes_for_account(
+                "account-work",
+                Some("Work"),
+                Some("work@example.com"),
+            )
+            .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]

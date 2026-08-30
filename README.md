@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.92 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.93 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -126,6 +126,16 @@ parallel. Press `d` on a selected account, then `y`/`Enter` to confirm deletion
 (`n`/`Esc` cancels). Removing the active account immediately activates the next
 available account. Adding, switching, or removing accounts does not require
 restarting `serve`.
+
+To reserve a saved account for particular models, press `m` from the main TUI
+or the account panel. Use `j`/`k` to select a model and `Enter`/`Space` to cycle
+between saved accounts and `automatic`; press `x` to clear an assignment or
+`a` to enter a catalog id that is not listed yet. Changes apply to new requests
+immediately without changing the active account. Model-bound live runs,
+conversation checkpoints, KV state, and tool continuations are partitioned by
+account, so two models can use different accounts concurrently in one `serve`
+process. The TUI stores the stable account id; labels and emails remain useful
+selectors for headless configuration.
 
 ### Point Claude Code at the proxy (Fable 5)
 
@@ -251,6 +261,10 @@ needed.
 The policy applies only to requests resolved to the Cursor provider; Codex,
 Kimi, and Grok routes are unchanged.
 
+Sand selection and account selection are independent. For example,
+`gemini-3.1-pro` can be marked `[sand]` with `s` and assigned to a specific
+Cursor account with `m`; both settings are applied to the same request.
+
 > **Recommended: configure Sand from the monitor TUI.** Keep one `serve`
 > process running and use the shortcuts below; this avoids hand-editing
 > configuration files and makes the active request type visible immediately.
@@ -263,6 +277,7 @@ Kimi, and Grok routes are unchanged.
 | `a` | Add a model id manually (for example `claude-fable-5`) |
 | `u` | Open the account-usage view |
 | `a` (main view) | Open the Cursor account panel |
+| `m` (main view) | Assign Cursor models to saved accounts |
 | `Esc` / `s` | Close the Sand editor |
 
 ### Fast setup
@@ -366,10 +381,10 @@ claude-cursor-proxy cursor auth status
 
 ## Configuration
 
-For interactive Sand routing and usage inspection, prefer the monitor TUI:
-`s` selects Sand models, `a` adds an exact model id, and `u` opens account
-usage. The file and environment settings below are primarily for headless or
-automated deployments.
+For interactive routing and usage inspection, prefer the monitor TUI: `s`
+selects Sand models, `m` assigns models to Cursor accounts, `a` opens account
+management, and `u` opens account usage. The file and environment settings
+below are primarily for headless or automated deployments.
 
 Precedence: **env > `config.json` > defaults**.
 
@@ -389,6 +404,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value |
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
+| `CCP_CURSOR_MODEL_ACCOUNTS` | unset | JSON object or `model=account` list assigning Cursor model selectors to account ids, unique labels, or emails; supports `*` and `?` |
 | `CCP_CURSOR_STATE_DB` | Cursor Desktop state path on macOS | Optional read-only state.vscdb path used by the TUI usage fallback |
 | `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Cursor catalog id used for Anthropic `haiku` aliases and desktop small-model probes |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | on | Disable with `0` / `false` |
@@ -438,15 +454,28 @@ These are Claude Code knobs (not proxy config). Useful when `/deep-research` or 
   "bindAddress": "127.0.0.1",
   "port": 18765,
   "cursor": {
-    "sandModels": ["claude-fable-5"]
+    "sandModels": ["claude-fable-5"],
+    "modelAccounts": {
+      "claude-fable-5": "work",
+      "gemini-3.1-pro": "ACCOUNT_ID"
+    }
   },
   "log": { "stderr": false, "verbose": false }
 }
 ```
 
 This is the shape written by the TUI; manual editing is mainly useful for
-automation. See [Sand mode](#sand-mode) for the complete routing, TUI, model
-discovery, and usage guide.
+automation. Account values may be the id printed by `cursor auth list`, a
+unique label, or a unique email. Model selectors are case-insensitive and may
+contain `*` and `?`; an exact model rule wins over a wildcard rule. For an
+environment-only deployment, the equivalent account policy is:
+
+```bash
+export CCP_CURSOR_MODEL_ACCOUNTS='{"claude-fable-5":"work","gemini-*":"ACCOUNT_ID"}'
+```
+
+See [Sand mode](#sand-mode) for the complete routing, TUI, model discovery,
+and usage guide.
 
 ---
 

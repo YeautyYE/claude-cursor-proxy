@@ -237,6 +237,11 @@ const ASK_USER_QUESTION_HEADER_MAX: usize = 12;
 /// runs are keyed by `(session_id, agent_id)` — never a new session UUID.
 const PARENT_RUN_PREFIX: &str = "p:";
 const AGENT_RUN_PREFIX: &str = "a:";
+/// Prefix used when an account-scoped identity is folded into the registry
+/// agent component.  Keeping this as a length-prefixed opaque component means
+/// account digests and Claude agent ids can contain arbitrary punctuation
+/// without colliding with the legacy `(session, agent)` key format.
+const ACCOUNT_SCOPED_AGENT_PREFIX: &str = "acctv1:";
 
 /// Identity for a Claude Code Messages POST that may be a nested agent.
 ///
@@ -248,6 +253,10 @@ pub struct LiveRunIdentity<'a> {
     pub session_id: &'a str,
     pub agent_id: Option<&'a str>,
     pub parent_agent_id: Option<&'a str>,
+    /// Stable account identity (normally a one-way digest of the bearer).
+    /// `None` preserves the pre-account-routing key format for compatibility
+    /// callers and older tests.
+    pub account_key: Option<&'a str>,
 }
 
 /// Prompt/image recovery hints captured by the request handler before it
@@ -268,6 +277,7 @@ impl<'a> LiveRunIdentity<'a> {
             session_id,
             agent_id: None,
             parent_agent_id: None,
+            account_key: None,
         }
     }
 
@@ -297,8 +307,32 @@ pub fn live_run_key(session_id: &str, agent_id: Option<&str>) -> String {
     }
 }
 
+/// Fold a stable account identity into the optional agent component used by
+/// the existing registry API.  The registry deliberately keeps its public
+/// `(session_id, agent_id)` methods unchanged so legacy callers continue to
+/// work; account-aware request paths pass the returned component instead.
+pub(crate) fn account_scoped_agent_id(
+    account_key: Option<&str>,
+    agent_id: Option<&str>,
+) -> Option<String> {
+    let account = account_key.map(str::trim).filter(|value| !value.is_empty());
+    let agent = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    let Some(account) = account else {
+        return agent.map(str::to_string);
+    };
+    let agent = agent.unwrap_or("");
+    Some(format!(
+        "{ACCOUNT_SCOPED_AGENT_PREFIX}{}:{}:{}:{}",
+        account.len(),
+        account,
+        agent.len(),
+        agent
+    ))
+}
+
 pub fn live_run_key_for(identity: LiveRunIdentity<'_>) -> String {
-    live_run_key(identity.session_id, identity.agent_id)
+    let agent = account_scoped_agent_id(identity.account_key, identity.agent_id);
+    live_run_key(identity.session_id, agent.as_deref())
 }
 
 fn claude_session_of(run_key: &str) -> &str {
@@ -20969,6 +21003,7 @@ mod tests {
             session_id: session,
             agent_id: Some("agent%2Fchild"),
             parent_agent_id: Some("agent%2Fparent"),
+            account_key: None,
         };
         assert_eq!(
             live_run_key_for(parent),
@@ -21016,6 +21051,41 @@ mod tests {
             "supersede_run on the parent slot must leave the nested agent"
         );
         LiveRunRegistry::clear();
+    }
+
+    #[test]
+    fn live_run_identity_partitions_the_same_session_and_agent_by_account() {
+        let session = "shared-claude-session";
+        let account_a = LiveRunIdentity {
+            session_id: session,
+            agent_id: Some("agent:child"),
+            parent_agent_id: None,
+            account_key: Some("account:a"),
+        };
+        let account_b = LiveRunIdentity {
+            account_key: Some("account:b"),
+            ..account_a
+        };
+        let different_tuple = LiveRunIdentity {
+            agent_id: Some("a:agent:child"),
+            account_key: Some("account"),
+            ..account_a
+        };
+
+        assert_ne!(live_run_key_for(account_a), live_run_key_for(account_b));
+        assert_ne!(
+            live_run_key_for(account_a),
+            live_run_key_for(different_tuple),
+            "length-prefixed account and agent components must not collide"
+        );
+        assert_eq!(
+            live_run_key_for(LiveRunIdentity {
+                account_key: None,
+                ..account_a
+            }),
+            live_run_key(session, Some("agent:child")),
+            "callers without an account retain the legacy registry key"
+        );
     }
 
     #[test]

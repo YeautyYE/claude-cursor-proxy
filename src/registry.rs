@@ -149,6 +149,17 @@ impl Registry {
             }
         }
 
+        // An explicit model-account assignment is also an explicit Cursor
+        // routing signal.  This allows server-introduced/custom model ids to
+        // enter the Cursor provider even before this process has fetched the
+        // account's live catalog.  The exact-provider loop above remains
+        // first, so a model owned by Codex/Kimi/Grok keeps its native route.
+        if self.handlers.contains_key("cursor")
+            && crate::config::cursor_model_account_route_matches(&normalized)
+        {
+            return self.handlers.get("cursor").cloned();
+        }
+
         // `/v1/models` lists live Cursor catalog ids (e.g. claude-fable-5-thinking-high[1m])
         // that are not in the static registry. Route those to Cursor only when no other
         // provider already claimed the exact id (gpt-5.5 stays Codex).
