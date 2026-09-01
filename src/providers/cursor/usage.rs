@@ -58,6 +58,14 @@ struct CachedAccountUsageEvent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct CachedAccountUsageSnapshot {
+    /// Optional identity fields are persisted beside the meter so the TUI can
+    /// keep showing a useful account name/email even when the registry read is
+    /// temporarily unavailable on the next launch. They are metadata only;
+    /// credentials are never written to this cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_active: Option<bool>,
     email: Option<String>,
     membership: Option<String>,
     auto_percent: Option<f64>,
@@ -77,8 +85,19 @@ struct CachedAccountUsageSnapshot {
 }
 
 impl CachedAccountUsageSnapshot {
+    #[cfg(test)]
     fn from_snapshot(snapshot: &AccountUsageSnapshot) -> Self {
+        Self::from_snapshot_with_metadata(snapshot, None, None)
+    }
+
+    fn from_snapshot_with_metadata(
+        snapshot: &AccountUsageSnapshot,
+        account_label: Option<&str>,
+        account_active: Option<bool>,
+    ) -> Self {
         Self {
+            account_label: bounded_cache_string(account_label),
+            account_active,
             email: bounded_cache_string(snapshot.email.as_deref()),
             membership: bounded_cache_string(snapshot.membership.as_deref()),
             auto_percent: finite(snapshot.auto_percent),
@@ -146,6 +165,28 @@ impl CachedAccountUsageSnapshot {
             fetched_at,
         })
     }
+
+    fn metadata(&self) -> Option<AccountUsageCacheMetadata> {
+        let fetched_at_ms = self.fetched_at_ms?;
+        let fetched_at = UNIX_EPOCH.checked_add(Duration::from_millis(fetched_at_ms))?;
+        Some(AccountUsageCacheMetadata {
+            label: self.account_label.clone(),
+            email: self.email.clone(),
+            active: self.account_active,
+            fetched_at,
+        })
+    }
+}
+
+/// Identity metadata retained with a successful usage snapshot.  This type is
+/// deliberately credential-free and is safe for the TUI to hold across
+/// registry refreshes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountUsageCacheMetadata {
+    pub label: Option<String>,
+    pub email: Option<String>,
+    pub active: Option<bool>,
+    pub fetched_at: SystemTime,
 }
 
 fn finite(value: Option<f64>) -> Option<f64> {
@@ -182,6 +223,20 @@ pub fn load_account_usage_cache() -> HashMap<String, AccountUsageSnapshot> {
     .unwrap_or_default()
 }
 
+/// Load the identity metadata stored alongside usage snapshots.  A malformed
+/// or missing cache is treated as an empty result just like the meter loader.
+pub fn load_account_usage_cache_metadata() -> HashMap<String, AccountUsageCacheMetadata> {
+    let deps = crate::paths::DirResolverEnv::default();
+    with_account_usage_cache_lock(&crate::paths::cursor_usage_cache_lock_file(&deps), || {
+        let entries = read_cached_usage_entries(&crate::paths::cursor_usage_cache_file(&deps))?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(id, snapshot)| snapshot.metadata().map(|metadata| (id, metadata)))
+            .collect())
+    })
+    .unwrap_or_default()
+}
+
 /// Persist one successful account snapshot without retaining any credential
 /// material. Updates are serialized across threads and processes so workers
 /// finishing out of order cannot replace another account's entry.
@@ -195,6 +250,23 @@ pub fn persist_account_usage(
         &crate::paths::cursor_usage_cache_lock_file(&deps),
         account_id,
         snapshot,
+    )
+}
+
+fn persist_account_usage_with_metadata(
+    account_id: &str,
+    snapshot: &AccountUsageSnapshot,
+    account_label: Option<&str>,
+    account_active: Option<bool>,
+) -> anyhow::Result<()> {
+    let deps = crate::paths::DirResolverEnv::default();
+    persist_account_usage_to_with_metadata(
+        &crate::paths::cursor_usage_cache_file(&deps),
+        &crate::paths::cursor_usage_cache_lock_file(&deps),
+        account_id,
+        snapshot,
+        account_label,
+        account_active,
     )
 }
 
@@ -222,7 +294,12 @@ pub fn persist_account_usage_for_profile(
         if current.as_deref() != Some(refreshed_auth.access_token.as_str()) {
             return Ok(());
         }
-        return persist_account_usage(&profile.id, snapshot);
+        return persist_account_usage_with_metadata(
+            &profile.id,
+            snapshot,
+            Some(profile.display_name()),
+            Some(profile.active),
+        );
     }
     let registry_backed =
         profile.auth.source == crate::providers::cursor::auth::cursor_accounts_location();
@@ -236,16 +313,31 @@ pub fn persist_account_usage_for_profile(
         &refreshed_auth.access_token,
         || {
             if registry_backed {
-                return persist_account_usage(&profile.id, snapshot);
+                return persist_account_usage_with_metadata(
+                    &profile.id,
+                    snapshot,
+                    Some(profile.display_name()),
+                    Some(profile.active),
+                );
             }
-            persist_account_usage(&profile.id, snapshot)?;
+            persist_account_usage_with_metadata(
+                &profile.id,
+                snapshot,
+                Some(profile.display_name()),
+                Some(profile.active),
+            )?;
             let refreshed_id = crate::providers::cursor::auth::cursor_account_id_for_token(
                 &refreshed_auth.access_token,
             );
             if refreshed_id == profile.id {
                 return Ok(());
             }
-            persist_account_usage(&refreshed_id, snapshot)?;
+            persist_account_usage_with_metadata(
+                &refreshed_id,
+                snapshot,
+                Some(profile.display_name()),
+                Some(profile.active),
+            )?;
             remove_account_usage(&profile.id)
         },
     ) else {
@@ -281,12 +373,52 @@ fn persist_account_usage_to(
     account_id: &str,
     snapshot: &AccountUsageSnapshot,
 ) -> anyhow::Result<()> {
+    persist_account_usage_to_with_metadata(cache_path, lock_path, account_id, snapshot, None, None)
+}
+
+fn persist_account_usage_to_with_metadata(
+    cache_path: &Path,
+    lock_path: &Path,
+    account_id: &str,
+    snapshot: &AccountUsageSnapshot,
+    account_label: Option<&str>,
+    account_active: Option<bool>,
+) -> anyhow::Result<()> {
     if !valid_cache_account_id(account_id) {
         anyhow::bail!("invalid Cursor account id for usage cache");
     }
     with_account_usage_cache_lock(lock_path, || {
         let mut cache = read_cached_usage_entries(cache_path)?;
-        let next = CachedAccountUsageSnapshot::from_snapshot(snapshot);
+        // The legacy `persist_account_usage(account_id, snapshot)` API does
+        // not carry identity metadata.  Keep fields learned by a previous
+        // profile-aware write instead of silently erasing the account name
+        // and active marker whenever that compatibility path publishes a
+        // newer meter.  Profile-aware callers pass `Some(...)` and therefore
+        // still replace changed labels/active state normally.
+        let previous_metadata = cache.get(account_id).map(|previous| {
+            (
+                previous.account_label.clone(),
+                previous.account_active,
+                previous.email.clone(),
+            )
+        });
+        let next = CachedAccountUsageSnapshot::from_snapshot_with_metadata(
+            snapshot,
+            account_label,
+            account_active,
+        );
+        let mut next = next;
+        if let Some((previous_label, previous_active, previous_email)) = previous_metadata {
+            if next.account_label.is_none() {
+                next.account_label = previous_label;
+            }
+            if next.account_active.is_none() {
+                next.account_active = previous_active;
+            }
+            if next.email.is_none() {
+                next.email = previous_email;
+            }
+        }
         let next_fetched_at = next.fetched_at_ms.unwrap_or_default();
         let should_replace = cache
             .get(account_id)
@@ -1494,6 +1626,62 @@ mod tests {
         let raw = fs::read_to_string(cache).unwrap();
         assert!(!raw.contains("access_token"));
         assert!(!raw.contains("refresh_token"));
+    }
+
+    #[test]
+    fn account_usage_cache_round_trips_identity_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        let snapshot = cache_snapshot(4321);
+        persist_account_usage_to_with_metadata(
+            &cache,
+            &lock,
+            "account-meta",
+            &snapshot,
+            Some("Work account"),
+            Some(true),
+        )
+        .unwrap();
+
+        let entries = read_cached_usage_entries(&cache).unwrap();
+        let metadata = entries
+            .get("account-meta")
+            .and_then(CachedAccountUsageSnapshot::metadata)
+            .expect("identity metadata");
+        assert_eq!(metadata.label.as_deref(), Some("Work account"));
+        assert_eq!(metadata.email.as_deref(), snapshot.email.as_deref());
+        assert_eq!(metadata.active, Some(true));
+        assert_eq!(metadata.fetched_at, snapshot.fetched_at);
+    }
+
+    #[test]
+    fn legacy_cache_writer_preserves_identity_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cursor").join("account-usage.json");
+        let lock = dir.path().join("cursor").join("account-usage.lock");
+        persist_account_usage_to_with_metadata(
+            &cache,
+            &lock,
+            "account-meta",
+            &cache_snapshot(10),
+            Some("Work account"),
+            Some(true),
+        )
+        .unwrap();
+
+        // This is the compatibility API used by older monitor callers.  A
+        // newer snapshot without profile metadata must not erase the label,
+        // active marker, or dashboard email needed during an offline render.
+        let mut newer = cache_snapshot(20);
+        newer.email = None;
+        persist_account_usage_to(&cache, &lock, "account-meta", &newer).unwrap();
+
+        let entries = read_cached_usage_entries(&cache).unwrap();
+        let cached = entries.get("account-meta").expect("cached account");
+        assert_eq!(cached.account_label.as_deref(), Some("Work account"));
+        assert_eq!(cached.account_active, Some(true));
+        assert_eq!(cached.email.as_deref(), Some("account-10@example.com"));
     }
 
     #[test]

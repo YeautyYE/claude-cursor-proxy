@@ -74,6 +74,14 @@ enum ProviderGroup {
         #[command(subcommand)]
         command: claude_cursor_proxy::provider::AuthCommand,
     },
+    /// Show the effective SandClientMode routing, identity, transport, and
+    /// credential-free usage-cache state without making an upstream request.
+    #[command(name = "sand-status")]
+    SandStatus {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -206,7 +214,23 @@ fn spawn_cursor_catalog_warmup(runtime: &tokio::runtime::Runtime) {
             return;
         };
         let client = providers::cursor::client::CursorHttpClient::new();
-        let _ = client.fetch_usable_models(&auth.access_token).await;
+        // Cursor can return a different catalog under its managed-local Sand
+        // identity than it does for the ordinary CLI identity.  Warm every
+        // identity selected by the current policy so the first TUI `s` press
+        // has the same choices as a later request turn. The HTTP client keeps
+        // these snapshots identity-scoped, so concurrent fetches cannot
+        // overwrite one another.
+        let client_types = config::cursor_catalog_client_types();
+        let fetches = client_types.into_iter().map(|client_type| {
+            let client = client.clone();
+            let token = auth.access_token.clone();
+            async move {
+                let _ = client
+                    .fetch_usable_models_for_client_type(&token, &client_type)
+                    .await;
+            }
+        });
+        futures_util::future::join_all(fetches).await;
     });
 }
 
@@ -274,6 +298,21 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
                 run_cursor_account_cli(command)
             }
         },
+        ProviderGroup::SandStatus { json } => {
+            if name != "cursor" {
+                anyhow::bail!("{name} sand-status is only available for the cursor provider");
+            }
+            let status = claude_cursor_proxy::providers::cursor::sand_status::snapshot();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print!(
+                    "{}",
+                    claude_cursor_proxy::providers::cursor::sand_status::render_text(&status)
+                );
+            }
+            Ok(())
+        }
     }
 }
 

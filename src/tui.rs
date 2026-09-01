@@ -279,6 +279,10 @@ struct AccountUiState {
     accounts: Vec<crate::providers::cursor::auth::CursorAccountProfile>,
     selected: usize,
     usage: HashMap<String, crate::monitor::AccountUsageState>,
+    /// Identity metadata hydrated from the durable usage cache.  The account
+    /// registry remains authoritative for credentials; this map only fills in
+    /// labels/emails while a registry refresh is unavailable.
+    account_metadata: HashMap<String, crate::providers::cursor::usage::AccountUsageCacheMetadata>,
     usage_rx: Option<mpsc::Receiver<AccountUsageEvent>>,
     /// Sender/receiver stay shared while the account panel is open. Each
     /// account still carries its own generation and cancellation token, so a
@@ -293,6 +297,18 @@ struct AccountUiState {
     usage_loading: HashSet<String>,
     usage_generations: HashMap<String, u64>,
     usage_cancels: HashMap<String, Arc<AtomicBool>>,
+    /// Explicit `u`/`U` refreshes requested while an account worker is still
+    /// running are coalesced here.  The underlying blocking reqwest call does
+    /// not support immediate cancellation; starting a replacement before it
+    /// unwinds would create two dashboard requests for one account and can
+    /// trigger Cursor's `already active` response.  A pending id is launched
+    /// as soon as the current lease is released.
+    usage_refresh_pending: HashSet<String>,
+    /// Account ids whose visible snapshot came from the durable disk cache
+    /// rather than the latest dashboard request.  Keeping this bit separate
+    /// from `AccountUsageState` lets us retain a useful Ready snapshot while
+    /// a refresh is in flight and makes its provenance explicit in the UI.
+    usage_cached: HashSet<String>,
     /// Network work can outlive its UI loading state after the watchdog fires.
     /// Keep the account leased until its result or worker completion arrives so
     /// retry input cannot create a second request for the same account.
@@ -776,6 +792,7 @@ fn cancel_usage_locked(ui: &mut AccountUiState) {
     // lease after this reset.
     ui.usage_in_flight.clear();
     ui.usage_loading.clear();
+    ui.usage_refresh_pending.clear();
 }
 
 fn cancel_account_usage_workers() {
@@ -793,6 +810,17 @@ fn cancel_account_usage_locked(ui: &mut AccountUiState, account_id: &str) {
         .or_default();
     *generation = generation.wrapping_add(1);
     ui.usage_loading.remove(account_id);
+}
+
+/// Return whether an account already owns a live/retired worker lease.  A
+/// force request is remembered for a follow-up wave rather than cancelling the
+/// socket in place (blocking reqwest calls are only cooperatively cancellable).
+fn account_usage_busy_locked(ui: &mut AccountUiState, account_id: &str, force: bool) -> bool {
+    let busy = ui.usage_loading.contains(account_id) || ui.usage_in_flight.contains_key(account_id);
+    if busy && force {
+        ui.usage_refresh_pending.insert(account_id.to_string());
+    }
+    busy
 }
 
 fn ensure_account_usage_channel_locked(ui: &mut AccountUiState) -> mpsc::Sender<AccountUsageEvent> {
@@ -828,9 +856,11 @@ fn open_accounts_view(app: &mut MonitorApp) {
 /// for a live catalog model without typing its id; persisted route patterns
 /// are merged as well to keep hand-authored rules visible.
 fn open_account_routes(app: &mut MonitorApp) {
-    if account_ui_lock().accounts.is_empty() {
-        refresh_account_list();
-    }
+    // Re-read the registry whenever the editor opens. Accounts can be added,
+    // removed, or switched from another terminal while this TUI remains
+    // running; only refreshing an empty list leaves newly-added accounts
+    // invisible in the chooser until the user manually presses `r`.
+    refresh_account_list();
     let policy = config::cursor_account_routing_policy();
     let mut models = app.sand_models.clone();
     models.extend(policy.routes().iter().map(|rule| rule.model.clone()));
@@ -960,7 +990,7 @@ fn handle_account_route_key(app: &mut MonitorApp, key: KeyCode) {
             }
         }
         KeyCode::Char('u') => request_route_selected_usage(),
-        KeyCode::Char('U') => request_account_usage(true),
+        KeyCode::Char('U') => request_account_usage_force(true),
         KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
             clear_selected_account_route();
             account_route_ui_lock().pane = AccountRoutePane::Models;
@@ -1010,7 +1040,7 @@ fn request_route_selected_usage() {
         }
     };
     if available {
-        request_account_usage(false);
+        request_account_usage_force(false);
     } else {
         account_route_ui_lock().message =
             Some("Selected account is no longer available".to_string());
@@ -1225,7 +1255,21 @@ fn clear_selected_account_route() {
 fn refresh_account_list() {
     let result = crate::providers::cursor::auth::list_cursor_accounts();
     let persisted = crate::providers::cursor::usage::load_account_usage_cache();
+    let persisted_metadata = crate::providers::cursor::usage::load_account_usage_cache_metadata();
     let mut ui = account_ui_lock();
+    // Hydrate identity metadata even when the registry read below fails.  A
+    // transient lock/parse error should not erase the names and emails that
+    // were already learned from the last successful dashboard response.
+    for (account_id, metadata) in &persisted_metadata {
+        let should_replace = ui
+            .account_metadata
+            .get(account_id)
+            .is_none_or(|current| metadata.fetched_at > current.fetched_at);
+        if should_replace {
+            ui.account_metadata
+                .insert(account_id.clone(), metadata.clone());
+        }
+    }
     match result {
         Ok(accounts) => {
             let selected_index = ui.selected;
@@ -1251,6 +1295,11 @@ fn refresh_account_list() {
                 .map(|account| account.id.clone())
                 .collect::<std::collections::HashSet<_>>();
             ui.usage.retain(|id, _| ids.contains(id.as_str()));
+            ui.usage_cached.retain(|id| ids.contains(id.as_str()));
+            ui.usage_refresh_pending
+                .retain(|id| ids.contains(id.as_str()));
+            ui.account_metadata
+                .retain(|id, _| ids.contains(id.as_str()));
             ui.usage_errors.retain(|id, _| ids.contains(id.as_str()));
             // A list refresh must not interrupt an account that is still
             // present. Only workers for removed accounts are invalidated.
@@ -1271,6 +1320,9 @@ fn refresh_account_list() {
                 // and cannot affect a different account row.
                 ui.usage_in_flight.remove(&id);
                 ui.usage.remove(&id);
+                ui.usage_cached.remove(&id);
+                ui.usage_refresh_pending.remove(&id);
+                ui.account_metadata.remove(&id);
                 ui.usage_errors.remove(&id);
             }
             // Successful snapshots survive process restarts and are loaded
@@ -1289,6 +1341,7 @@ fn refresh_account_list() {
                     _ => persisted.contains_key(&account_id),
                 };
                 if should_load_cached && let Some(snapshot) = persisted.get(&account_id) {
+                    ui.usage_cached.insert(account_id.clone());
                     ui.usage.insert(
                         account_id,
                         crate::monitor::AccountUsageState::Ready(snapshot.clone()),
@@ -1307,6 +1360,55 @@ fn refresh_account_list() {
             // Keep the last account list and its cached meters visible when a
             // transient registry read fails. A failed refresh must not make a
             // usable account pool disappear from the TUI.
+            if ui.accounts.is_empty() && !persisted.is_empty() {
+                // A fresh TUI process has no in-memory rows to retain. Build
+                // display-only rows from the credential-free cache so users
+                // can still inspect names, meters, and fetch times while the
+                // registry is temporarily unreadable. They are marked with a
+                // cache source and are excluded from network refresh jobs
+                // until a later `r` successfully reloads credentials.
+                let mut ids = persisted.keys().cloned().collect::<Vec<_>>();
+                ids.sort_unstable();
+                ui.accounts = ids
+                    .into_iter()
+                    .map(|id| {
+                        let metadata = persisted_metadata.get(&id);
+                        let email = metadata.and_then(|entry| entry.email.clone()).or_else(|| {
+                            persisted
+                                .get(&id)
+                                .and_then(|snapshot| snapshot.email.clone())
+                        });
+                        crate::providers::cursor::auth::CursorAccountProfile {
+                            id,
+                            label: metadata.and_then(|entry| entry.label.clone()),
+                            auth: crate::providers::cursor::auth::CursorAuth {
+                                access_token: String::new(),
+                                refresh_token: None,
+                                api_key: None,
+                                expires: None,
+                                user_id: None,
+                                email,
+                                source: "account-usage-cache".to_string(),
+                            },
+                            active: metadata.and_then(|entry| entry.active).unwrap_or(false),
+                        }
+                    })
+                    .collect();
+                ui.accounts.sort_by_key(|account| {
+                    (!account.active, account.display_name().to_ascii_lowercase())
+                });
+                ui.usage = persisted
+                    .iter()
+                    .map(|(id, snapshot)| {
+                        (
+                            id.clone(),
+                            crate::monitor::AccountUsageState::Ready(snapshot.clone()),
+                        )
+                    })
+                    .collect();
+                ui.usage_cached = persisted.keys().cloned().collect();
+                ui.selected = ui.selected.min(ui.accounts.len().saturating_sub(1));
+            }
             ui.message = Some(format!("Account list refresh failed: {error}"));
         }
     }
@@ -1347,8 +1449,11 @@ fn handle_account_key(app: &mut MonitorApp, key: KeyCode) {
                 .min(ui.accounts.len().saturating_sub(1));
         }
         KeyCode::Enter => switch_selected_account(),
-        KeyCode::Char('u') => request_account_usage(false),
-        KeyCode::Char('U') => request_account_usage(true),
+        // Lowercase `u` is an explicit refresh of the selected row.  It must
+        // be able to replace a request that has gone idle; otherwise opening
+        // the panel's automatic warm-up can permanently occupy the row.
+        KeyCode::Char('u') => request_account_usage_force(false),
+        KeyCode::Char('U') => request_account_usage_force(true),
         KeyCode::Char('d') | KeyCode::Char('D') => request_account_delete(),
         KeyCode::Char('r') => {
             refresh_account_list();
@@ -1498,7 +1603,7 @@ fn request_account_usage_force(all: bool) {
 }
 
 fn request_account_usage_inner(all: bool, force: bool) {
-    let profiles = {
+    let requested_profiles = {
         let ui = account_ui_lock();
         if all {
             ui.accounts.clone()
@@ -1506,9 +1611,36 @@ fn request_account_usage_inner(all: bool, force: bool) {
             ui.accounts.get(ui.selected).cloned().into_iter().collect()
         }
     };
-    if profiles.is_empty() {
+    if requested_profiles.is_empty() {
         let mut ui = account_ui_lock();
         ui.message = Some("No Cursor accounts are available".to_string());
+        return;
+    }
+    request_account_usage_profiles(requested_profiles, all, force);
+}
+
+/// Start usage workers for an explicit set of profiles. Keeping this separate
+/// from [`request_account_usage_inner`] lets a coalesced force-refresh launch
+/// the account that was selected earlier even after the user has navigated to
+/// another row.
+fn request_account_usage_profiles(
+    requested_profiles: Vec<crate::providers::cursor::auth::CursorAccountProfile>,
+    all: bool,
+    force: bool,
+) {
+    // Rows reconstructed from the credential-free identity cache are useful
+    // for inspection but intentionally cannot make dashboard requests.  Keep
+    // them visible until the registry recovers instead of attempting a call
+    // with an empty bearer.
+    let profiles = requested_profiles
+        .into_iter()
+        .filter(|profile| !profile.auth.access_token.trim().is_empty())
+        .collect::<Vec<_>>();
+    if profiles.is_empty() {
+        let mut ui = account_ui_lock();
+        ui.message = Some(
+            "Account credentials are unavailable; press r to reload the account list".to_string(),
+        );
         return;
     }
 
@@ -1520,16 +1652,17 @@ fn request_account_usage_inner(all: bool, force: bool) {
         let mut skipped = 0usize;
         for profile in profiles {
             let account_id = profile.id.clone();
-            // Repeated `u`/`U` input is idempotent for an account that is
-            // already loading. Cancellation of a blocking dashboard request
-            // is cooperative, so starting a replacement here would create
-            // overlapping requests and defeat the per-account isolation.
-            if ui.usage_loading.contains(&account_id)
-                || ui.usage_in_flight.contains_key(&account_id)
-            {
+            // A blocking dashboard request cannot be interrupted reliably
+            // once reqwest has entered the socket read. Coalesce an explicit
+            // force refresh behind the current lease instead of admitting an
+            // overlapping request (which Cursor reports as 503 already-active).
+            if account_usage_busy_locked(&mut ui, &account_id, force) {
                 skipped += 1;
                 continue;
             }
+            // This id may have been queued by an earlier explicit refresh. It
+            // is now being admitted, so remove the marker before spawning.
+            ui.usage_refresh_pending.remove(&account_id);
             let generation = ui
                 .usage_generations
                 .entry(account_id.clone())
@@ -1602,10 +1735,10 @@ fn request_account_usage_inner(all: bool, force: bool) {
             });
         } else if skipped > 0 {
             // Leave an existing status intact while the selected row is
-            // already being fetched.
+            // already being fetched. A force call has been coalesced and will
+            // start automatically after the worker releases its lease.
             ui.message = Some(if force {
-                "Account usage is already being fetched; keeping one request per account"
-                    .to_string()
+                "Account usage refresh queued; keeping one request per account".to_string()
             } else {
                 "Account usage is already being fetched".to_string()
             });
@@ -1663,6 +1796,42 @@ fn request_account_usage_inner(all: bool, force: bool) {
             release_account_usage_leases(&spawn_failure_account_ids, wave_id);
             let _ = spawn_failure_tx.send(AccountUsageEvent::WaveComplete { wave_id });
         }
+    }
+}
+
+/// Launch coalesced explicit refreshes whose previous worker has now released
+/// its account lease. This is deliberately called outside the account mutex;
+/// worker creation may allocate and can otherwise block result application.
+fn drain_pending_account_usage() {
+    let profiles = {
+        let mut ui = account_ui_lock();
+        let ready_ids = ui
+            .usage_refresh_pending
+            .iter()
+            .filter(|account_id| {
+                !ui.usage_loading.contains(*account_id)
+                    && !ui.usage_in_flight.contains_key(*account_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if ready_ids.is_empty() {
+            return;
+        }
+        let mut profiles = Vec::new();
+        for account_id in ready_ids {
+            ui.usage_refresh_pending.remove(&account_id);
+            if let Some(profile) = ui.accounts.iter().find(|profile| profile.id == account_id) {
+                // Cache-only rows have no credentials and must wait for a
+                // successful registry reload instead of spinning a worker.
+                if !profile.auth.access_token.trim().is_empty() {
+                    profiles.push(profile.clone());
+                }
+            }
+        }
+        profiles
+    };
+    if !profiles.is_empty() {
+        request_account_usage_profiles(profiles, false, false);
     }
 }
 
@@ -1764,6 +1933,13 @@ fn finish_account_usage_wave(
         }
         if invalidate_generation {
             cancel_account_usage_locked(ui, &account.account_id);
+            // Keep the lease until the detached worker's guard runs. The
+            // watchdog only retires the UI generation; reqwest may still be
+            // reading the socket, and admitting a replacement here would
+            // overlap requests for one Cursor account (which commonly yields
+            // 503 `already active`). A force `u` is coalesced in
+            // `usage_refresh_pending` and drained after this lease is truly
+            // released by the worker result/guard.
         } else {
             ui.usage_loading.remove(&account.account_id);
             ui.usage_cancels.remove(&account.account_id);
@@ -1943,6 +2119,11 @@ fn poll_account_usage_results() {
             ui.message = Some("Usage updated".to_string());
         }
     }
+    drop(ui);
+    // A force refresh requested while another worker was active is launched
+    // only after the result/guard released that account's lease. This keeps
+    // the UI responsive while guaranteeing one dashboard request per account.
+    drain_pending_account_usage();
 }
 
 #[cfg(test)]
@@ -2009,6 +2190,11 @@ fn apply_account_usage_result_for_wave(
                 _ => true,
             };
             if should_apply {
+                if matches!(state, crate::monitor::AccountUsageState::Ready(_)) {
+                    // A successful network response supersedes the snapshot
+                    // that was hydrated from disk.
+                    ui.usage_cached.remove(&result.account_id);
+                }
                 ui.usage.insert(result.account_id, state);
             }
         }
@@ -3343,9 +3529,15 @@ fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             ui.message.clone(),
         )
     };
-    let (accounts, usage, usage_message) = {
+    let (accounts, usage, usage_cached, metadata, usage_message) = {
         let ui = account_ui_lock();
-        (ui.accounts.clone(), ui.usage.clone(), ui.message.clone())
+        (
+            ui.accounts.clone(),
+            ui.usage.clone(),
+            ui.usage_cached.clone(),
+            ui.account_metadata.clone(),
+            ui.message.clone(),
+        )
     };
 
     // Keep instructions and status outside the panes so the two lists retain
@@ -3435,6 +3627,8 @@ fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             policy: &policy,
             accounts: &accounts,
             usage: &usage,
+            usage_cached: &usage_cached,
+            metadata: &metadata,
             selected: account_selected,
             focused: pane == AccountRoutePane::Accounts,
         },
@@ -3537,6 +3731,8 @@ struct AccountRouteAccountsView<'a> {
     policy: &'a config::CursorAccountRoutingPolicy,
     accounts: &'a [crate::providers::cursor::auth::CursorAccountProfile],
     usage: &'a HashMap<String, crate::monitor::AccountUsageState>,
+    usage_cached: &'a HashSet<String>,
+    metadata: &'a HashMap<String, crate::providers::cursor::usage::AccountUsageCacheMetadata>,
     selected: usize,
     focused: bool,
 }
@@ -3551,6 +3747,8 @@ fn render_account_route_accounts(
         policy,
         accounts,
         usage,
+        usage_cached,
+        metadata,
         selected,
         focused,
     } = view;
@@ -3608,8 +3806,20 @@ fn render_account_route_accounts(
         let email = snapshot
             .and_then(|snapshot| snapshot.email.as_deref())
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| account.email().filter(|value| !value.trim().is_empty()));
-        let name = account_name_for_display(account, email);
+            .or_else(|| account.email().filter(|value| !value.trim().is_empty()))
+            .or_else(|| {
+                metadata
+                    .get(&account.id)
+                    .and_then(|entry| entry.email.as_deref())
+                    .filter(|value| !value.trim().is_empty())
+            });
+        let name = account_name_for_display_with_label(
+            account,
+            email,
+            metadata
+                .get(&account.id)
+                .and_then(|entry| entry.label.as_deref()),
+        );
         let identity = email
             .map(|email| {
                 format!(
@@ -3653,7 +3863,14 @@ fn render_account_route_accounts(
             format!("{}/wk", metrics[3])
         };
         let updated = snapshot
-            .map(|snapshot| format_system_time(snapshot.fetched_at))
+            .map(|snapshot| {
+                let time = format_system_time_short(snapshot.fetched_at);
+                if usage_cached.contains(&account.id) {
+                    format!("cached {time}")
+                } else {
+                    time
+                }
+            })
             .unwrap_or_else(|| "-".to_string());
         let quota = format!(
             "  updated {updated}  {plan}{plan_spend}  total {}  auto {}  api {}  bot {bot}",
@@ -3665,7 +3882,14 @@ fn render_account_route_accounts(
         // the full row would otherwise ellipsize its last meter.
         let quota = if quota.chars().count() > width {
             let compact_updated = snapshot
-                .map(|snapshot| format_system_time_short(snapshot.fetched_at))
+                .map(|snapshot| {
+                    let time = format_system_time_short(snapshot.fetched_at);
+                    if usage_cached.contains(&account.id) {
+                        format!("cached {time}")
+                    } else {
+                        time
+                    }
+                })
                 .unwrap_or_else(|| "-".to_string());
             format!(
                 "  updated {compact_updated}  {plan}{plan_spend}  total {}  auto {}  api {}  bot {bot}",
@@ -3787,8 +4011,20 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             let email = usage_snapshot
                 .and_then(|snapshot| snapshot.email.as_deref())
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| account.email().filter(|value| !value.trim().is_empty()));
-            let name = account_name_for_display(account, email);
+                .or_else(|| account.email().filter(|value| !value.trim().is_empty()))
+                .or_else(|| {
+                    ui.account_metadata
+                        .get(&account.id)
+                        .and_then(|entry| entry.email.as_deref())
+                        .filter(|value| !value.trim().is_empty())
+                });
+            let name = account_name_for_display_with_label(
+                account,
+                email,
+                ui.account_metadata
+                    .get(&account.id)
+                    .and_then(|entry| entry.label.as_deref()),
+            );
             let metrics = account_usage_metrics(usage_state, columns.compact);
             let mut row = vec![Span::styled(
                 format!(" {marker} {} ", if selected { ">" } else { " " }),
@@ -3800,7 +4036,12 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
             }
             if let Some(width) = columns.updated_width {
                 let updated = usage_snapshot
-                    .map(|snapshot| format_system_time(snapshot.fetched_at))
+                    .map(|snapshot| {
+                        // Include the calendar date so a cached value from a
+                        // previous billing day is not mistaken for a fresh
+                        // same-clock reading after restart.
+                        format_system_time_short_with_date(snapshot.fetched_at)
+                    })
                     .or_else(|| {
                         ui.usage_loading
                             .contains(&account.id)
@@ -3822,9 +4063,16 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
                 ]));
                 if let Some(snapshot) = usage_snapshot {
                     lines.push(Line::from(vec![
-                        Span::styled("     usage updated ", Style::default().fg(DIM)),
                         Span::styled(
-                            format_system_time(snapshot.fetched_at),
+                            if ui.usage_cached.contains(&account.id) {
+                                "     usage cached at "
+                            } else {
+                                "     usage updated "
+                            },
+                            Style::default().fg(DIM),
+                        ),
+                        Span::styled(
+                            format_system_time_with_date(snapshot.fetched_at),
                             Style::default().fg(DIM),
                         ),
                     ]));
@@ -4020,9 +4268,18 @@ fn account_name_for_display(
     account: &crate::providers::cursor::auth::CursorAccountProfile,
     email: Option<&str>,
 ) -> String {
+    account_name_for_display_with_label(account, email, None)
+}
+
+fn account_name_for_display_with_label(
+    account: &crate::providers::cursor::auth::CursorAccountProfile,
+    email: Option<&str>,
+    cached_label: Option<&str>,
+) -> String {
     let label = account
         .label
         .as_deref()
+        .or(cached_label)
         .map(str::trim)
         .filter(|label| !label.is_empty() && *label != account.id);
     if let Some(label) = label {
@@ -4600,16 +4857,38 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn format_system_time(time: SystemTime) -> String {
-    format_system_time_in_zone(time, TimeZone::system())
-}
-
 fn format_system_time_short(time: SystemTime) -> String {
     let Ok(timestamp) = Timestamp::try_from(time) else {
         return "-".to_string();
     };
     Zoned::new(timestamp, TimeZone::system())
         .strftime("%H:%M")
+        .to_string()
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    format_system_time_in_zone(time, TimeZone::system())
+}
+
+/// Calendar-aware timestamp used for account usage freshness.  The existing
+/// request tables intentionally stay clock-only; account meters can survive a
+/// restart, so showing the date here prevents an old cached 03:47 reading
+/// from looking current tomorrow.
+fn format_system_time_short_with_date(time: SystemTime) -> String {
+    let Ok(timestamp) = Timestamp::try_from(time) else {
+        return "-".to_string();
+    };
+    Zoned::new(timestamp, TimeZone::system())
+        .strftime("%m-%d %H:%M")
+        .to_string()
+}
+
+fn format_system_time_with_date(time: SystemTime) -> String {
+    let Ok(timestamp) = Timestamp::try_from(time) else {
+        return "-".to_string();
+    };
+    Zoned::new(timestamp, TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
 
@@ -5848,6 +6127,42 @@ mod tests {
     }
 
     #[test]
+    fn account_usage_force_refresh_is_coalesced_behind_live_lease() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut ui = AccountUiState::default();
+        ui.usage_loading.insert("account-a".into());
+        ui.usage_in_flight.insert(
+            "account-a".into(),
+            AccountUsageLease {
+                wave_id: 4,
+                generation: 2,
+            },
+        );
+
+        assert!(account_usage_busy_locked(&mut ui, "account-a", true));
+        assert!(ui.usage_refresh_pending.contains("account-a"));
+        // A repeated key is idempotent and must not create a second marker or
+        // alter the existing lease while the first socket is still live.
+        assert!(account_usage_busy_locked(&mut ui, "account-a", true));
+        assert_eq!(
+            ui.usage_in_flight.get("account-a"),
+            Some(&AccountUsageLease {
+                wave_id: 4,
+                generation: 2,
+            })
+        );
+
+        // Once the worker releases its lease, the pending marker is the only
+        // signal needed by `drain_pending_account_usage` to launch one
+        // follow-up request for the same account.
+        release_account_usage_lease_locked(&mut ui, "account-a", 4, 2);
+        assert!(!ui.usage_in_flight.contains_key("account-a"));
+        assert!(ui.usage_refresh_pending.contains("account-a"));
+    }
+
+    #[test]
     fn account_usage_wave_completion_clears_missing_result_and_keeps_ready() {
         let _test_lock = ACCOUNT_TEST_LOCK
             .lock()
@@ -5889,7 +6204,7 @@ mod tests {
     }
 
     #[test]
-    fn account_usage_wave_watchdog_keeps_lease_until_late_result() {
+    fn account_usage_wave_watchdog_keeps_lease_then_drains_queued_refresh() {
         let _test_lock = ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -5932,14 +6247,12 @@ mod tests {
                 if message == "Account usage refresh timed out"
         ));
         assert_eq!(ui.usage_generations["account-stuck"], 4);
-        assert_eq!(
-            ui.usage_in_flight.get("account-stuck"),
-            Some(&AccountUsageLease {
-                wave_id: 9,
-                generation: 3,
-            }),
-            "the timed-out request remains leased while its worker is running"
+        assert!(
+            ui.usage_in_flight.contains_key("account-stuck"),
+            "a timed-out socket keeps its lease until the worker truly exits"
         );
+        assert!(account_usage_busy_locked(&mut ui, "account-stuck", true));
+        assert!(ui.usage_refresh_pending.contains("account-stuck"));
 
         apply_account_usage_event_locked(
             &mut ui,
@@ -5956,6 +6269,7 @@ mod tests {
         );
 
         assert!(!ui.usage_in_flight.contains_key("account-stuck"));
+        assert!(ui.usage_refresh_pending.contains("account-stuck"));
         assert!(matches!(
             ui.usage.get("account-stuck"),
             Some(crate::monitor::AccountUsageState::Failed(message))
@@ -6257,6 +6571,40 @@ mod tests {
             Some(crate::monitor::AccountUsageState::Ready(_))
         ));
         assert!(!ui.usage.contains_key("account-b"));
+    }
+
+    #[test]
+    fn account_list_marks_disk_hydrated_usage_as_cached() {
+        let _test_lock = ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let account = crate::providers::cursor::auth::CursorAccountProfile {
+            id: "cached-account".into(),
+            label: Some("Cached work".into()),
+            auth: crate::providers::cursor::auth::CursorAuth {
+                access_token: "cached-token".into(),
+                refresh_token: None,
+                api_key: None,
+                expires: None,
+                user_id: None,
+                email: Some("cached@example.com".into()),
+                source: "test".into(),
+            },
+            active: true,
+        };
+        let snapshot = usage_state_with_sand_percent(17.0);
+        {
+            let mut ui = account_ui_lock();
+            ui.accounts = vec![account];
+            ui.usage.insert("cached-account".into(), snapshot);
+            ui.usage_cached.insert("cached-account".into());
+            ui.selected = 0;
+        }
+        let rendered = draw(150, 18, |frame| render_accounts_detail(frame, frame.area()));
+        let text = buffer_text(&rendered);
+        assert!(text.contains("cached at"), "{text}");
+        assert!(text.contains("Cached work"), "{text}");
+        *account_ui_lock() = AccountUiState::default();
     }
 
     #[test]

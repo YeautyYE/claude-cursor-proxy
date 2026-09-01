@@ -77,10 +77,35 @@ struct CursorConfig {
     pub client_version: Option<String>,
     #[serde(rename = "clientType")]
     pub client_type: Option<String>,
+    /// Desktop Cursor identity fields used by the patched Sand client path.
+    /// They remain optional so the default CLI profile keeps its historical
+    /// wire shape.  Environment variables with the `CCP_CURSOR_*` prefix take
+    /// precedence over these values.
+    #[serde(rename = "clientLayout")]
+    pub client_layout: Option<String>,
+    #[serde(rename = "clientOsVersion")]
+    pub client_os_version: Option<String>,
+    #[serde(rename = "canary")]
+    pub canary: Option<bool>,
+    #[serde(rename = "configVersion")]
+    pub config_version: Option<String>,
+    #[serde(rename = "sandClientVersion")]
+    pub sand_client_version: Option<String>,
+    #[serde(rename = "localClientMode")]
+    pub local_client_mode: Option<bool>,
     #[serde(rename = "clientCommit")]
     pub client_commit: Option<String>,
     #[serde(rename = "ghostMode")]
     pub ghost_mode: Option<bool>,
+    /// Value for Cursor Desktop's `x-new-onboarding-completed` common
+    /// header.  The patched Sand client intentionally disables snippet
+    /// eligibility, so the desktop helper normally emits `false`; expose an
+    /// override for installations whose local eligibility state differs.
+    #[serde(rename = "newOnboardingCompleted")]
+    pub new_onboarding_completed: Option<bool>,
+    /// Optional IANA timezone override used by the desktop identity helper.
+    #[serde(rename = "timezone")]
+    pub timezone: Option<String>,
     #[serde(rename = "agentBundle")]
     pub agent_bundle: Option<String>,
     #[serde(rename = "sandModels")]
@@ -758,6 +783,23 @@ pub fn normalize_sand_model(model: &str) -> String {
         if normalized.ends_with(&suffix.to_ascii_lowercase()) {
             normalized.truncate(normalized.len().saturating_sub(suffix.len()));
             break;
+        }
+    }
+    // Claude Code and a few OpenAI-compatible clients use a human-readable
+    // context marker instead of the bracketed `[1m]`/`[2m]` spelling.  Keep
+    // account and Sand selectors equivalent across both wire forms so a
+    // model bound in the TUI still resolves when the client reports
+    // `claude-fable-5 (1M context)`.
+    if let Some(open) = normalized.rfind('(')
+        && normalized.ends_with(')')
+    {
+        let inner = normalized[open + 1..normalized.len() - 1]
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect::<String>();
+        if inner == "1mcontext" || inner == "2mcontext" {
+            normalized.truncate(open);
+            normalized = normalized.trim_end().to_string();
         }
     }
     for prefix in ["cursor-plan:", "cursor-ask:", "cursor-agent:", "cursor:"] {
@@ -1450,6 +1492,88 @@ pub fn cursor_client_version() -> String {
     "cli-2026.07.16-899851b".to_string()
 }
 
+/// Return the client-version value used by a request identity.
+///
+/// Cursor's desktop Sand path uses the product version (for example
+/// `3.18.9`), while the standalone Agent CLI uses `cli-<version>`.  Sending
+/// the CLI-prefixed value together with `x-cursor-client-type: sand` can make
+/// the server classify the request as a legacy CLI stream and skip the local
+/// runtime route.  Keep the Sand override request-scoped and deterministic:
+/// `CCP_CURSOR_SAND_CLIENT_VERSION` wins, then `cursor.sandClientVersion`, then
+/// a locally installed Cursor product version, and finally the normal client
+/// version as an offline fallback.
+pub fn cursor_client_version_for_type(client_type: &str) -> String {
+    if !client_type.trim().eq_ignore_ascii_case("sand") {
+        return cursor_client_version();
+    }
+
+    if let Ok(raw) = std::env::var("CCP_CURSOR_SAND_CLIENT_VERSION") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(version) = cursor.sand_client_version
+    {
+        let value = version.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
+    detect_installed_cursor_desktop_version().unwrap_or_else(cursor_client_version)
+}
+
+/// Best-effort detection of the installed Cursor desktop product version.
+///
+/// The helper intentionally reads only small JSON metadata files and never
+/// starts or mutates Cursor.  It is useful for Sand identity headers on macOS
+/// and Linux; callers can override it with `CCP_CURSOR_SAND_CLIENT_VERSION`.
+pub fn detect_installed_cursor_desktop_version() -> Option<String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(raw) = std::env::var_os("CCP_CURSOR_APP") {
+        let root = PathBuf::from(raw);
+        candidates.push(root.join("Contents/Resources/app/package.json"));
+        candidates.push(root.join("resources/app/package.json"));
+        candidates.push(root.join("package.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.extend([
+            home.join("Applications/Cursor.app/Contents/Resources/app/package.json"),
+            home.join(".local/share/cursor/package.json"),
+            home.join(".local/share/cursor/resources/app/package.json"),
+        ]);
+    }
+    candidates.push(PathBuf::from(
+        "/Applications/Cursor.app/Contents/Resources/app/package.json",
+    ));
+    candidates.push(PathBuf::from(
+        "/Applications/Cursor.app/Contents/Resources/app/product.json",
+    ));
+
+    for path in candidates {
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(version) = value.get("version").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let version = version.trim();
+        if !version.is_empty() {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
 /// Cursor `x-cursor-client-type` header.
 /// Official agent CLI defaults to `cli` (see surface:"cli" in cursor-agent index.js).
 /// Set `CCP_CURSOR_CLIENT_TYPE=ide` only when intentionally spoofing the desktop app.
@@ -1483,6 +1607,28 @@ pub fn cursor_client_type_for_model(model: &str) -> String {
     } else {
         cursor_client_type()
     }
+}
+
+/// Request identities whose live `GetUsableModels` catalogs should be kept
+/// warm for the current routing policy.  Cursor can expose a different model
+/// catalog through the managed-local Sand identity than through the ordinary
+/// CLI identity, so enabling any Sand rule requires a second, identity-scoped
+/// catalog lookup.
+///
+/// The process-wide fallback identity remains first.  When it is already Sand
+/// we deliberately avoid a duplicate request; otherwise Sand is appended only
+/// when at least one model can select that route.
+pub fn cursor_catalog_client_types() -> Vec<String> {
+    let default_client_type = cursor_client_type();
+    let mut client_types = vec![default_client_type];
+    if !cursor_sand_policy().is_empty()
+        && !client_types
+            .iter()
+            .any(|client_type| client_type.trim().eq_ignore_ascii_case("sand"))
+    {
+        client_types.push("sand".to_string());
+    }
+    client_types
 }
 
 /// Detect installed Cursor Agent CLI version directory name
@@ -1551,6 +1697,47 @@ pub fn cursor_ghost_mode() -> bool {
     true
 }
 
+/// Wire representation used by Cursor Desktop's common-header helper.  An
+/// unset privacy value is deliberately distinct from an explicit `true` or
+/// `false`: the desktop helper emits `implicit-false` for the unset case.
+/// Keeping that distinction avoids Sand requests being classified as the
+/// legacy CLI profile by the gateway.
+pub fn cursor_ghost_mode_header() -> String {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_GHOST_MODE") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return if parse_env_bool(value) {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            };
+        }
+    }
+    let config_value = read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.ghost_mode);
+    match config_value {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => "implicit-false".to_string(),
+    }
+}
+
+/// Cursor Desktop always sends `x-new-onboarding-completed` on common-header
+/// requests.  Its value is the conjunction of snippet eligibility and privacy
+/// state; SandClientMode forces eligibility off, therefore `false` is the
+/// correct headless default.  Keep an explicit env/config override for users
+/// who mirror a different Desktop profile.
+pub fn cursor_new_onboarding_completed() -> bool {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_NEW_ONBOARDING_COMPLETED") {
+        return parse_env_bool(&raw);
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.new_onboarding_completed)
+        .unwrap_or(false)
+}
+
 /// Whether to attach IDE-only fingerprint headers (device-type/os/arch/checksum…).
 /// Official CLI Agent path does NOT set these; only the IDE `ccf()` helper does.
 /// Profiles: `cli` (default) | `ide`
@@ -1562,6 +1749,82 @@ pub fn cursor_client_profile() -> String {
         }
     }
     "cli".to_string()
+}
+
+/// Optional desktop layout marker (`ide`/`glass`) copied by Cursor's common
+/// header interceptor.  Sand clients may need this marker when an upstream
+/// gateway applies desktop eligibility rules; leaving it unset preserves the
+/// normal CLI request shape.
+pub fn cursor_client_layout() -> Option<String> {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CLIENT_LAYOUT") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    let config_dir = paths::config_dir();
+    read_file_config(&config_dir)
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.client_layout)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Optional operating-system version used by the desktop identity helper.
+pub fn cursor_client_os_version() -> Option<String> {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CLIENT_OS_VERSION") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    let config_dir = paths::config_dir();
+    read_file_config(&config_dir)
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.client_os_version)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Optional Cursor canary marker.  The desktop app only sends this header for
+/// Anysphere/canary builds; it is omitted unless explicitly configured.
+pub fn cursor_canary() -> bool {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CANARY") {
+        return parse_env_bool(&raw);
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.canary)
+        .unwrap_or(false)
+}
+
+/// Optional Cursor configuration-version marker used by the desktop common
+/// header helper.  Empty values are treated as absent.
+pub fn cursor_config_version() -> Option<String> {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_CONFIG_VERSION") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.config_version)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether an identity should advertise Cursor's local-client mode.  Sand is
+/// local-runtime backed by definition; an explicit environment/config value
+/// can opt a custom identity into the same header for troubleshooting.
+pub fn cursor_local_client_mode(client_type: &str) -> bool {
+    if let Ok(raw) = std::env::var("CCP_CURSOR_LOCAL_CLIENT_MODE") {
+        return parse_env_bool(&raw);
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.local_client_mode)
+        .unwrap_or_else(|| client_type.trim().eq_ignore_ascii_case("sand"))
 }
 
 /// Request timeout for Cursor Agent runs (seconds).
@@ -1611,7 +1874,48 @@ pub fn cursor_timezone() -> Option<String> {
             return Some(t.to_string());
         }
     }
-    // Best-effort: leave unset if we cannot resolve; IDE uses Intl timezone.
+    let config_dir = paths::config_dir();
+    if let Some(value) = read_file_config(&config_dir)
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.timezone)
+    {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
+    // Cursor's desktop helper uses `Intl.DateTimeFormat().resolvedOptions()`.
+    // Reproduce the common local-zone resolution without spawning a process:
+    // `TZ` is honored first, then Unix zoneinfo links/files.  Keep this
+    // best-effort because minimal containers may intentionally omit timezone
+    // data; the header is optional on the server.
+    if let Ok(raw) = std::env::var("TZ") {
+        let value = raw.trim();
+        if !value.is_empty() && !value.starts_with(':') {
+            return Some(value.to_string());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::path::Path;
+        let localtime = Path::new("/etc/localtime");
+        if let Ok(target) = std::fs::canonicalize(localtime)
+            && let Some(path) = target.to_str()
+            && let Some((_, zone)) = path.split_once("/zoneinfo/")
+        {
+            let zone = zone.trim_matches('/');
+            if !zone.is_empty() && !zone.contains("..") {
+                return Some(zone.to_string());
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string("/etc/timezone") {
+            let value = raw.trim();
+            if !value.is_empty() && !value.starts_with('#') {
+                return Some(value.to_string());
+            }
+        }
+    }
     None
 }
 
@@ -1670,6 +1974,7 @@ mod tests {
             std::env::remove_var("CCP_CURSOR_SAND_MODELS");
             std::env::remove_var("CCP_CURSOR_MODEL_ACCOUNTS");
             std::env::remove_var("CCP_CURSOR_CLIENT_TYPE");
+            std::env::remove_var("CCP_CURSOR_TIMEZONE");
         }
     }
 
@@ -1681,6 +1986,29 @@ mod tests {
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
         assert_eq!(load_config().bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn cursor_timezone_prefers_explicit_environment_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let _timezone = EnvGuard::set("CCP_CURSOR_TIMEZONE", "Asia/Shanghai");
+        assert_eq!(cursor_timezone().as_deref(), Some("Asia/Shanghai"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_timezone_detects_local_zoneinfo_when_no_override_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let detected = cursor_timezone();
+        // CI images may omit /etc/localtime and /etc/timezone, so accept an
+        // absent value; when present it must be a relative IANA zone name.
+        if let Some(value) = detected {
+            assert!(!value.starts_with('/'));
+            assert!(!value.contains(".."));
+            assert!(!value.trim().is_empty());
+        }
     }
 
     #[test]
@@ -1941,6 +2269,22 @@ mod tests {
     }
 
     #[test]
+    fn account_policy_normalizes_human_readable_context_suffixes() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("claude-fable-5", "long-context"),
+            CursorModelAccountRule::new("gemini-3.1-pro (2M context)", "gemini-account"),
+        ]);
+        assert_eq!(
+            policy.account_for_model("claude-fable-5 (1M context)"),
+            Some("long-context")
+        );
+        assert_eq!(
+            policy.account_for_model("gemini-3.1-pro[2m]"),
+            Some("gemini-account")
+        );
+    }
+
+    #[test]
     fn account_policy_prefers_direct_alias_over_resolved_catalog_id() {
         let policy = CursorAccountRoutingPolicy::new([
             CursorModelAccountRule::new("claude-fable-5-thinking-max", "catalog-account"),
@@ -2061,6 +2405,46 @@ mod tests {
             crate::providers::cursor::model::resolve_cursor_model("frontier-account-model")
                 .expect("an explicitly routed custom id should reach Cursor");
         assert_eq!(resolved.model_id, "frontier-account-model");
+    }
+
+    #[test]
+    fn model_account_route_overrides_alias_provider_for_anthropic_alias() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"aliasProvider":"codex","cursor":{"modelAccounts":{"claude-fable-5":"work"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        // The explicit model→account binding is a Cursor routing signal; it
+        // must not silently follow the process-wide Anthropic alias provider.
+        let registry = crate::registry::Registry::new(AliasProvider::Codex);
+        let provider = registry
+            .provider_for_model("claude-fable-5[1m]", None)
+            .expect("bound alias should route to Cursor");
+        assert_eq!(provider.name(), "cursor");
+    }
+
+    #[test]
+    fn concrete_model_account_route_overrides_alias_provider_for_public_fable_alias() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"aliasProvider":"codex","cursor":{"modelAccounts":{"claude-fable-5-thinking-max":"work"}}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let registry = crate::registry::Registry::new(AliasProvider::Codex);
+        let provider = registry
+            .provider_for_model("claude-fable-5[1m]", None)
+            .expect("concrete bound Fable tier should route alias to Cursor");
+        assert_eq!(provider.name(), "cursor");
     }
 
     #[test]
@@ -2319,6 +2703,40 @@ mod tests {
             "ide",
             "explicit default identity remains available for other models"
         );
+    }
+
+    #[test]
+    fn catalog_warmup_fetches_cli_and_sand_when_sand_policy_is_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["gemini-3.1-pro"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        assert_eq!(cursor_catalog_client_types(), vec!["cli", "sand"]);
+
+        let _sand_default = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "SAND");
+        assert_eq!(
+            cursor_catalog_client_types(),
+            vec!["SAND"],
+            "a global Sand identity must not issue a duplicate Sand catalog request"
+        );
+    }
+
+    #[test]
+    fn catalog_warmup_does_not_probe_sand_without_a_sand_rule() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "ide");
+
+        assert_eq!(cursor_catalog_client_types(), vec!["ide"]);
     }
 
     #[test]

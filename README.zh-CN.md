@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.95 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.96 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -252,6 +252,11 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 Sand 选择和账号选择相互独立。例如，可以先按 `s` 把 `gemini-3.1-pro` 设为
 `[sand]`，再按 `m` 指定它使用某个 Cursor 账号，两项设置会同时应用到请求。
 
+`SandClientMode` 和 `SandStreamToolkit` 是绑定特定 Cursor Desktop 版本的
+bundle 补丁工具。本代理不会安装、修改或依赖打过补丁的 `Cursor.app`，而是让
+每条选中的请求走自身的 Sand H2 路径。`sand-status` 中可选的 Desktop bundle
+检查仅供查看，不是启动条件。
+
 > **推荐优先使用监控 TUI 配置 Sand。** 保持一个 `serve` 进程运行，使用
 > 下面的快捷键即可，不需要手动编辑配置文件，而且请求当前走 `[sand]` 还是
 > `[cli]` 会直接显示出来。
@@ -279,6 +284,18 @@ claude-cursor-proxy serve              # 保持监控 TUI 打开
 `claude-fable-5`）；在模型列表中按 `u` 查看账号用量。列表会标记 `[sand]`
 或 `[cli]`；修改只影响新请求，并以原子方式写入 `config.json`。TUI 需要
 终端；`serve --no-monitor` 仍可运行代理，但不会显示设置面板。
+
+需要在终端只读检查 Sand 是否完整时，可运行：
+
+```bash
+claude-cursor-proxy cursor sand-status
+claude-cursor-proxy cursor sand-status --json
+```
+
+该命令会显示当前模型策略、Sand client 版本、H2 传输、代理路由标记、账号名称
+和用量缓存时间。Desktop bundle 检查会明确显示为可选，且
+`requiredForProxy: false`；命令不会发起 Cursor 请求，也不会消耗模型额度。
+JSON 输出不包含 access/refresh token。
 
 Sessions、Active requests、Recent requests 和 Events 面板的 Cursor 模型列
 也会显示同样的 `[sand]`/`[cli]` 标记，不用打开设置就能确认请求面。Fable

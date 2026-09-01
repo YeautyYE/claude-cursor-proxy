@@ -10,11 +10,12 @@
 //! checksum = I + machineId + "/" + macMachineId
 //! ```
 //!
-//! Machine ids: unofficial clients commonly derive them as
-//! `sha256(token + "machineId")` / `sha256(token + "macMachineId")` (see
-//! cursor-free-vip). IDE traffic instead uses `telemetry.machineId` from
-//! storage.json. We prefer token-derived ids for API calls (matches free-vip
-//! DashboardService requests), with storage.json as fallback.
+//! Machine ids: Cursor Desktop first uses the abuse-service machine ids and
+//! falls back to the telemetry ids persisted in `storage.json`.  A proxy does
+//! not have the Desktop abuse service, so persisted ids are the closest stable
+//! identity and are preferred whenever available.  Token-derived ids remain a
+//! deterministic last resort for headless installations (and preserve
+//! compatibility with older CLI clients).
 
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -33,10 +34,14 @@ pub fn acf_obfuscate(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn b64_std(bytes: &[u8]) -> String {
+fn b64_url_no_pad(bytes: &[u8]) -> String {
     use base64::Engine;
-    // free-vip uses standard base64; 6-byte blocks need no padding.
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    // Cursor's desktop `Vzg`/`ccf` helper uses the URL-safe alphabet and
+    // strips padding (`base64url(...).replace(/=+$/, "")`).  Six-byte
+    // timestamps happen to need no `=` padding, but `+` and `/` still occur
+    // for some epochs; using STANDARD there makes the checksum fail header
+    // validation on those timestamps.
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// `sha256(input + salt)` hex, as in cursor-free-vip `generate_hashed64_hex`.
@@ -74,20 +79,47 @@ pub fn build_cursor_checksum(machine_id: &str, mac_machine_id: Option<&str>) -> 
         (e & 0xff) as u8,
     ];
     let hashed = acf_obfuscate(&raw);
-    let prefix = b64_std(&hashed);
+    let prefix = b64_url_no_pad(&hashed);
     match mac_machine_id.filter(|s| !s.is_empty()) {
         Some(mac) => format!("{prefix}{machine_id}/{mac}"),
         None => format!("{prefix}{machine_id}"),
     }
 }
 
-/// Preferred checksum for Agent/API calls: token-derived machine ids + acf time.
+/// Preferred checksum for headless Agent/API calls: token-derived machine ids
+/// + acf time.
 pub fn build_cursor_checksum_for_token(token: &str) -> String {
     let ids = machine_ids_from_token(token);
     build_cursor_checksum(
         ids.machine_id.as_deref().unwrap_or(""),
         ids.mac_machine_id.as_deref(),
     )
+}
+
+/// Build a checksum using the same stable machine identity as Cursor Desktop
+/// whenever the local Cursor storage is available.  Sand requests originate
+/// from the patched Desktop/local-agent route, so using a token-derived device
+/// id here can make the server classify every account as a different machine
+/// and reject the request or route it away from managed-local.  If no storage
+/// identity exists (for example a fresh headless install), fall back to the
+/// deterministic token-derived identity.
+pub fn build_cursor_checksum_for_storage_or_token(token: &str) -> String {
+    build_cursor_checksum_for_ids_or_token(load_cursor_machine_ids(), token)
+}
+
+/// Pure counterpart of [`build_cursor_checksum_for_storage_or_token`] used by
+/// callers that already loaded an identity and by tests.  Keeping the fallback
+/// decision in one place prevents the buffered and live paths from diverging.
+pub fn build_cursor_checksum_for_ids_or_token(ids: CursorMachineIds, token: &str) -> String {
+    if let Some(machine_id) = ids
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return build_cursor_checksum(machine_id, ids.mac_machine_id.as_deref());
+    }
+    build_cursor_checksum_for_token(token)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,7 +129,30 @@ pub struct CursorMachineIds {
     pub dev_device_id: Option<String>,
 }
 
-/// Resolve machine ids: env → token-derived (if token given later) → IDE storage.
+/// Fill missing identity fields from `fallback` while retaining explicit
+/// values.  Cursor profiles occasionally contain only one telemetry key, and
+/// environment overrides are intentionally field-scoped rather than all-or-
+/// nothing.
+fn merge_machine_ids(
+    mut primary: CursorMachineIds,
+    fallback: CursorMachineIds,
+) -> CursorMachineIds {
+    if primary.machine_id.is_none() {
+        primary.machine_id = fallback.machine_id;
+    }
+    if primary.mac_machine_id.is_none() {
+        primary.mac_machine_id = fallback.mac_machine_id;
+    }
+    if primary.dev_device_id.is_none() {
+        primary.dev_device_id = fallback.dev_device_id;
+    }
+    primary
+}
+
+/// Resolve machine ids from explicit environment overrides and Cursor's local
+/// storage.  Each field is merged independently: setting only
+/// `CCP_CURSOR_MACHINE_ID` must not discard `telemetry.macMachineId` from
+/// storage, since Desktop sends the pair when both are present.
 pub fn load_cursor_machine_ids() -> CursorMachineIds {
     let mut ids = CursorMachineIds::default();
 
@@ -114,25 +169,12 @@ pub fn load_cursor_machine_ids() -> CursorMachineIds {
         }
     }
 
-    if ids.machine_id.is_some() {
-        return ids;
-    }
-
     // Prefer IDE telemetry ids when present (matches official desktop `ccf`).
     for path in cursor_storage_json_candidates() {
         if let Some(parsed) = read_storage_json(&path) {
-            if ids.machine_id.is_none() {
-                ids.machine_id = parsed.machine_id;
-            }
-            if ids.mac_machine_id.is_none() {
-                ids.mac_machine_id = parsed.mac_machine_id;
-            }
-            if ids.dev_device_id.is_none() {
-                ids.dev_device_id = parsed.dev_device_id;
-            }
-            if ids.machine_id.is_some() {
-                break;
-            }
+            ids = merge_machine_ids(ids, parsed);
+            // Do not stop after machineId: macMachineId/devDeviceId may be in
+            // a later candidate when users have migrated Cursor profiles.
         }
     }
 
@@ -226,6 +268,14 @@ mod tests {
     }
 
     #[test]
+    fn checksum_prefix_uses_cursor_url_safe_base64() {
+        // Cursor's desktop helper uses base64url without padding. These
+        // vectors exercise both alphabet substitutions (`+` → `-`, `/` → `_`).
+        assert_eq!(b64_url_no_pad(&[0xfb, 0xef, 0xbe]), "----");
+        assert_eq!(b64_url_no_pad(&[0xff, 0xff, 0xff]), "____");
+    }
+
+    #[test]
     fn token_derived_ids_are_stable_sha256() {
         let ids = machine_ids_from_token("tok");
         assert_eq!(
@@ -236,5 +286,46 @@ mod tests {
             ids.mac_machine_id.as_deref(),
             Some(hashed64_hex("tok", "macMachineId").as_str())
         );
+    }
+
+    #[test]
+    fn storage_or_token_checksum_prefers_persisted_machine_identity_when_present() {
+        // Keep this test independent of the host's Cursor installation.  The
+        // pure builder is used by the integration path after the storage
+        // lookup, so it verifies that a persisted pair is encoded as
+        // `machine/mac` rather than silently switching to token-derived ids.
+        let persisted = build_cursor_checksum_for_ids_or_token(
+            CursorMachineIds {
+                machine_id: Some("machine-id".into()),
+                mac_machine_id: Some("mac-id".into()),
+                dev_device_id: None,
+            },
+            "tok",
+        );
+        assert!(persisted.contains("machine-id/mac-id"));
+
+        let token = build_cursor_checksum_for_ids_or_token(CursorMachineIds::default(), "tok");
+        assert!(token.contains(&hashed64_hex("tok", "machineId")));
+    }
+
+    #[test]
+    fn load_machine_ids_merges_partial_environment_overrides() {
+        // Exercise the merge behavior without mutating process environment:
+        // this guards the field-wise semantics used by `load_cursor_machine_ids`.
+        let ids = merge_machine_ids(
+            CursorMachineIds {
+                machine_id: Some("env-machine".into()),
+                mac_machine_id: None,
+                dev_device_id: None,
+            },
+            CursorMachineIds {
+                machine_id: Some("storage-machine".into()),
+                mac_machine_id: Some("storage-mac".into()),
+                dev_device_id: Some("storage-device".into()),
+            },
+        );
+        assert_eq!(ids.machine_id.as_deref(), Some("env-machine"));
+        assert_eq!(ids.mac_machine_id.as_deref(), Some("storage-mac"));
+        assert_eq!(ids.dev_device_id.as_deref(), Some("storage-device"));
     }
 }

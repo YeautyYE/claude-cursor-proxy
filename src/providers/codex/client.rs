@@ -1362,6 +1362,37 @@ mod tests {
         client
     }
 
+    async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::with_capacity(1024);
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.expect("read request");
+            assert!(read > 0, "peer closed before completing its request");
+            request.extend_from_slice(&chunk[..read]);
+
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).expect("request headers");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                return request;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn buffered_http_retries_retryable_status() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1405,10 +1436,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut websocket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 16 * 1024];
-            let read = websocket.read(&mut request).await.unwrap();
-            assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
+            let request = read_complete_http_request(&mut websocket).await;
+            assert!(String::from_utf8_lossy(&request).contains("Upgrade: websocket"));
             websocket
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 13\r\nconnection: close\r\n\r\npolicy denied",
@@ -1418,9 +1447,8 @@ mod tests {
             drop(websocket);
 
             let (mut http, _) = listener.accept().await.unwrap();
-            let read = http.read(&mut request).await.unwrap();
-            assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+            let request = read_complete_http_request(&mut http).await;
+            assert!(String::from_utf8_lossy(&request).starts_with("POST "));
             let body = b"data: keep\n\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -1428,6 +1456,7 @@ mod tests {
             );
             http.write_all(response.as_bytes()).await.unwrap();
             http.write_all(body).await.unwrap();
+            http.shutdown().await.unwrap();
         });
 
         let response = authenticated_http_test_client(format!("http://{addr}/responses"))

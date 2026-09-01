@@ -259,12 +259,40 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
 
     if let Ok(Some(auth)) = crate::providers::cursor::auth::load_cursor_auth() {
         let client = crate::providers::cursor::client::CursorHttpClient::new();
-        if let Ok(ids) = client.fetch_usable_models(&auth.access_token).await {
+        // Fetch every active request identity in parallel. Sand's model
+        // entitlement catalog is not guaranteed to equal the ordinary CLI
+        // catalog for the same account, and the client cache partitions the
+        // responses by identity to keep the two surfaces isolated.
+        let client_types = crate::config::cursor_catalog_client_types();
+        let fetches = client_types.into_iter().map(|client_type| {
+            let client = client.clone();
+            let token = auth.access_token.clone();
+            async move {
+                client
+                    .fetch_usable_models_for_client_type(&token, &client_type)
+                    .await
+            }
+        });
+        for ids in futures_util::future::join_all(fetches)
+            .await
+            .into_iter()
+            .flatten()
+        {
             for id in ids {
                 // Fable catalog → …[1m]; other catalog ids unchanged.
                 push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
             }
         }
+    }
+
+    // Insert explicit model/account routes before the static registry so an
+    // Anthropic alias bound to Cursor can override a same-named alias exposed
+    // by the process-wide `aliasProvider` (the dedupe set preserves the first
+    // owner). Literal route-only ids are also discoverable when the active
+    // account's catalog omits them.
+    let route_policy = crate::config::cursor_account_routing_policy();
+    for id in configured_cursor_route_models(&state.registry, &route_policy) {
+        push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
     }
 
     for (id, provider) in state.registry.all_supported_models() {
@@ -294,6 +322,47 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "object": "list",
         "data": data,
     }))
+}
+
+/// Return literal model-account route keys that resolve to the Cursor
+/// provider.  Keep this pure so `/v1/models` can be tested without a network
+/// request or account registry; the caller supplies the already-loaded policy.
+fn configured_cursor_route_models(
+    registry: &Registry,
+    policy: &crate::config::CursorAccountRoutingPolicy,
+) -> Vec<String> {
+    let mut models = policy
+        .routes()
+        .iter()
+        .filter(|rule| !rule.model.chars().any(|ch| matches!(ch, '*' | '?')))
+        .filter_map(|rule| {
+            let normalized = normalize_incoming_model(&rule.model);
+            if normalized.is_empty() {
+                return None;
+            }
+            // `provider_for_model` reads the process-global route policy. Use
+            // the static/live-only helper here so this function can classify
+            // an isolated policy in tests. Known non-Cursor concrete ids keep
+            // their native owner; Anthropic aliases are included because an
+            // explicit account route intentionally overrides aliasProvider;
+            // otherwise-unclaimed literals are Cursor declarations by
+            // definition.
+            let static_provider = registry
+                .provider_for_model_without_account_routes(&normalized, None)
+                .map(|provider| provider.name());
+            if static_provider.is_some_and(|name| name != "cursor")
+                && !crate::registry::is_anthropic_alias(&normalized)
+                && !crate::registry::is_cursor_model(&normalized)
+            {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect::<Vec<_>>();
+    models.sort_unstable();
+    models.dedup();
+    models
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -1872,13 +1941,15 @@ fn set_mode(path: &Path, mode: u32) {
 mod tests {
     use super::{
         RequestMonitorGuard, advertised_surface_model, claude_code_headers_from,
-        derive_fallback_session_id, enable_accepted_tcp_nodelay, header_text_all,
-        monitor_response_body, parse_advertised_models, resolve_responses_session_id,
-        resolve_session_id, session_id_from_headers, wrap_anthropic_as_responses,
+        configured_cursor_route_models, derive_fallback_session_id, enable_accepted_tcp_nodelay,
+        header_text_all, monitor_response_body, parse_advertised_models,
+        resolve_responses_session_id, resolve_session_id, session_id_from_headers,
+        wrap_anthropic_as_responses,
     };
     use crate::anthropic::error::json_error;
     use crate::anthropic::schema::MessagesRequest;
     use crate::monitor::{EndpointKind, MonitorHandle, RequestStatus};
+    use crate::registry::Registry;
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
     use bytes::Bytes;
@@ -2343,6 +2414,22 @@ mod tests {
             advertised_surface_model("gpt-5.6-sol", "codex"),
             "gpt-5.6-sol"
         );
+    }
+
+    #[test]
+    fn route_only_cursor_models_are_added_to_discovery_but_foreign_ids_are_not() {
+        let registry = Registry::new(crate::config::AliasProvider::Codex);
+        let policy = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new("frontier-custom", "work"),
+            crate::config::CursorModelAccountRule::new("claude-fable-5", "fable"),
+            // A known Codex id remains owned by Codex; users can use
+            // `cursor:gpt-5.5` when they intentionally want Cursor.
+            crate::config::CursorModelAccountRule::new("gpt-5.5", "cursor-work"),
+            // Wildcards are matching rules, not enumerable model ids.
+            crate::config::CursorModelAccountRule::new("gemini-*", "gemini"),
+        ]);
+        let models = configured_cursor_route_models(&registry, &policy);
+        assert_eq!(models, vec!["claude-fable-5", "frontier-custom"]);
     }
 
     #[test]

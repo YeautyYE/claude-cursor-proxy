@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.95 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.96 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -270,6 +270,11 @@ Sand selection and account selection are independent. For example,
 `gemini-3.1-pro` can be marked `[sand]` with `s` and assigned to a specific
 Cursor account with `m`; both settings are applied to the same request.
 
+`SandClientMode` and `SandStreamToolkit` are version-locked Cursor Desktop
+bundle patchers. This proxy does not install, modify, or require a patched
+`Cursor.app`: it routes each selected request through its own Sand H2 path.
+The optional Desktop-bundle section in `sand-status` is informational only.
+
 > **Recommended: configure Sand from the monitor TUI.** Keep one `serve`
 > process running and use the shortcuts below; this avoids hand-editing
 > configuration files and makes the active request type visible immediately.
@@ -298,6 +303,19 @@ catalog id such as `claude-fable-5`. From the model list, press `u` to inspect
 account usage. The list is marked `[sand]` or `[cli]`; changes apply to new
 requests and are written atomically to `config.json`. The TUI requires a
 terminal; `serve --no-monitor` keeps the proxy running without it.
+
+For a read-only terminal diagnostic, run:
+
+```bash
+claude-cursor-proxy cursor sand-status
+claude-cursor-proxy cursor sand-status --json
+```
+
+This reports the effective model policy, Sand client version, H2 transport,
+proxy route markers, account names, and usage-cache timestamps. Its Desktop
+bundle inspection is explicitly marked optional and `requiredForProxy: false`;
+the command does not open a Cursor request or consume model quota. JSON output
+contains no access or refresh tokens.
 
 Cursor model cells in the Sessions, Active requests, Recent requests, and
 Events panes carry the same `[sand]`/`[cli]` badge, so the selected request

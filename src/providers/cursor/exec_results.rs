@@ -439,6 +439,7 @@ pub fn encode_exec_heartbeat(id: u32) -> Result<Bytes, prost::EncodeError> {
         run_request: None,
         exec_client_message: None,
         kv_client_message: None,
+        conversation_action: None,
         interaction_response: None,
         exec_client_control_message: Some(ExecClientControlMessage {
             stream_close: None,
@@ -446,6 +447,7 @@ pub fn encode_exec_heartbeat(id: u32) -> Result<Bytes, prost::EncodeError> {
             heartbeat: Some(ExecClientHeartbeat { id }),
         }),
         client_heartbeat: None,
+        prewarm_request: None,
     })
 }
 
@@ -455,6 +457,7 @@ pub fn encode_control_throw(id: u32, error: String) -> Result<Vec<Bytes>, prost:
             run_request: None,
             exec_client_message: None,
             kv_client_message: None,
+            conversation_action: None,
             exec_client_control_message: Some(ExecClientControlMessage {
                 stream_close: None,
                 throw: Some(ExecClientThrow {
@@ -467,6 +470,7 @@ pub fn encode_control_throw(id: u32, error: String) -> Result<Vec<Bytes>, prost:
             }),
             interaction_response: None,
             client_heartbeat: None,
+            prewarm_request: None,
         })?,
         encode_control_close(id)?,
     ])
@@ -518,9 +522,11 @@ fn encode_exec_message(
         run_request: None,
         exec_client_message: Some(exec),
         kv_client_message: None,
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: None,
         client_heartbeat: None,
+        prewarm_request: None,
     })
 }
 
@@ -529,6 +535,7 @@ pub(crate) fn encode_control_close(id: u32) -> Result<Bytes, prost::EncodeError>
         run_request: None,
         exec_client_message: None,
         kv_client_message: None,
+        conversation_action: None,
         interaction_response: None,
         exec_client_control_message: Some(ExecClientControlMessage {
             stream_close: Some(ExecClientStreamClose { id }),
@@ -536,6 +543,7 @@ pub(crate) fn encode_control_close(id: u32) -> Result<Bytes, prost::EncodeError>
             heartbeat: None,
         }),
         client_heartbeat: None,
+        prewarm_request: None,
     })
 }
 

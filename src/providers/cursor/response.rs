@@ -1142,6 +1142,7 @@ mod tests {
             interaction_update: None,
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 0,
                 exec_id: Some("session-123".to_string()),
@@ -1156,6 +1157,8 @@ mod tests {
                 pi_write_args: None,
                 pi_edit_args: None,
             }),
+
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1316,6 +1319,7 @@ mod tests {
             interaction_update: None,
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 7,
                 exec_id: Some("read-7".into()),
@@ -1335,6 +1339,8 @@ mod tests {
                 pi_write_args: None,
                 pi_edit_args: None,
             }),
+
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1382,6 +1388,7 @@ mod tests {
             interaction_update: None,
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 17,
                 exec_id: Some("pi-buffered-17".into()),
@@ -1408,6 +1415,8 @@ mod tests {
                     ],
                 }),
             }),
+
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1498,7 +1507,9 @@ mod tests {
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1541,7 +1552,10 @@ mod tests {
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1592,7 +1606,10 @@ mod tests {
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1700,7 +1717,10 @@ mod tests {
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();

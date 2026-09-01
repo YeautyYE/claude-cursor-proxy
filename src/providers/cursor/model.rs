@@ -394,29 +394,54 @@ pub fn requested_model_parameters(
 /// Merged into [`cursor_supported_models`] for listing and used by
 /// [`resolve_cursor_model`] to validate exact account-specific catalog ids.
 ///
-/// The cache is account-scoped. Cursor account switches happen in a separate
-/// CLI process while `serve` remains alive; a process-wide, unkeyed catalog
-/// would otherwise keep returning the previous account's model list until the
-/// TTL elapsed. We retain only a short token digest, never the bearer itself.
+/// The cache is scoped by both account and Cursor request identity. Cursor
+/// account switches happen in a separate CLI process while `serve` remains
+/// alive; a process-wide, unkeyed catalog would otherwise keep returning the
+/// previous account's model list until the TTL elapsed. Sand can expose a
+/// different catalog from the CLI identity for the same account, so a CLI
+/// snapshot must never satisfy a Sand lookup. We retain only a short token
+/// digest, never the bearer itself.
 #[derive(Debug, Clone)]
 struct LiveCatalogSnapshot {
     fetched_at: std::time::Instant,
-    account_key: String,
     models: Vec<String>,
+}
+
+#[derive(Debug)]
+struct AccountLiveCatalog {
+    /// Generation captured by in-flight fetches for this account. It changes
+    /// whenever the account becomes active again after another account, so a
+    /// late A response cannot overwrite a newer A -> B -> A observation.
+    generation: u64,
+    last_observed_at: std::time::Instant,
+    /// One fresh snapshot per request identity (`cli`, `sand`, ...).
+    snapshots: std::collections::BTreeMap<String, LiveCatalogSnapshot>,
+}
+
+impl AccountLiveCatalog {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            last_observed_at: std::time::Instant::now(),
+            snapshots: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct LiveCatalogCache {
-    /// Account currently observed by the auth loader. Keeping this separate
-    /// from the snapshot prevents an old in-flight fetch from repopulating the
-    /// cache after a hot account switch.
+    /// Account currently observed by the auth loader. Other account catalogs
+    /// remain cached for fast TUI switching, but process-wide model discovery
+    /// reads only this account.
     active_account_key: Option<String>,
-    /// Monotonic (wrapping) generation for the active-account identity. A
-    /// fetch captures this value before going over the network; if auth is
-    /// switched while it is in flight, the completion is discarded even when
-    /// the account later switches back to the same token.
+    /// Process-wide monotonic source for per-account generations.
     generation: u64,
-    snapshot: Option<LiveCatalogSnapshot>,
+    /// Catalogs are keyed by a digest of the bearer, never by credential
+    /// material. Each account then partitions snapshots by request identity.
+    accounts: std::collections::BTreeMap<String, AccountLiveCatalog>,
+    /// Compatibility snapshots written before any auth account was observed.
+    /// They are listing-only and never authorize a dynamic model id.
+    legacy_snapshots: std::collections::BTreeMap<String, LiveCatalogSnapshot>,
 }
 
 fn live_catalog_cache() -> &'static std::sync::Mutex<LiveCatalogCache> {
@@ -426,59 +451,160 @@ fn live_catalog_cache() -> &'static std::sync::Mutex<LiveCatalogCache> {
 }
 
 const LIVE_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const LIVE_CATALOG_MAX_ACCOUNTS: usize = 64;
+const LEGACY_CATALOG_IDENTITY: &str = "__legacy__";
+
+fn live_catalog_snapshot_is_fresh(snapshot: &LiveCatalogSnapshot) -> bool {
+    snapshot.fetched_at.elapsed() < LIVE_CATALOG_TTL
+}
+
+/// Drop expired snapshots and bound stale account identities. The active
+/// account is retained even before its first successful fetch so generation
+/// checks remain effective for the request currently in flight.
+fn prune_live_catalog_cache(cache: &mut LiveCatalogCache) {
+    cache
+        .legacy_snapshots
+        .retain(|_, snapshot| live_catalog_snapshot_is_fresh(snapshot));
+
+    let active_account_key = cache.active_account_key.clone();
+    cache.accounts.retain(|account_key, account| {
+        account
+            .snapshots
+            .retain(|_, snapshot| live_catalog_snapshot_is_fresh(snapshot));
+        !account.snapshots.is_empty() || active_account_key.as_deref() == Some(account_key.as_str())
+    });
+
+    if cache.accounts.len() <= LIVE_CATALOG_MAX_ACCOUNTS {
+        return;
+    }
+
+    let mut eviction_candidates = cache
+        .accounts
+        .iter()
+        .filter(|(account_key, _)| active_account_key.as_deref() != Some(account_key.as_str()))
+        .map(|(account_key, account)| (account_key.clone(), account.last_observed_at))
+        .collect::<Vec<_>>();
+    eviction_candidates.sort_unstable_by_key(|(_, last_observed_at)| *last_observed_at);
+    let remove_count = cache
+        .accounts
+        .len()
+        .saturating_sub(LIVE_CATALOG_MAX_ACCOUNTS);
+    for (account_key, _) in eviction_candidates.into_iter().take(remove_count) {
+        cache.accounts.remove(&account_key);
+    }
+}
+
+/// Normalize the part of the Cursor request identity that determines catalog
+/// eligibility. Sand is case-insensitive on the wire and always canonicalized
+/// to lowercase by the HTTP client; other custom client types remain
+/// byte-for-byte distinct after whitespace trimming.
+pub(crate) fn live_catalog_identity_key(client_type: &str) -> String {
+    let client_type = client_type.trim();
+    if client_type.eq_ignore_ascii_case("sand") {
+        "sand".to_string()
+    } else if client_type.is_empty() {
+        "cli".to_string()
+    } else {
+        client_type.to_string()
+    }
+}
 
 /// Store a freshly fetched GetUsableModels catalog (5-minute TTL).
 pub fn store_live_usable_models(models: Vec<String>) {
     if let Ok(mut guard) = live_catalog_cache().lock() {
+        prune_live_catalog_cache(&mut guard);
         // This legacy helper has no account identity. It is safe only before
         // the auth loader has observed an account; account-aware fetches use
         // `store_live_usable_models_for_account_at_generation` below.
         if guard.active_account_key.is_some() {
             return;
         }
-        guard.snapshot = Some(LiveCatalogSnapshot {
-            fetched_at: std::time::Instant::now(),
-            account_key: String::new(),
-            models,
-        });
+        guard.legacy_snapshots.insert(
+            LEGACY_CATALOG_IDENTITY.to_string(),
+            LiveCatalogSnapshot {
+                fetched_at: std::time::Instant::now(),
+                models,
+            },
+        );
     }
 }
 
-/// Store a catalog only when the account identity has remained unchanged
-/// since the fetch began. This is used by the asynchronous HTTP client; the
-/// generation check closes the A -> B -> A switch race that an account-key
-/// comparison alone cannot detect.
+/// Store a catalog only when the same account generation that began the fetch
+/// is still current. The response may arrive after that account becomes
+/// inactive; retaining it under its own digest is safe and lets a later TUI
+/// switch reuse it. A -> B -> A transition still advances A's generation, so
+/// a response from the first A observation cannot overwrite the later one.
+#[allow(dead_code)]
 pub(crate) fn store_live_usable_models_for_account_at_generation(
     token: &str,
     generation: u64,
     models: Vec<String>,
 ) {
+    store_live_usable_models_for_account_and_identity_at_generation(
+        token,
+        &crate::config::cursor_client_type(),
+        generation,
+        models,
+    );
+}
+
+/// Store a catalog only when both the account and request identity that began
+/// the fetch still match. This prevents a CLI catalog response from replacing
+/// (or being reused as) a Sand catalog for the same account.
+pub(crate) fn store_live_usable_models_for_account_and_identity_at_generation(
+    token: &str,
+    client_type: &str,
+    generation: u64,
+    models: Vec<String>,
+) {
     let account_key = account_catalog_key(token);
+    let identity_key = live_catalog_identity_key(client_type);
     if let Ok(mut guard) = live_catalog_cache().lock() {
-        if guard.active_account_key.as_deref() != Some(account_key.as_str())
-            || guard.generation != generation
-        {
+        prune_live_catalog_cache(&mut guard);
+        let Some(account) = guard.accounts.get_mut(&account_key) else {
+            return;
+        };
+        if account.generation != generation {
             return;
         }
-        guard.snapshot = Some(LiveCatalogSnapshot {
-            fetched_at: std::time::Instant::now(),
-            account_key,
-            models,
-        });
+        account.last_observed_at = std::time::Instant::now();
+        account.snapshots.insert(
+            identity_key,
+            LiveCatalogSnapshot {
+                fetched_at: std::time::Instant::now(),
+                models,
+            },
+        );
     }
 }
 
-/// Mark the account whose credentials are currently active. Switching or
-/// logging out immediately retires the previous catalog snapshot.
+/// Mark the account whose credentials are currently active. Switching changes
+/// which catalog is visible process-wide while retaining other fresh account
+/// snapshots for later TUI/model-account reuse.
 pub(crate) fn observe_live_usable_models_account(token: &str) -> u64 {
     let account_key = account_catalog_key(token);
     if let Ok(mut guard) = live_catalog_cache().lock() {
-        if guard.active_account_key.as_deref() != Some(account_key.as_str()) {
-            guard.active_account_key = Some(account_key);
+        prune_live_catalog_cache(&mut guard);
+        let switched = guard.active_account_key.as_deref() != Some(account_key.as_str());
+        if switched {
             guard.generation = guard.generation.wrapping_add(1);
-            guard.snapshot = None;
+            guard.active_account_key = Some(account_key.clone());
         }
-        return guard.generation;
+        let generation = guard.generation;
+        let account = guard
+            .accounts
+            .entry(account_key)
+            .or_insert_with(|| AccountLiveCatalog::new(generation));
+        if switched {
+            account.generation = generation;
+        }
+        account.last_observed_at = std::time::Instant::now();
+        let account_generation = account.generation;
+        // The newly active account is protected from eviction; applying the
+        // bound after insertion keeps a large saved-account registry from
+        // retaining a 65th stale catalog until the next request.
+        prune_live_catalog_cache(&mut guard);
+        return account_generation;
     }
     // A poisoned cache is treated as a new generation. Callers still proceed
     // with the request, while the normal lock-recovery path prevents stale
@@ -489,29 +615,35 @@ pub(crate) fn observe_live_usable_models_account(token: &str) -> u64 {
 /// Clear account identity and any catalog when authentication disappears.
 pub(crate) fn clear_live_usable_models_account() {
     if let Ok(mut guard) = live_catalog_cache().lock() {
-        if guard.active_account_key.is_some() || guard.snapshot.is_some() {
+        if guard.active_account_key.is_some()
+            || !guard.accounts.is_empty()
+            || !guard.legacy_snapshots.is_empty()
+        {
             guard.generation = guard.generation.wrapping_add(1);
         }
         guard.active_account_key = None;
-        guard.snapshot = None;
+        guard.accounts.clear();
+        guard.legacy_snapshots.clear();
     }
 }
 
 /// Return cached live model ids if still within TTL.
 pub fn cached_live_usable_models() -> Option<Vec<String>> {
-    let guard = live_catalog_cache().lock().ok()?;
-    let snapshot = guard.snapshot.as_ref()?;
-    if let Some(active) = guard.active_account_key.as_deref()
-        && snapshot.account_key != active
-    {
-        return None;
+    let mut guard = live_catalog_cache().lock().ok()?;
+    prune_live_catalog_cache(&mut guard);
+    let mut models = std::collections::BTreeSet::new();
+    if let Some(active_account_key) = guard.active_account_key.as_deref() {
+        if let Some(account) = guard.accounts.get(active_account_key) {
+            for snapshot in account.snapshots.values() {
+                models.extend(snapshot.models.iter().cloned());
+            }
+        }
+    } else {
+        for snapshot in guard.legacy_snapshots.values() {
+            models.extend(snapshot.models.iter().cloned());
+        }
     }
-    // An account-keyed snapshot must never be visible after logout/unknown
-    // auth. The empty key is reserved for the legacy pre-auth helper.
-    if guard.active_account_key.is_none() && !snapshot.account_key.is_empty() {
-        return None;
-    }
-    (snapshot.fetched_at.elapsed() < LIVE_CATALOG_TTL).then(|| snapshot.models.clone())
+    (!models.is_empty()).then(|| models.into_iter().collect())
 }
 
 /// Resolve one exact id only from the catalog belonging to the currently
@@ -519,34 +651,44 @@ pub fn cached_live_usable_models() -> Option<Vec<String>> {
 /// predates hot account switching and is useful for listing tests, but is not
 /// strong enough evidence to authorize an otherwise unknown wire id.
 fn current_account_live_catalog_model(model: &str) -> Option<String> {
-    let guard = live_catalog_cache().lock().ok()?;
+    let mut guard = live_catalog_cache().lock().ok()?;
+    prune_live_catalog_cache(&mut guard);
     let active_account_key = guard.active_account_key.as_deref()?;
-    let snapshot = guard.snapshot.as_ref()?;
-    if snapshot.account_key != active_account_key
-        || snapshot.fetched_at.elapsed() >= LIVE_CATALOG_TTL
-    {
-        return None;
-    }
-    snapshot
-        .models
-        .iter()
+    let account = guard.accounts.get(active_account_key)?;
+    // Model resolution deliberately accepts ids from every current identity
+    // snapshot so the picker can expose both CLI and Sand-specific entries.
+    // Dispatch still chooses one request identity per model; the fetch cache
+    // APIs below never substitute a CLI snapshot for a Sand request.
+    account
+        .snapshots
+        .values()
+        .flat_map(|snapshot| snapshot.models.iter())
         .find(|id| id.as_str() == model)
         .cloned()
 }
 
-/// Return a cached catalog only when it was fetched with the current account.
-/// A token rotation for the same account may cause one extra refresh, which is
-/// preferable to presenting another account's model entitlements.
+/// Compatibility helper for the configured request identity. The supplied
+/// token still selects the exact account snapshot, including an inactive
+/// model-bound account; process-wide discovery remains active-account-only.
+#[allow(dead_code)]
 pub(crate) fn cached_live_usable_models_for_account(token: &str) -> Option<Vec<String>> {
-    let guard = live_catalog_cache().lock().ok()?;
-    let snapshot = guard.snapshot.as_ref()?;
+    cached_live_usable_models_for_account_and_identity(token, &crate::config::cursor_client_type())
+}
+
+/// Return a cached catalog only when it was fetched under the exact account
+/// and request identity. The account may be inactive: callers possess its
+/// token and can use this for model-bound routing or a multi-account picker,
+/// while process-wide listing remains scoped to `active_account_key`.
+pub(crate) fn cached_live_usable_models_for_account_and_identity(
+    token: &str,
+    client_type: &str,
+) -> Option<Vec<String>> {
+    let mut guard = live_catalog_cache().lock().ok()?;
+    prune_live_catalog_cache(&mut guard);
+    let identity_key = live_catalog_identity_key(client_type);
     let account_key = account_catalog_key(token);
-    if guard.active_account_key.as_deref() != Some(account_key.as_str())
-        || snapshot.account_key != account_key
-        || snapshot.fetched_at.elapsed() >= LIVE_CATALOG_TTL
-    {
-        return None;
-    }
+    let account = guard.accounts.get(&account_key)?;
+    let snapshot = account.snapshots.get(&identity_key)?;
     Some(snapshot.models.clone())
 }
 
@@ -918,6 +1060,114 @@ mod tests {
             Some(vec!["gemini-b".into()])
         );
         assert_eq!(cached_live_usable_models(), Some(vec!["gemini-b".into()]));
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn live_catalog_cache_is_partitioned_by_request_identity() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        let generation = observe_live_usable_models_account("account-a-token");
+        store_live_usable_models_for_account_and_identity_at_generation(
+            "account-a-token",
+            "cli",
+            generation,
+            vec!["cli-only-model".into(), "shared-model".into()],
+        );
+        store_live_usable_models_for_account_and_identity_at_generation(
+            "account-a-token",
+            " SAND ",
+            generation,
+            vec!["sand-only-model".into(), "shared-model".into()],
+        );
+
+        assert_eq!(
+            cached_live_usable_models_for_account_and_identity("account-a-token", "cli"),
+            Some(vec!["cli-only-model".into(), "shared-model".into()]),
+            "the CLI lookup must not consume Sand's catalog"
+        );
+        assert_eq!(
+            cached_live_usable_models_for_account_and_identity("account-a-token", "sand"),
+            Some(vec!["sand-only-model".into(), "shared-model".into()]),
+            "the Sand lookup must not consume the CLI catalog"
+        );
+        assert_eq!(
+            cached_live_usable_models_for_account_and_identity("account-a-token", "SAND"),
+            Some(vec!["sand-only-model".into(), "shared-model".into()]),
+            "Sand identity matching must follow its lowercase wire spelling"
+        );
+
+        assert_eq!(
+            cached_live_usable_models(),
+            Some(vec![
+                "cli-only-model".into(),
+                "sand-only-model".into(),
+                "shared-model".into(),
+            ]),
+            "the model picker may expose the union, while dispatch remains partitioned"
+        );
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn live_catalog_cache_retains_inactive_accounts_without_exposing_them() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        let generation_a = observe_live_usable_models_account("account-a-token");
+        store_live_usable_models_for_account_and_identity_at_generation(
+            "account-a-token",
+            "sand",
+            generation_a,
+            vec!["sand-a-only".into()],
+        );
+
+        let generation_b = observe_live_usable_models_account("account-b-token");
+        store_live_usable_models_for_account_and_identity_at_generation(
+            "account-b-token",
+            "sand",
+            generation_b,
+            vec!["sand-b-only".into()],
+        );
+
+        assert_eq!(
+            cached_live_usable_models_for_account_and_identity("account-a-token", "sand"),
+            Some(vec!["sand-a-only".into()]),
+            "an inactive model-bound account keeps its own fresh Sand catalog"
+        );
+        assert_eq!(
+            cached_live_usable_models_for_account_and_identity("account-b-token", "sand"),
+            Some(vec!["sand-b-only".into()])
+        );
+        assert_eq!(
+            cached_live_usable_models(),
+            Some(vec!["sand-b-only".into()]),
+            "global discovery must expose only the active account"
+        );
+        assert!(
+            resolve_cursor_model("sand-a-only").is_err(),
+            "an inactive account catalog must not authorize an active request"
+        );
+
+        let generation_a_again = observe_live_usable_models_account("account-a-token");
+        assert_ne!(generation_a, generation_a_again);
+        assert_eq!(
+            cached_live_usable_models(),
+            Some(vec!["sand-a-only".into()]),
+            "switching back may reuse the exact account catalog"
+        );
+        store_live_usable_models_for_account_and_identity_at_generation(
+            "account-a-token",
+            "sand",
+            generation_a,
+            vec!["stale-a".into()],
+        );
+        assert_eq!(
+            cached_live_usable_models(),
+            Some(vec!["sand-a-only".into()]),
+            "a pre-switch A request cannot overwrite the newer A generation"
+        );
         clear_live_usable_models_account();
     }
 

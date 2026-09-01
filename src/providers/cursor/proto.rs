@@ -17,6 +17,10 @@ pub struct AgentClientMessage {
     /// transcript around native tool calls.
     #[prost(message, optional, tag = "3")]
     pub kv_client_message: Option<KvClientMessage>,
+    /// Modern Agent Host control action.  Cursor keeps this in the same
+    /// oneof as `run_request`; older CLI builds simply ignore the field.
+    #[prost(message, optional, tag = "4")]
+    pub conversation_action: Option<ConversationAction>,
     /// Control plane for a pending exec (heartbeat / close / throw).
     #[prost(message, optional, tag = "5")]
     pub exec_client_control_message: Option<ExecClientControlMessage>,
@@ -26,6 +30,86 @@ pub struct AgentClientMessage {
     /// CLI heartbeats use tag 7 (not 2).
     #[prost(message, optional, tag = "7")]
     pub client_heartbeat: Option<ClientHeartbeat>,
+    /// Agent Host prewarm request (used before the first user turn and when a
+    /// model/runtime is switched).  This is deliberately represented on the
+    /// wire even though the proxy does not currently issue proactive warms.
+    #[prost(message, optional, tag = "8")]
+    pub prewarm_request: Option<PrewarmRequest>,
+}
+
+/// Cursor `agent.v1.PrewarmRequest` (AgentClientMessage tag 8).
+///
+/// The desktop runtime sends this message to hydrate a local Agent Host
+/// before dispatching a user action.  Keeping all current fields here makes
+/// the proxy forward-compatible with Sand's managed-local route while empty
+/// optional fields remain wire-compatible with older servers.
+#[derive(Clone, PartialEq, Message)]
+pub struct PrewarmRequest {
+    #[prost(message, optional, tag = "1")]
+    pub model_details: Option<ModelDetails>,
+    #[prost(string, optional, tag = "2")]
+    pub conversation_id: Option<String>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub conversation_state: Option<Vec<u8>>,
+    #[prost(message, optional, tag = "4")]
+    pub mcp_tools: Option<McpTools>,
+    #[prost(message, optional, tag = "5")]
+    pub mcp_file_system_options: Option<McpFileSystemOptions>,
+    #[prost(string, optional, tag = "6")]
+    pub best_of_n_group_id: Option<String>,
+    #[prost(bool, optional, tag = "7")]
+    pub try_use_best_of_n_promotion: Option<bool>,
+    #[prost(string, optional, tag = "8")]
+    pub custom_system_prompt: Option<String>,
+    #[prost(message, optional, tag = "9")]
+    pub requested_model: Option<CursorModel>,
+    #[prost(bool, optional, tag = "10")]
+    pub suggest_next_prompt: Option<bool>,
+    #[prost(string, optional, tag = "11")]
+    pub subagent_type_name: Option<String>,
+    #[prost(bool, optional, tag = "12")]
+    pub exclude_workspace_context: Option<bool>,
+    #[prost(string, optional, tag = "13")]
+    pub harness: Option<String>,
+    #[prost(message, repeated, tag = "14")]
+    pub selected_subagent_models: Vec<CursorModel>,
+    #[prost(message, repeated, tag = "15")]
+    pub selected_subagent_model_details: Vec<ModelDetails>,
+    #[prost(string, optional, tag = "16")]
+    pub conversation_group_id: Option<String>,
+    #[prost(message, repeated, tag = "17")]
+    pub pre_fetched_blobs: Vec<PreFetchedBlob>,
+    #[prost(bool, optional, tag = "18")]
+    pub client_supports_inline_images: Option<bool>,
+    #[prost(message, repeated, tag = "19")]
+    pub subagent_model_overrides: Vec<SubagentModelOverride>,
+    #[prost(bool, optional, tag = "20")]
+    pub can_create_cloud_subagents: Option<bool>,
+    #[prost(bool, optional, tag = "21")]
+    pub suppress_subagent_progress_update_tool: Option<bool>,
+    #[prost(bool, optional, tag = "22")]
+    pub client_supports_send_to_user: Option<bool>,
+    /// Cursor Desktop 3.17.19: computer-use coordinate mode. The proxy does
+    /// not currently advertise a local computer-use executor, so callers
+    /// leave this unset; decoding it keeps a Prewarm frame wire-complete.
+    #[prost(string, optional, tag = "23")]
+    pub computer_use_coordinate_mode: Option<String>,
+    /// Stable Agent Host worker identity for a prewarmed runtime. This is
+    /// intentionally distinct from the Cursor conversation id.
+    #[prost(string, optional, tag = "24")]
+    pub agent_session_id: Option<String>,
+    #[prost(bool, optional, tag = "25")]
+    pub client_supports_prompt_context_usage_rpc: Option<bool>,
+    #[prost(bool, optional, tag = "26")]
+    pub client_supports_routed_model_update: Option<bool>,
+    /// Gateway credentials are supplied only by a real Desktop runtime. The
+    /// proxy preserves the schema for decoding but never synthesizes them.
+    #[prost(message, optional, tag = "27")]
+    pub client_llm_gateway_credential: Option<ClientLlmGatewayCredential>,
+    #[prost(bool, optional, tag = "28")]
+    pub client_supports_preview_card: Option<bool>,
+    #[prost(bool, optional, tag = "29")]
+    pub started_as_new_project: Option<bool>,
 }
 
 /// Correlates RunSSE ↔ BidiAppend (also used as RunSSE request body).
@@ -59,8 +143,8 @@ pub struct RunRequest {
     // Do not send empty SkillOptions.
     //
     // Anthropic Messages `thinking` / `max_tokens` / `tool_choice` have **no**
-    // AgentRunRequest fields. Verified 2026-08:
-    // - Cursor.app `cursor-agent-exec` + `workbench.desktop.main.js`: tags 1–23
+    // AgentRunRequest fields. Verified against Cursor Desktop Agent Host:
+    // - tags 1–32 include the managed-local lifecycle and capability fields
     //   (conversation_state, action, model_details, mcp_tools, conversation_id,
     //   mcp_file_system_options, skill_options, custom_system_prompt,
     //   requested_model, suggest_next_prompt, subagent_type_name,
@@ -97,6 +181,162 @@ pub struct RunRequest {
     pub pre_fetched_blobs: Vec<PreFetchedBlob>,
     #[prost(bool, optional, tag = "19")]
     pub client_supports_inline_images: Option<bool>,
+    /// Optional filesystem bridge metadata used by Cursor's managed-local
+    /// agent host.  Older servers ignore this field; keeping the exact wire
+    /// tag lets a Sand-capable sidecar forward the descriptor without having
+    /// to maintain a second protobuf definition.
+    #[prost(message, optional, tag = "6")]
+    pub mcp_file_system_options: Option<McpFileSystemOptions>,
+    /// Skill descriptors collected by the local runtime.
+    #[prost(message, optional, tag = "7")]
+    pub skill_options: Option<SkillOptions>,
+    #[prost(bool, optional, tag = "10")]
+    pub suggest_next_prompt: Option<bool>,
+    #[prost(string, optional, tag = "11")]
+    pub subagent_type_name: Option<String>,
+    #[prost(message, repeated, tag = "15")]
+    pub selected_subagent_model_details: Vec<ModelDetails>,
+    #[prost(string, optional, tag = "18")]
+    pub dev_raw_model_slug: Option<String>,
+    #[prost(message, repeated, tag = "20")]
+    pub subagent_model_overrides: Vec<SubagentModelOverride>,
+    #[prost(bool, optional, tag = "21")]
+    pub can_create_cloud_subagents: Option<bool>,
+    #[prost(bool, optional, tag = "22")]
+    pub suppress_subagent_progress_update_tool: Option<bool>,
+    #[prost(bool, optional, tag = "23")]
+    pub client_supports_send_to_user: Option<bool>,
+    /// Coordinate system advertised by a real computer-use client.  The
+    /// proxy leaves this unset until it can execute that tool locally.
+    #[prost(string, optional, tag = "24")]
+    pub computer_use_coordinate_mode: Option<String>,
+    /// Stable logical turn identity.  It must survive a ResumeAction retry;
+    /// callers should not substitute a transport-attempt request id here.
+    #[prost(string, optional, tag = "25")]
+    pub run_id: Option<String>,
+    /// Stable Agent Host worker identity.  This intentionally remains
+    /// independent from a Cursor conversation binding, which can rotate when
+    /// the server compacts its KV state.
+    #[prost(string, optional, tag = "26")]
+    pub agent_session_id: Option<String>,
+    #[prost(bool, optional, tag = "27")]
+    pub client_supports_prompt_context_usage_rpc: Option<bool>,
+    #[prost(bool, optional, tag = "28")]
+    pub client_supports_routed_model_update: Option<bool>,
+    #[prost(message, optional, tag = "29")]
+    pub system_prompt_spec: Option<SystemPromptSpec>,
+    /// Real desktop gateway credentials only.  The proxy never synthesizes
+    /// this value from its normal Cursor account token.
+    #[prost(message, optional, tag = "30")]
+    pub client_llm_gateway_credential: Option<ClientLlmGatewayCredential>,
+    #[prost(bool, optional, tag = "31")]
+    pub client_supports_preview_card: Option<bool>,
+    #[prost(bool, optional, tag = "32")]
+    pub started_as_new_project: Option<bool>,
+}
+
+/// Metadata sent by the local MCP filesystem bridge (agent.v1).
+#[derive(Clone, PartialEq, Message)]
+pub struct McpFileSystemOptions {
+    #[prost(bool, tag = "1")]
+    pub enabled: bool,
+    #[prost(string, tag = "2")]
+    pub workspace_project_dir: String,
+    #[prost(message, repeated, tag = "3")]
+    pub mcp_descriptors: Vec<McpDescriptor>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct McpDescriptor {
+    #[prost(string, tag = "1")]
+    pub server_name: String,
+    #[prost(string, tag = "2")]
+    pub server_identifier: String,
+    #[prost(string, optional, tag = "3")]
+    pub folder_path: Option<String>,
+    #[prost(string, optional, tag = "4")]
+    pub server_use_instructions: Option<String>,
+    #[prost(message, repeated, tag = "5")]
+    pub tools: Vec<McpToolDescriptor>,
+    #[prost(string, optional, tag = "7")]
+    pub plugin: Option<String>,
+    #[prost(string, optional, tag = "8")]
+    pub marketplace: Option<String>,
+    #[prost(string, optional, tag = "9")]
+    pub plugin_db_id: Option<String>,
+    #[prost(string, optional, tag = "10")]
+    pub marketplace_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct McpToolDescriptor {
+    #[prost(string, tag = "1")]
+    pub tool_name: String,
+    #[prost(string, optional, tag = "2")]
+    pub definition_path: Option<String>,
+    #[prost(string, optional, tag = "3")]
+    pub description: Option<String>,
+    #[prost(message, optional, tag = "4")]
+    pub input_schema: Option<prost_types::Value>,
+    #[prost(string, optional, tag = "5")]
+    pub input_schema_json: Option<String>,
+    #[prost(string, optional, tag = "6")]
+    pub annotations_json: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SkillOptions {
+    #[prost(message, repeated, tag = "1")]
+    pub skill_descriptors: Vec<SkillDescriptor>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SkillDescriptor {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub description: String,
+    #[prost(string, tag = "3")]
+    pub folder_path: String,
+    #[prost(bool, tag = "4")]
+    pub enabled: bool,
+    #[prost(string, optional, tag = "5")]
+    pub parse_error: Option<String>,
+    #[prost(string, tag = "6")]
+    pub readme_file_path: String,
+    /// Enum values are intentionally represented as i32 so unknown package
+    /// kinds from newer Cursor builds round-trip without a generated enum.
+    #[prost(int32, tag = "7")]
+    pub package_type: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SubagentModelOverride {
+    #[prost(string, tag = "1")]
+    pub subagent_type: String,
+    /// The generated Cursor schema uses a oneof (`model`/`inherit`/`disabled`).
+    /// Optional fields preserve the same wire tags while keeping this module's
+    /// intentionally lightweight protobuf style (which avoids oneof enums).
+    #[prost(message, optional, tag = "2")]
+    pub model: Option<CursorModel>,
+    #[prost(bool, optional, tag = "3")]
+    pub inherit: Option<bool>,
+    #[prost(bool, optional, tag = "4")]
+    pub disabled: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SystemPromptSpec {
+    #[prost(string, optional, tag = "1")]
+    pub replace: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub append: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientLlmGatewayCredential {
+    #[prost(string, tag = "1")]
+    pub bearer_token: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -107,13 +347,259 @@ pub struct PreFetchedBlob {
     pub value: Vec<u8>,
 }
 
+/// Modern `agent.v1.ConversationAction` envelope.  The generated Cursor
+/// schema models these fields as a protobuf `oneof`; this hand-written schema
+/// keeps optional arms flat so older callers can continue using the `Action`
+/// alias while preserving the exact wire tags.
 #[derive(Clone, PartialEq, Message)]
-pub struct Action {
+pub struct ConversationAction {
     #[prost(message, optional, tag = "1")]
     pub user_message_action: Option<UserMessageAction>,
-    /// Reconnect mid-turn only; normal follow-ups use user_message_action.
     #[prost(message, optional, tag = "2")]
     pub resume_action: Option<ResumeAction>,
+    #[prost(message, optional, tag = "3")]
+    pub cancel_action: Option<CancelAction>,
+    #[prost(message, optional, tag = "4")]
+    pub summarize_action: Option<SummarizeAction>,
+    #[prost(message, optional, tag = "5")]
+    pub shell_command_action: Option<ShellCommandAction>,
+    #[prost(message, optional, tag = "6")]
+    pub start_plan_action: Option<StartPlanAction>,
+    #[prost(message, optional, tag = "7")]
+    pub execute_plan_action: Option<ExecutePlanAction>,
+    #[prost(message, optional, tag = "8")]
+    pub async_ask_question_completion_action: Option<AsyncAskQuestionCompletionAction>,
+    #[prost(message, optional, tag = "10")]
+    pub cancel_subagent_action: Option<CancelSubagentAction>,
+    #[prost(string, optional, tag = "11")]
+    pub triggering_auth_id: Option<String>,
+    #[prost(message, optional, tag = "12")]
+    pub background_task_completion_action: Option<BackgroundTaskCompletionAction>,
+    #[prost(message, optional, tag = "13")]
+    pub background_shell_action: Option<BackgroundShellAction>,
+    #[prost(message, optional, tag = "14")]
+    pub background_subagent_action: Option<BackgroundSubagentAction>,
+    #[prost(message, optional, tag = "15")]
+    pub triggering_user_info: Option<TriggeringUserInfo>,
+}
+
+/// Backwards-compatible name used by the original proxy code.  Cursor's
+/// `AgentRunRequest.action` has always been this ConversationAction envelope;
+/// the alias exposes the newly added control arms without a second protobuf
+/// message definition.
+pub type Action = ConversationAction;
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CancelAction {
+    #[prost(string, tag = "1")]
+    pub reason: String,
+    #[prost(message, optional, tag = "3")]
+    pub interrupted_pending_tool_call_resolutions: Option<InterruptedPendingToolCallResolutions>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SummarizeAction {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShellCommandAction {
+    #[prost(message, optional, tag = "1")]
+    pub shell_command: Option<ShellCommand>,
+    #[prost(string, optional, tag = "2")]
+    pub exec_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShellCommand {
+    #[prost(string, tag = "1")]
+    pub command: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StartPlanAction {
+    #[prost(message, optional, tag = "1")]
+    pub user_message: Option<UserMessage>,
+    #[prost(message, optional, tag = "2")]
+    pub request_context: Option<RequestContext>,
+    #[prost(bool, optional, tag = "3")]
+    pub is_spec: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecutePlanAction {
+    #[prost(message, optional, tag = "1")]
+    pub request_context: Option<RequestContext>,
+    #[prost(message, optional, tag = "2")]
+    pub plan: Option<ConversationPlan>,
+    #[prost(string, optional, tag = "3")]
+    pub plan_file_uri: Option<String>,
+    #[prost(string, optional, tag = "4")]
+    pub plan_file_content: Option<String>,
+    #[prost(int32, optional, tag = "5")]
+    pub execution_mode: Option<i32>,
+    #[prost(string, optional, tag = "6")]
+    pub kickoff_message_id: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub plan_id: Option<String>,
+    #[prost(string, optional, tag = "8")]
+    pub plan_file_path: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationPlan {
+    #[prost(string, tag = "1")]
+    pub plan: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AsyncAskQuestionCompletionAction {
+    #[prost(string, tag = "1")]
+    pub original_tool_call_id: String,
+    /// Opaque encoded ask-question args/result are retained for forward
+    /// compatibility; the normal Claude bridge handles these at the HTTP
+    /// layer and does not synthesize this action.
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub original_args: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub result: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CancelSubagentAction {
+    #[prost(string, tag = "1")]
+    pub subagent_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BackgroundTaskCompletionAction {
+    #[prost(message, repeated, tag = "1")]
+    pub completions: Vec<BackgroundTaskCompletion>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BackgroundTaskCompletion {
+    #[prost(string, tag = "1")]
+    pub task_id: String,
+    #[prost(int32, tag = "2")]
+    pub kind: i32,
+    #[prost(int32, tag = "3")]
+    pub status: i32,
+    #[prost(string, tag = "4")]
+    pub title: String,
+    #[prost(string, optional, tag = "5")]
+    pub detail: Option<String>,
+    #[prost(string, optional, tag = "6")]
+    pub output_path: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub thread_id: Option<String>,
+    #[prost(int32, optional, tag = "8")]
+    pub reason: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BackgroundShellAction {
+    #[prost(string, tag = "1")]
+    pub tool_call_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BackgroundSubagentAction {
+    #[prost(string, tag = "1")]
+    pub tool_call_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TriggeringUserInfo {
+    #[prost(string, optional, tag = "1")]
+    pub auth_id: Option<String>,
+    #[prost(int32, optional, tag = "2")]
+    pub user_id: Option<i32>,
+}
+
+/// Additional context emitted by a Claude/Cursor hook.  Cursor models this
+/// as a small message repeated on `UserMessage`; keeping it explicit avoids
+/// dropping hook output when a native tool result is resumed.
+#[derive(Clone, PartialEq, Message)]
+pub struct HookAdditionalContext {
+    #[prost(string, tag = "1")]
+    pub hook_event_name: String,
+    #[prost(string, tag = "2")]
+    pub content: String,
+}
+
+/// Metadata attached to plan-execution and other synthetic user messages.
+/// The enum-valued fields intentionally use `i32`: protobuf enum values are
+/// represented by the same wire type and this preserves unknown future
+/// values without rejecting a frame.
+#[derive(Clone, PartialEq, Message)]
+pub struct SimulatedMessageMetadata {
+    #[prost(string, optional, tag = "1")]
+    pub title: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub task_id: Option<String>,
+    #[prost(string, optional, tag = "3")]
+    pub fsd_finding_action: Option<String>,
+    #[prost(string, optional, tag = "4")]
+    pub url: Option<String>,
+    #[prost(int32, optional, tag = "5")]
+    pub subscription_source: Option<i32>,
+}
+
+/// Plan descriptor carried by `UserMessage.execute_plan_info`.
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecutePlanInfo {
+    #[prost(string, tag = "1")]
+    pub plan_id: String,
+    #[prost(string, tag = "2")]
+    pub plan_title: String,
+}
+
+/// Submitted custom mode descriptor used by `CustomModeIntent.enter`.
+#[derive(Clone, PartialEq, Message)]
+pub struct SubmittedCustomMode {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(string, tag = "2")]
+    pub label: String,
+    #[prost(int32, tag = "5")]
+    pub source: i32,
+    #[prost(string, optional, tag = "6")]
+    pub source_path: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub source_hash: Option<String>,
+    #[prost(string, optional, tag = "10")]
+    pub managed_skill_id: Option<String>,
+    #[prost(string, optional, tag = "11")]
+    pub plugin_id: Option<String>,
+    #[prost(string, optional, tag = "12")]
+    pub plugin_snapshot_token: Option<String>,
+}
+
+/// Descriptor for the mode being left by `CustomModeIntent.exit`.
+#[derive(Clone, PartialEq, Message)]
+pub struct SubmittedExitedCustomMode {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(string, tag = "2")]
+    pub label: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CustomModeExitIntent {
+    #[prost(int32, tag = "1")]
+    pub next_mode: i32,
+    #[prost(message, optional, tag = "2")]
+    pub exited_mode: Option<SubmittedExitedCustomMode>,
+}
+
+/// Cursor's generated schema uses a oneof (`enter`/`exit`).  Flat optional
+/// arms retain the exact field numbers while matching the lightweight proto
+/// style used throughout this proxy.
+#[derive(Clone, PartialEq, Message)]
+pub struct CustomModeIntent {
+    #[prost(message, optional, tag = "1")]
+    pub enter: Option<SubmittedCustomMode>,
+    #[prost(message, optional, tag = "2")]
+    pub exit: Option<CustomModeExitIntent>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -126,10 +612,19 @@ pub struct ResumeAction {
 pub struct UserMessageAction {
     #[prost(message, optional, tag = "1")]
     pub user_message: Option<UserMessage>,
-    // CLI `UserMessageAction` may also carry `request_context` (tag 2). Official
-    // live construction fills RequestContext on `request_context_result` (exec
-    // reply), not on RunRequest / UserMessageAction. Do not add that field here
-    // unless a captured CLI Run frame actually encodes it.
+    /// Request context can be attached directly to a user action by the
+    /// desktop Agent Host.  The exec request/reply path remains supported for
+    /// older CLI builds.
+    #[prost(message, optional, tag = "2")]
+    pub request_context: Option<RequestContext>,
+    #[prost(bool, optional, tag = "3")]
+    pub send_to_interaction_listener: Option<bool>,
+    #[prost(message, repeated, tag = "4")]
+    pub prepend_user_messages: Vec<UserMessage>,
+    #[prost(message, optional, tag = "6")]
+    pub interrupted_pending_tool_call_resolutions: Option<InterruptedPendingToolCallResolutions>,
+    #[prost(message, optional, tag = "7")]
+    pub conversation_history: Option<ConversationHistory>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -144,6 +639,208 @@ pub struct UserMessage {
     /// 0=UNSPECIFIED, 1=AGENT, 2=ASK, 3=PLAN, …
     #[prost(int32, tag = "4")]
     pub mode: i32,
+    #[prost(bool, optional, tag = "5")]
+    pub is_simulated_msg: Option<bool>,
+    #[prost(string, optional, tag = "6")]
+    pub best_of_n_group_id: Option<String>,
+    #[prost(bool, optional, tag = "7")]
+    pub try_use_best_of_n_promotion: Option<bool>,
+    #[prost(string, optional, tag = "8")]
+    pub rich_text: Option<String>,
+    /// Enum `agent.v1.SimulatedMsgReason` (wire-compatible i32).
+    #[prost(int32, optional, tag = "9")]
+    pub simulated_msg_reason: Option<i32>,
+    #[prost(bytes = "vec", tag = "10")]
+    pub conversation_state_blob_id: Vec<u8>,
+    #[prost(string, optional, tag = "11")]
+    pub subagent_system_reminder: Option<String>,
+    #[prost(message, optional, tag = "13")]
+    pub triggering_user_info: Option<TriggeringUserInfo>,
+    #[prost(message, optional, tag = "14")]
+    pub execute_plan_info: Option<ExecutePlanInfo>,
+    #[prost(message, optional, tag = "15")]
+    pub simulated_message_metadata: Option<SimulatedMessageMetadata>,
+    #[prost(string, optional, tag = "16")]
+    pub prompt_reference_id: Option<String>,
+    #[prost(string, optional, tag = "17")]
+    pub thread_id: Option<String>,
+    #[prost(bytes = "vec", optional, tag = "18")]
+    pub text_blob_id: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "19")]
+    pub rich_text_blob_id: Option<Vec<u8>>,
+    #[prost(message, repeated, tag = "21")]
+    pub hook_additional_contexts: Vec<HookAdditionalContext>,
+    #[prost(message, optional, tag = "22")]
+    pub custom_mode_intent: Option<CustomModeIntent>,
+}
+
+/// A compact representation of Cursor's conversation history action payload.
+/// Content arms are kept as optional fields rather than Rust enums so callers
+/// can decode newer oneof variants without losing the surrounding message.
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistory {
+    #[prost(message, repeated, tag = "1")]
+    pub messages: Vec<ConversationHistoryMessage>,
+    #[prost(bool, optional, tag = "2")]
+    pub replace_user_info: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryMessage {
+    #[prost(message, optional, tag = "1")]
+    pub user: Option<ConversationHistoryUserMessage>,
+    #[prost(message, optional, tag = "2")]
+    pub assistant: Option<ConversationHistoryAssistantMessage>,
+    #[prost(message, optional, tag = "3")]
+    pub tool: Option<ConversationHistoryToolMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryUserMessage {
+    #[prost(message, repeated, tag = "1")]
+    pub content: Vec<ConversationHistoryUserContent>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryUserContent {
+    #[prost(message, optional, tag = "1")]
+    pub text: Option<ConversationHistoryTextContent>,
+    #[prost(message, optional, tag = "2")]
+    pub image: Option<ConversationHistoryImageContent>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryTextContent {
+    #[prost(string, tag = "1")]
+    pub text: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryImageContent {
+    #[prost(string, tag = "1")]
+    pub data: String,
+    #[prost(string, optional, tag = "2")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryAssistantMessage {
+    #[prost(message, repeated, tag = "1")]
+    pub content: Vec<ConversationHistoryAssistantContent>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryAssistantContent {
+    #[prost(message, optional, tag = "1")]
+    pub text: Option<ConversationHistoryTextContent>,
+    #[prost(message, optional, tag = "2")]
+    pub reasoning: Option<ConversationHistoryReasoningContent>,
+    #[prost(message, optional, tag = "3")]
+    pub redacted_reasoning: Option<ConversationHistoryRedactedReasoningContent>,
+    #[prost(message, optional, tag = "4")]
+    pub tool_call: Option<ConversationHistoryToolCall>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryReasoningContent {
+    #[prost(string, tag = "1")]
+    pub text: String,
+    #[prost(string, optional, tag = "2")]
+    pub signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryRedactedReasoningContent {
+    #[prost(string, tag = "1")]
+    pub data: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryToolCall {
+    #[prost(string, tag = "1")]
+    pub tool_call_id: String,
+    #[prost(string, tag = "2")]
+    pub tool_name: String,
+    #[prost(string, tag = "3")]
+    pub args_json: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryToolMessage {
+    #[prost(string, tag = "1")]
+    pub tool_call_id: String,
+    #[prost(string, tag = "2")]
+    pub tool_name: String,
+    #[prost(message, repeated, tag = "3")]
+    pub content: Vec<ConversationHistoryToolResultContent>,
+    #[prost(bool, optional, tag = "4")]
+    pub is_error: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationHistoryToolResultContent {
+    #[prost(message, optional, tag = "1")]
+    pub text: Option<ConversationHistoryTextContent>,
+    #[prost(message, optional, tag = "2")]
+    pub image: Option<ConversationHistoryImageContent>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InterruptedPendingToolCallResolutions {
+    #[prost(message, repeated, tag = "1")]
+    pub resolutions: Vec<InterruptedPendingToolCallResolution>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InterruptedPendingToolCallResolution {
+    #[prost(string, tag = "1")]
+    pub tool_call_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub shell_result: Option<ShellResult>,
+    #[prost(message, optional, tag = "3")]
+    pub task_result: Option<TaskResult>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TaskResult {
+    #[prost(message, optional, tag = "1")]
+    pub success: Option<TaskSuccess>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<TaskError>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TaskSuccess {
+    #[prost(message, repeated, tag = "1")]
+    pub conversation_steps: Vec<ConversationStep>,
+    #[prost(string, optional, tag = "2")]
+    pub agent_id: Option<String>,
+    #[prost(bool, tag = "3")]
+    pub is_background: bool,
+    #[prost(uint64, optional, tag = "4")]
+    pub duration_ms: Option<u64>,
+    #[prost(string, optional, tag = "5")]
+    pub result_suffix: Option<String>,
+    #[prost(int32, tag = "6")]
+    pub background_reason: i32,
+    #[prost(string, optional, tag = "7")]
+    pub transcript_path: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TaskError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConversationStep {
+    #[prost(message, optional, tag = "1")]
+    pub assistant_message: Option<ConversationHistoryAssistantMessage>,
+    #[prost(message, optional, tag = "2")]
+    pub tool_call: Option<ToolCall>,
+    #[prost(message, optional, tag = "3")]
+    pub thinking_message: Option<ConversationHistoryReasoningContent>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -191,17 +888,95 @@ pub struct CursorModel {
     pub max_mode: Option<bool>,
     #[prost(message, repeated, tag = "3")]
     pub parameters: Vec<ModelParameter>,
+    /// Optional BYOK credentials accepted by the current RequestedModel
+    /// schema.  The upstream schema declares these three fields as a oneof;
+    /// this module keeps the same lightweight optional-field convention used
+    /// by the rest of the hand-written proto definitions.  Callers should set
+    /// at most one arm for a request.
+    #[prost(message, optional, tag = "4")]
+    pub api_key_credentials: Option<ApiKeyCredentials>,
+    #[prost(message, optional, tag = "5")]
+    pub azure_credentials: Option<AzureCredentials>,
+    #[prost(message, optional, tag = "6")]
+    pub bedrock_credentials: Option<BedrockCredentials>,
+    /// Cursor's built-in catalog marker.  The desktop AgentHost sets this to
+    /// true for a normal catalog model; Sand's local PromptSession uses the
+    /// marker when selecting its direct executor.
+    #[prost(bool, optional, tag = "7")]
+    pub built_in_model: Option<bool>,
+    /// False for ordinary catalog ids; true only when the model id is a
+    /// variant-string representation.  Explicitly carrying false mirrors the
+    /// desktop client object and avoids an undefined-vs-false branch in older
+    /// managed-local runtimes.
+    #[prost(bool, optional, tag = "8")]
+    pub is_variant_string_representation: Option<bool>,
+}
+
+/// `agent.v1.ApiKeyCredentials` (RequestedModel credentials oneof arm).
+#[derive(Clone, PartialEq, Message)]
+pub struct ApiKeyCredentials {
+    #[prost(string, tag = "1")]
+    pub api_key: String,
+    #[prost(string, optional, tag = "2")]
+    pub base_url: Option<String>,
+}
+
+/// `agent.v1.AzureCredentials` (RequestedModel credentials oneof arm).
+#[derive(Clone, PartialEq, Message)]
+pub struct AzureCredentials {
+    #[prost(string, tag = "1")]
+    pub api_key: String,
+    #[prost(string, tag = "2")]
+    pub base_url: String,
+    #[prost(string, tag = "3")]
+    pub deployment: String,
+}
+
+/// `agent.v1.BedrockCredentials` (RequestedModel credentials oneof arm).
+#[derive(Clone, PartialEq, Message)]
+pub struct BedrockCredentials {
+    #[prost(string, tag = "1")]
+    pub access_key: String,
+    #[prost(string, tag = "2")]
+    pub secret_key: String,
+    #[prost(string, tag = "3")]
+    pub region: String,
+    #[prost(string, optional, tag = "4")]
+    pub session_token: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct ModelDetails {
     #[prost(string, optional, tag = "1")]
     pub model_id: Option<String>,
+    /// Optional marker emitted by current Cursor catalog responses.  The
+    /// upstream type is an empty message; retaining the exact tag/type avoids
+    /// mis-decoding the following display metadata on newer Sand builds.
+    #[prost(message, optional, tag = "2")]
+    pub thinking_details: Option<ThinkingDetails>,
     #[prost(string, optional, tag = "3")]
     pub display_model_id: Option<String>,
     #[prost(string, optional, tag = "4")]
     pub display_name: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    pub display_name_short: Option<String>,
+    #[prost(string, repeated, tag = "6")]
+    pub aliases: Vec<String>,
+    #[prost(bool, optional, tag = "7")]
+    pub max_mode: Option<bool>,
+    #[prost(message, optional, tag = "8")]
+    pub api_key_credentials: Option<ApiKeyCredentials>,
+    #[prost(message, optional, tag = "9")]
+    pub azure_credentials: Option<AzureCredentials>,
+    #[prost(message, optional, tag = "10")]
+    pub bedrock_credentials: Option<BedrockCredentials>,
 }
+
+/// `agent.v1.ThinkingDetails` is currently an empty marker message.  Keep a
+/// named type rather than representing field 2 as opaque bytes so protobuf
+/// decoders remain aligned with Cursor's ModelDetails schema.
+#[derive(Clone, PartialEq, Message)]
+pub struct ThinkingDetails {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct ModelParameter {
@@ -272,9 +1047,56 @@ pub struct AgentServerMessage {
     /// before starting the next model call after a native tool result.
     #[prost(message, optional, tag = "4")]
     pub kv_server_message: Option<KvServerMessage>,
+    /// Server-side control for a pending exec (currently the abort arm).
+    ///
+    /// Cursor's `agent.v1` schema reserves tag 5 for this message.  It is
+    /// emitted when the Agent Host cancels an in-flight native tool call; the
+    /// abort id corresponds to `ExecServerMessage.id`.  Keeping this arm in
+    /// the envelope lets clients observe cancellation instead of treating the
+    /// frame as an unknown/empty update.
+    #[prost(message, optional, tag = "5")]
+    pub exec_server_control_message: Option<ExecServerControlMessage>,
     /// Approval / interactive prompts (web search, plan, ask, MCP auth).
     #[prost(message, optional, tag = "7")]
     pub interaction_query: Option<InteractionQuery>,
+    /// Server-side time-to-first-token accounting. This is metadata only, but
+    /// modern Agent Host streams emit it before the first visible update.
+    #[prost(message, optional, tag = "8")]
+    pub ttft_breakdown: Option<TtftBreakdown>,
+}
+
+/// Cursor `agent.v1.TtftBreakdown` (`AgentServerMessage` tag 8).
+///
+/// The fields are doubles in the Desktop schema. Keeping them typed avoids a
+/// decoder silently dropping a non-empty Agent Host frame before Sand emits
+/// its first interaction update.
+#[derive(Clone, PartialEq, Message)]
+pub struct TtftBreakdown {
+    #[prost(double, tag = "1")]
+    pub server_first_token_ms: f64,
+    #[prost(double, tag = "2")]
+    pub pre_stream_setup_ms: f64,
+    #[prost(double, tag = "3")]
+    pub wait_for_first_event_ms: f64,
+    #[prost(double, optional, tag = "4")]
+    pub provider_ttft_ms: Option<f64>,
+    #[prost(double, tag = "5")]
+    pub slow_pool_wait_ms: f64,
+}
+
+/// Server → client control message for an execution stream
+/// (`AgentServerMessage.exec_server_control_message`, tag 5).
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecServerControlMessage {
+    #[prost(message, optional, tag = "1")]
+    pub abort: Option<ExecServerAbort>,
+}
+
+/// Identifies the execution that the server aborted.
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecServerAbort {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
 }
 
 /// Server → client approval / interactive query (AgentServerMessage tag 7).
@@ -527,10 +1349,12 @@ pub struct KvError {
     pub message: String,
 }
 
-/// InteractionUpdate oneof fields (CLI 2026.07 / IDE 3.12 `agent.v1`):
+/// InteractionUpdate oneof fields (CLI 2026.07 / Cursor Desktop 3.17.19
+/// `agent.v1`):
 /// 1=text_delta, 2=tool_call_started, 3=tool_call_completed, 4=thinking_delta,
-/// 5=thinking_completed, 7=partial_tool_call, 8=token_delta, 13=heartbeat,
-/// 14=turn_ended, 15=tool_call_delta, …
+/// 5=thinking_completed, 6=user_message_appended, 7=partial_tool_call,
+/// 8=token_delta, 9-12=summary/shell updates, 13=heartbeat, 14=turn_ended,
+/// 15=tool_call_delta, 16-24=Agent Host lifecycle/metadata updates.
 #[derive(Clone, PartialEq, Message)]
 pub struct InteractionUpdate {
     #[prost(message, optional, tag = "1")]
@@ -544,11 +1368,21 @@ pub struct InteractionUpdate {
     /// Empty marker that reasoning finished (CLI tag 5).
     #[prost(message, optional, tag = "5")]
     pub thinking_completed: Option<ThinkingCompleted>,
+    #[prost(message, optional, tag = "6")]
+    pub user_message_appended: Option<UserMessageAppendedUpdate>,
     /// Streaming tool args before `tool_call_started` (CLI `PartialToolCallUpdate`).
     #[prost(message, optional, tag = "7")]
     pub partial_tool_call: Option<PartialToolCall>,
     #[prost(message, optional, tag = "8")]
     pub token_delta: Option<TokenDelta>,
+    #[prost(message, optional, tag = "9")]
+    pub summary: Option<SummaryUpdate>,
+    #[prost(message, optional, tag = "10")]
+    pub summary_started: Option<SummaryStartedUpdate>,
+    #[prost(message, optional, tag = "11")]
+    pub summary_completed: Option<SummaryCompletedUpdate>,
+    #[prost(message, optional, tag = "12")]
+    pub shell_output_delta: Option<ShellStream>,
     /// Server keep-alive during long thinking (CLI tag 13). Must refresh our
     /// idle timers — otherwise quiet Fable thinking looks stalled.
     #[prost(message, optional, tag = "13")]
@@ -560,6 +1394,174 @@ pub struct InteractionUpdate {
     /// nest another InteractionUpdate that itself carries `partial_tool_call`.
     #[prost(message, optional, tag = "15")]
     pub tool_call_delta: Option<ToolCallDeltaUpdate>,
+    #[prost(message, optional, tag = "16")]
+    pub step_started: Option<StepStartedUpdate>,
+    #[prost(message, optional, tag = "17")]
+    pub step_completed: Option<StepCompletedUpdate>,
+    #[prost(message, optional, tag = "18")]
+    pub prompt_suggestion: Option<PromptSuggestionUpdate>,
+    #[prost(message, optional, tag = "19")]
+    pub post_request_prompt: Option<PostRequestPromptUpdate>,
+    #[prost(message, optional, tag = "20")]
+    pub active_branch_change: Option<ActiveBranchChange>,
+    #[prost(message, optional, tag = "21")]
+    pub feedback_request: Option<FeedbackRequestUpdate>,
+    #[prost(message, optional, tag = "22")]
+    pub response_comparison: Option<ResponseComparisonUpdate>,
+    #[prost(message, optional, tag = "23")]
+    pub context_injection_state: Option<ContextInjectionStateUpdate>,
+    #[prost(message, optional, tag = "24")]
+    pub routed_model: Option<RoutedModelUpdate>,
+}
+
+impl AgentServerMessage {
+    /// Whether this frame proves the Agent Host advanced without carrying an
+    /// Anthropic-visible text or tool event. These lifecycle frames are valid
+    /// progress for retry/idle bookkeeping, but callers must not translate
+    /// them into model output.
+    pub(crate) fn has_agent_host_metadata_progress(&self) -> bool {
+        self.ttft_breakdown.is_some()
+            || self
+                .interaction_update
+                .as_ref()
+                .is_some_and(InteractionUpdate::has_agent_host_metadata_progress)
+    }
+}
+
+impl InteractionUpdate {
+    /// Desktop Agent Host lifecycle/UI metadata that can legitimately arrive
+    /// before the first text delta. Keep this separate from `heartbeat`: a
+    /// heartbeat proves only that the transport remains open, whereas these
+    /// fields prove the server actually processed the run.
+    pub(crate) fn has_agent_host_metadata_progress(&self) -> bool {
+        self.has_agent_host_metadata_progress_at_depth(0)
+    }
+
+    fn has_agent_host_metadata_progress_at_depth(&self, depth: u8) -> bool {
+        let direct = self.user_message_appended.is_some()
+            || self.summary.is_some()
+            || self.summary_started.is_some()
+            || self.summary_completed.is_some()
+            || self.shell_output_delta.is_some()
+            || self.step_started.is_some()
+            || self.step_completed.is_some()
+            || self.prompt_suggestion.is_some()
+            || self.post_request_prompt.is_some()
+            || self.active_branch_change.is_some()
+            || self.feedback_request.is_some()
+            || self.response_comparison.is_some()
+            || self.context_injection_state.is_some()
+            || self.routed_model.is_some();
+        if direct || depth >= MAX_TASK_DELTA_NEST {
+            return direct;
+        }
+        self.tool_call_delta
+            .as_ref()
+            .and_then(ToolCallDeltaUpdate::nested_task_update)
+            .is_some_and(|nested| nested.has_agent_host_metadata_progress_at_depth(depth + 1))
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserMessageAppendedUpdate {
+    #[prost(message, optional, tag = "1")]
+    pub user_message: Option<UserMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SummaryUpdate {
+    #[prost(string, tag = "1")]
+    pub summary: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SummaryStartedUpdate {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SummaryCompletedUpdate {
+    #[prost(string, optional, tag = "1")]
+    pub hook_message: Option<String>,
+    #[prost(bool, optional, tag = "2")]
+    pub failed: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StepStartedUpdate {
+    #[prost(uint64, tag = "1")]
+    pub step_id: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StepCompletedUpdate {
+    #[prost(uint64, tag = "1")]
+    pub step_id: u64,
+    #[prost(int64, tag = "2")]
+    pub step_duration_ms: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PromptSuggestionUpdate {
+    #[prost(string, tag = "1")]
+    pub suggestion: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PostRequestPromptUpdate {
+    #[prost(string, tag = "1")]
+    pub title: String,
+    #[prost(string, tag = "2")]
+    pub message: String,
+    #[prost(string, tag = "3")]
+    pub button_label: String,
+    #[prost(string, tag = "4")]
+    pub button_url: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ActiveBranchChange {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub branch_name: String,
+}
+
+/// Feedback metadata is intentionally decoded only through stable scalar
+/// fields. The nested category schema is UI-only and can evolve without
+/// affecting live-run recovery.
+#[derive(Clone, PartialEq, Message)]
+pub struct FeedbackRequestUpdate {
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+    #[prost(string, optional, tag = "2")]
+    pub canonical_model_name: Option<String>,
+}
+
+/// Response-comparison events are UI metadata. Retaining the id lets the
+/// proxy recognize the frame as progress while safely skipping newer arms.
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseComparisonUpdate {
+    #[prost(string, tag = "1")]
+    pub comparison_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ContextInjectionStateUpdate {
+    #[prost(string, tag = "1")]
+    pub injection_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub state: Option<ContextInjectionState>,
+}
+
+/// The state is a oneof whose payloads are all UI bookkeeping. An empty
+/// typed message safely consumes all known/future state arms while preserving
+/// the outer progress signal.
+#[derive(Clone, PartialEq, Message)]
+pub struct ContextInjectionState {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RoutedModelUpdate {
+    #[prost(string, tag = "1")]
+    pub display_name: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1904,6 +2906,266 @@ pub struct GetUsableModelsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_server_exec_control_abort_round_trips_tag_five() {
+        let message = AgentServerMessage {
+            exec_server_control_message: Some(ExecServerControlMessage {
+                abort: Some(ExecServerAbort { id: 42 }),
+            }),
+            ..Default::default()
+        };
+        let bytes = message.encode_to_vec();
+        // AgentServerMessage tag 5 is length-delimited (0x2a). The nested
+        // control arm (tag 1) wraps the abort id (field 1, varint 42).
+        assert_eq!(bytes, vec![0x2a, 0x04, 0x0a, 0x02, 0x08, 0x2a]);
+        let decoded = AgentServerMessage::decode(bytes.as_slice()).expect("decode control");
+        assert_eq!(decoded, message);
+        assert_eq!(
+            decoded
+                .exec_server_control_message
+                .and_then(|control| control.abort)
+                .map(|abort| abort.id),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn run_request_extended_agent_host_fields_round_trip() {
+        // These fields were added to Cursor's AgentRunRequest after the
+        // original CLI schema.  Keep a fixture in the proxy so a schema
+        // refresh cannot silently drop managed-local/Sand metadata.
+        let request = RunRequest {
+            conversation_state: Some(vec![]),
+            action: None,
+            model_details: None,
+            mcp_tools: None,
+            conversation_id: Some("conv".into()),
+            custom_system_prompt: None,
+            requested_model: Some(CursorModel {
+                model_id: "claude-fable-5-thinking-max".into(),
+                max_mode: Some(true),
+                parameters: vec![ModelParameter {
+                    id: "effort".into(),
+                    value: "max".into(),
+                }],
+                api_key_credentials: None,
+                azure_credentials: None,
+                bedrock_credentials: None,
+                built_in_model: Some(true),
+                is_variant_string_representation: Some(false),
+            }),
+            exclude_workspace_context: Some(false),
+            harness: Some("sand-client".into()),
+            selected_subagent_models: vec![],
+            conversation_group_id: None,
+            pre_fetched_blobs: vec![],
+            client_supports_inline_images: Some(true),
+            mcp_file_system_options: Some(McpFileSystemOptions {
+                enabled: true,
+                workspace_project_dir: "/workspace".into(),
+                mcp_descriptors: vec![McpDescriptor {
+                    server_name: "local".into(),
+                    server_identifier: "local-1".into(),
+                    folder_path: Some("/workspace/.mcp".into()),
+                    server_use_instructions: None,
+                    tools: vec![McpToolDescriptor {
+                        tool_name: "read".into(),
+                        definition_path: None,
+                        description: Some("read file".into()),
+                        input_schema: None,
+                        input_schema_json: Some("{}".into()),
+                        annotations_json: None,
+                    }],
+                    plugin: None,
+                    marketplace: None,
+                    plugin_db_id: None,
+                    marketplace_id: None,
+                }],
+            }),
+            skill_options: Some(SkillOptions {
+                skill_descriptors: vec![SkillDescriptor {
+                    name: "shell".into(),
+                    description: "run shell commands".into(),
+                    folder_path: "/workspace/.cursor/skills".into(),
+                    enabled: true,
+                    parse_error: None,
+                    readme_file_path: "/workspace/.cursor/skills/README.md".into(),
+                    package_type: 1,
+                }],
+            }),
+            suggest_next_prompt: Some(true),
+            subagent_type_name: Some("worker".into()),
+            selected_subagent_model_details: vec![ModelDetails {
+                model_id: Some("composer-2.5".into()),
+                thinking_details: None,
+                display_name_short: Some("Composer".into()),
+                display_model_id: Some("composer-2.5".into()),
+                display_name: Some("Composer".into()),
+                aliases: vec!["composer".into()],
+                max_mode: None,
+                api_key_credentials: None,
+                azure_credentials: None,
+                bedrock_credentials: None,
+            }],
+            dev_raw_model_slug: Some("fable".into()),
+            subagent_model_overrides: vec![SubagentModelOverride {
+                subagent_type: "worker".into(),
+                model: Some(CursorModel {
+                    model_id: "composer-2.5".into(),
+                    max_mode: None,
+                    parameters: vec![],
+                    api_key_credentials: None,
+                    azure_credentials: None,
+                    bedrock_credentials: None,
+                    built_in_model: None,
+                    is_variant_string_representation: None,
+                }),
+                inherit: None,
+                disabled: None,
+            }],
+            can_create_cloud_subagents: Some(false),
+            suppress_subagent_progress_update_tool: Some(true),
+            client_supports_send_to_user: Some(true),
+            computer_use_coordinate_mode: Some("screen-pixels".into()),
+            run_id: Some("run-1".into()),
+            agent_session_id: Some("session-1".into()),
+            client_supports_prompt_context_usage_rpc: Some(false),
+            client_supports_routed_model_update: Some(false),
+            system_prompt_spec: Some(SystemPromptSpec {
+                replace: Some("fixture system prompt".into()),
+                append: None,
+            }),
+            client_llm_gateway_credential: Some(ClientLlmGatewayCredential {
+                bearer_token: "fixture-only-token".into(),
+            }),
+            client_supports_preview_card: Some(false),
+            started_as_new_project: Some(true),
+        };
+
+        let mut encoded = Vec::new();
+        request
+            .encode(&mut encoded)
+            .expect("encode extended request");
+        let decoded = RunRequest::decode(encoded.as_slice()).expect("decode extended request");
+        assert_eq!(decoded, request);
+
+        // Tags 24–31 use two-byte protobuf keys; tag 32 switches to a
+        // three-byte key.  Keep each one visible so a schema refresh cannot
+        // silently truncate new desktop metadata.
+        for key in [
+            [0xc2, 0x01], // computer_use_coordinate_mode
+            [0xca, 0x01], // run_id
+            [0xd2, 0x01], // agent_session_id
+            [0xd8, 0x01], // prompt-context capability
+            [0xe0, 0x01], // routed-model capability
+            [0xea, 0x01], // system_prompt_spec
+            [0xf2, 0x01], // client_llm_gateway_credential
+            [0xf8, 0x01], // preview-card capability
+            [0x80, 0x02], // started_as_new_project
+        ] {
+            assert!(
+                encoded.windows(2).any(|window| window == key),
+                "missing AgentRunRequest extension key {key:?} in {encoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_model_current_schema_fields_round_trip() {
+        // Cursor 3.18's RequestedModel has credential arms (tags 4–6) and
+        // explicit built-in/variant markers (tags 7–8).  Keep a focused
+        // fixture so a future proto edit does not silently truncate these
+        // fields while forwarding a Sand request.
+        let model = CursorModel {
+            model_id: "claude-fable-5".into(),
+            max_mode: Some(false),
+            parameters: vec![ModelParameter {
+                id: "effort".into(),
+                value: "high".into(),
+            }],
+            api_key_credentials: Some(ApiKeyCredentials {
+                api_key: "KEY".into(),
+                base_url: Some("https://gateway.invalid".into()),
+            }),
+            azure_credentials: None,
+            bedrock_credentials: None,
+            built_in_model: Some(true),
+            is_variant_string_representation: Some(false),
+        };
+        let mut encoded = Vec::new();
+        model.encode(&mut encoded).expect("encode RequestedModel");
+        let decoded = CursorModel::decode(encoded.as_slice()).expect("decode RequestedModel");
+        assert_eq!(decoded, model);
+
+        // Verify the other credential message shapes independently.  They
+        // are oneof arms upstream, so callers should never populate more than
+        // one in a single model object.
+        for credential in [
+            CursorModel {
+                model_id: "azure-model".into(),
+                max_mode: None,
+                parameters: vec![],
+                api_key_credentials: None,
+                azure_credentials: Some(AzureCredentials {
+                    api_key: "AZURE_KEY".into(),
+                    base_url: "https://azure.invalid".into(),
+                    deployment: "deployment".into(),
+                }),
+                bedrock_credentials: None,
+                built_in_model: None,
+                is_variant_string_representation: None,
+            },
+            CursorModel {
+                model_id: "bedrock-model".into(),
+                max_mode: None,
+                parameters: vec![],
+                api_key_credentials: None,
+                azure_credentials: None,
+                bedrock_credentials: Some(BedrockCredentials {
+                    access_key: "ACCESS".into(),
+                    secret_key: "SECRET".into(),
+                    region: "us-east-1".into(),
+                    session_token: Some("SESSION".into()),
+                }),
+                built_in_model: None,
+                is_variant_string_representation: None,
+            },
+        ] {
+            let mut bytes = Vec::new();
+            credential.encode(&mut bytes).unwrap();
+            assert_eq!(CursorModel::decode(bytes.as_slice()).unwrap(), credential);
+        }
+    }
+
+    #[test]
+    fn model_details_current_schema_field_numbers_round_trip() {
+        // Cursor 3.18 places display_name_short/aliases at tags 5/6 and
+        // reserves tag 2 for the empty ThinkingDetails marker.  A previous
+        // hand-written schema put these at 2/5, which made a desktop response
+        // decode as an invalid string/message pair.
+        let details = ModelDetails {
+            model_id: Some("claude-fable-5".into()),
+            thinking_details: Some(ThinkingDetails {}),
+            display_model_id: Some("fable".into()),
+            display_name: Some("Fable".into()),
+            display_name_short: Some("Fable".into()),
+            aliases: vec!["fable".into(), "claude-fable-5".into()],
+            max_mode: Some(true),
+            api_key_credentials: None,
+            azure_credentials: None,
+            bedrock_credentials: None,
+        };
+        let mut bytes = Vec::new();
+        details.encode(&mut bytes).expect("encode ModelDetails");
+        let decoded = ModelDetails::decode(bytes.as_slice()).expect("decode ModelDetails");
+        assert_eq!(decoded, details);
+        // Empty marker is encoded as key 0x12 + zero-length payload, while
+        // display_name_short/aliases use keys 0x2a/0x32 respectively.
+        assert!(bytes.windows(2).any(|window| window == [0x12, 0x00]));
+        assert!(bytes.contains(&0x2a));
+        assert!(bytes.contains(&0x32));
+    }
     use prost::Message;
 
     #[test]
@@ -1922,6 +3184,236 @@ mod tests {
         let mut buf = Vec::new();
         req.encode(&mut buf).unwrap();
         assert!(buf.is_empty(), "empty RunRequest must stay wire-empty");
+    }
+
+    #[test]
+    fn modern_agent_client_control_actions_round_trip() {
+        // Cursor Desktop uses AgentClientMessage tags 4/8 for actions that
+        // happen outside a model turn.  Keep a fixture covering both arms so
+        // a future schema cleanup does not silently renumber them.
+        let action = ConversationAction {
+            summarize_action: Some(SummarizeAction {}),
+            ..Default::default()
+        };
+        let prewarm = PrewarmRequest {
+            model_details: Some(ModelDetails {
+                model_id: Some("claude-fable-5".into()),
+                thinking_details: None,
+                display_model_id: Some("claude-fable-5".into()),
+                display_name: Some("Claude Fable 5".into()),
+                display_name_short: Some("Fable 5".into()),
+                aliases: vec!["fable5".into()],
+                max_mode: Some(true),
+                api_key_credentials: None,
+                azure_credentials: None,
+                bedrock_credentials: None,
+            }),
+            conversation_id: Some("conversation-1".into()),
+            conversation_state: Some(vec![1, 2, 3]),
+            requested_model: Some(CursorModel {
+                model_id: "claude-fable-5".into(),
+                max_mode: Some(true),
+                parameters: vec![],
+                api_key_credentials: None,
+                azure_credentials: None,
+                bedrock_credentials: None,
+                built_in_model: Some(true),
+                is_variant_string_representation: Some(false),
+            }),
+            client_supports_inline_images: Some(true),
+            ..Default::default()
+        };
+        let message = AgentClientMessage {
+            conversation_action: Some(action),
+            prewarm_request: Some(prewarm),
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        message.encode(&mut bytes).unwrap();
+        assert!(bytes.contains(&0x22), "conversation_action tag 4 missing");
+        assert!(bytes.contains(&0x42), "prewarm_request tag 8 missing");
+        let decoded = AgentClientMessage::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.conversation_action, message.conversation_action);
+        assert_eq!(decoded.prewarm_request, message.prewarm_request);
+    }
+
+    #[test]
+    fn prewarm_request_current_desktop_extension_fields_round_trip() {
+        // Cursor Desktop 3.17.19 declares PrewarmRequest tags 23–29 with a
+        // different layout from AgentRunRequest's tags 24–32. In particular,
+        // Prewarm tag 27 is the gateway credential and tag 29 is the boolean
+        // new-project marker; neither must be decoded as AgentRunRequest's
+        // system-prompt shape.
+        let request = PrewarmRequest {
+            computer_use_coordinate_mode: Some("screen-pixels".into()),
+            agent_session_id: Some("prewarm-session-1".into()),
+            client_supports_prompt_context_usage_rpc: Some(false),
+            client_supports_routed_model_update: Some(true),
+            client_llm_gateway_credential: Some(ClientLlmGatewayCredential {
+                bearer_token: "fixture-gateway-token".into(),
+            }),
+            client_supports_preview_card: Some(false),
+            started_as_new_project: Some(true),
+            ..Default::default()
+        };
+
+        let encoded = request.encode_to_vec();
+        let decoded = PrewarmRequest::decode(encoded.as_slice()).expect("decode PrewarmRequest");
+        assert_eq!(decoded, request);
+
+        // Field 23 is the first two-byte field key in this message. Keep all
+        // keys explicit so a future schema refresh cannot silently shift the
+        // Sand prewarm metadata into AgentRunRequest's adjacent field range.
+        for key in [
+            [0xba, 0x01], // computer_use_coordinate_mode (23, length-delimited)
+            [0xc2, 0x01], // agent_session_id (24, length-delimited)
+            [0xc8, 0x01], // prompt-context capability (25, varint)
+            [0xd0, 0x01], // routed-model capability (26, varint)
+            [0xda, 0x01], // client_llm_gateway_credential (27, length-delimited)
+            [0xe0, 0x01], // preview-card capability (28, varint)
+            [0xe8, 0x01], // started_as_new_project (29, varint)
+        ] {
+            assert!(
+                encoded.windows(2).any(|window| window == key),
+                "missing PrewarmRequest extension key {key:?} in {encoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_action_history_and_image_fields_round_trip() {
+        let action = UserMessageAction {
+            user_message: Some(UserMessage {
+                text: "with image".into(),
+                message_id: "m1".into(),
+                selected_context: None,
+                mode: 1,
+                is_simulated_msg: Some(false),
+                best_of_n_group_id: Some("group".into()),
+                try_use_best_of_n_promotion: Some(false),
+                rich_text: Some("**with image**".into()),
+                simulated_msg_reason: None,
+                conversation_state_blob_id: vec![9, 8],
+                subagent_system_reminder: Some("reminder".into()),
+                triggering_user_info: None,
+                execute_plan_info: None,
+                simulated_message_metadata: None,
+                prompt_reference_id: None,
+                thread_id: None,
+                text_blob_id: None,
+                rich_text_blob_id: None,
+                hook_additional_contexts: vec![],
+                custom_mode_intent: None,
+            }),
+            request_context: None,
+            send_to_interaction_listener: Some(true),
+            prepend_user_messages: vec![UserMessage {
+                text: "preface".into(),
+                message_id: "m0".into(),
+                selected_context: None,
+                mode: 1,
+                ..Default::default()
+            }],
+            interrupted_pending_tool_call_resolutions: None,
+            conversation_history: Some(ConversationHistory {
+                messages: vec![ConversationHistoryMessage {
+                    user: Some(ConversationHistoryUserMessage {
+                        content: vec![ConversationHistoryUserContent {
+                            text: Some(ConversationHistoryTextContent {
+                                text: "old turn".into(),
+                            }),
+                            image: Some(ConversationHistoryImageContent {
+                                data: "BASE64".into(),
+                                mime_type: Some("image/png".into()),
+                            }),
+                        }],
+                    }),
+                    assistant: None,
+                    tool: None,
+                }],
+                replace_user_info: Some(true),
+            }),
+        };
+        let mut bytes = Vec::new();
+        action.encode(&mut bytes).unwrap();
+        let decoded = UserMessageAction::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn user_message_official_extension_fields_round_trip() {
+        // Cursor's current agent.v1.UserMessage leaves tags 12 and 20
+        // reserved and adds synthetic-message/hook metadata at 9, 13–19,
+        // 21 and 22. Exercise every extension so a schema refresh cannot
+        // accidentally collapse bytes into the reserved slots.
+        let message = UserMessage {
+            text: "synthetic".into(),
+            message_id: "m-ext".into(),
+            selected_context: None,
+            mode: 1,
+            is_simulated_msg: Some(true),
+            best_of_n_group_id: None,
+            try_use_best_of_n_promotion: None,
+            rich_text: Some("rich".into()),
+            simulated_msg_reason: Some(17),
+            conversation_state_blob_id: vec![1, 2],
+            subagent_system_reminder: Some("reminder".into()),
+            triggering_user_info: Some(TriggeringUserInfo {
+                auth_id: Some("auth".into()),
+                user_id: Some(42),
+            }),
+            execute_plan_info: Some(ExecutePlanInfo {
+                plan_id: "plan-1".into(),
+                plan_title: "Plan".into(),
+            }),
+            simulated_message_metadata: Some(SimulatedMessageMetadata {
+                title: Some("Task".into()),
+                task_id: Some("task-1".into()),
+                fsd_finding_action: Some("apply".into()),
+                url: Some("https://example.invalid".into()),
+                subscription_source: Some(2),
+            }),
+            prompt_reference_id: Some("prompt-1".into()),
+            thread_id: Some("thread-1".into()),
+            text_blob_id: Some(vec![3, 4]),
+            rich_text_blob_id: Some(vec![5, 6]),
+            hook_additional_contexts: vec![HookAdditionalContext {
+                hook_event_name: "after_tool".into(),
+                content: "context".into(),
+            }],
+            custom_mode_intent: Some(CustomModeIntent {
+                enter: Some(SubmittedCustomMode {
+                    id: "mode-1".into(),
+                    label: "Mode".into(),
+                    source: 1,
+                    source_path: None,
+                    source_hash: None,
+                    managed_skill_id: None,
+                    plugin_id: None,
+                    plugin_snapshot_token: None,
+                }),
+                exit: None,
+            }),
+        };
+        let mut bytes = Vec::new();
+        message.encode(&mut bytes).expect("encode UserMessage");
+        let decoded = UserMessage::decode(bytes.as_slice()).expect("decode UserMessage");
+        assert_eq!(decoded, message);
+        // Reserved tags 12 (0x62) and 20 (0xa2 0x01) must not be emitted by
+        // this message; all extension tags are length-delimited except the
+        // enum varint at tag 9.
+        assert!(!bytes.contains(&0x62), "reserved tag 12 unexpectedly set");
+        assert!(!bytes.windows(2).any(|w| w == [0xa2, 0x01]));
+        assert!(bytes.contains(&0x48), "simulated_msg_reason tag 9 missing");
+        assert!(bytes.contains(&0x6a), "triggering_user_info tag 13 missing");
+        assert!(
+            bytes.contains(&0xaa),
+            "hook_additional_contexts tag 21 missing"
+        );
+        assert!(
+            bytes.windows(2).any(|w| w == [0xb2, 0x01]),
+            "custom_mode_intent tag 22 missing"
+        );
     }
 
     #[test]
@@ -2050,6 +3542,109 @@ mod tests {
                 .unwrap()
                 .tool_name,
             "Workflow"
+        );
+    }
+
+    #[test]
+    fn agent_host_metadata_progress_distinguishes_lifecycle_from_heartbeat() {
+        let ttft = AgentServerMessage {
+            ttft_breakdown: Some(TtftBreakdown::default()),
+            ..Default::default()
+        };
+        assert!(ttft.has_agent_host_metadata_progress());
+
+        let updates = [
+            InteractionUpdate {
+                user_message_appended: Some(UserMessageAppendedUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                summary: Some(SummaryUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                summary_started: Some(SummaryStartedUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                summary_completed: Some(SummaryCompletedUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                shell_output_delta: Some(ShellStream::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                step_started: Some(StepStartedUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                step_completed: Some(StepCompletedUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                prompt_suggestion: Some(PromptSuggestionUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                post_request_prompt: Some(PostRequestPromptUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                active_branch_change: Some(ActiveBranchChange::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                feedback_request: Some(FeedbackRequestUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                response_comparison: Some(ResponseComparisonUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                context_injection_state: Some(ContextInjectionStateUpdate::default()),
+                ..Default::default()
+            },
+            InteractionUpdate {
+                routed_model: Some(RoutedModelUpdate::default()),
+                ..Default::default()
+            },
+        ];
+        for update in updates {
+            assert!(update.has_agent_host_metadata_progress());
+            assert!(
+                AgentServerMessage {
+                    interaction_update: Some(update),
+                    ..Default::default()
+                }
+                .has_agent_host_metadata_progress()
+            );
+        }
+
+        let nested = InteractionUpdate {
+            routed_model: Some(RoutedModelUpdate::default()),
+            ..Default::default()
+        };
+        let parent = InteractionUpdate {
+            tool_call_delta: Some(ToolCallDeltaUpdate {
+                tool_call_delta: Some(ToolCallDelta {
+                    task_tool_call_delta: Some(TaskToolCallDelta {
+                        interaction_update: Some(Box::new(nested)),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(parent.has_agent_host_metadata_progress());
+        assert!(
+            !InteractionUpdate {
+                heartbeat: Some(InteractionHeartbeat::default()),
+                ..Default::default()
+            }
+            .has_agent_host_metadata_progress()
         );
     }
 

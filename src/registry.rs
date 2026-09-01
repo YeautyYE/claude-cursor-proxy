@@ -135,35 +135,83 @@ impl Registry {
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
+        // A model-account assignment is an explicit request to use Cursor for
+        // that model, even when the same Anthropic-style alias would normally
+        // follow the process-wide `aliasProvider` (for example `fable` with
+        // `aliasProvider: codex`).  Account routing is intentionally checked
+        // before the alias branch so the TUI's model→account binding cannot
+        // silently send the request to another provider.  Keep the known
+        // provider table below authoritative for concrete ids such as
+        // `gpt-5.5`; users can still force those through Cursor with the
+        // explicit `cursor:` prefix.
         if is_anthropic_alias(&normalized) {
-            let target = session_affinity.unwrap_or(&self.alias_provider);
-            return self.handlers.get(target.as_str()).cloned();
-        }
-        if is_cursor_model(&normalized) {
-            return self.handlers.get("cursor").cloned();
-        }
-
-        for (name, models) in &self.models {
-            if models.iter().any(|candidate| candidate == &normalized) {
-                return self.handlers.get(name).cloned();
+            // Check the full alias/resolution chain as well as a direct rule.
+            // The TUI commonly persists a concrete Fable tier (for example
+            // `claude-fable-5-thinking-max`) while Claude Code sends the
+            // public `claude-fable-5[1m]` alias.  A direct-only check would
+            // let `aliasProvider: codex` steal that request before the
+            // account-bound Cursor route had a chance to select its token.
+            let route_policy = crate::config::cursor_account_routing_policy();
+            if route_policy.account_for_model(&normalized).is_some() {
+                return self.handlers.get("cursor").cloned();
             }
         }
-
-        // An explicit model-account assignment is also an explicit Cursor
-        // routing signal.  This allows server-introduced/custom model ids to
-        // enter the Cursor provider even before this process has fetched the
-        // account's live catalog.  The exact-provider loop above remains
-        // first, so a model owned by Codex/Kimi/Grok keeps its native route.
+        // Keep the static/provider catalog authoritative when it already
+        // claims an id (for example `gpt-5.5` remains Codex even if someone
+        // adds a broad account rule).  If no provider knows the id yet,
+        // however, an explicit model→account route is itself a declaration
+        // that the id belongs to Cursor.  This is important for newly added
+        // server-side catalog ids and for the TUI's manual `a` entry: they
+        // must work before the next `GetUsableModels` refresh.
+        if let Some(provider) =
+            self.provider_for_model_without_account_routes_normalized(&normalized, session_affinity)
+        {
+            return Some(provider);
+        }
         if self.handlers.contains_key("cursor")
             && crate::config::cursor_model_account_route_matches(&normalized)
         {
             return self.handlers.get("cursor").cloned();
         }
+        None
+    }
+
+    /// Resolve a model using only the static/live provider catalog and alias
+    /// affinity. This deliberately omits `modelAccounts` so callers that are
+    /// inspecting a separate policy (such as `/v1/models` discovery tests)
+    /// can classify route keys without relying on process-global config.
+    pub(crate) fn provider_for_model_without_account_routes(
+        &self,
+        raw_model: &str,
+        session_affinity: Option<&AliasProvider>,
+    ) -> Option<Arc<dyn Provider>> {
+        let normalized = normalize_incoming_model(raw_model);
+        self.provider_for_model_without_account_routes_normalized(&normalized, session_affinity)
+    }
+
+    fn provider_for_model_without_account_routes_normalized(
+        &self,
+        normalized: &str,
+        session_affinity: Option<&AliasProvider>,
+    ) -> Option<Arc<dyn Provider>> {
+        if is_anthropic_alias(normalized) {
+            let target = session_affinity.unwrap_or(&self.alias_provider);
+            return self.handlers.get(target.as_str()).cloned();
+        }
+        if is_cursor_model(normalized) {
+            return self.handlers.get("cursor").cloned();
+        }
+
+        for (name, models) in &self.models {
+            if models.iter().any(|candidate| candidate == normalized) {
+                return self.handlers.get(name).cloned();
+            }
+        }
 
         // `/v1/models` lists live Cursor catalog ids (e.g. claude-fable-5-thinking-high[1m])
         // that are not in the static registry. Route those to Cursor only when no other
         // provider already claimed the exact id (gpt-5.5 stays Codex).
-        if self.handlers.contains_key("cursor") && is_unclaimed_cursor_catalog_id(&normalized) {
+        if self.handlers.contains_key("cursor") && is_unclaimed_cursor_catalog_id(normalized) {
             return self.handlers.get("cursor").cloned();
         }
 
@@ -182,11 +230,36 @@ impl Registry {
 }
 
 pub fn normalize_incoming_model(model: &str) -> String {
-    let suffix = "[1m]";
-    if model.len() >= suffix.len() && model.to_ascii_lowercase().ends_with(suffix) {
-        return model[..model.len() - suffix.len()].to_string();
+    // Claude Code appends a context-window marker to the model id.  The
+    // registry must remove every supported spelling before checking the
+    // provider catalog; otherwise a harmless `[2m]`/`(1M context)` suffix can
+    // make a known Codex model look like an unclaimed Cursor id.  Keep this
+    // helper deliberately narrower than `config::normalize_sand_model`: the
+    // `cursor:` prefixes are routing controls and must remain available to
+    // `is_cursor_model` below.
+    let mut normalized = model.trim().to_string();
+    for suffix in ["[1m]", "[2m]"] {
+        if normalized.len() >= suffix.len()
+            && normalized[normalized.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            normalized.truncate(normalized.len() - suffix.len());
+            normalized = normalized.trim_end().to_string();
+            break;
+        }
     }
-    model.to_string()
+    if let Some(open) = normalized.rfind('(')
+        && normalized.ends_with(')')
+    {
+        let inner = normalized[open + 1..normalized.len() - 1]
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect::<String>();
+        if inner.eq_ignore_ascii_case("1mcontext") || inner.eq_ignore_ascii_case("2mcontext") {
+            normalized.truncate(open);
+            normalized = normalized.trim_end().to_string();
+        }
+    }
+    normalized
 }
 
 pub fn is_anthropic_alias(model: &str) -> bool {
@@ -339,6 +412,34 @@ mod tests {
     fn normalize_model_trims_hint() {
         assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
         assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
+    }
+
+    #[test]
+    fn normalize_model_strips_all_context_hint_spellings_without_prefixes() {
+        for (raw, expected) in [
+            ("gpt-5.5[2m]", "gpt-5.5"),
+            ("gpt-5.5[2M]", "gpt-5.5"),
+            ("gpt-5.5 (1M context)", "gpt-5.5"),
+            ("gpt-5.5 ( 2m Context )", "gpt-5.5"),
+            (" cursor:gpt-5.5[2m] ", "cursor:gpt-5.5"),
+        ] {
+            assert_eq!(normalize_incoming_model(raw), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn context_hints_do_not_change_static_provider_selection() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in ["gpt-5.5[2m]", "gpt-5.5 (1M context)"] {
+            assert_eq!(
+                registry
+                    .provider_for_model(model, None)
+                    .expect("known Codex model")
+                    .name(),
+                "codex",
+                "context marker must not make {model} look like Cursor"
+            );
+        }
     }
 
     #[test]

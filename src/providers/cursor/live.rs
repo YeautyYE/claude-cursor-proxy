@@ -25,8 +25,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use crate::logging::create_logger;
 
 use super::client::{
-    CursorError, CursorHttpClient, build_resume_run_request, build_run_request_with_continuation,
-    continuation_binding_changed, encode_client_heartbeat_frame, retry_after_header,
+    CursorError, CursorHttpClient, build_resume_run_request_with_agent_session,
+    build_run_request_with_context_and_agent_session, continuation_binding_changed,
+    encode_client_heartbeat_frame, retry_after_header,
 };
 use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
@@ -642,7 +643,10 @@ impl SegmentReplayLog {
     /// turn yet: the live run remains resumable while Claude Code executes
     /// the exposed tool and sends its `tool_result` on the next segment.
     fn ends_with_native_tool_batch(&self) -> bool {
-        matches!(self.events.last(), Some(LiveRunEvent::NativeToolBatch(_)))
+        matches!(
+            self.events.last(),
+            Some(LiveRunEvent::NativeToolBatch(tools)) if !tools.is_empty()
+        )
     }
 
     /// Hand the recorded segment to the Succeeded tombstone. `None` when
@@ -1337,6 +1341,57 @@ impl PendingExecState {
         if !self.collecting.is_empty() && self.collect_deadline.is_none() {
             self.collect_deadline = Some(tokio::time::Instant::now());
         }
+    }
+
+    /// Remove one native execution cancelled by Cursor's Agent Host.
+    ///
+    /// `ExecServerControl.abort.id` refers to the numeric id on the original
+    /// `ExecServerMessage`, not the downstream Anthropic tool-use id.  Keep the
+    /// other parallel executions (and all ClientOnly entries) intact.  The
+    /// seen/exposed tombstones deliberately remain in place so a delayed
+    /// duplicate of the aborted server message cannot create a second tool.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn abort_native_by_id(&mut self, id: u32) -> Option<PendingCursorExec> {
+        let mut removed = None;
+        self.awaiting.retain(|exec| {
+            let is_native = !matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly);
+            let matches = is_native
+                && (exec.id == id
+                    || matches!(
+                        exec.kind,
+                        super::exec_results::CursorExecKind::PiEditContinuation { parent_id, .. }
+                            if parent_id == id
+                    ));
+            if matches {
+                removed.get_or_insert_with(|| exec.clone());
+            }
+            !matches
+        });
+        self.collecting.retain(|exec| {
+            let is_native = !matches!(exec.kind, super::exec_results::CursorExecKind::ClientOnly);
+            let matches = is_native
+                && (exec.id == id
+                    || matches!(
+                        exec.kind,
+                        super::exec_results::CursorExecKind::PiEditContinuation { parent_id, .. }
+                            if parent_id == id
+                    ));
+            if matches {
+                removed.get_or_insert_with(|| exec.clone());
+            }
+            !matches
+        });
+
+        if self.awaiting.is_empty() && removed.is_some() {
+            self.awaiting_since = None;
+        }
+        if self.collecting.is_empty() {
+            self.collecting_since = None;
+            self.collect_deadline = None;
+        } else if self.collect_deadline.is_none() {
+            self.collect_deadline = Some(tokio::time::Instant::now());
+        }
+        removed
     }
 
     fn awaiting(&self) -> &[PendingCursorExec] {
@@ -3667,18 +3722,52 @@ async fn race_initial_live_operation<T>(
     }
 }
 
+/// Resolve the live BiDi toggle without reading process state. Keeping this
+/// as a pure helper makes the transport rule testable and documents the
+/// precedence: an explicit `CCP_CURSOR_BIDI` value applies to ordinary
+/// identities, while HTTPS Sand always remains on BiDi.
+#[inline]
+fn live_bidi_enabled_for_base_url(base_url: &str, configured: Option<&str>) -> bool {
+    match configured
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => !base_url.starts_with("http://"),
+    }
+}
+
+#[inline]
+fn live_bidi_enabled_for_client_type(
+    base_url: &str,
+    configured: Option<&str>,
+    client_type: &str,
+) -> bool {
+    if client_type_requires_h2(client_type) && !base_url.starts_with("http://") {
+        return true;
+    }
+    live_bidi_enabled_for_base_url(base_url, configured)
+}
+
 impl CursorHttpClient {
     pub fn live_bidi_enabled(&self) -> bool {
-        match std::env::var("CCP_CURSOR_BIDI")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => !self.base_url.starts_with("http://"),
-        }
+        let configured = std::env::var("CCP_CURSOR_BIDI").ok();
+        live_bidi_enabled_for_base_url(&self.base_url, configured.as_deref())
+    }
+
+    /// Return whether this request may use the live transport for a specific
+    /// Cursor identity.  Sand has no usable RunSSE fallback: Cursor rejects
+    /// `x-cursor-client-type: sand` on that endpoint.  Therefore an explicit
+    /// process-wide `CCP_CURSOR_BIDI=0` (which remains useful for CLI/IDE
+    /// troubleshooting) must not silently downgrade a HTTPS Sand request to
+    /// the buffered HTTP/1 path.  Cleartext loopback fixtures retain their
+    /// unary behavior so local tests do not deadlock on an open body stream.
+    pub(crate) fn live_bidi_enabled_for_client_type(&self, client_type: &str) -> bool {
+        let configured = std::env::var("CCP_CURSOR_BIDI").ok();
+        live_bidi_enabled_for_client_type(&self.base_url, configured.as_deref(), client_type)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3879,7 +3968,14 @@ impl CursorHttpClient {
         compaction_mode: bool,
         recovery: LiveStartRecovery<'_>,
     ) -> Result<LiveRunStart, CursorError> {
-        if !self.live_bidi_enabled() {
+        let requested_client_type = canonicalize_client_type(
+            client_type_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::config::cursor_client_type_for_model(model)),
+        );
+        if !self.live_bidi_enabled_for_client_type(&requested_client_type) {
             return Err(CursorError::internal(
                 "Cursor live agent is disabled for this transport",
             ));
@@ -3896,52 +3992,79 @@ impl CursorHttpClient {
             }
         };
 
+        // Reuse the identity captured for the eligibility check.  The public
+        // convenience wrappers pass `None` for the override; rebuilding from
+        // process config here would otherwise turn a model-selected Sand run
+        // back into `cli` after we had already forced it onto H2.
         let cursor_identity =
-            LiveIdentityHeaders::build_with_client_type(token, client_type_override);
+            LiveIdentityHeaders::build_with_client_type(token, Some(&requested_client_type));
         let mut h2_probe_guard = None;
         let mut process_h2_epoch = process_h2_circuit_epoch();
-        let (http, force_http1) = match live_open_circuit_route() {
-            H2CircuitRoute::Http2(epoch) => {
-                process_h2_epoch = epoch;
-                (
-                    if self.prefers_http1() {
-                        CursorHttpClient::with_prefer_http1(false)
-                    } else {
-                        self.clone()
-                    },
-                    false,
-                )
-            }
-            H2CircuitRoute::Http1 => (
-                if self.prefers_http1() {
-                    self.clone()
-                } else {
-                    CursorHttpClient::with_prefer_http1(true)
-                },
-                true,
-            ),
-            H2CircuitRoute::ProbeHttp2 { probe_id, epoch } => {
-                process_h2_epoch = epoch;
-                let h2 = CursorHttpClient::with_prefer_http1(false);
-                let guard = ProcessH2ProbeGuard::new(probe_id);
-                let h2_ok = race_initial_live_operation(cancel.as_mut(), None, async {
-                    Ok(h2.probe_h2_transport(token, &cursor_identity).await)
-                })
-                .await?;
-                let still_owner = guard.transport_result(h2_ok);
-                if h2_ok && still_owner {
-                    h2_probe_guard = Some(guard);
-                    (h2, false)
-                } else {
-                    (CursorHttpClient::with_prefer_http1(true), true)
+        // Cursor's Sand identity is accepted by the BiDi AgentService/Run
+        // endpoint, but the HTTP/1 RunSSE method explicitly rejects it with
+        // "Sand traffic is not supported on this endpoint".  The process H2
+        // circuit is intentionally shared by CLI/IDE traffic and may be open
+        // after an unrelated Gemini/Grok reset; never let that global state
+        // route a Sand run to RunSSE.  Likewise, an operator-wide
+        // CCP_CURSOR_HTTP1 setting cannot be used for Sand.
+        let (http, force_http1) =
+            match live_open_circuit_route_for_client(&cursor_identity.client_type) {
+                H2CircuitRoute::Http2(epoch) => {
+                    process_h2_epoch = epoch;
+                    (
+                        if client_type_requires_h2(&cursor_identity.client_type) {
+                            self.with_sand_transport_mode()
+                        } else if self.prefers_http1() {
+                            self.with_transport_mode(false)
+                        } else {
+                            self.clone()
+                        },
+                        false,
+                    )
                 }
-            }
-        };
+                H2CircuitRoute::Http1 => (
+                    if self.prefers_http1() {
+                        self.clone()
+                    } else {
+                        self.with_transport_mode(true)
+                    },
+                    true,
+                ),
+                H2CircuitRoute::ProbeHttp2 { probe_id, epoch } => {
+                    process_h2_epoch = epoch;
+                    let h2 = if client_type_requires_h2(&cursor_identity.client_type) {
+                        self.with_sand_transport_mode()
+                    } else {
+                        self.with_transport_mode(false)
+                    };
+                    let guard = ProcessH2ProbeGuard::new(probe_id);
+                    let h2_ok = race_initial_live_operation(cancel.as_mut(), None, async {
+                        Ok(h2.probe_h2_transport(token, &cursor_identity).await)
+                    })
+                    .await?;
+                    let still_owner = guard.transport_result(h2_ok);
+                    if h2_ok && still_owner {
+                        h2_probe_guard = Some(guard);
+                        (h2, false)
+                    } else if client_type_requires_h2(&cursor_identity.client_type) {
+                        // Sand has no valid RunSSE fallback.  A failed
+                        // side-effect-free probe must not turn the actual Run
+                        // into HTTP/1; retry it with a fresh strict H2 client.
+                        (self.with_sand_transport_mode(), false)
+                    } else {
+                        (self.with_transport_mode(true), true)
+                    }
+                }
+            };
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
         let request_id = uuid::Uuid::new_v4().to_string();
         let original_request_id = original_request_id.unwrap_or(&request_id).to_string();
         let worker_session = live_run_key_for(identity);
+        // The desktop RunRequest carries a logical run id independently from
+        // its transport request id.  Allocate it before the first open and
+        // retain it through every ResumeAction reconnect.
+        let run_id = uuid::Uuid::new_v4().to_string();
         let continuation = super::conversation::continuation_for(Some(&worker_session));
         let conversation_id = continuation
             .conversation_id
@@ -3998,7 +4121,7 @@ impl CursorHttpClient {
                 ])),
             );
         }
-        let run_request = build_run_request_with_continuation(
+        let run_request = build_run_request_with_context_and_agent_session(
             opening_prompt,
             &resolved,
             opening_images,
@@ -4006,14 +4129,19 @@ impl CursorHttpClient {
             custom_system_prompt,
             &continuation,
             mcp_tools.clone(),
+            Some(&request_context),
+            Some(&worker_session),
+            Some(&run_id),
         );
         let first_message = AgentClientMessage {
             run_request: Some(run_request),
             exec_client_message: None,
             kv_client_message: None,
+            conversation_action: None,
             exec_client_control_message: None,
             interaction_response: None,
             client_heartbeat: None,
+            prewarm_request: None,
         };
         let open = http.open_live_transport(
             token,
@@ -4035,7 +4163,13 @@ impl CursorHttpClient {
             Ok(pair) => pair,
             Err(err) => return Err(annotate_live_cursor_error(&worker_session, err)),
         };
-        let force_http1 = matches!(outbound, ClientOutbound::Http1(_));
+        // Keep the transport invariant even if a future opener or test
+        // double returns an HTTP/1 outbound for a Sand identity.  Sand's
+        // RunSSE endpoint rejects that identity, and allowing the state bit
+        // to propagate would make subsequent ResumeAction/tool appends use
+        // the wrong transport.
+        let force_http1 = !client_type_requires_h2(&cursor_identity.client_type)
+            && matches!(outbound, ClientOutbound::Http1(_));
 
         // Larger fan-out so token deltas don't block the BiDi read loop under
         // Claude Code backpressure (coalescing in live_sse_response).
@@ -4046,7 +4180,6 @@ impl CursorHttpClient {
         let completed = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let resume_in_flight = Arc::clone(&generation_permit.resume_in_flight);
-        let run_id = uuid::Uuid::new_v4().to_string();
         let handle = Arc::new(CursorLiveRunHandle {
             run_id: run_id.clone(),
             command_tx,
@@ -4067,6 +4200,7 @@ impl CursorHttpClient {
             token: token.to_string(),
             identity: cursor_identity,
             original_request_id,
+            run_id: run_id.clone(),
             session_id: worker_session.clone(),
             model_id: resolved.model_id.clone(),
             conversation_id: continuation.conversation_id.clone(),
@@ -4133,6 +4267,28 @@ impl CursorHttpClient {
         h2_timeout: Duration,
         h1_timeout: Duration,
     ) -> Result<(ClientOutbound, reqwest::Response), CursorError> {
+        // RunSSE is a CLI/IDE compatibility endpoint.  Cursor rejects the
+        // Sand identity there before it evaluates the request body, so keep a
+        // Sand run on the HTTP/2 BiDi AgentService/Run path even when the
+        // process circuit or a caller requested HTTP/1 globally.
+        let sand_h2_only = client_type_requires_h2(&identity.client_type);
+        let requested_force_http1 = force_http1;
+        let force_http1 = force_http1 && !sand_h2_only;
+        let allow_h1_fallback = allow_h1_fallback && !sand_h2_only;
+        if sand_h2_only && requested_force_http1 {
+            // Log only when a caller actually selected H1. Normal Sand opens
+            // already arrive with `force_http1=false` and need no diagnostic.
+            crate::logging::create_logger("cursor").warn(
+                "sand_h2_only_transport",
+                Some(serde_json::Map::from_iter([
+                    ("reason".into(), serde_json::json!("runsse_unsupported")),
+                    (
+                        "clientType".into(),
+                        serde_json::json!(&identity.client_type),
+                    ),
+                ])),
+            );
+        }
         if force_http1 {
             let h1_result = with_live_open_timeout(
                 h1_timeout,
@@ -4160,7 +4316,7 @@ impl CursorHttpClient {
                             serde_json::json!(h1_error.client_message()),
                         )])),
                     );
-                    let h2 = CursorHttpClient::with_prefer_http1(false);
+                    let h2 = self.with_transport_mode(false);
                     let probe_request_id = uuid::Uuid::new_v4().to_string();
                     match with_live_open_timeout(
                         h2_timeout,
@@ -4175,14 +4331,23 @@ impl CursorHttpClient {
                     .await
                     {
                         Ok(pair) => {
-                            note_process_h2_open_success(h2_probe_id);
+                            note_process_h2_open_success_for_client(
+                                &identity.client_type,
+                                h2_probe_id,
+                            );
                             Ok(pair)
                         }
                         Err(h2_error) => {
                             if is_ambiguous_live_open_timeout(&h2_error) {
-                                note_process_h2_open_timeout(process_h2_epoch);
+                                note_process_h2_open_timeout_for_client(
+                                    &identity.client_type,
+                                    process_h2_epoch,
+                                );
                             } else {
-                                note_process_h2_probe_run_failure(h2_probe_id);
+                                note_process_h2_probe_run_failure_for_client(
+                                    &identity.client_type,
+                                    h2_probe_id,
+                                );
                             }
                             Err(h2_half_open_error(h1_error, h2_error))
                         }
@@ -4192,10 +4357,30 @@ impl CursorHttpClient {
             };
         }
 
+        // A caller can hand us an HTTP/1-pinned client even when the route
+        // decision says H2 (notably Sand under `CCP_CURSOR_HTTP1=1`).  Merely
+        // clearing `force_http1` would still post `/Run` with reqwest's H1
+        // client, so materialize a real H2 client while preserving endpoint
+        // and timeout.  Reuse an existing H2 client to retain its connection
+        // pool on the common path.  Build it only after the explicit H1 path
+        // returns so ordinary CLI/IDE H1 requests do not allocate an unused
+        // second reqwest pool.
+        let h2_client = if sand_h2_only {
+            if self.prefers_http2_only() {
+                self.clone()
+            } else {
+                self.with_sand_transport_mode()
+            }
+        } else if self.prefers_http1() {
+            self.with_transport_mode(false)
+        } else {
+            self.clone()
+        };
+
         let started = Instant::now();
         match with_live_open_timeout(
             h2_timeout,
-            self.open_h2_bidi_run(
+            h2_client.open_h2_bidi_run(
                 token,
                 request_id,
                 original_request_id,
@@ -4206,14 +4391,20 @@ impl CursorHttpClient {
         .await
         {
             Ok(pair) => {
-                note_process_h2_open_success(h2_probe_id);
+                note_process_h2_open_success_for_client(&identity.client_type, h2_probe_id);
                 Ok(pair)
             }
             Err(err) if allow_h1_fallback && live_open_should_retry_http1(&err) => {
                 if is_ambiguous_live_open_timeout(&err) {
-                    note_process_h2_open_timeout(process_h2_epoch);
+                    note_process_h2_open_timeout_for_client(
+                        &identity.client_type,
+                        process_h2_epoch,
+                    );
                 } else {
-                    note_process_h2_probe_run_failure(h2_probe_id);
+                    note_process_h2_probe_run_failure_for_client(
+                        &identity.client_type,
+                        h2_probe_id,
+                    );
                 }
                 let wait = if is_ambiguous_live_open_timeout(&err) {
                     h1_timeout
@@ -4229,7 +4420,7 @@ impl CursorHttpClient {
                         err.status
                     );
                 }
-                let h1 = CursorHttpClient::with_prefer_http1(true);
+                let h1 = self.with_transport_mode(true);
                 let fallback_request_id = uuid::Uuid::new_v4().to_string();
                 match with_live_open_timeout(
                     wait,
@@ -4250,11 +4441,17 @@ impl CursorHttpClient {
             }
             Err(err) => {
                 if is_ambiguous_live_open_timeout(&err) {
-                    note_process_h2_open_timeout(process_h2_epoch);
+                    note_process_h2_open_timeout_for_client(
+                        &identity.client_type,
+                        process_h2_epoch,
+                    );
                 } else if h2_probe_run_error_is_transport_failure(&err) {
-                    note_process_h2_probe_run_failure(h2_probe_id);
+                    note_process_h2_probe_run_failure_for_client(
+                        &identity.client_type,
+                        h2_probe_id,
+                    );
                 } else {
-                    note_process_h2_open_success(h2_probe_id);
+                    note_process_h2_open_success_for_client(&identity.client_type, h2_probe_id);
                 }
                 Err(err)
             }
@@ -4269,6 +4466,18 @@ impl CursorHttpClient {
         first_message: &AgentClientMessage,
         identity: &LiveIdentityHeaders,
     ) -> Result<(ClientOutbound, reqwest::Response), CursorError> {
+        // Defensive backstop for future callers: Sand traffic is accepted by
+        // Cursor only on the HTTP/2 AgentService/Run endpoint.  Returning
+        // before constructing/sending the request prevents an accidental
+        // RunSSE call from creating a deterministic 400 (or entering a
+        // retry loop) if a route selector is ever bypassed.
+        if client_type_requires_h2(&identity.client_type) {
+            return Err(CursorError::new(
+                400,
+                "Cursor RunSSE does not support Sand traffic",
+                None,
+            ));
+        }
         let run_url = format!(
             "{}/agent.v1.AgentService/RunSSE",
             self.base_url.trim_end_matches('/')
@@ -4299,7 +4508,14 @@ impl CursorHttpClient {
         }
         if identity.ide_profile {
             request = request
-                .header("x-new-onboarding-completed", "true")
+                .header(
+                    "x-new-onboarding-completed",
+                    if crate::config::cursor_new_onboarding_completed() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
                 .header("x-amzn-trace-id", format!("Root={request_id}"));
         }
         let response = request
@@ -4389,13 +4605,26 @@ impl CursorHttpClient {
             .header("x-request-id", request_id)
             .header("x-original-request-id", original_request_id);
 
-        if identity.ide_profile {
+        if identity.ide_profile || client_type_requires_h2(&identity.client_type) {
             request = request
                 .header("x-cursor-client-device-type", "desktop")
                 .header("x-cursor-client-os", crate::config::cursor_client_os())
                 .header("x-cursor-client-arch", crate::config::cursor_client_arch())
-                .header("x-new-onboarding-completed", "true")
+                .header(
+                    "x-new-onboarding-completed",
+                    if crate::config::cursor_new_onboarding_completed() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
                 .header("x-amzn-trace-id", format!("Root={request_id}"));
+            if let Some(os_version) = crate::config::cursor_client_os_version() {
+                request = request.header("x-cursor-client-os-version", os_version);
+            }
+            if let Some(layout) = crate::config::cursor_client_layout() {
+                request = request.header("x-cursor-client-layout", layout);
+            }
             if let Some(commit) = crate::config::cursor_client_commit() {
                 request = request.header("x-cursor-client-commit", commit);
             }
@@ -4408,6 +4637,15 @@ impl CursorHttpClient {
             if let Some(sid) = crate::config::cursor_session_id() {
                 request = request.header("x-session-id", sid);
             }
+        }
+        if crate::config::cursor_local_client_mode(&identity.client_type) {
+            request = request.header("local-client-mode", "true");
+        }
+        if crate::config::cursor_canary() {
+            request = request.header("x-cursor-canary", "true");
+        }
+        if let Some(version) = crate::config::cursor_config_version() {
+            request = request.header("x-cursor-config-version", version);
         }
         if let Some(cs) = identity
             .headers
@@ -4424,6 +4662,24 @@ impl CursorHttpClient {
         heartbeat_task.abort();
         let response = send_result.map_err(|e| CursorError::from_reqwest(e, self.timeout_secs))?;
         let status = response.status().as_u16();
+        // `Http2Only` normally makes this impossible, but an intermediary can
+        // still terminate TLS and answer with an HTTP/1 response.  Do not
+        // treat that response as an accepted Sand Run: the Sand identity is
+        // valid only on the HTTP/2 AgentService/Run endpoint.  Returning a
+        // capability-style error also keeps diagnostics distinct from model
+        // or quota failures and prevents a later reconnect from entering
+        // RunSSE.
+        if client_type_requires_h2(&identity.client_type)
+            && response.version() != reqwest::Version::HTTP_2
+        {
+            let version = format!("{:?}", response.version());
+            drop(response);
+            return Err(CursorError::new(
+                421,
+                "HTTP_1_1_REQUIRED: Cursor Sand requires HTTP/2 AgentService/Run",
+                Some(version),
+            ));
+        }
         if status >= 400 {
             let retry_after = retry_after_header(response.headers());
             let detail = response.text().await.ok();
@@ -4459,14 +4715,7 @@ impl CursorHttpClient {
             .header("x-original-request-id", &request_id)
             .body("{}");
         for (name, value) in &identity.headers {
-            if name.starts_with("x-cursor-client-device")
-                || name.starts_with("x-cursor-client-os")
-                || name.starts_with("x-cursor-client-arch")
-                || name == "x-new-onboarding-completed"
-                || name == "x-cursor-timezone"
-                || name == "x-client-key"
-                || name == "x-session-id"
-            {
+            if live_probe_copies_identity_header(name) {
                 request = request.header(name, value);
             }
         }
@@ -4482,6 +4731,28 @@ fn h2_probe_response_is_viable(version: reqwest::Version, status: reqwest::Statu
     version == reqwest::Version::HTTP_2 && !matches!(status.as_u16(), 421 | 464)
 }
 
+/// The side-effect-free H2 probe must carry the same desktop identity that a
+/// Sand Run uses. A missing checksum can make a healthy managed-local route
+/// look unavailable, which would unnecessarily keep Sand in its retry path.
+fn live_probe_copies_identity_header(name: &str) -> bool {
+    name.starts_with("x-cursor-client-device")
+        || name.starts_with("x-cursor-client-os")
+        || name.starts_with("x-cursor-client-arch")
+        || matches!(
+            name,
+            "x-new-onboarding-completed"
+                | "x-cursor-client-layout"
+                | "x-cursor-client-os-version"
+                | "local-client-mode"
+                | "x-cursor-canary"
+                | "x-cursor-config-version"
+                | "x-cursor-timezone"
+                | "x-client-key"
+                | "x-session-id"
+                | "x-cursor-checksum"
+        )
+}
+
 struct LiveIdentityHeaders {
     client_type: String,
     client_version: String,
@@ -4492,23 +4763,37 @@ struct LiveIdentityHeaders {
 
 impl LiveIdentityHeaders {
     fn build_with_client_type(token: &str, client_type_override: Option<&str>) -> Self {
-        let client_version = crate::config::cursor_client_version();
         let client_type = client_type_override
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or_else(crate::config::cursor_client_type);
-        let ghost_mode = crate::config::cursor_ghost_mode().to_string();
+        let client_type = canonicalize_client_type(client_type);
+        let client_version = crate::config::cursor_client_version_for_type(&client_type);
         let profile = crate::config::cursor_client_profile();
         let ide_profile = profile.eq_ignore_ascii_case("ide");
+        let sand_profile = client_type_requires_h2(&client_type);
+        let ghost_mode = if ide_profile || sand_profile {
+            crate::config::cursor_ghost_mode_header()
+        } else {
+            crate::config::cursor_ghost_mode().to_string()
+        };
 
         let mut headers: Vec<(String, String)> = vec![
             ("x-cursor-client-type".into(), client_type.clone()),
             ("x-cursor-client-version".into(), client_version.clone()),
             ("x-ghost-mode".into(), ghost_mode.clone()),
         ];
-        if ide_profile {
+        if ide_profile || sand_profile {
             headers.push(("x-cursor-client-device-type".into(), "desktop".into()));
+            headers.push((
+                "x-new-onboarding-completed".into(),
+                if crate::config::cursor_new_onboarding_completed() {
+                    "true".into()
+                } else {
+                    "false".into()
+                },
+            ));
             headers.push((
                 "x-cursor-client-os".into(),
                 crate::config::cursor_client_os(),
@@ -4517,11 +4802,41 @@ impl LiveIdentityHeaders {
                 "x-cursor-client-arch".into(),
                 crate::config::cursor_client_arch(),
             ));
+            if let Some(os_version) = crate::config::cursor_client_os_version() {
+                headers.push(("x-cursor-client-os-version".into(), os_version));
+            }
+            if let Some(layout) = crate::config::cursor_client_layout() {
+                headers.push(("x-cursor-client-layout".into(), layout));
+            }
+            if let Some(commit) = crate::config::cursor_client_commit() {
+                headers.push(("x-cursor-client-commit".into(), commit));
+            }
+            if let Some(tz) = crate::config::cursor_timezone() {
+                headers.push(("x-cursor-timezone".into(), tz));
+            }
+            if let Some(key) = crate::config::cursor_client_key() {
+                headers.push(("x-client-key".into(), key));
+            }
+            if let Some(sid) = crate::config::cursor_session_id() {
+                headers.push(("x-session-id".into(), sid));
+            }
+        }
+        if crate::config::cursor_local_client_mode(&client_type) {
+            headers.push(("local-client-mode".into(), "true".into()));
+        }
+        if crate::config::cursor_canary() {
+            headers.push(("x-cursor-canary".into(), "true".into()));
+        }
+        if let Some(version) = crate::config::cursor_config_version() {
+            headers.push(("x-cursor-config-version".into(), version));
         }
 
         let checksum_mode = std::env::var("CCP_CURSOR_CHECKSUM_MODE").unwrap_or_else(|_| {
-            if ide_profile {
-                "token".into()
+            if ide_profile || sand_profile {
+                // Cursor Desktop's common-header helper uses a stable machine
+                // identity.  The storage-or-token helper falls back cleanly
+                // for headless installations.
+                "storage".into()
             } else {
                 "none".into()
             }
@@ -4531,13 +4846,9 @@ impl LiveIdentityHeaders {
             "none" | "off" | "0"
         ) {
             if checksum_mode.eq_ignore_ascii_case("storage") {
-                let ids = super::identity::load_cursor_machine_ids();
-                ids.machine_id.as_ref().map(|machine_id| {
-                    super::identity::build_cursor_checksum(
-                        machine_id,
-                        ids.mac_machine_id.as_deref(),
-                    )
-                })
+                Some(super::identity::build_cursor_checksum_for_storage_or_token(
+                    token,
+                ))
             } else {
                 Some(super::identity::build_cursor_checksum_for_token(token))
             }
@@ -4612,6 +4923,9 @@ struct LiveReconnectContext {
     token: String,
     identity: LiveIdentityHeaders,
     original_request_id: String,
+    /// Cursor AgentRunRequest tag 25.  It is assigned once at the initial
+    /// open and must remain stable while a reconnect resumes that same run.
+    run_id: String,
     session_id: String,
     model_id: String,
     conversation_id: Option<String>,
@@ -4756,6 +5070,13 @@ fn connect_frame_has_top_level_eos(frame: &ConnectFrame) -> bool {
 }
 
 fn server_message_resets_reconnect_budget(message: &proto::AgentServerMessage) -> bool {
+    // TTFT and current Agent Host lifecycle records are server-side progress
+    // even though they must not be exposed as text/tools downstream. A Sand
+    // stream can emit one of these before its first visible delta; treating
+    // that as a hollow reconnect makes the retry budget collapse early.
+    if message.has_agent_host_metadata_progress() {
+        return true;
+    }
     if let Some(exec) = message.exec_server_message.as_ref() {
         return exec.request_context_args.is_none();
     }
@@ -4776,6 +5097,7 @@ fn heartbeat_only_interaction(update: &InteractionUpdate) -> bool {
         && update.token_delta.is_none()
         && update.turn_ended.is_none()
         && update.tool_call_delta.is_none()
+        && !update.has_agent_host_metadata_progress()
 }
 
 fn interaction_has_model_progress(update: &InteractionUpdate) -> bool {
@@ -5884,6 +6206,34 @@ fn note_process_h2_open_success(probe_id: Option<u64>) -> bool {
     closed
 }
 
+/// Sand has an H2-only endpoint and must not participate in the process-wide
+/// CLI/IDE transport breaker.  A transient Sand model/route failure should
+/// neither force unrelated requests onto RunSSE nor close a half-open probe
+/// owned by another client type.
+#[inline]
+fn note_process_h2_open_success_for_client(client_type: &str, probe_id: Option<u64>) -> bool {
+    if !client_type_uses_process_h2_breaker(client_type) {
+        return false;
+    }
+    note_process_h2_open_success(probe_id)
+}
+
+#[inline]
+fn note_process_h2_open_timeout_for_client(client_type: &str, epoch: u64) {
+    if !client_type_uses_process_h2_breaker(client_type) {
+        return;
+    }
+    note_process_h2_open_timeout(epoch);
+}
+
+#[inline]
+fn note_process_h2_probe_run_failure_for_client(client_type: &str, probe_id: Option<u64>) {
+    if !client_type_uses_process_h2_breaker(client_type) {
+        return;
+    }
+    note_process_h2_probe_run_failure(probe_id);
+}
+
 fn note_process_h2_stream_reset(epoch: Option<u64>) {
     let Some(epoch) = epoch else {
         return;
@@ -5960,6 +6310,14 @@ fn record_transport_success(reconnect: &mut LiveReconnectContext) {
 }
 
 fn apply_transport_breakers(reconnect: &mut LiveReconnectContext, now: Instant) {
+    // Sand traffic is only supported by Cursor's HTTP/2 BiDi endpoint.  The
+    // process-wide breaker is shared with CLI/IDE traffic, so an H2 failure on
+    // another request must never route this run through RunSSE.
+    if client_type_requires_h2(&reconnect.identity.client_type) {
+        reconnect.force_http1 = false;
+        reconnect.http1_rejected = false;
+        return;
+    }
     if reconnect.http1_rejected {
         reconnect.force_http1 = false;
         return;
@@ -6056,6 +6414,63 @@ fn hollow_resume_can_rotate(saw_text: bool, pending_empty: bool) -> bool {
     // Thinking deltas set `useful` but are discarded when grok-build retries
     // the HTTP request. Duplicate danger is client-visible text or exposed tools.
     !saw_text && pending_empty
+}
+
+/// Decide whether a generation/lifetime timeout can be handed to the bounded
+/// fresh-conversation retry lane without risking a duplicate client action.
+///
+/// A timeout after text, an exposed native tool, or an uncommitted turn
+/// boundary has crossed the Anthropic acceptance boundary and remains
+/// fail-closed.  A post-tool continuation is the one exception: its request
+/// history already contains the completed `tool_result`, so replaying that
+/// history on a fresh Cursor conversation does not execute the tool again.
+#[inline]
+fn hard_timeout_can_rotate_without_duplicate(
+    saw_text: bool,
+    pending_empty: bool,
+    held_turn_end: bool,
+    accepted_resume_unconfirmed: bool,
+    tool_results_sent_unconfirmed: bool,
+    post_tool_continuation: bool,
+) -> bool {
+    if held_turn_end || saw_text || !pending_empty {
+        return false;
+    }
+    post_tool_continuation || (!accepted_resume_unconfirmed && !tool_results_sent_unconfirmed)
+}
+
+/// Decide whether a generation hard/lifetime timeout can be closed locally
+/// after the model has already emitted client-visible text.
+///
+/// Grok 4.x occasionally sends the final text delta and then keeps the
+/// Connect body alive with heartbeats/reconnects without ever producing the
+/// optional `turn_ended`/`FLAG_END` pair.  Treating that state as an
+/// acceptance ambiguity leaves a 409 tombstone behind; the next Claude Code
+/// retry then observes the stale Run forever.  Once text is present and no
+/// native tool or unconfirmed tool-result boundary exists, emitting a local
+/// End is the only deterministic terminal representation and is safe to
+/// replay from `SegmentReplayLog`.
+///
+/// Keep fail-closed behavior for every state in which replaying/closing could
+/// duplicate a client action: pending tools, held turn boundaries, or an
+/// accepted-but-unconfirmed ResumeAction/tool-result batch.  UI-only logical
+/// markers are included in the predicate because they can still resolve to a
+/// native tool when the final XML flush runs.
+#[inline]
+fn hard_timeout_can_synthesize_terminal(
+    saw_text: bool,
+    pending_empty: bool,
+    held_turn_end: bool,
+    accepted_resume_unconfirmed: bool,
+    tool_results_sent_unconfirmed: bool,
+    logical_tools_empty: bool,
+) -> bool {
+    saw_text
+        && pending_empty
+        && !held_turn_end
+        && !accepted_resume_unconfirmed
+        && !tool_results_sent_unconfirmed
+        && logical_tools_empty
 }
 
 fn live_cancel_is_ambiguous(
@@ -6390,6 +6805,61 @@ fn live_reconnect_on_open_error(
     LiveReconnectTransportAction::KeepTrying
 }
 
+/// Cursor accepts the `sand` identity only on the HTTP/2 BiDi
+/// `AgentService/Run` endpoint.  `RunSSE` (the HTTP/1 fallback) responds with
+/// a deterministic 400 for Sand before processing the request body.
+#[inline]
+fn client_type_requires_h2(client_type: &str) -> bool {
+    client_type.trim().eq_ignore_ascii_case("sand")
+}
+
+/// Cursor expects the Sand client identity in lowercase on the wire. Preserve
+/// all non-Sand overrides exactly as supplied while making explicit `SAND`
+/// values consistent with route selection and request headers.
+#[inline]
+fn canonicalize_client_type(client_type: String) -> String {
+    if client_type_requires_h2(&client_type) {
+        "sand".to_string()
+    } else {
+        client_type
+    }
+}
+
+#[inline]
+fn client_type_uses_process_h2_breaker(client_type: &str) -> bool {
+    !client_type_requires_h2(client_type)
+}
+
+/// Select a transport route without allowing the process-wide CLI/IDE H2
+/// breaker to force Sand onto RunSSE.  The epoch is retained for diagnostics;
+/// Sand still uses a fresh H2 client when the circuit is open.
+fn live_open_circuit_route_for_client(client_type: &str) -> H2CircuitRoute {
+    if client_type_requires_h2(client_type) {
+        H2CircuitRoute::Http2(process_h2_circuit_epoch())
+    } else {
+        live_open_circuit_route()
+    }
+}
+
+/// A transport error can normally request an H1 fallback.  For Sand that
+/// transition is invalid and would produce an avoidable 400 loop, so keep the
+/// reconnect state on H2 and let its bounded retry policy decide when to stop.
+fn live_reconnect_on_open_error_for_client(
+    force_http1: bool,
+    http1_rejected: bool,
+    err: &CursorError,
+    client_type: &str,
+) -> LiveReconnectTransportAction {
+    let action = live_reconnect_on_open_error(force_http1, http1_rejected, err);
+    if client_type_requires_h2(client_type)
+        && matches!(action, LiveReconnectTransportAction::ForceHttp1)
+    {
+        LiveReconnectTransportAction::KeepTrying
+    } else {
+        action
+    }
+}
+
 fn live_reconnect_on_hollow_body(
     _force_http1: bool,
     _http1_rejected: bool,
@@ -6641,12 +7111,33 @@ pub(crate) fn live_start_error_seals_tombstone(err: &CursorError) -> bool {
 }
 
 pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
+    // A recovery helper appends `CONVERSATION_RESET_RETRY_NOTE` only after it
+    // has proved that the current segment carried no client-visible text or
+    // tools.  Likewise, a KV blob-store diagnostic without an explicit
+    // acceptance/partial-send marker is deterministically rejected before the
+    // operation can be replayed.  Transport wrappers may still retain the
+    // words "completion is ambiguous" from the failed ResumeAction; the
+    // explicit fresh-history marker must take precedence or the registry will
+    // create an Ambiguous tombstone and every same-turn retry will get 409.
+    if terminal_error_allows_fresh_retry(message) {
+        return false;
+    }
     // NOTE: a policy 429 nested inside stall/reconnect wrapper text does NOT
     // suppress ambiguity. The wrapper means an accepted Run stalled and the
     // *reconnect* was rejected — the original Run's state is unknown, so
     // fail-closed sealing is required to prevent duplicate execution. Plain
     // policy 429s contain none of these markers and never match.
     let lower = message.to_ascii_lowercase();
+    // These two bounded local waits explicitly report that the upstream
+    // operation was *not* accepted yet.  Treating their generic "timed out"
+    // wording as an acceptance ambiguity would seal a 409 tombstone and make
+    // the caller's retry wave unrecoverable.
+    if lower.contains("before driver acceptance")
+        || (lower.contains("request stream send timed out")
+            && !lower.contains("acceptance is ambiguous"))
+    {
+        return false;
+    }
     if crate::retry::is_idle_no_progress(message)
         && (lower.contains("connect failed")
             || lower.contains("error sending request for url")
@@ -6664,10 +7155,33 @@ pub(crate) fn terminal_error_is_ambiguous_accept(message: &str) -> bool {
         || lower.contains("ended before the first byte")
 }
 
+/// A hollow ResumeAction wrapper means Cursor accepted the generation but
+/// reconnecting it failed before a `turn_ended` marker was observed.  A KV
+/// 413 nested inside that wrapper is still replay-safe for the *owning* late
+/// recovery path (which has already proved that no client-visible output was
+/// committed), but a generic POST probing the slot must remain fail-closed:
+/// it cannot distinguish an in-flight accepted generation from the rejected
+/// SetBlob.  Keep this context bit separate from
+/// [`live_error_is_kv_blob_overflow_replayable`], whose plain/direct KV form
+/// intentionally releases the slot to avoid a 409 retry storm.
+fn kv_overflow_hollow_wrapper_is_ambiguous(message: &str) -> bool {
+    if !live_error_is_kv_blob_overflow(message) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("upstream ended without turn_ended")
+        && (lower.contains("completion is ambiguous") || lower.contains("acceptance is ambiguous"))
+}
+
 /// Probe `TerminalError` that must 502 the current POST. Ambiguous accept and
-/// same-request-retryable errors must not brick grok-build's next turn.
+/// same-request-retryable errors must not brick grok-build's next turn.  The
+/// hollow KV wrapper is the one intentional split: the late owner may rotate
+/// the conversation, while an unrelated/new POST stays blocked until that
+/// handoff is complete.
 pub(crate) fn live_probe_error_blocks_new_run(error: &str) -> bool {
-    terminal_error_is_ambiguous_accept(error) || !live_error_is_same_request_retryable(error)
+    kv_overflow_hollow_wrapper_is_ambiguous(error)
+        || terminal_error_is_ambiguous_accept(error)
+        || !live_error_is_same_request_retryable(error)
 }
 
 /// Cursor rejects a SetBlob once the remote conversation's aggregate KV
@@ -6710,7 +7224,14 @@ pub(crate) fn cursor_error_is_kv_blob_overflow(err: &CursorError) -> bool {
 }
 
 fn terminal_error_allows_fresh_retry(message: &str) -> bool {
-    message.contains(CONVERSATION_RESET_RETRY_NOTE)
+    // The reset marker is emitted only after a hollow segment has been
+    // classified as replay-safe.  Keep an explicit partial/acceptance marker
+    // authoritative, though: a transport wrapper may append the reset note
+    // while an earlier tool batch had already crossed the upstream boundary.
+    let lower = message.to_ascii_lowercase();
+    (message.contains(CONVERSATION_RESET_RETRY_NOTE)
+        && !lower.contains("acceptance is ambiguous")
+        && !lower.contains("partially sent"))
         || live_error_is_kv_blob_overflow_replayable(message)
 }
 
@@ -6981,6 +7502,46 @@ fn abrupt_eof_should_error(_had_progress: bool) -> bool {
     true
 }
 
+/// A clean Connect body EOF is a valid terminal boundary for a few Cursor
+/// model routes (notably Grok 4.x) that omit both `turn_ended` and a FLAG_END
+/// frame after sending the final text delta.  Keep the fail-closed policy for
+/// hollow/thinking-only turns, but allow a text-bearing segment with no
+/// pending tools to be closed by the driver.  Transport *errors* still take
+/// the reconnect/ambiguity path; this helper is used only for `Ok(None)` EOF.
+#[inline]
+fn clean_eof_can_synthesize_terminal(saw_text: bool, pending_empty: bool) -> bool {
+    saw_text && pending_empty
+}
+
+/// Whether a retained replay already carries an Anthropic terminal boundary.
+/// Native tool batches finalize the downstream segment with `stop_reason:
+/// tool_use`; a plain text segment needs an explicit `End` event.
+#[inline]
+fn replay_event_is_terminal(event: &LiveRunEvent) -> bool {
+    match event {
+        LiveRunEvent::NativeToolBatch(tools) => !tools.is_empty(),
+        LiveRunEvent::Cursor(CursorStreamEvent::NativeTool { .. } | CursorStreamEvent::End) => true,
+        LiveRunEvent::Cursor(_) => false,
+    }
+}
+
+/// Older completed-run snapshots can contain text but no final `End` (for
+/// example when the original SSE consumer disconnected at the exact EOF
+/// boundary).  Replaying that snapshot would make the Anthropic adapter emit
+/// a synthetic 502 even though the response body is useful.  Add one bounded
+/// local terminal for text-bearing snapshots; thinking/metadata-only snapshots
+/// remain retryable and are deliberately not converted into an empty answer.
+#[inline]
+pub(crate) fn replay_needs_synthetic_terminal(events: &[LiveRunEvent]) -> bool {
+    !events.last().is_some_and(replay_event_is_terminal)
+        && events.iter().any(|event| match event {
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) => !text.is_empty(),
+            LiveRunEvent::Cursor(CursorStreamEvent::NativeTool { .. }) => true,
+            LiveRunEvent::NativeToolBatch(tools) => !tools.is_empty(),
+            _ => false,
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveReconnectOutcome {
     Reconnected,
@@ -7094,6 +7655,16 @@ fn prepare_live_reconnect(
     stream_error: Option<&str>,
 ) {
     reconnect.last_trigger = stream_error.unwrap_or("stream_drop").to_string();
+    if client_type_requires_h2(&reconnect.identity.client_type) {
+        // H2 reset recovery normally switches to RunSSE.  That endpoint does
+        // not accept Sand traffic, so retain the BiDi transport for this run.
+        reconnect.force_http1 = false;
+        reconnect.http1_rejected = false;
+        reconnect
+            .h2_epoch
+            .get_or_insert_with(process_h2_circuit_epoch);
+        return;
+    }
     if live_reconnect_should_force_http1(
         got_chunk_since_reconnect,
         reconnect_attempts,
@@ -7437,13 +8008,18 @@ async fn try_live_reconnect(
                 }
             }
         };
-        let base_url = reconnect.http.base_url.clone();
-        reconnect.http =
-            CursorHttpClient::with_prefer_http1(reconnect_prefers_http1(reconnect.force_http1));
-        // A recovery episode must stay on the endpoint selected when the Run
-        // started. Re-reading a changed environment here can silently move an
-        // accepted conversation to a different upstream.
-        reconnect.http.base_url = base_url;
+        let sand_h2_only = client_type_requires_h2(&reconnect.identity.client_type);
+        let prefer_http1 = !sand_h2_only && reconnect_prefers_http1(reconnect.force_http1);
+        // A recovery episode must stay on the endpoint and timeout selected
+        // when the Run started. Re-reading process configuration here can
+        // silently move an accepted conversation to a different upstream (or
+        // lose a test/custom timeout), and rebuilding an HTTPS client for a
+        // cleartext endpoint would select the wrong H2 negotiation mode.
+        reconnect.http = if sand_h2_only {
+            reconnect.http.with_sand_transport_mode()
+        } else {
+            reconnect.http.with_transport_mode(prefer_http1)
+        };
 
         let cont = super::conversation::RunContinuation {
             conversation_id: reconnect.conversation_id.clone(),
@@ -7462,15 +8038,23 @@ async fn try_live_reconnect(
             },
         };
         let request_id = uuid::Uuid::new_v4().to_string();
-        let run_request =
-            build_resume_run_request(&resolved, &request_id, &cont, reconnect.mcp_tools.clone());
+        let run_request = build_resume_run_request_with_agent_session(
+            &resolved,
+            &request_id,
+            &cont,
+            reconnect.mcp_tools.clone(),
+            Some(&reconnect.session_id),
+            Some(&reconnect.run_id),
+        );
         let first_message = AgentClientMessage {
             run_request: Some(run_request),
             exec_client_message: None,
             kv_client_message: None,
+            conversation_action: None,
             exec_client_control_message: None,
             interaction_response: None,
             client_heartbeat: None,
+            prewarm_request: None,
         };
 
         let open_wait = live_reconnect_open_timeout(
@@ -7567,10 +8151,11 @@ async fn try_live_reconnect(
                 }
                 last_fail = Some(format!("{} ({})", err.message, err.status));
                 record_transport_failure(reconnect, Instant::now());
-                match live_reconnect_on_open_error(
+                match live_reconnect_on_open_error_for_client(
                     reconnect.force_http1,
                     reconnect.http1_rejected,
                     &err,
+                    &reconnect.identity.client_type,
                 ) {
                     LiveReconnectTransportAction::GiveUp(reason) => {
                         let outcome = LiveReconnectOutcome::Failed(format!(
@@ -7612,7 +8197,9 @@ async fn try_live_reconnect(
                         upstream_pump.abort();
                         let _ = (&mut *upstream_pump).await;
                         *outbound = new_outbound;
-                        reconnect.force_http1 = matches!(*outbound, ClientOutbound::Http1(_));
+                        reconnect.force_http1 =
+                            !client_type_requires_h2(&reconnect.identity.client_type)
+                                && matches!(*outbound, ClientOutbound::Http1(_));
                         reconnect.h2_epoch =
                             (!reconnect.force_http1).then(process_h2_circuit_epoch);
                         let pump_tx = fence_live_upstream(upstream, upstream_tx);
@@ -8281,9 +8868,11 @@ async fn drive_live_run(
             run_request: None,
             exec_client_message: None,
             kv_client_message: None,
+            conversation_action: None,
             exec_client_control_message: None,
             interaction_response: None,
             client_heartbeat: Some(ClientHeartbeat {}),
+            prewarm_request: None,
         };
         encode_agent_message(&message).ok()
     };
@@ -8506,7 +9095,15 @@ async fn drive_live_run(
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        prefetched_upstream.push_back(Ok(None));
+                        // Preserve the distinction between a body pump's
+                        // explicit `Ok(None)` (clean HTTP EOF) and an
+                        // internally disconnected channel.  The latter can
+                        // happen while a retired pump is being fenced during
+                        // ResumeAction and must remain on the reconnect /
+                        // ambiguity path rather than being mistaken for a
+                        // successful text-bearing completion.
+                        prefetched_upstream
+                            .push_back(Err("Cursor upstream channel disconnected".to_string()));
                         break;
                     }
                 }
@@ -8589,7 +9186,117 @@ async fn drive_live_run(
         release_generation_permit_between_segments(&sink, &mut generation_permit);
         generation_budget.observe_waiting(pending.tool_wait_since().is_some());
         if generation_budget.is_expired() {
-            let message = if generation_budget.absolute_is_expired() {
+            let post_tool_continuation = user_prompt == EMPTY_TURN_CHECKPOINT_CONTINUE_PROMPT;
+            let can_rotate = hard_timeout_can_rotate_without_duplicate(
+                saw_text,
+                pending.is_empty(),
+                !held_turn_end_frames.is_empty(),
+                accepted_resume_unconfirmed,
+                tool_results_sent_unconfirmed,
+                post_tool_continuation,
+            );
+            // Grok 4.6 can finish the answer payload and then remain alive on
+            // heartbeat/reconnect frames without sending Cursor's optional
+            // terminal markers.  A hard timeout in that state is not an
+            // unresolved tool operation: all client-visible text is already
+            // retained in the segment replay log and no native/UI marker is
+            // waiting to become a tool.  Synthesize the same local End used
+            // by the clean-EOF path so Claude Code receives a complete,
+            // replayable response instead of a 409 ambiguity tombstone.
+            let can_synthesize = hard_timeout_can_synthesize_terminal(
+                saw_text,
+                pending.is_empty(),
+                !held_turn_end_frames.is_empty(),
+                accepted_resume_unconfirmed,
+                tool_results_sent_unconfirmed,
+                logical_tools_waiting.is_empty(),
+            );
+            crate::logging::create_logger("cursor").warn(
+                "live_generation_timeout",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(&session_id)),
+                    ("runId".into(), serde_json::json!(&run_id)),
+                    ("model".into(), serde_json::json!(&reconnect.model_id)),
+                    ("segmentCount".into(), serde_json::json!(segment_count)),
+                    ("sawText".into(), serde_json::json!(saw_text)),
+                    ("useful".into(), serde_json::json!(useful)),
+                    (
+                        "pendingAwaiting".into(),
+                        serde_json::json!(pending.awaiting.len()),
+                    ),
+                    (
+                        "pendingCollecting".into(),
+                        serde_json::json!(pending.collecting.len()),
+                    ),
+                    (
+                        "acceptedResumeUnconfirmed".into(),
+                        serde_json::json!(accepted_resume_unconfirmed),
+                    ),
+                    (
+                        "toolResultsSentUnconfirmed".into(),
+                        serde_json::json!(tool_results_sent_unconfirmed),
+                    ),
+                    (
+                        "postToolContinuation".into(),
+                        serde_json::json!(post_tool_continuation),
+                    ),
+                    (
+                        "recovery".into(),
+                        serde_json::json!(if can_rotate {
+                            "fresh_conversation"
+                        } else {
+                            "ambiguous"
+                        }),
+                    ),
+                ])),
+            );
+            if can_synthesize {
+                crate::logging::create_logger("cursor").info(
+                    "live_hard_timeout_terminal_synthesized",
+                    Some(serde_json::Map::from_iter([
+                        ("sessionId".into(), serde_json::json!(&session_id)),
+                        ("runId".into(), serde_json::json!(&run_id)),
+                        ("model".into(), serde_json::json!(&reconnect.model_id)),
+                        ("sawText".into(), serde_json::json!(saw_text)),
+                        (
+                            "pending".into(),
+                            serde_json::json!(pending.awaiting().len() + pending.collecting.len()),
+                        ),
+                        (
+                            "absoluteExpired".into(),
+                            serde_json::json!(generation_budget.absolute_is_expired()),
+                        ),
+                    ])),
+                );
+                // Route the synthetic boundary through the normal END
+                // handler. It flushes split XML/EOS/coalesced deltas, records
+                // End in the replay snapshot, and leaves `terminal_error`
+                // empty so cleanup seals a Succeeded tombstone.
+                if !process_driver_frames!(std::iter::once(ConnectFrame {
+                    flags: FLAG_END,
+                    payload: Bytes::new(),
+                })) {
+                    break 'driver;
+                }
+                break 'driver;
+            }
+            let message = if can_rotate {
+                let fallback = if generation_budget.absolute_is_expired() {
+                    "Cursor live run lifetime expired without client-visible output"
+                } else {
+                    "Cursor live segment hard timeout without client-visible output"
+                };
+                hollow_resume_terminal_message(
+                    &session_id,
+                    saw_text,
+                    pending.is_empty(),
+                    post_tool_continuation,
+                    post_tool_checkpoint.confirmed,
+                    &mut latest_checkpoint,
+                    &mut kv_blobs,
+                    fallback,
+                )
+            } else if generation_budget.absolute_is_expired() {
                 "Cursor live run lifetime expired; completion is ambiguous".into()
             } else if !held_turn_end_frames.is_empty() {
                 "Cursor live segment timed out after an uncommitted turn_ended frame; completion is ambiguous"
@@ -8876,13 +9583,40 @@ async fn drive_live_run(
                             // impossible while we hold the receiver in new_rx.
                             let _ = new_tx.try_send(Ok(event.clone()));
                         }
-                        // Adopt the new consumer only while this segment is
-                        // still open. A segment that already closed (tool batch
-                        // exposed / turn delivered) is fully reproduced by the
-                        // replay alone; dropping new_tx ends the retry's
-                        // response exactly where the original ended.
+                        // Acknowledge before taking over the sender. If the
+                        // caller disappeared while this command was queued,
+                        // retaining its sender would make the live run look
+                        // attached even though no HTTP consumer exists.
+                        if ack.send(Ok(new_rx)).is_err() {
+                            crate::logging::create_logger("cursor").warn(
+                                "live_attach_replay_rollback",
+                                Some(serde_json::Map::from_iter([
+                                    (
+                                        "sessionId".into(),
+                                        serde_json::json!(session_id.as_str()),
+                                    ),
+                                    (
+                                        "reason".into(),
+                                        serde_json::json!("attach_ack_receiver_dropped"),
+                                    ),
+                                ])),
+                            );
+                            // `new_rx` was dropped by the failed send, so the
+                            // temporary sender is closed as well. Keep the
+                            // existing sink untouched for a still-live
+                            // original request.
+                            continue;
+                        }
+
+                        // Adopt the newest consumer only while this segment is
+                        // still open. A segment that already closed (tool
+                        // batch exposed / turn delivered) is fully reproduced
+                        // by the replay alone; dropping `new_tx` ends the
+                        // retry's response exactly where the original ended.
                         if sink.is_some() {
                             sink = Some(new_tx);
+                        } else {
+                            drop(new_tx);
                         }
                         crate::logging::create_logger("cursor").info(
                             "live_attach_replay",
@@ -8898,7 +9632,6 @@ async fn drive_live_run(
                                 ("segmentOpen".into(), serde_json::json!(sink.is_some())),
                             ])),
                         );
-                        let _ = ack.send(Ok(new_rx));
                         continue;
                     }
                     Some(RunCommand::ResumeBatch {
@@ -9087,7 +9820,7 @@ async fn drive_live_run(
                         // immediately after the submit below.
                         logical_tools_waiting.begin_new_segment();
                         // The command arm is biased. Absorb already-queued
-                        // upstream bytes before snapshotting the baseline, or a
+        // upstream bytes before snapshotting the baseline, or a
                         // pre-submit checkpoint can later look like post-tool
                         // proof.
                         post_tool_checkpoint = PostToolCheckpointEvidence::default();
@@ -9484,7 +10217,14 @@ async fn drive_live_run(
                             }
                         }
                     }
-                    Some(Ok(None)) | None => {
+                    // Keep the distinction between a clean HTTP body EOF and
+                    // a disconnected internal channel.  The former is a
+                    // valid terminal boundary for text-bearing Gemini/Grok
+                    // turns; the latter usually means an old upstream pump
+                    // was fenced during ResumeAction and still needs the
+                    // reconnect/ambiguity path below.
+                    eof @ (Some(Ok(None)) | None) => {
+                        let clean_eof = matches!(&eof, Some(Ok(None)));
                         if decoder.buffered() != 0 {
                             report_terminal_error(
                                 &mut sink,
@@ -9505,6 +10245,42 @@ async fn drive_live_run(
                             }
                             // Defensive fallback if a malformed candidate did
                             // not actually terminate when decoded.
+                            if !process_driver_frames!(std::iter::once(ConnectFrame {
+                                flags: FLAG_END,
+                                payload: Bytes::new(),
+                            })) {
+                                break 'driver;
+                            }
+                            break 'driver;
+                        }
+                        // Gemini 3.1 Pro (and a few Grok routes) sometimes
+                        // finish a complete text answer by cleanly closing
+                        // the Connect body without sending either
+                        // `turn_ended` or FLAG_END.  Do not issue a
+                        // ResumeAction for this shape: a fresh resume races
+                        // the already-finished Run and commonly yields 503
+                        // "live run already active", after which Claude Code
+                        // retries the same request in a loop.  Route the
+                        // synthetic FLAG_END through the normal terminal
+                        // handler so EOS/XML/coalescer state is flushed and
+                        // replay records the exact same End boundary.
+                        //
+                        // Restrict this fast path to an explicit clean body
+                        // EOF with visible text and no pending native tools.
+                        // An internal channel disconnect, a hollow/thinking
+                        // turn, or an in-flight tool still uses ResumeAction
+                        // and fail-closed ambiguity handling below.
+                        if clean_eof
+                            && clean_eof_can_synthesize_terminal(saw_text, pending.is_empty())
+                        {
+                            crate::logging::create_logger("cursor").info(
+                                "live_clean_eof_terminal",
+                                Some(serde_json::Map::from_iter([
+                                    ("sessionId".into(), serde_json::json!(&session_id)),
+                                    ("model".into(), serde_json::json!(&reconnect.model_id)),
+                                    ("reconnectSkipped".into(), serde_json::json!(true)),
+                                ])),
+                            );
                             if !process_driver_frames!(std::iter::once(ConnectFrame {
                                 flags: FLAG_END,
                                 payload: Bytes::new(),
@@ -9650,6 +10426,32 @@ async fn drive_live_run(
                             break 'driver;
                         }
                         if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
+                            break 'driver;
+                        }
+                        // Some Grok routes close a clean Connect body after
+                        // the final text delta without emitting `turn_ended`
+                        // or FLAG_END.  At this point the body decoder is
+                        // empty, reconnect has been exhausted, and there are
+                        // no pending tools; synthesize the same local END
+                        // boundary used by a normal Connect END.  Keeping this
+                        // restricted to clean EOF + visible text avoids
+                        // turning heartbeat/thinking-only or tool-in-flight
+                        // truncations into successful empty answers.
+                        if clean_eof_can_synthesize_terminal(saw_text, pending.is_empty()) {
+                            crate::logging::create_logger("cursor").info(
+                                "live_clean_eof_terminal",
+                                Some(serde_json::Map::from_iter([
+                                    ("sessionId".into(), serde_json::json!(&session_id)),
+                                    ("model".into(), serde_json::json!(&reconnect.model_id)),
+                                    ("reconnect".into(), serde_json::json!(reconnect_note(&reconnect_outcome))),
+                                ])),
+                            );
+                            if !process_driver_frames!(std::iter::once(ConnectFrame {
+                                flags: FLAG_END,
+                                payload: Bytes::new(),
+                            })) {
+                                break 'driver;
+                            }
                             break 'driver;
                         }
                         if abrupt_eof_should_error(useful || saw_text) {
@@ -10198,6 +11000,48 @@ async fn process_live_frame_impl(
             return true;
         }
     };
+
+    // Cursor Desktop's Agent Host may send TTFT accounting before any
+    // InteractionUpdate. It is meaningful upstream progress for setup/retry
+    // timers, but intentionally has no Anthropic event mapping.
+    if message.ttft_breakdown.is_some() {
+        *useful = true;
+        *last_progress = Instant::now();
+    }
+
+    // Agent Host can cancel a native exec without ending the Connect stream.
+    // Consume that control message locally: Claude Code never received a
+    // tool_use for the cancellation and must not be asked for a fabricated
+    // result.  Removing the exact pending id also releases the driver's wait
+    // state so a later turn cannot remain stuck behind a server-side abort.
+    if let Some(control) = message.exec_server_control_message
+        && let Some(abort) = control.abort
+    {
+        let removed = pending.abort_native_by_id(abort.id);
+        // `pending_shared` is the exposed (Claude-owed) view.  Keep it in
+        // lockstep with `awaiting`; this makes a delayed tool_result for
+        // an aborted exec fail validation as an orphan instead of being
+        // sent upstream after Cursor already cancelled it.
+        *pending_shared.lock().unwrap_or_else(|e| e.into_inner()) = pending.awaiting.clone();
+        *useful = true;
+        *last_progress = Instant::now();
+        crate::logging::create_logger("cursor").info(
+            "live_exec_server_abort",
+            Some(serde_json::Map::from_iter([
+                ("id".into(), serde_json::json!(abort.id)),
+                ("removed".into(), serde_json::json!(removed.is_some())),
+                (
+                    "pendingAwaiting".into(),
+                    serde_json::json!(pending.awaiting.len()),
+                ),
+                (
+                    "pendingCollecting".into(),
+                    serde_json::json!(pending.collecting.len()),
+                ),
+            ])),
+        );
+        return true;
+    }
 
     if let Some(checkpoint) = message.conversation_checkpoint_update {
         if !checkpoint.is_empty() {
@@ -10749,6 +11593,14 @@ async fn process_interaction_update(
     turn_ctx: &mut Option<&mut LiveTurnCtx<'_>>,
     task_nest_depth: u8,
 ) -> bool {
+    // Lifecycle metadata can precede the first text/tool delta, including in
+    // a nested Task update. Count it as server progress so Sand does not take
+    // the setup-idle path, while leaving `saw_text` untouched so a metadata-
+    // only END is still recovered as an empty turn.
+    if update.has_agent_host_metadata_progress() {
+        *useful = true;
+        *last_progress = Instant::now();
+    }
     // Some Cursor model routes expose the tokenizer EOS as a literal text
     // marker and omit `turn_ended`. Filter it through a per-depth state
     // machine: protobuf boundaries may split the marker (`◁` + `eos▷`).
@@ -11535,20 +12387,31 @@ async fn publish_exposed_tools(
         })
         .collect();
 
-    let Some(tx) = sink.clone() else {
-        return false;
-    };
-    let permit = match tokio::time::timeout(
-        Duration::from_secs(env_u64("CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_SECS", 5)),
-        tx.reserve(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => Some(permit),
-        // Closed consumer: still expose and record so an identical retry can
-        // attach to the tool-result wait instead of 503-storming.
-        Ok(Err(_)) => None,
-        Err(_) => return false,
+    // A dropped Claude Code SSE leaves no primary sink.  Still commit the
+    // tool batch to the replay log and pending state: an identical retry can
+    // AttachReplay and receive the exact tool_use instead of seeing a 503
+    // while Cursor waits for its tool_result.  If a sink exists, reserve its
+    // capacity before marking the tool-result admission boundary as usual.
+    let permit = if let Some(tx) = sink.clone() {
+        match tokio::time::timeout(
+            Duration::from_secs(env_u64("CCP_CURSOR_DOWNSTREAM_SEND_TIMEOUT_SECS", 5)),
+            // `reserve` borrows the sender for the duration of its future.
+            // Since this branch awaits under a local clone, that borrow can
+            // outlive the temporary sender on some compiler versions.  Use
+            // the owned permit variant so the sender is moved into the
+            // future and the resulting permit remains valid after the await.
+            tx.reserve_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Some(permit),
+            // Closed consumer: still expose and record so an identical retry
+            // can attach to the tool-result wait instead of 503-storming.
+            Ok(Err(_)) => None,
+            Err(_) => return false,
+        }
+    } else {
+        None
     };
     // No await may occur between publishing the matching ids/clock and making
     // the event receivable. This is the result-admission boundary.
@@ -12929,9 +13792,11 @@ fn encode_request_context_reply(
             pi_edit_result: None,
         }),
         kv_client_message: None,
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: None,
         client_heartbeat: None,
+        prewarm_request: None,
     };
     let result = encode_agent_message(&message)?;
     let close = encode_control_close(exec.id)
@@ -13062,9 +13927,11 @@ fn encode_kv_reply_with_total(
         run_request: None,
         exec_client_message: None,
         kv_client_message: Some(reply),
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: None,
         client_heartbeat: None,
+        prewarm_request: None,
     })
     .map(Some)
 }
@@ -13143,9 +14010,11 @@ fn encode_interaction_auto_response(
         run_request: None,
         exec_client_message: None,
         kv_client_message: None,
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: Some(response),
         client_heartbeat: None,
+        prewarm_request: None,
     })
     .map(Some)
 }
@@ -13578,8 +14447,8 @@ pub fn live_sse_response(
 #[cfg(test)]
 mod tests {
     use super::super::proto::{
-        ExecReadArgs, ExecServerMessage, GitRepoInfo, InteractionUpdate, RequestContextArgs,
-        RequestContextEnv, TextDelta, TurnEnded,
+        ExecReadArgs, ExecServerAbort, ExecServerControlMessage, ExecServerMessage, GitRepoInfo,
+        InteractionUpdate, RequestContextArgs, RequestContextEnv, TextDelta, TurnEnded,
     };
     use super::*;
     use base64::Engine as _;
@@ -13620,6 +14489,7 @@ mod tests {
                 headers: vec![],
             },
             original_request_id: "original-test-request".into(),
+            run_id: "test-live-run".into(),
             session_id: "sess-test".into(),
             model_id: "composer-2.5".into(),
             conversation_id: Some("conv-test".into()),
@@ -13722,6 +14592,7 @@ mod tests {
 
         let mut payload = Vec::new();
         proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 1,
                 exec_id: Some("read-exec".into()),
@@ -14217,6 +15088,7 @@ mod tests {
         assert!(!server_message_resets_reconnect_budget(&query));
 
         let request_context = proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(proto::ExecServerMessage {
                 request_context_args: Some(proto::RequestContextArgs::default()),
                 ..proto::ExecServerMessage::default()
@@ -14228,6 +15100,7 @@ mod tests {
             "handshake request_context must not replenish ResumeAction"
         );
         let native_exec = proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(proto::ExecServerMessage::default()),
             ..proto::AgentServerMessage::default()
         };
@@ -15901,6 +16774,25 @@ mod tests {
     }
 
     #[test]
+    fn h2_probe_preserves_sand_desktop_identity_headers() {
+        for header in [
+            "x-cursor-client-device-type",
+            "x-cursor-client-os",
+            "x-cursor-client-arch",
+            "x-new-onboarding-completed",
+            "local-client-mode",
+            "x-cursor-checksum",
+        ] {
+            assert!(
+                live_probe_copies_identity_header(header),
+                "Sand H2 probe must include {header}"
+            );
+        }
+        assert!(!live_probe_copies_identity_header("authorization"));
+        assert!(!live_probe_copies_identity_header("x-original-request-id"));
+    }
+
+    #[test]
     fn live_open_prefers_http1_from_env_or_circuit() {
         assert!(!live_open_prefers_http1_from(false, false));
         assert!(live_open_prefers_http1_from(true, false));
@@ -16745,6 +17637,44 @@ mod tests {
     fn text_frames_reset_reconnect_budget() {
         let frames = decoded_frames(&super::super::test_frames::text_frame("hello"));
         assert!(live_reconnect_should_reset_budget(&frames));
+    }
+
+    #[test]
+    fn agent_host_metadata_frames_reset_reconnect_budget_but_heartbeats_do_not() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, InteractionHeartbeat, InteractionUpdate, RoutedModelUpdate,
+            TtftBreakdown,
+        };
+
+        for message in [
+            AgentServerMessage {
+                ttft_breakdown: Some(TtftBreakdown::default()),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    routed_model: Some(RoutedModelUpdate::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            assert!(live_reconnect_should_reset_budget(&decoded_frames(
+                &encode_connect_frame(message.encode_to_vec(), 0)
+            )));
+        }
+
+        let heartbeat = AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                heartbeat: Some(InteractionHeartbeat::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!live_reconnect_should_reset_budget(&decoded_frames(
+            &encode_connect_frame(heartbeat.encode_to_vec(), 0)
+        )));
     }
 
     #[test]
@@ -18251,6 +19181,111 @@ mod tests {
         );
         assert_eq!(state.awaiting().len(), 2);
         assert!(!state.can_expose());
+    }
+
+    #[test]
+    fn pending_exec_abort_removes_only_the_matching_native_exec() {
+        let mut state = PendingExecState::default();
+        assert!(state.queue(pending_exec(1, "tool-1"), Duration::ZERO));
+        assert!(state.queue(pending_exec(2, "tool-2"), Duration::ZERO));
+        assert!(state.queue(pending_client_only(3, "workflow-3"), Duration::ZERO));
+
+        // A mixed batch exposes the ClientOnly item first and keeps native
+        // executions collecting. The abort must work in either queue.
+        let exposed = state.expose();
+        assert_eq!(exposed.len(), 1);
+        assert_eq!(exposed[0].tool_use_id, "workflow-3");
+        assert!(state.abort_native_by_id(1).is_some());
+        assert!(state.abort_native_by_id(3).is_none());
+        assert!(state.awaiting().iter().any(|exec| exec.id == 3));
+        assert!(state.collecting.iter().any(|exec| exec.id == 2));
+        assert!(!state.collecting.iter().any(|exec| exec.id == 1));
+
+        state.complete_awaiting();
+        let remaining = state.expose();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, 2);
+        assert!(state.abort_native_by_id(2).is_some());
+        assert!(state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exec_server_abort_frame_clears_shared_native_pending() {
+        use super::super::connect::encode_connect_frame;
+        use prost::Message;
+
+        let mut pending = PendingExecState::default();
+        assert!(pending.queue(pending_exec(41, "tool-41"), Duration::ZERO));
+        assert!(pending.queue(pending_exec(42, "tool-42"), Duration::ZERO));
+        let exposed = pending.expose();
+        assert_eq!(exposed.len(), 2);
+        let pending_shared = Arc::new(Mutex::new(exposed));
+
+        let mut payload = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_control_message: Some(ExecServerControlMessage {
+                abort: Some(ExecServerAbort { id: 41 }),
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode abort control");
+        let frame = encode_connect_frame(payload, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frame = decoder.push(frame).expect("decode frame").remove(0);
+
+        let (request_tx, _request_rx) = mpsc::channel(2);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let mut sink = None;
+        let mut deferred = VecDeque::new();
+        let mut replay = SegmentReplayLog::default();
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now() - Duration::from_secs(5);
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
+
+        assert!(
+            process_live_frame(
+                frame,
+                &outbound,
+                &mut sink,
+                &mut deferred,
+                &mut replay,
+                &mut pending,
+                &pending_shared,
+                &mut kv_blobs,
+                &mut latest_checkpoint,
+                &terminal_error,
+                None,
+                &mut saw_text,
+                &mut useful,
+                &mut logical,
+                &mut last_progress,
+                Duration::ZERO,
+                &mut xml_parser,
+                None,
+            )
+            .await
+        );
+        assert!(useful);
+        assert!(last_progress.elapsed() < Duration::from_secs(2));
+        assert_eq!(pending.awaiting().len(), 1);
+        assert_eq!(pending.awaiting()[0].id, 42);
+        let shared = pending_shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].id, 42);
+        assert!(
+            terminal_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none()
+        );
     }
 
     #[test]
@@ -21144,10 +22179,15 @@ mod tests {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -21196,6 +22236,110 @@ mod tests {
         assert!(
             last_progress.elapsed() >= Duration::from_secs(599),
             "server InteractionUpdate.heartbeat must not reset setup/stream idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_host_metadata_refreshes_live_progress_without_emitting_output() {
+        use super::super::proto::{
+            ActiveBranchChange, AgentServerMessage, ContextInjectionStateUpdate,
+            FeedbackRequestUpdate, ResponseComparisonUpdate, RoutedModelUpdate, TtftBreakdown,
+        };
+
+        let messages = vec![
+            AgentServerMessage {
+                ttft_breakdown: Some(TtftBreakdown::default()),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    active_branch_change: Some(ActiveBranchChange::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    feedback_request: Some(FeedbackRequestUpdate::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    response_comparison: Some(ResponseComparisonUpdate::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    context_injection_state: Some(ContextInjectionStateUpdate::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    routed_model: Some(RoutedModelUpdate::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now() - Duration::from_secs(600);
+        let mut xml_parser = CursorToolUseXmlParser::new(None);
+
+        for message in messages {
+            assert!(
+                process_live_frame(
+                    ConnectFrame {
+                        flags: 0,
+                        payload: Bytes::from(message.encode_to_vec()),
+                    },
+                    &outbound,
+                    &mut sink,
+                    &mut deferred,
+                    &mut segment_replay,
+                    &mut pending,
+                    &pending_shared,
+                    &mut kv_blobs,
+                    &mut latest_checkpoint,
+                    &terminal_error,
+                    None,
+                    &mut saw_text,
+                    &mut useful,
+                    &mut logical,
+                    &mut last_progress,
+                    Duration::from_millis(50),
+                    &mut xml_parser,
+                    None,
+                )
+                .await
+            );
+            assert!(useful, "metadata is valid upstream progress");
+            assert!(!saw_text, "metadata must not become an Anthropic delta");
+            assert!(last_progress.elapsed() < Duration::from_secs(1));
+            last_progress = Instant::now() - Duration::from_secs(600);
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "metadata must not emit a text or native-tool event"
         );
     }
 
@@ -21740,10 +22884,13 @@ mod tests {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -22029,10 +23176,15 @@ mod tests {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -22136,10 +23288,15 @@ mod tests {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -22248,10 +23405,15 @@ mod tests {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -22720,6 +23882,7 @@ mod tests {
 
         let mut full = Vec::new();
         proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 21,
                 exec_id: Some("exec-read".into()),
@@ -24081,10 +25244,13 @@ mod tests {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -24612,10 +25778,15 @@ mod tests {
                     cache_write_tokens: None,
                     reasoning_tokens: None,
                 }),
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -25069,6 +26240,7 @@ mod tests {
 
         let mut tool_payload = Vec::new();
         proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 1,
                 exec_id: Some("read-exec".into()),
@@ -25959,7 +27131,10 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
+
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -26075,7 +27250,10 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
+
+            ..Default::default()
         }
         .encode(&mut full)
         .unwrap();
@@ -26894,6 +28072,7 @@ mod tests {
         let mut last_progress = Instant::now();
         let mut xml_parser = CursorToolUseXmlParser::new(None);
         let server_message = proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(proto::ExecServerMessage {
                 id: 41,
                 exec_id: Some("pi-late-exec".into()),
@@ -27474,6 +28653,7 @@ mod tests {
                 interaction_update: None,
                 kv_server_message: None,
                 interaction_query: None,
+                exec_server_control_message: None,
                 exec_server_message: Some(ExecServerMessage {
                     id,
                     exec_id: Some(format!("exec-{id}")),
@@ -27485,6 +28665,8 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+
+                ..Default::default()
             })
         }
 
@@ -27573,7 +28755,10 @@ mod tests {
                 }),
                 kv_server_message: None,
                 interaction_query: None,
+                exec_server_control_message: None,
                 exec_server_message: None,
+
+                ..Default::default()
             }));
         }
         buffered.extend_from_slice(&server_frame(proto::AgentServerMessage {
@@ -27581,12 +28766,15 @@ mod tests {
             interaction_update: None,
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 99,
                 exec_id: Some("context-barrier".into()),
                 request_context_args: Some(RequestContextArgs::default()),
                 ..Default::default()
             }),
+
+            ..Default::default()
         }));
         upstream_tx
             .send(Ok(Some(Bytes::from(buffered))))
@@ -27687,7 +28875,10 @@ mod tests {
                 }),
                 kv_server_message: None,
                 interaction_query: None,
+                exec_server_control_message: None,
                 exec_server_message: None,
+
+                ..Default::default()
             }))))
             .await
             .unwrap();
@@ -27707,7 +28898,10 @@ mod tests {
                 }),
                 kv_server_message: None,
                 interaction_query: None,
+                exec_server_control_message: None,
                 exec_server_message: None,
+
+                ..Default::default()
             }))))
             .await
             .unwrap();
@@ -28137,6 +29331,7 @@ mod tests {
 
         let mut payload = Vec::new();
         proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 7,
                 exec_id: Some("blocked-read".into()),
@@ -28304,7 +29499,10 @@ mod tests {
                 }),
                 kv_server_message: None,
                 interaction_query: None,
+                exec_server_control_message: None,
                 exec_server_message: None,
+
+                ..Default::default()
             }
             .encode(&mut payload)
             .unwrap();
@@ -28542,7 +29740,10 @@ mod tests {
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+
+            ..Default::default()
         }
         .encode(&mut payload)
         .unwrap();
@@ -28769,6 +29970,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_replay_transfers_native_tool_handoff_to_single_owner() {
+        // A same-operation retry may arrive before Cursor emits its first
+        // native tool. The latest retry owns the downstream segment: exposing
+        // the tool to both HTTP responses would permit two tool-result
+        // continuations for one Cursor execution.
+        let mut harness = spawn_attach_replay_driver("attach-tool-takeover");
+        let mut attached = attach_replay(&harness.command_tx, 7)
+            .await
+            .expect("same-operation retry takes over the open segment");
+
+        let mut payload = Vec::new();
+        proto::AgentServerMessage {
+            exec_server_message: Some(ExecServerMessage {
+                id: 1,
+                exec_id: Some("read-exec".into()),
+                read_args: Some(ExecReadArgs {
+                    path: "/tmp/input.txt".into(),
+                    tool_call_id: "read-call".into(),
+                    offset: None,
+                    limit: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode native tool");
+        harness
+            .upstream_tx
+            .send(Ok(Some(encode_connect_frame(payload, 0))))
+            .await
+            .expect("send native tool");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), attached.recv())
+            .await
+            .expect("new owner receives native tool")
+            .expect("new owner stream stays open")
+            .expect("native tool is not an error");
+        let LiveRunEvent::NativeToolBatch(tools) = event else {
+            panic!("new owner must receive the native tool batch: {event:?}");
+        };
+        assert_eq!(tools.len(), 1, "one native tool is handed off");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+                .await
+                .expect("old stream closes after takeover")
+                .is_none(),
+            "the displaced stream must not receive the same native tool"
+        );
+    }
+
+    #[tokio::test]
     async fn attach_replay_reproduces_exposed_native_tool_batch() {
         // Segment already closed by a NativeToolBatch handoff (the exact state
         // from the grok-build 503 storms: run Running, waiting on tool
@@ -28777,6 +30030,7 @@ mod tests {
         let mut harness = spawn_attach_replay_driver("attach-tool-batch");
         let mut payload = Vec::new();
         proto::AgentServerMessage {
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 1,
                 exec_id: Some("read-exec".into()),

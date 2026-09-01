@@ -1,6 +1,7 @@
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::anthropic::sse::{SseEvent, encode_sse_event, parse_sse_events};
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 pub fn catalog_model(id: &str, owned_by: &str) -> Value {
     // grok-build's official Grok path is OpenAI Responses (`/v1/responses`).
@@ -363,13 +364,12 @@ fn convert_input(input: Option<&Value>) -> anyhow::Result<(Vec<Message>, Vec<Str
             "function_call_output" => {
                 let id = item
                     .get("call_id")
+                    .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
                     .ok_or_else(|| anyhow::anyhow!("function_call_output lacks call_id"))?;
                 let output = item.get("output").cloned().unwrap_or(json!(""));
-                let content = match output {
-                    Value::String(text) => json!(text),
-                    other => json!(other.to_string()),
-                };
+                let content = convert_function_call_output(output)?;
                 messages.push(Message {
                     role: "user".into(),
                     content: json!([{
@@ -397,6 +397,146 @@ fn convert_input(input: Option<&Value>) -> anyhow::Result<(Vec<Message>, Vec<Str
         }
     }
     Ok((messages, system_parts))
+}
+
+/// Convert an OpenAI Responses `function_call_output.output` value into the
+/// Anthropic tool-result content accepted by the Cursor request renderer.
+///
+/// Responses permits either a plain string or an array of input content parts
+/// (text and images are the useful forms for Claude Code).  The old adapter
+/// serialized every non-string value as one JSON string, which discarded image
+/// parts and made tool results needlessly opaque.  Keep known content blocks
+/// structured, while retaining a compact JSON-text fallback for provider
+/// extensions we do not understand.
+fn convert_function_call_output(output: Value) -> anyhow::Result<Value> {
+    match output {
+        Value::String(text) => Ok(json!(text)),
+        Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                append_tool_output_part(&mut blocks, part)?;
+            }
+            if blocks.is_empty() {
+                Ok(json!(""))
+            } else {
+                Ok(Value::Array(blocks))
+            }
+        }
+        Value::Object(object) => {
+            // A few Responses-compatible clients send one content part rather
+            // than wrapping it in an array. Preserve it when it has a known
+            // type; arbitrary result objects remain JSON text for maximum
+            // compatibility with Anthropic tool_result consumers.
+            if object.get("type").is_some() {
+                let mut blocks = Vec::new();
+                append_tool_output_part(&mut blocks, Value::Object(object))?;
+                if blocks.is_empty() {
+                    Ok(json!(""))
+                } else {
+                    Ok(Value::Array(blocks))
+                }
+            } else {
+                Ok(json!(serde_json::to_string(&Value::Object(object))?))
+            }
+        }
+        other => Ok(json!(serde_json::to_string(&other)?)),
+    }
+}
+
+fn append_tool_output_part(blocks: &mut Vec<Value>, part: Value) -> anyhow::Result<()> {
+    match part {
+        Value::String(text) => blocks.push(json!({"type": "text", "text": text})),
+        Value::Object(object) => {
+            let Some(kind) = object.get("type").and_then(Value::as_str) else {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": serde_json::to_string(&Value::Object(object))?
+                }));
+                return Ok(());
+            };
+            match kind {
+                "input_text" | "output_text" | "text" => {
+                    if let Some(text) = object.get("text").and_then(Value::as_str) {
+                        blocks.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                "input_image" | "image" | "image_url" => {
+                    if let Some(image) = convert_image_part(&Value::Object(object.clone()))? {
+                        blocks.push(image);
+                    } else {
+                        // Preserve an unsupported image shape as text instead
+                        // of dropping the tool result silently.
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": serde_json::to_string(&Value::Object(object))?
+                        }));
+                    }
+                }
+                // Refusals and provider-specific content still carry useful
+                // text. Keep their textual field without inventing a new
+                // Anthropic block type that Cursor would reject.
+                "refusal" => {
+                    if let Some(text) = object
+                        .get("refusal")
+                        .or_else(|| object.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        blocks.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                _ => blocks.push(json!({
+                    "type": "text",
+                    "text": serde_json::to_string(&Value::Object(object))?
+                })),
+            }
+        }
+        other => blocks.push(json!({
+            "type": "text",
+            "text": serde_json::to_string(&other)?
+        })),
+    }
+    Ok(())
+}
+
+/// Return an Anthropic image block for a Responses input-image-like value.
+/// `None` means the value has no usable URL/source; callers can then retain a
+/// textual fallback instead of losing the original tool output.
+fn convert_image_part(part: &Value) -> anyhow::Result<Option<Value>> {
+    let url = part
+        .get("image_url")
+        .or_else(|| part.get("url"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("url").and_then(Value::as_str))
+        });
+    if let Some(url) = url {
+        if let Some(image) = data_uri_image(url)? {
+            return Ok(Some(image));
+        }
+        return Ok(Some(json!({
+            "type": "image",
+            "source": { "type": "url", "url": url }
+        })));
+    }
+    if let Some(source) = part.get("source") {
+        return Ok(Some(json!({"type": "image", "source": source})));
+    }
+    Ok(None)
+}
+
+fn initial_tool_arguments(value: &Value) -> Option<String> {
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        Value::Null => return None,
+        other => serde_json::to_string(other).ok()?,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" || trimmed == "null" {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 fn flatten_text_content(content: Option<&Value>) -> String {
@@ -540,7 +680,17 @@ pub struct AnthropicToResponses {
     compaction_item_id: Option<String>,
     compaction_output_index: Option<usize>,
     compaction_active_index: Option<usize>,
+    reasoning_output_index: Option<usize>,
     tool_item_ids: Vec<String>,
+    /// Maps the Anthropic content-block index carried by a delta event to the
+    /// corresponding Responses function-call ordinal.  A Messages stream can
+    /// interleave text/thinking and multiple `tool_use` blocks; using the last
+    /// tool for every `input_json_delta` silently joins those calls together.
+    tool_block_ordinals: HashMap<usize, usize>,
+    /// Output-item indexes are carried on stream events but not embedded in
+    /// the item object. Retain them so the terminal Responses object can keep
+    /// the same ordering when Anthropic interleaves reasoning/text/tools.
+    output_item_indexes: HashMap<String, usize>,
     output_items: Vec<Value>,
     stop_reason: Option<String>,
 }
@@ -669,10 +819,11 @@ impl AnthropicToResponses {
                     Some("thinking_delta") => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
                             self.reasoning_text.push_str(text);
+                            let output_index = self.ensure_reasoning_output_index();
                             self.emit(json!({
                                 "type": "response.reasoning_text.delta",
                                 "item_id": format!("rs_{}", self.id),
-                                "output_index": 0,
+                                "output_index": output_index,
                                 "content_index": 0,
                                 "delta": text
                             }))
@@ -695,7 +846,19 @@ impl AnthropicToResponses {
                     }
                     Some("input_json_delta") => {
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
-                            let index = self.tool_index.saturating_sub(1);
+                            // Anthropic puts the owning content block index on
+                            // the outer event (not inside `delta`).  Resolve
+                            // that index to the tool ordinal captured at
+                            // `content_block_start`.  Keep the previous
+                            // latest-tool fallback for providers that omit the
+                            // outer index on malformed/legacy streams.
+                            let block_index = value
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .map(|index| index as usize);
+                            let index = block_index
+                                .and_then(|block| self.tool_block_ordinals.get(&block).copied())
+                                .unwrap_or_else(|| self.tool_index.saturating_sub(1));
                             let tool_item_id = self.tool_item_ids.get(index).map(String::as_str);
                             if let Some(item) = self.output_items.iter_mut().find(|item| {
                                 tool_item_id.is_some_and(|id| {
@@ -733,6 +896,8 @@ impl AnthropicToResponses {
                     let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                     let item_id = format!("msg_cmp_{}_{}", self.id, index);
                     let output_index = self.allocate_output_index();
+                    self.output_item_indexes
+                        .insert(item_id.clone(), output_index);
                     self.compaction_item_id = Some(item_id.clone());
                     self.compaction_output_index = Some(output_index);
                     self.compaction_active_index = Some(index);
@@ -767,31 +932,73 @@ impl AnthropicToResponses {
                     }
                     out
                 } else if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let tool_ordinal = self.tool_index;
                     self.tool_index += 1;
+                    if let Some(block_index) = value
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|index| index as usize)
+                    {
+                        self.tool_block_ordinals.insert(block_index, tool_ordinal);
+                    }
                     let call_id = block
                         .get("id")
                         .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                        .filter(|id| !id.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            // Strict Responses consumers require a stable,
+                            // non-empty call id. Anthropic normally supplies
+                            // one, but a few Cursor tool streams omit it.
+                            format!("call_{}_{}", self.id, tool_ordinal)
+                        });
                     let name = block.get("name").cloned().unwrap_or(json!(""));
                     let item_id = format!("fc_{call_id}");
                     self.tool_item_ids.push(item_id.clone());
                     let output_index = self.allocate_output_index();
                     self.tool_output_indexes.push(output_index);
+                    self.output_item_indexes
+                        .insert(item_id.clone(), output_index);
+                    let initial_arguments = block
+                        .get("input")
+                        .and_then(initial_tool_arguments)
+                        .unwrap_or_default();
                     let item = json!({
                         "type": "function_call",
                         "id": item_id,
                         "call_id": call_id,
                         "name": name,
+                        // Arguments are streamed below as a delta. Keeping
+                        // the added item empty avoids duplicating an initial
+                        // input in the terminal `response.completed` object.
                         "arguments": "",
                         "status": "in_progress"
                     });
                     self.output_items.push(item.clone());
-                    self.emit(json!({
+                    let mut out = self.emit(json!({
                         "type": "response.output_item.added",
                         "output_index": output_index,
                         "item": item
-                    }))
+                    }));
+                    // When a provider includes a non-empty initial input on
+                    // `content_block_start`, surface it as a normal argument
+                    // delta. Empty `{}` is the common Anthropic placeholder
+                    // and is intentionally omitted so later deltas are not
+                    // prefixed with a duplicate object.
+                    if !initial_arguments.is_empty() {
+                        if let Some(stored) = self.output_items.iter_mut().find(|stored| {
+                            stored.get("id").and_then(Value::as_str) == Some(item_id.as_str())
+                        }) {
+                            stored["arguments"] = json!(initial_arguments.clone());
+                        }
+                        out.extend(self.emit(json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": initial_arguments
+                        })));
+                    }
+                    out
                 } else {
                     Vec::new()
                 }
@@ -1130,19 +1337,28 @@ impl AnthropicToResponses {
     }
 
     fn final_output(&self) -> Value {
-        let mut output = Vec::new();
+        let mut output: Vec<(usize, usize, Value)> = Vec::new();
+        let mut tie_breaker = 0usize;
         if !self.reasoning_text.is_empty() {
-            output.push(json!({
+            output.push((
+                self.reasoning_output_index.unwrap_or(0),
+                tie_breaker,
+                json!({
                 "type": "reasoning",
                 "id": format!("rs_{}", self.id),
                 "summary": [{
                     "type": "summary_text",
                     "text": self.reasoning_text
                 }]
-            }));
+                }),
+            ));
+            tie_breaker = tie_breaker.saturating_add(1);
         }
         if let Some(item_id) = &self.text_item_id {
-            output.push(json!({
+            output.push((
+                self.text_output_index.unwrap_or(0),
+                tie_breaker,
+                json!({
                 "type": "message",
                 "id": item_id,
                 "role": "assistant",
@@ -1153,13 +1369,40 @@ impl AnthropicToResponses {
                     "annotations": [],
                     "logprobs": []
                 }]
-            }));
+                }),
+            ));
+            tie_breaker = tie_breaker.saturating_add(1);
         }
-        output.extend(self.output_items.iter().cloned().map(|mut item| {
-            item["status"] = json!("completed");
-            item
-        }));
-        Value::Array(output)
+        output.extend(
+            self.output_items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, mut item)| {
+                    item["status"] = json!("completed");
+                    let item_id = item.get("id").and_then(Value::as_str);
+                    let output_index = item_id
+                        .and_then(|id| self.output_item_indexes.get(id).copied())
+                        .unwrap_or_else(|| {
+                            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                                item_id
+                                    .and_then(|id| {
+                                        self.tool_item_ids
+                                            .iter()
+                                            .position(|candidate| candidate == id)
+                                    })
+                                    .map(|tool_index| self.tool_output_index(tool_index))
+                                    .unwrap_or(index)
+                            } else {
+                                self.compaction_output_index.unwrap_or(index)
+                            }
+                        });
+                    let order = tie_breaker.saturating_add(index);
+                    (output_index, order, item)
+                }),
+        );
+        output.sort_by_key(|(output_index, order, _)| (*output_index, *order));
+        Value::Array(output.into_iter().map(|(_, _, item)| item).collect())
     }
 
     fn base_response(&self, status: &str, output: Value) -> Value {
@@ -1202,6 +1445,15 @@ impl AnthropicToResponses {
     fn allocate_output_index(&mut self) -> usize {
         let index = self.next_output_index;
         self.next_output_index = self.next_output_index.saturating_add(1);
+        index
+    }
+
+    fn ensure_reasoning_output_index(&mut self) -> usize {
+        if let Some(index) = self.reasoning_output_index {
+            return index;
+        }
+        let index = self.allocate_output_index();
+        self.reasoning_output_index = Some(index);
         index
     }
 
@@ -1456,6 +1708,43 @@ mod tests {
         assert_eq!(request.messages.len(), 3);
         assert_eq!(request.extra["output_config"]["effort"], "high");
         assert_eq!(request.extra["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn responses_to_messages_accepts_function_output_id_alias_and_preserves_parts() {
+        let body = json!({
+            "model": "claude-fable-5",
+            "input": [
+                {"type":"function_call", "id":"call_1", "name":"lookup", "arguments":"{}"},
+                {"type":"function_call_output", "id":"call_1", "output":[
+                    {"type":"input_text", "text":"lookup result"},
+                    {"type":"input_image", "image_url":"data:image/png;base64,aGVsbG8="}
+                ]}
+            ]
+        });
+        let request = responses_to_messages(&body).expect("Responses function output");
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[1].role, "user");
+        let blocks = request.messages[1].content.as_array().expect("tool blocks");
+        let result_content = blocks[0]["content"].as_array().expect("result content");
+        assert_eq!(
+            result_content[0],
+            json!({"type":"text","text":"lookup result"})
+        );
+        assert_eq!(result_content[1]["type"], "image");
+        assert_eq!(result_content[1]["source"]["type"], "base64");
+        assert_eq!(result_content[1]["source"]["media_type"], "image/png");
+        assert_eq!(result_content[1]["source"]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn responses_to_messages_rejects_blank_function_output_id() {
+        let body = json!({
+            "model": "claude-fable-5",
+            "input": [{"type":"function_call_output", "call_id":"  ", "output":"ok"}]
+        });
+        let error = responses_to_messages(&body).expect_err("blank call id");
+        assert!(error.to_string().contains("lacks call_id"));
     }
 
     #[test]
@@ -1796,5 +2085,172 @@ data: {"type":"ping"}
             !ping_text.contains("response.completed"),
             "a keepalive must not complete the Responses stream"
         );
+    }
+
+    #[test]
+    fn anthropic_to_responses_keeps_parallel_tool_arguments_on_their_blocks() {
+        let mut translator =
+            AnthropicToResponses::new("resp_parallel_tools".into(), "grok-4.6".into());
+        let mut bytes = Vec::new();
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_start"),
+            r#"{"type":"message_start","message":{"model":"grok-4.6"}}"#,
+        )));
+        // Two tool blocks are opened before either one emits arguments.  This
+        // is the ordering used by Cursor for parallel native tool calls and
+        // exposes the old "always use the last tool" bug.
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_start"),
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_first","name":"first"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_start"),
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_second","name":"second"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"first\":1}"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"second\":2}"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_stop"),
+            r#"{"type":"message_stop"}"#,
+        )));
+
+        let events = parse_sse_events(&bytes);
+        let argument_deltas: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str)
+                    == Some("response.function_call_arguments.delta")
+            })
+            .collect();
+        assert_eq!(argument_deltas.len(), 2);
+        assert_eq!(argument_deltas[0]["item_id"], "fc_call_first");
+        assert_eq!(argument_deltas[0]["output_index"], 0);
+        assert_eq!(argument_deltas[0]["delta"], "{\"first\":1}");
+        assert_eq!(argument_deltas[1]["item_id"], "fc_call_second");
+        assert_eq!(argument_deltas[1]["output_index"], 1);
+        assert_eq!(argument_deltas[1]["delta"], "{\"second\":2}");
+
+        let completed = events
+            .iter()
+            .find_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .filter(|value| {
+                        value.get("type").and_then(Value::as_str) == Some("response.completed")
+                    })
+            })
+            .expect("response.completed event");
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["call_id"], "call_first");
+        assert_eq!(output[0]["arguments"], "{\"first\":1}");
+        assert_eq!(output[1]["call_id"], "call_second");
+        assert_eq!(output[1]["arguments"], "{\"second\":2}");
+    }
+
+    #[test]
+    fn anthropic_to_responses_uses_initial_tool_input_and_fallback_id() {
+        let mut translator =
+            AnthropicToResponses::new("resp_initial_tool".into(), "grok-4.6".into());
+        let mut bytes = Vec::new();
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_start"),
+            r#"{"type":"message_start","message":{"model":"grok-4.6"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_start"),
+            r#"{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","name":"lookup","input":{"q":"initial"}}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_stop"),
+            r#"{"type":"message_stop"}"#,
+        )));
+
+        let events = parse_sse_events(&bytes);
+        let added = events
+            .iter()
+            .find_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .filter(|value| {
+                        value.get("type").and_then(Value::as_str)
+                            == Some("response.output_item.added")
+                    })
+            })
+            .expect("tool output item");
+        assert_eq!(added["item"]["call_id"], "call_resp_initial_tool_0");
+        assert_eq!(added["item"]["arguments"], "");
+        let delta = events
+            .iter()
+            .find_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .filter(|value| {
+                        value.get("type").and_then(Value::as_str)
+                            == Some("response.function_call_arguments.delta")
+                    })
+            })
+            .expect("initial argument delta");
+        assert_eq!(delta["delta"], "{\"q\":\"initial\"}");
+        let completed = events
+            .iter()
+            .find_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .filter(|value| {
+                        value.get("type").and_then(Value::as_str) == Some("response.completed")
+                    })
+            })
+            .expect("completed response");
+        assert_eq!(
+            completed["response"]["output"][0]["arguments"],
+            "{\"q\":\"initial\"}"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_responses_terminal_output_follows_stream_indexes() {
+        let mut translator =
+            AnthropicToResponses::new("resp_ordered_output".into(), "grok-4.6".into());
+        let mut bytes = Vec::new();
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_start"),
+            r#"{"type":"message_start","message":{"model":"grok-4.6"}}"#,
+        )));
+        // Text arrives first, then reasoning. The terminal output must retain
+        // that event order rather than always forcing reasoning ahead of text.
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"late thought"}}"#,
+        )));
+        bytes.extend(translator.push(&encode_sse_event(
+            Some("message_stop"),
+            r#"{"type":"message_stop"}"#,
+        )));
+        let events = parse_sse_events(&bytes);
+        let completed = events
+            .iter()
+            .find_map(|event| {
+                serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .filter(|value| {
+                        value.get("type").and_then(Value::as_str) == Some("response.completed")
+                    })
+            })
+            .expect("completed response");
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[1]["type"], "reasoning");
     }
 }

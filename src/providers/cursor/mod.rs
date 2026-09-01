@@ -13,6 +13,7 @@ pub(crate) mod operation_ledger;
 pub mod proto;
 pub mod request;
 pub mod response;
+pub mod sand_status;
 pub mod sse;
 #[cfg(test)]
 pub(crate) mod test_frames;
@@ -1719,15 +1720,42 @@ fn replay_completed_turn_channel(
     events: &Arc<Vec<LiveRunEvent>>,
 ) -> mpsc::Receiver<LiveEventResult> {
     const REPLAY_CHANNEL_CAP: usize = 32;
-    let (tx, rx) = mpsc::channel(REPLAY_CHANNEL_CAP.min(events.len().max(1)));
+    // A completed snapshot normally ends in `CursorStreamEvent::End` (or a
+    // NativeToolBatch).  A narrow race at clean upstream EOF can seal a
+    // useful text segment just before that marker is recorded, however.  Do
+    // not replay such a segment into `live_sse_response` without a terminal:
+    // the adapter quite correctly turns a closed, non-finalized stream into a
+    // 502, which then makes every identical Grok retry fail the same way.
+    // Append one local End only when the snapshot contains client-visible text
+    // or a native tool; metadata/thinking-only snapshots remain hollow and are
+    // left untouched for the normal retry classifier.
+    let synthesized_terminal =
+        crate::providers::cursor::live::replay_needs_synthetic_terminal(events);
+    let replay_events = if synthesized_terminal {
+        let mut copy = (**events).clone();
+        copy.push(LiveRunEvent::Cursor(
+            crate::providers::cursor::response::CursorStreamEvent::End,
+        ));
+        Arc::new(copy)
+    } else {
+        Arc::clone(events)
+    };
+    let (tx, rx) = mpsc::channel(REPLAY_CHANNEL_CAP.min(replay_events.len().max(1)));
     create_logger("cursor").info(
         "live_replay_completed_turn",
         Some(serde_json::Map::from_iter([
             ("sessionId".into(), serde_json::json!(session_id)),
-            ("replayedEvents".into(), serde_json::json!(events.len())),
+            (
+                "replayedEvents".into(),
+                serde_json::json!(replay_events.len()),
+            ),
+            (
+                "synthesizedTerminal".into(),
+                serde_json::json!(synthesized_terminal),
+            ),
         ])),
     );
-    let events = Arc::clone(events);
+    let events = replay_events;
     tokio::spawn(async move {
         for event in events.iter() {
             if tx.send(Ok(event.clone())).await.is_err() {
@@ -3236,7 +3264,10 @@ enum LivePumpOutcome {
 /// stall restart without exposing a terminal error after hidden reasoning.
 fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
     match event {
-        LiveRunEvent::NativeToolBatch(_) => true,
+        // `emit_tool_batch` finalizes only when at least one tool is
+        // present; an empty batch is a protocol keep-alive/malformed event,
+        // not client-visible progress.
+        LiveRunEvent::NativeToolBatch(tools) => !tools.is_empty(),
         LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { text }) => !text.is_empty(),
         LiveRunEvent::Cursor(CursorStreamEvent::NativeTool { .. } | CursorStreamEvent::End) => true,
         LiveRunEvent::Cursor(
@@ -3899,21 +3930,52 @@ async fn collect_live_events_to_json(
     let mut acc = AnthropicJsonAcc::new_mode(estimated_input, compaction_mode);
     let mut saw_end = false;
     let mut tool_handoff = false;
+    // Keep this bit separate from `acc.has_useful()`: a compaction
+    // reasoning fallback is useful for diagnostics, but it is not evidence
+    // that an ordinary non-streaming answer reached a clean terminal.  A
+    // visible text delta is the same commit signal used by the live replay
+    // path and is the only payload that may close a clean EOF into an
+    // `end_turn` response.
+    let mut saw_text = false;
     while let Some(item) = events.recv().await {
         match item {
             Ok(LiveRunEvent::Cursor(event)) => {
                 let ended = matches!(event, CursorStreamEvent::End);
+                if let CursorStreamEvent::TextDelta { text } = &event {
+                    saw_text |= !text.is_empty();
+                }
+                // `NativeTool` is already a finalized Anthropic segment in
+                // the incremental encoder (equivalent to NativeToolBatch).
+                // Treat it as a handoff here too, otherwise a valid
+                // non-streaming tool response that closes without a separate
+                // End marker is misreported as "without turn_ended".
+                if matches!(event, CursorStreamEvent::NativeTool { .. }) {
+                    tool_handoff = true;
+                }
                 acc.push(&event);
                 if ended {
                     saw_end = true;
                     break;
                 }
+                if tool_handoff {
+                    // A single Cursor NativeTool is encoded as a complete
+                    // Anthropic tool-use handoff. Ignore any metadata/text
+                    // that may arrive after it on the channel, just as the
+                    // streaming encoder does after finalization.
+                    break;
+                }
             }
             Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                let has_tools = !tools.is_empty();
                 for tool in tools {
                     acc.push_native_tool(tool.tool_use_id, tool.name, tool.input);
                 }
-                tool_handoff = true;
+                // An empty batch is not client-visible progress.  Keep the
+                // handoff bit tied to an actual tool so a malformed empty
+                // event cannot turn into a successful `tool_use` response.
+                if has_tools {
+                    tool_handoff = true;
+                }
                 break;
             }
             Err(error) => return Err(error),
@@ -3923,9 +3985,33 @@ async fn collect_live_events_to_json(
         return Err("Cursor stream produced no useful progress".into());
     }
     if !saw_end && !tool_handoff {
-        return Err("Cursor stream ended without turn_ended".into());
+        if clean_json_eof_can_synthesize_terminal(saw_text) {
+            // JSON has no event channel on which to append FLAG_END.  The
+            // accumulator's `end_turn` stop reason is the equivalent local
+            // terminal for a clean text-bearing EOF.  This mirrors replay's
+            // bounded synthetic End while preserving fail-closed behavior
+            // for metadata/thinking-only or empty responses.
+            create_logger("cursor").info(
+                "live_json_clean_eof_terminal",
+                Some(serde_json::Map::from_iter([
+                    ("messageId".into(), serde_json::json!(message_id)),
+                    ("model".into(), serde_json::json!(model)),
+                ])),
+            );
+        } else {
+            return Err("Cursor stream ended without turn_ended".into());
+        }
     }
     Ok(acc.into_message_json(message_id, model))
+}
+
+/// A non-streaming live channel can close without carrying a separate End
+/// event when the upstream emitted its final text and then cleanly EOF'd.  Do
+/// not apply this to thinking/metadata-only channels: those remain retryable
+/// hollow turns, matching `replay_needs_synthetic_terminal`.
+#[inline]
+fn clean_json_eof_can_synthesize_terminal(saw_text: bool) -> bool {
+    saw_text
 }
 
 async fn live_json_recording_usage(
@@ -4059,14 +4145,304 @@ fn live_operation_fingerprint_payload(
     body: &MessagesRequest,
     client_request_id: Option<&str>,
 ) -> Vec<u8> {
-    if let Some(request_id) = client_request_id.filter(|value| !value.is_empty()) {
+    // The sampler keeps `x-grok-req-id` stable across transport retries, but
+    // it may rebuild the JSON body along the way.  Hash a canonical semantic
+    // projection rather than serde's insertion order or the wire's transient
+    // image/trace metadata.  This is deliberately done before the request is
+    // rendered for Cursor: the same projection is needed by the registry,
+    // retry worker, and preflight attach checks.
+    let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
+    if let Some(request_id) = client_request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let mut payload = b"x-grok-req-id\0".to_vec();
         payload.extend_from_slice(request_id.as_bytes());
         payload.push(0);
-        payload.extend_from_slice(&serde_json::to_vec(body).unwrap_or_default());
+        payload.extend_from_slice(&canonical_live_fingerprint_json(&body_value));
         return payload;
     }
-    serde_json::to_vec(&body.messages).unwrap_or_default()
+    // Clients predating x-grok-req-id use message history as their fallback
+    // identity.  Keep that compatibility boundary, while applying the same
+    // canonicalization so image re-encoding and object key order do not open
+    // a second live Run.
+    // Preserve the exact legacy bytes for ordinary text/tool messages. The
+    // in-memory live registry can contain a generation admitted by an older
+    // code path (which used serde's insertion order), and changing those bytes
+    // would make a concurrent tool-result waiter look like a different turn.
+    // Image/thinking blocks are the exceptional wire shapes that may be
+    // re-encoded between retries, so use the canonical traversal only when
+    // one is actually present.
+    if let Ok(raw_messages) = serde_json::to_vec(&body.messages) {
+        let messages = serde_json::to_value(&body.messages).unwrap_or(serde_json::Value::Null);
+        if !legacy_fingerprint_needs_normalization(&messages) {
+            return raw_messages;
+        }
+        return canonical_live_fingerprint_json_with_context(
+            &messages,
+            LiveFingerprintContext::LegacyMessages,
+        );
+    }
+    Vec::new()
+}
+
+fn legacy_fingerprint_needs_normalization(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            is_live_fingerprint_image_block(object, LiveFingerprintContext::LegacyContent)
+                || object.values().any(legacy_fingerprint_needs_normalization)
+        }
+        serde_json::Value::Array(values) => values.iter().any(|value| {
+            is_live_internal_thinking_block(value) || legacy_fingerprint_needs_normalization(value)
+        }),
+        _ => false,
+    }
+}
+
+/// Context used while constructing the operation fingerprint.  Message
+/// content needs a little more normalization than arbitrary request objects:
+/// historical thinking blocks and transport-only cache metadata do not alter
+/// the prompt that reaches Cursor, while tool-result ids and ordering do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveFingerprintContext {
+    Root,
+    Messages,
+    Message,
+    Content,
+    /// Legacy message-history fingerprinting used when a client does not
+    /// provide an explicit request id.  Keep the old scalar/content wire
+    /// shape so an in-flight generation created by an older proxy remains
+    /// attachable, while still normalizing image bytes and thinking blocks.
+    LegacyMessages,
+    LegacyMessage,
+    LegacyContent,
+    Metadata,
+    Generic,
+}
+
+/// Serialize a JSON value with deterministic object ordering and the small
+/// set of retry-only normalizations needed by Grok/Claude clients.
+fn canonical_live_fingerprint_json(value: &serde_json::Value) -> Vec<u8> {
+    canonical_live_fingerprint_json_with_context(value, LiveFingerprintContext::Root)
+}
+
+fn canonical_live_fingerprint_json_with_context(
+    value: &serde_json::Value,
+    context: LiveFingerprintContext,
+) -> Vec<u8> {
+    let normalized = normalize_live_fingerprint_value(value, context);
+    serde_json::to_vec(&normalized).unwrap_or_default()
+}
+
+fn normalize_live_fingerprint_value(
+    value: &serde_json::Value,
+    context: LiveFingerprintContext,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            // Inline images are carried in several equivalent Anthropic/OpenAI
+            // shapes.  Their bytes may be omitted, wrapped, or re-encoded on a
+            // retry; the block's position/type is the stable operation signal.
+            if is_live_fingerprint_image_block(object, context) {
+                return normalized_live_fingerprint_image();
+            }
+
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort_unstable();
+            let mut normalized = serde_json::Map::new();
+            for key in keys {
+                if should_drop_live_fingerprint_field(context, key) {
+                    continue;
+                }
+                let raw_value = object
+                    .get(key)
+                    .expect("key collected from the same JSON object");
+                let child_context = match (context, key.as_str()) {
+                    (LiveFingerprintContext::Root, "messages") => LiveFingerprintContext::Messages,
+                    (LiveFingerprintContext::Root, "metadata") => LiveFingerprintContext::Metadata,
+                    (LiveFingerprintContext::Messages, _) => LiveFingerprintContext::Message,
+                    (LiveFingerprintContext::LegacyMessages, _) => {
+                        LiveFingerprintContext::LegacyMessage
+                    }
+                    (LiveFingerprintContext::Message, "content")
+                    | (LiveFingerprintContext::Content, "content") => {
+                        LiveFingerprintContext::Content
+                    }
+                    (LiveFingerprintContext::LegacyMessage, "content")
+                    | (LiveFingerprintContext::LegacyContent, "content") => {
+                        LiveFingerprintContext::LegacyContent
+                    }
+                    (LiveFingerprintContext::Metadata, _) => LiveFingerprintContext::Metadata,
+                    _ => LiveFingerprintContext::Generic,
+                };
+
+                // A string message and a one-block text message are wire
+                // equivalents.  Normalize both to the block form used by the
+                // renderer; this also makes a reconstructed retry stable.
+                let normalized_value = if matches!(
+                    (context, key.as_str()),
+                    (LiveFingerprintContext::Message, "content")
+                        | (LiveFingerprintContext::Content, "content")
+                ) {
+                    normalize_live_message_content(raw_value)
+                } else {
+                    normalize_live_fingerprint_value(raw_value, child_context)
+                };
+                normalized.insert(key.clone(), normalized_value);
+            }
+            serde_json::Value::Object(normalized)
+        }
+        serde_json::Value::Array(values) => {
+            let mut normalized = Vec::with_capacity(values.len());
+            for value in values {
+                // Thinking is an internal history artifact and is omitted by
+                // render_cursor_prompt.  Keeping it in the idempotency body
+                // would make a retry that gained/lost a signature look like a
+                // new operation.  Preserve every other block and its order.
+                if matches!(
+                    context,
+                    LiveFingerprintContext::Content | LiveFingerprintContext::LegacyContent
+                ) && is_live_internal_thinking_block(value)
+                {
+                    continue;
+                }
+                let child_context = match context {
+                    LiveFingerprintContext::Messages => LiveFingerprintContext::Message,
+                    LiveFingerprintContext::LegacyMessages => LiveFingerprintContext::LegacyMessage,
+                    LiveFingerprintContext::Content => LiveFingerprintContext::Content,
+                    LiveFingerprintContext::LegacyContent => LiveFingerprintContext::LegacyContent,
+                    LiveFingerprintContext::Metadata => LiveFingerprintContext::Metadata,
+                    _ => LiveFingerprintContext::Generic,
+                };
+                normalized.push(normalize_live_fingerprint_value(value, child_context));
+            }
+            serde_json::Value::Array(normalized)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn normalize_live_message_content(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::json!([
+            {"type": "text", "text": text}
+        ]),
+        serde_json::Value::Object(object)
+            if object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some() =>
+        {
+            serde_json::Value::Array(vec![normalize_live_fingerprint_value(
+                value,
+                LiveFingerprintContext::Content,
+            )])
+        }
+        _ => normalize_live_fingerprint_value(value, LiveFingerprintContext::Content),
+    }
+}
+
+fn normalized_live_fingerprint_image() -> serde_json::Value {
+    // Keep one compact marker instead of base64 bytes, signed URLs, UUIDs, or
+    // local paths.  Array position still distinguishes multiple images in a
+    // turn, while retries with stripped/re-encoded payloads remain identical.
+    serde_json::json!({"type": "image"})
+}
+
+fn is_live_fingerprint_image_block(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: LiveFingerprintContext,
+) -> bool {
+    let block_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    if matches!(
+        context,
+        LiveFingerprintContext::Content | LiveFingerprintContext::LegacyContent
+    ) && matches!(
+        block_type.as_deref(),
+        Some("image" | "input_image" | "image_url")
+    ) {
+        return true;
+    }
+    // A few OpenAI-compatible retries omit `type` while retaining a sole
+    // `image_url` wrapper.  Restrict this compatibility branch to message
+    // content and a single key so a tool input containing an `image_url`
+    // parameter is never collapsed into an image marker.
+    context == LiveFingerprintContext::Content
+        && object.len() == 1
+        && (object.contains_key("image_url") || object.contains_key("imageUrl"))
+}
+
+fn is_live_internal_thinking_block(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("thinking") || kind.eq_ignore_ascii_case("redacted_thinking")
+        })
+}
+
+fn normalized_live_fingerprint_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn should_drop_live_fingerprint_field(context: LiveFingerprintContext, key: &str) -> bool {
+    let normalized = normalized_live_fingerprint_key(key);
+    match context {
+        LiveFingerprintContext::Root => matches!(
+            normalized.as_str(),
+            // Streaming and telemetry envelopes can change when a client
+            // retries through a different HTTP path; they do not change the
+            // generated turn.
+            "stream"
+                | "streamoptions"
+                | "requestid"
+                | "requestuuid"
+                | "requestnonce"
+                | "nonce"
+                | "timestamp"
+                | "createdat"
+                | "updatedat"
+                | "traceid"
+                | "spanid"
+                | "correlationid"
+                | "xrequestid"
+                | "xoriginalrequestid"
+                | "xgrokreqid"
+                | "xgrokagentid"
+                | "xgroksessionid"
+        ),
+        LiveFingerprintContext::Metadata => matches!(
+            normalized.as_str(),
+            "requestid"
+                | "requestuuid"
+                | "requestnonce"
+                | "nonce"
+                | "timestamp"
+                | "createdat"
+                | "updatedat"
+                | "traceid"
+                | "spanid"
+                | "correlationid"
+                | "xrequestid"
+                | "xoriginalrequestid"
+                | "xgrokreqid"
+                | "xgrokagentid"
+                | "xgroksessionid"
+        ),
+        LiveFingerprintContext::Content => {
+            // Prompt-cache directives are transport hints and are frequently
+            // regenerated by Claude Code.  Tool ids, text, and all semantic
+            // fields remain part of the fingerprint.
+            normalized == "cachecontrol"
+        }
+        _ => false,
+    }
 }
 
 /// Cursor conversation key for prompt compaction (`delta_only` / checkpoint).
@@ -5429,22 +5805,19 @@ impl Provider for CursorProvider {
         // non-streaming fallback (`stream=false`) still uses live; we collect the
         // same events into one JSON body instead of SSE.
         let has_session = session_id.is_some_and(|s| !s.is_empty());
-        let live_eligible =
-            live_path_eligible(want_stream, has_session, client.live_bidi_enabled());
+        let bidi_enabled = client.live_bidi_enabled_for_client_type(&client_type);
+        let live_eligible = live_path_eligible(want_stream, has_session, bidi_enabled);
         if !live_eligible {
             let mut fields = serde_json::Map::new();
             fields.insert("stream".into(), serde_json::json!(want_stream));
             fields.insert("hasSession".into(), serde_json::json!(has_session));
-            fields.insert(
-                "bidiEnabled".into(),
-                serde_json::json!(client.live_bidi_enabled()),
-            );
+            fields.insert("bidiEnabled".into(), serde_json::json!(bidi_enabled));
             fields.insert(
                 "reason".into(),
                 serde_json::json!(live_path_skip_reason(
                     want_stream,
                     has_session,
-                    client.live_bidi_enabled()
+                    bidi_enabled
                 )),
             );
             create_logger("cursor").info("live_skipped", Some(fields));
@@ -7797,6 +8170,7 @@ mod tests {
             LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
                 text: "speculative reasoning".into(),
             }),
+            LiveRunEvent::NativeToolBatch(Vec::new()),
         ] {
             let (tx, rx) = mpsc::channel(2);
             tx.send(Ok(event)).await.unwrap();
@@ -9033,6 +9407,166 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fingerprint_preserves_ordinary_message_bytes() {
+        // A live generation may have been admitted by an older proxy (or by
+        // the preflight path immediately before a hot reload).  Without an
+        // explicit request id, its operation key is the serialized message
+        // history; scalar content and ordinary tool payloads must remain
+        // byte-for-byte compatible so a waiter can still attach to it.
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-fable-5",
+            "messages": [
+                {"role": "user", "content": "same turn"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Read",
+                    "input": {"path": "src/lib.rs"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "done"
+                }]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            live_operation_fingerprint_payload(&body, None),
+            serde_json::to_vec(&body.messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn live_fingerprint_normalizes_retry_wire_noise_and_images() {
+        let first: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "grok-build",
+            "max_tokens": 256,
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect this screenshot"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAE="
+                    }}
+                ]
+            }],
+            "metadata": {"trace_id": "attempt-a", "user_id": "stable-user"},
+            "request_id": "attempt-a",
+        }))
+        .unwrap();
+        let retry: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "attempt-b",
+            "metadata": {"user_id": "stable-user", "traceId": "attempt-b"},
+            "messages": [{
+                "content": [
+                    {"text": "inspect this screenshot", "type": "text"},
+                    {"source": {"data": "<stripped>", "media_type": "image/png"}, "type": "input_image"}
+                ],
+                "role": "user"
+            }],
+            "stream": false,
+            "max_tokens": 256,
+            "model": "grok-build",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            live_operation_fingerprint_payload(&first, Some(" req-image ")),
+            live_operation_fingerprint_payload(&retry, Some("req-image")),
+            "retries may reorder keys, switch stream mode, and strip/re-encode image bytes"
+        );
+    }
+
+    #[test]
+    fn live_fingerprint_keeps_tool_result_stage_distinct_after_normalization() {
+        let initial: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "grok-build",
+            "messages": [{"role": "user", "content": "run the tool"}],
+        }))
+        .unwrap();
+        let mut resumed = initial.clone();
+        resumed.messages.push(
+            serde_json::from_value(serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "done"
+                }]
+            }))
+            .unwrap(),
+        );
+        assert_ne!(
+            live_operation_fingerprint_payload(&initial, Some("req-stage")),
+            live_operation_fingerprint_payload(&resumed, Some("req-stage")),
+            "adding a tool result is a new sampling stage even when request id is reused"
+        );
+    }
+
+    #[test]
+    fn live_fingerprint_does_not_collapse_tool_input_image_url_fields() {
+        let first: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-1",
+                "name": "inspect",
+                "input": {"image_url": "https://one.example/image.png"}
+            }]}]
+        }))
+        .unwrap();
+        let second: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-1",
+                "name": "inspect",
+                "input": {"image_url": "https://two.example/image.png"}
+            }]}]
+        }))
+        .unwrap();
+        assert_ne!(
+            live_operation_fingerprint_payload(&first, None),
+            live_operation_fingerprint_payload(&second, None),
+            "tool arguments remain semantic even when a key is named image_url"
+        );
+    }
+
+    #[test]
+    fn live_fingerprint_fallback_ignores_image_encoding_but_preserves_image_count() {
+        let one_image: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}
+            }]}]
+        }))
+        .unwrap();
+        let one_image_retry: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"content": [{
+                "image_url": {"url": "<omitted>"}, "type": "image"
+            }], "role": "user"}]
+        }))
+        .unwrap();
+        let two_images: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"data": "AAAA"}},
+                {"type": "image", "source": {"data": "BBBB"}}
+            ]}]
+        }))
+        .unwrap();
+        assert_eq!(
+            live_operation_fingerprint_payload(&one_image, None),
+            live_operation_fingerprint_payload(&one_image_retry, None)
+        );
+        assert_ne!(
+            live_operation_fingerprint_payload(&one_image, None),
+            live_operation_fingerprint_payload(&two_images, None),
+            "image count/order remains part of the operation stage"
+        );
+    }
+
+    #[test]
     fn count_tokens_uses_current_request_body_not_previous_turn() {
         let _guard = SESSION_USAGE_TEST_LOCK.lock().unwrap();
         reset_session_usage_for_test();
@@ -9235,6 +9769,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_live_events_to_json_clean_text_eof_synthesizes_terminal() {
+        // Grok/Gemini routes can close a clean live body immediately after
+        // the final text delta. JSON has no wire End event to append, so the
+        // collector must still return a normal end_turn message.
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "clean EOF answer".into(),
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+        let json = collect_live_events_to_json(rx, "msg_clean_eof", "gemini-3.1-pro", 3, false)
+            .await
+            .expect("text-bearing clean EOF should be finalized locally");
+        assert_eq!(json["content"][0]["text"], "clean EOF answer");
+        assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn collect_live_events_to_json_native_tool_is_terminal_without_end() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::NativeTool {
+            tool_use_id: "tool-1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "/tmp/a"}),
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+        let json = collect_live_events_to_json(rx, "msg_native_tool", "claude-fable-5", 3, false)
+            .await
+            .expect("native tool is an Anthropic terminal handoff");
+        assert_eq!(json["content"][0]["type"], "tool_use");
+        assert_eq!(json["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn collect_live_events_to_json_stops_after_native_tool_handoff() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::NativeTool {
+            tool_use_id: "tool-stop".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "/tmp/a"}),
+        })))
+        .await
+        .unwrap();
+        // A finalized tool handoff must not be invalidated by a late stream
+        // error that belongs to the next Cursor segment.
+        tx.send(Err("late transport diagnostic".into()))
+            .await
+            .unwrap();
+        drop(tx);
+        let json = collect_live_events_to_json(rx, "msg_native_stop", "claude-fable-5", 3, false)
+            .await
+            .expect("late post-handoff errors must not replace tool_use");
+        assert_eq!(json["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn completed_replay_adds_missing_text_terminal() {
+        let events = Arc::new(vec![LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
+            text: "replayed answer".into(),
+        })]);
+        let mut rx = replay_completed_turn_channel("replay-terminal", &events);
+        let first = rx.recv().await.expect("replayed text").expect("text event");
+        assert!(matches!(
+            first,
+            LiveRunEvent::Cursor(CursorStreamEvent::TextDelta { .. })
+        ));
+        let second = rx
+            .recv()
+            .await
+            .expect("synthetic terminal")
+            .expect("end event");
+        assert!(matches!(
+            second,
+            LiveRunEvent::Cursor(CursorStreamEvent::End)
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_replay_does_not_invent_terminal_for_thinking_only() {
+        let events = Arc::new(vec![LiveRunEvent::Cursor(
+            CursorStreamEvent::ThinkingDelta {
+                text: "private reasoning".into(),
+            },
+        )]);
+        let mut rx = replay_completed_turn_channel("replay-hollow", &events);
+        let item = rx
+            .recv()
+            .await
+            .expect("replayed thinking")
+            .expect("thinking event");
+        assert!(matches!(
+            item,
+            LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta { .. })
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn collect_live_events_to_json_empty_is_error() {
         let (tx, rx) = mpsc::channel::<LiveEventResult>(1);
         drop(tx);
@@ -9271,18 +9907,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_live_events_to_json_truncated_useful_is_error() {
+    async fn collect_live_events_to_json_thinking_only_eof_is_error() {
         let (tx, rx) = mpsc::channel(4);
-        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
-            text: "partial".into(),
+        tx.send(Ok(LiveRunEvent::Cursor(CursorStreamEvent::ThinkingDelta {
+            text: "speculative".into(),
         })))
         .await
         .unwrap();
         drop(tx);
-        let err = collect_live_events_to_json(rx, "msg_trunc", "claude-fable-5", 3, false)
+        let err = collect_live_events_to_json(rx, "msg_thinking_eof", "claude-fable-5", 3, true)
             .await
             .unwrap_err();
         assert!(err.contains("without turn_ended"), "{err}");
+    }
+
+    #[test]
+    fn clean_json_eof_terminal_requires_visible_text() {
+        assert!(clean_json_eof_can_synthesize_terminal(true));
+        assert!(!clean_json_eof_can_synthesize_terminal(false));
     }
 
     #[test]

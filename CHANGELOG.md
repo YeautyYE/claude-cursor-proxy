@@ -3,6 +3,29 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.96 (2026-09-01)
+
+- Rework Sand as a request-scoped, HTTP/2-only `AgentService/Run` route. A
+  selected model keeps its Sand desktop identity, local-client marker,
+  checksum, stable Agent Host session/run ids, and native tool bridge across
+  retries and reconnects; it never falls through to `RunSSE`, including when
+  ordinary Cursor traffic is pinned to HTTP/1.
+- Bring the Agent Host wire model up to date with current lifecycle,
+  prewarm, TTFT, control, interaction-metadata, and managed-local fields.
+  Metadata-only frames now count as upstream progress without leaking into
+  Claude Code output, preventing first-turn setup-idle and reconnect-budget
+  failures.
+- Align H2 probes with the Sand identity, including the desktop checksum, so
+  a healthy managed-local route is not misclassified after a transport
+  half-open check.
+- Add `cursor sand-status` (including JSON) for the effective routing policy,
+  identity, transport, account cache, and read-only desktop inspection. The
+  reference Sand desktop-bundle patch is optional and explicitly not required
+  by this proxy.
+- Expand Sand regression coverage for strict H2, no `RunSSE` fallback,
+  desktop identity headers, checksum, current prewarm tags, lifecycle-only
+  progress, and nested Task metadata.
+
 ## v0.1.86 (2026-08-29)
 
 - Add Cursor multi-account management. `cursor auth login` keeps its hot-switch

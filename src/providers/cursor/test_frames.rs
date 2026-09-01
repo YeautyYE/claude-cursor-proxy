@@ -22,10 +22,14 @@ pub(crate) fn text_frame(text: &str) -> Vec<u8> {
             partial_tool_call: None,
             tool_call_delta: None,
             turn_ended: None,
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     })
 }
 
@@ -45,10 +49,14 @@ pub(crate) fn thinking_frame(text: &str) -> Vec<u8> {
             partial_tool_call: None,
             tool_call_delta: None,
             turn_ended: None,
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     })
 }
 
@@ -81,10 +89,14 @@ pub(crate) fn usage_frame_full(
                 cache_write_tokens: Some(cache_write),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     })
 }
 
@@ -106,10 +118,14 @@ pub(crate) fn heartbeat_frame() -> Vec<u8> {
             partial_tool_call: None,
             tool_call_delta: None,
             turn_ended: None,
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     })
 }
 

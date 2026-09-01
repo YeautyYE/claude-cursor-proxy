@@ -80,19 +80,27 @@ impl CursorUpstreamResponse {
 /// - `x-ghost-mode: true` when privacy unset
 /// - `User-Agent: connect-es/1.6.1`
 /// - HTTP/1.1 preferred (CLI uses H1 when server forces BiDi disabled)
-/// - No `x-cursor-checksum` on the main Agent path (IDE-only)
+/// - No `x-cursor-checksum` on the ordinary CLI Agent path; Sand/IDE profiles
+///   use the Desktop common-header checksum with local machine identity.
 #[derive(Clone)]
 pub struct CursorHttpClient {
     pub(crate) client: reqwest::Client,
     pub(crate) base_url: String,
     pub(crate) timeout_secs: u64,
     http1_only: bool,
+    http2_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorReqwestMode {
     Http1Only,
     Http2Alpn,
+    /// Force HTTP/2 for both TLS ALPN and the request engine.  Sand's
+    /// `x-cursor-client-type` is accepted only by AgentService/Run over H2;
+    /// allowing reqwest's normal HTTP/1 fallback can make a proxy downgrade
+    /// the request and return the deterministic "Sand traffic is not
+    /// supported on this endpoint" response.
+    Http2Only,
     CleartextH2PriorKnowledge,
 }
 
@@ -116,6 +124,11 @@ fn apply_cursor_reqwest_mode(
             builder.no_proxy().http2_prior_knowledge()
         }
         CursorReqwestMode::Http1Only => builder.http1_only(),
+        CursorReqwestMode::Http2Only => builder
+            .http2_prior_knowledge()
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
+            .http2_keep_alive_while_idle(false)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(60)),
         // gRPC keepalive: do not PING more often than ~60s. 10s/15s closed the
         // shared H2 connection (every live stream) when Clash delayed ACK.
         CursorReqwestMode::Http2Alpn => builder
@@ -147,8 +160,38 @@ impl CursorHttpClient {
     /// reconnect die with `stream error received: unexpected internal error`.
     pub fn with_prefer_http1(prefer_http1: bool) -> Self {
         let base_url = config::cursor_base_url();
-        let is_cleartext = base_url.starts_with("http://");
         let timeout_secs = config::cursor_request_timeout_secs();
+
+        Self::with_base_url_timeout_and_prefer_http1(base_url, timeout_secs, prefer_http1)
+    }
+
+    /// Build a transport variant while retaining the endpoint and timeout of
+    /// an existing client.  Retry/fallback clients used to call
+    /// `with_prefer_http1`, which re-read the process configuration and could
+    /// silently move a test/custom endpoint back to `api2.cursor.sh` (and lose
+    /// a per-client timeout).  Keeping this constructor next to the canonical
+    /// builder also ensures cleartext loopback endpoints select prior-knowledge
+    /// H2 instead of inheriting the configured HTTPS ALPN mode.
+    pub(crate) fn with_base_url_timeout_and_prefer_http1(
+        base_url: String,
+        timeout_secs: u64,
+        prefer_http1: bool,
+    ) -> Self {
+        let is_cleartext = base_url.starts_with("http://");
+        let mode = cursor_reqwest_mode(prefer_http1, is_cleartext);
+        Self::with_base_url_timeout_and_mode(base_url, timeout_secs, mode)
+    }
+
+    /// Build a client with an explicit protocol mode while retaining the
+    /// endpoint and timeout.  Most callers use [`Self::with_prefer_http1`],
+    /// but Sand needs the stricter `Http2Only` mode rather than the ordinary
+    /// H2/HTTP-1 ALPN negotiation used by CLI/IDE traffic.
+    fn with_base_url_timeout_and_mode(
+        base_url: String,
+        timeout_secs: u64,
+        mode: CursorReqwestMode,
+    ) -> Self {
+        let is_cleartext = base_url.starts_with("http://");
 
         // No whole-request timeout on the HTTP client: BiDi agent turns can exceed
         // several minutes while still streaming. Completion / stall is enforced in
@@ -164,7 +207,6 @@ impl CursorHttpClient {
             .tcp_keepalive(std::time::Duration::from_secs(30));
         let _ = timeout_secs; // retained for error messages / hard-timeout default
 
-        let mode = cursor_reqwest_mode(prefer_http1, is_cleartext);
         if !is_cleartext
             && cursor_http_bypass_proxy(std::env::var("CCP_CURSOR_NO_PROXY").ok().as_deref())
         {
@@ -180,31 +222,98 @@ impl CursorHttpClient {
             base_url,
             timeout_secs,
             http1_only,
+            http2_only: matches!(
+                mode,
+                CursorReqwestMode::Http2Only | CursorReqwestMode::CleartextH2PriorKnowledge
+            ),
         }
+    }
+
+    /// Rebuild this client for another transport mode without changing its
+    /// endpoint or request timeout.  Sand requests use this to escape a
+    /// process-wide HTTP/1 pin while remaining on the configured Sand host.
+    pub(crate) fn with_transport_mode(&self, prefer_http1: bool) -> Self {
+        Self::with_base_url_timeout_and_prefer_http1(
+            self.base_url.clone(),
+            self.timeout_secs,
+            prefer_http1,
+        )
+    }
+
+    /// Rebuild a request client for Sand's H2-only endpoint.  This is kept
+    /// request-scoped: ordinary CLI/IDE traffic can continue using the
+    /// process-wide HTTP/1 circuit and fallback policy without affecting Sand.
+    pub(crate) fn with_sand_transport_mode(&self) -> Self {
+        let mode = if self.base_url.starts_with("http://") {
+            CursorReqwestMode::CleartextH2PriorKnowledge
+        } else {
+            CursorReqwestMode::Http2Only
+        };
+        Self::with_base_url_timeout_and_mode(self.base_url.clone(), self.timeout_secs, mode)
     }
 
     pub(crate) fn prefers_http1(&self) -> bool {
         self.http1_only
     }
 
+    pub(crate) fn prefers_http2_only(&self) -> bool {
+        self.http2_only
+    }
+
     /// Fetch the live Cursor model catalog via `AgentService/GetUsableModels`.
     ///
     /// Prefers Connect JSON (same as official CLI `agent models`); falls back to
     /// Connect protobuf unary when JSON fails. Results are cached in-process for
-    /// ~5 minutes and partitioned by the active Cursor account.
+    /// ~5 minutes and partitioned by the active Cursor account and request
+    /// identity. This compatibility entry point uses the configured process
+    /// identity (`cli` by default); model-selected Sand callers should use
+    /// [`Self::fetch_usable_models_for_client_type`].
     pub async fn fetch_usable_models(&self, token: &str) -> Result<Vec<String>, CursorError> {
+        let client_type = config::cursor_client_type();
+        self.fetch_usable_models_for_client_type(token, &client_type)
+            .await
+    }
+
+    /// Fetch Cursor's live model catalog for one request identity.
+    ///
+    /// The catalog is not purely account-global: Cursor's managed-local Sand
+    /// route can return a different model entitlement set from the ordinary
+    /// CLI route for the same bearer. Keep the identity explicit all the way
+    /// through the cache and headers so a prior CLI warm-up cannot satisfy a
+    /// Sand lookup. Sand also stays on the strict H2 transport used by
+    /// `AgentService/Run`; an HTTP/1 catalog probe can make a healthy Sand
+    /// runtime appear unavailable.
+    pub async fn fetch_usable_models_for_client_type(
+        &self,
+        token: &str,
+        client_type: &str,
+    ) -> Result<Vec<String>, CursorError> {
+        let client_type = canonicalize_client_type(client_type.trim().to_string());
+        let request_client = if client_type_requires_h2(&client_type) && !self.prefers_http2_only()
+        {
+            self.with_sand_transport_mode()
+        } else {
+            self.clone()
+        };
+
         // Capture the account generation before the network request. Auth can
         // be hot-swapped by another process while this request is in flight;
         // the generation-aware store below then drops a stale completion.
         let account_generation = super::model::observe_live_usable_models_account(token);
-        if let Some(cached) = super::model::cached_live_usable_models_for_account(token) {
+        if let Some(cached) =
+            super::model::cached_live_usable_models_for_account_and_identity(token, &client_type)
+        {
             return Ok(cached);
         }
 
-        match self.fetch_usable_models_json(token).await {
+        match request_client
+            .fetch_usable_models_json(token, &client_type)
+            .await
+        {
             Ok(models) if !models.is_empty() => {
-                super::model::store_live_usable_models_for_account_at_generation(
+                super::model::store_live_usable_models_for_account_and_identity_at_generation(
                     token,
+                    &client_type,
                     account_generation,
                     models.clone(),
                 );
@@ -214,10 +323,13 @@ impl CursorHttpClient {
             Err(_) => { /* fall through to proto */ }
         }
 
-        let models = self.fetch_usable_models_proto(token).await?;
+        let models = request_client
+            .fetch_usable_models_proto(token, &client_type)
+            .await?;
         if !models.is_empty() {
-            super::model::store_live_usable_models_for_account_at_generation(
+            super::model::store_live_usable_models_for_account_and_identity_at_generation(
                 token,
+                &client_type,
                 account_generation,
                 models.clone(),
             );
@@ -225,7 +337,11 @@ impl CursorHttpClient {
         Ok(models)
     }
 
-    async fn fetch_usable_models_json(&self, token: &str) -> Result<Vec<String>, CursorError> {
+    async fn fetch_usable_models_json(
+        &self,
+        token: &str,
+        client_type: &str,
+    ) -> Result<Vec<String>, CursorError> {
         let url = format!(
             "{}/agent.v1.AgentService/GetUsableModels",
             self.base_url.trim_end_matches('/')
@@ -239,7 +355,7 @@ impl CursorHttpClient {
             .header("connect-protocol-version", "1")
             .header("user-agent", "connect-es/1.6.1")
             .body("{}");
-        let req = apply_cursor_identity_headers(req, token);
+        let req = apply_cursor_identity_headers_for_client_type(req, token, Some(client_type));
 
         let resp = req
             .send()
@@ -264,7 +380,11 @@ impl CursorHttpClient {
         parse_usable_models_json(&body)
     }
 
-    async fn fetch_usable_models_proto(&self, token: &str) -> Result<Vec<String>, CursorError> {
+    async fn fetch_usable_models_proto(
+        &self,
+        token: &str,
+        client_type: &str,
+    ) -> Result<Vec<String>, CursorError> {
         let url = format!(
             "{}/agent.v1.AgentService/GetUsableModels",
             self.base_url.trim_end_matches('/')
@@ -286,7 +406,7 @@ impl CursorHttpClient {
             .header("connect-protocol-version", "1")
             .header("user-agent", "connect-es/1.6.1")
             .body(payload);
-        let req = apply_cursor_identity_headers(req, token);
+        let req = apply_cursor_identity_headers_for_client_type(req, token, Some(client_type));
 
         let resp = req
             .send()
@@ -375,6 +495,33 @@ impl CursorHttpClient {
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
 
+        let client_type = canonicalize_client_type(
+            options
+                .client_type
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| config::cursor_client_type_for_model(model)),
+        );
+        // Cursor's HTTP/1 RunSSE endpoint rejects Sand traffic with a
+        // deterministic 400.  A process-level CCP_CURSOR_HTTP1 setting is
+        // still useful for CLI/IDE, but must not leak into a Sand request.
+        // Rebuild an HTTP/2 client while preserving a test/custom base URL;
+        // the recursive call is one hop because the replacement is not
+        // HTTP/1-pinned.
+        if client_type_requires_h2(&client_type) && !self.prefers_http2_only() {
+            let h2 = self.with_sand_transport_mode();
+            return Box::pin(h2.run_agent_with_session_profile(
+                token,
+                prompt,
+                model,
+                images,
+                custom_system_prompt,
+                options,
+            ))
+            .await;
+        }
+
         let request_id = uuid::Uuid::new_v4().to_string();
         let continuation = super::conversation::continuation_for(options.session_id);
         // `continuation_for` is intentionally called as close to dispatch as
@@ -412,7 +559,10 @@ impl CursorHttpClient {
                 ])),
             );
         }
-        let run_request = build_run_request_with_continuation(
+        // Keep the logical Agent Host identity stable across KV/conversation
+        // rotation.  Buffered requests use the account-scoped continuation
+        // key when available; this is the same partition used by live runs.
+        let run_request = build_run_request_with_continuation_and_agent_session(
             request_prompt,
             &resolved,
             request_images,
@@ -420,15 +570,19 @@ impl CursorHttpClient {
             custom_system_prompt,
             &continuation,
             None,
+            options.session_id,
+            Some(&request_id),
         );
 
         let msg = AgentClientMessage {
             run_request: Some(run_request),
             exec_client_message: None,
             kv_client_message: None,
+            conversation_action: None,
             exec_client_control_message: None,
             interaction_response: None,
             client_heartbeat: None,
+            prewarm_request: None,
         };
 
         let mut payload = Vec::new();
@@ -441,35 +595,39 @@ impl CursorHttpClient {
             self.base_url.trim_end_matches('/')
         );
 
-        let client_version = config::cursor_client_version();
-        let client_type = options
-            .client_type
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(config::cursor_client_type);
-        let ghost_mode = if config::cursor_ghost_mode() {
-            "true"
-        } else {
-            "false"
-        };
+        let client_version = config::cursor_client_version_for_type(&client_type);
         let profile = config::cursor_client_profile();
         let ide_profile = profile.eq_ignore_ascii_case("ide");
+        let sand_profile = client_type_requires_h2(&client_type);
+        let ghost_mode = if ide_profile || sand_profile {
+            config::cursor_ghost_mode_header()
+        } else if config::cursor_ghost_mode() {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        };
 
         // HTTPS → BiDi duplex (heartbeats). Cleartext mock servers are unary and
         // deadlock if the request stream never ends — send a finite body there.
         // HTTP/1 pinning follows this client (`with_prefer_http1`), not a second
         // read of `CCP_CURSOR_HTTP1` (that made 0.1.36 retries stay on H2).
-        let use_bidi = !self.base_url.starts_with("http://")
-            && !matches!(
-                std::env::var("CCP_CURSOR_BIDI")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "0" | "false" | "no" | "off"
-            );
-        let use_http1_sse = buffered_run_use_http1_sse(use_bidi, self.prefers_http1());
+        let bidi_configured = !matches!(
+            std::env::var("CCP_CURSOR_BIDI")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        );
+        // Sand has no valid HTTP/1 or finite-body fallback on HTTPS: Cursor's
+        // Sand identity is accepted only by the long-lived H2 BiDi Run.  Keep
+        // the process-wide `CCP_CURSOR_BIDI=0` escape hatch for CLI/IDE, but
+        // never let it downgrade a Sand request into a potentially hollow
+        // finite-body exchange.
+        let use_bidi =
+            buffered_run_use_bidi_for_client(&self.base_url, bidi_configured, &client_type);
+        let use_http1_sse =
+            buffered_run_use_http1_sse_for_client(use_bidi, self.prefers_http1(), &client_type);
 
         let (tx, h1_append, body, url, heartbeat_task) = if use_http1_sse {
             let run_url = format!(
@@ -592,13 +750,27 @@ impl CursorHttpClient {
             .header("x-cursor-streaming", "true")
             .header("x-original-request-id", &request_id);
 
-        if ide_profile {
+        if ide_profile || sand_profile {
             req = req
                 .header("x-cursor-client-device-type", "desktop")
                 .header("x-cursor-client-os", config::cursor_client_os())
                 .header("x-cursor-client-arch", config::cursor_client_arch())
-                .header("x-new-onboarding-completed", "true")
+                .header(
+                    "x-new-onboarding-completed",
+                    if config::cursor_new_onboarding_completed() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
                 .header("x-amzn-trace-id", format!("Root={request_id}"));
+
+            if let Some(os_version) = config::cursor_client_os_version() {
+                req = req.header("x-cursor-client-os-version", os_version);
+            }
+            if let Some(layout) = config::cursor_client_layout() {
+                req = req.header("x-cursor-client-layout", layout);
+            }
 
             if let Some(commit) = config::cursor_client_commit() {
                 req = req.header("x-cursor-client-commit", commit);
@@ -614,9 +786,22 @@ impl CursorHttpClient {
             }
         }
 
+        if config::cursor_local_client_mode(&client_type) {
+            req = req.header("local-client-mode", "true");
+        }
+        if config::cursor_canary() {
+            req = req.header("x-cursor-canary", "true");
+        }
+        if let Some(version) = config::cursor_config_version() {
+            req = req.header("x-cursor-config-version", version);
+        }
+
         let checksum_mode = std::env::var("CCP_CURSOR_CHECKSUM_MODE").unwrap_or_else(|_| {
-            if ide_profile {
-                "token".into()
+            if ide_profile || sand_profile {
+                // Match Cursor Desktop's common-header helper: use the
+                // persisted machine identity, with a token-derived fallback
+                // only when this is a headless installation.
+                "storage".into()
             } else {
                 "none".into()
             }
@@ -626,13 +811,9 @@ impl CursorHttpClient {
             && !checksum_mode.eq_ignore_ascii_case("0")
         {
             let checksum = if checksum_mode.eq_ignore_ascii_case("storage") {
-                let machine_ids = super::identity::load_cursor_machine_ids();
-                machine_ids.machine_id.as_ref().map(|mid| {
-                    super::identity::build_cursor_checksum(
-                        mid,
-                        machine_ids.mac_machine_id.as_deref(),
-                    )
-                })
+                Some(super::identity::build_cursor_checksum_for_storage_or_token(
+                    token,
+                ))
             } else {
                 Some(super::identity::build_cursor_checksum_for_token(token))
             };
@@ -824,6 +1005,7 @@ impl CursorHttpClient {
                                 let retain_frame = class.is_end
                                     || class.has_text
                                     || class.has_thinking
+                                    || class.has_metadata_progress
                                     || class.thinking_completed
                                     || class.turn_ended
                                     || class.has_tool_call
@@ -839,6 +1021,10 @@ impl CursorHttpClient {
                                     last_progress = Instant::now();
                                 }
                                 if class.has_thinking {
+                                    useful = true;
+                                    last_progress = Instant::now();
+                                }
+                                if class.has_metadata_progress {
                                     useful = true;
                                     last_progress = Instant::now();
                                 }
@@ -946,6 +1132,7 @@ impl CursorHttpClient {
                                 if class.is_end
                                     || class.has_text
                                     || class.has_thinking
+                                    || class.has_metadata_progress
                                     || class.turn_ended
                                     || class.thinking_completed
                                 {
@@ -1056,7 +1243,8 @@ impl CursorHttpClient {
                         body_bytes.len(),
                     )
                 };
-                if run_agent_should_retry_http1(
+                if buffered_retry_can_use_http1(
+                    &client_type,
                     self.prefers_http1(),
                     finish_reason,
                     useful,
@@ -1069,14 +1257,15 @@ impl CursorHttpClient {
                     fields.insert("elapsedMs".into(), json!(elapsed_ms as u64));
                     create_logger("cursor").warn("run_agent_retry_http1", Some(fields));
                     return Box::pin(
-                        CursorHttpClient::with_prefer_http1(true).run_agent_with_session_profile(
-                            token,
-                            prompt,
-                            model,
-                            images,
-                            custom_system_prompt,
-                            options,
-                        ),
+                        self.with_transport_mode(true)
+                            .run_agent_with_session_profile(
+                                token,
+                                prompt,
+                                model,
+                                images,
+                                custom_system_prompt,
+                                options,
+                            ),
                     )
                     .await;
                 }
@@ -1277,6 +1466,10 @@ struct FrameClass {
     has_text: bool,
     has_eos: bool,
     has_thinking: bool,
+    /// Agent Host TTFT/lifecycle metadata is genuine upstream progress, but
+    /// never Anthropic-visible output. Retain it so a buffered Sand turn does
+    /// not look like an untouched setup stream.
+    has_metadata_progress: bool,
     thinking_completed: bool,
     turn_ended: bool,
     has_tool_call: bool,
@@ -1297,6 +1490,7 @@ fn classify_frame(frame: &ConnectFrame) -> FrameClass {
     let Ok(msg) = proto::AgentServerMessage::decode(payload.as_ref()) else {
         return class;
     };
+    class.has_metadata_progress = msg.has_agent_host_metadata_progress();
     if let Some(update) = msg.interaction_update {
         class.has_text = update
             .text_delta
@@ -1351,32 +1545,63 @@ fn body_has_terminal_end(body: &[u8]) -> bool {
     })
 }
 
-/// Shared identity headers for AgentService unary + BiDi calls (CLI/IDE profile).
-fn apply_cursor_identity_headers(
+/// Apply the common Cursor desktop/CLI identity headers for a request-scoped
+/// client type.  Sand is not merely a different model quota: the patched
+/// Cursor client enters the managed-local runtime and emits the desktop
+/// identity tuple (`local-client-mode`, device/os/arch, layout, and optional
+/// config markers).  Keep this helper shared by catalog and buffered calls so
+/// a Sand probe cannot silently fall back to the process-wide CLI identity.
+pub(crate) fn apply_cursor_identity_headers_for_client_type(
     mut req: reqwest::RequestBuilder,
     token: &str,
+    client_type_override: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let client_version = config::cursor_client_version();
-    let client_type = config::cursor_client_type();
-    let ghost_mode = if config::cursor_ghost_mode() {
-        "true"
-    } else {
-        "false"
-    };
+    let requested_type = client_type_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(config::cursor_client_type);
+    let client_type = canonicalize_client_type(requested_type);
+    let client_version = config::cursor_client_version_for_type(&client_type);
     let profile = config::cursor_client_profile();
     let ide_profile = profile.eq_ignore_ascii_case("ide");
+    let sand_profile = client_type_requires_h2(&client_type);
+    let ghost_mode = if ide_profile || sand_profile {
+        config::cursor_ghost_mode_header()
+    } else if config::cursor_ghost_mode() {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    };
 
     req = req
         .header("x-cursor-client-type", &client_type)
         .header("x-cursor-client-version", &client_version)
         .header("x-ghost-mode", ghost_mode);
 
-    if ide_profile {
+    // Sand's managed-local route uses the desktop common-header interceptor
+    // even when the proxy's process profile remains `cli`.  Preserve the old
+    // IDE behavior and extend it to Sand only.
+    if ide_profile || sand_profile {
         req = req
             .header("x-cursor-client-device-type", "desktop")
             .header("x-cursor-client-os", config::cursor_client_os())
             .header("x-cursor-client-arch", config::cursor_client_arch())
-            .header("x-new-onboarding-completed", "true");
+            .header(
+                "x-new-onboarding-completed",
+                if config::cursor_new_onboarding_completed() {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+
+        if let Some(os_version) = config::cursor_client_os_version() {
+            req = req.header("x-cursor-client-os-version", os_version);
+        }
+        if let Some(layout) = config::cursor_client_layout() {
+            req = req.header("x-cursor-client-layout", layout);
+        }
 
         if let Some(commit) = config::cursor_client_commit() {
             req = req.header("x-cursor-client-commit", commit);
@@ -1392,9 +1617,21 @@ fn apply_cursor_identity_headers(
         }
     }
 
+    if config::cursor_local_client_mode(&client_type) {
+        req = req.header("local-client-mode", "true");
+    }
+    if config::cursor_canary() {
+        req = req.header("x-cursor-canary", "true");
+    }
+    if let Some(version) = config::cursor_config_version() {
+        req = req.header("x-cursor-config-version", version);
+    }
+
     let checksum_mode = std::env::var("CCP_CURSOR_CHECKSUM_MODE").unwrap_or_else(|_| {
-        if ide_profile {
-            "token".into()
+        if ide_profile || sand_profile {
+            // Desktop/Sand requests use the stable Cursor storage identity;
+            // the helper itself falls back to token-derived ids headlessly.
+            "storage".into()
         } else {
             "none".into()
         }
@@ -1404,10 +1641,9 @@ fn apply_cursor_identity_headers(
         && !checksum_mode.eq_ignore_ascii_case("0")
     {
         let checksum = if checksum_mode.eq_ignore_ascii_case("storage") {
-            let machine_ids = super::identity::load_cursor_machine_ids();
-            machine_ids.machine_id.as_ref().map(|mid| {
-                super::identity::build_cursor_checksum(mid, machine_ids.mac_machine_id.as_deref())
-            })
+            Some(super::identity::build_cursor_checksum_for_storage_or_token(
+                token,
+            ))
         } else {
             Some(super::identity::build_cursor_checksum_for_token(token))
         };
@@ -1531,9 +1767,11 @@ pub(crate) fn encode_client_heartbeat_frame() -> Result<Bytes, CursorError> {
         run_request: None,
         exec_client_message: None,
         kv_client_message: None,
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: None,
         client_heartbeat: Some(ClientHeartbeat {}),
+        prewarm_request: None,
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload)
@@ -1587,9 +1825,11 @@ fn build_request_context_reply(frame: &ConnectFrame) -> Result<Option<Bytes>, Cu
             pi_edit_result: None,
         }),
         kv_client_message: None,
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: None,
         client_heartbeat: None,
+        prewarm_request: None,
     };
     let mut payload = Vec::new();
     reply
@@ -1626,6 +1866,79 @@ pub(crate) fn build_run_request_with_continuation(
     continuation: &super::conversation::RunContinuation,
     mcp_tools: Option<proto::McpTools>,
 ) -> RunRequest {
+    build_run_request_with_context_and_agent_session(
+        prompt,
+        resolved,
+        images,
+        request_id,
+        custom_system_prompt,
+        continuation,
+        mcp_tools,
+        None,
+        None,
+        Some(request_id),
+    )
+}
+
+/// Build an AgentRunRequest while allowing the caller to pin the logical
+/// Agent Host session independently from Cursor's conversation binding.
+///
+/// Cursor rotates `conversation_id` when its KV blob store is compacted or a
+/// reconnect has to replay full history.  The desktop Sand runtime keeps a
+/// separate `agentSessionId` stable across that rotation; using the request
+/// UUID (the old fallback) makes a ResumeAction look like a new worker and is
+/// a common source of duplicate/active-run conflicts.  `agent_session_id` is
+/// therefore request-scoped and supplied by the live-run identity when known;
+/// legacy callers retain the conversation/request fallback through the wrapper
+/// above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_run_request_with_continuation_and_agent_session(
+    prompt: &str,
+    resolved: &CursorModelResolution,
+    images: &[CursorSelectedImage],
+    request_id: &str,
+    custom_system_prompt: Option<&str>,
+    continuation: &super::conversation::RunContinuation,
+    mcp_tools: Option<proto::McpTools>,
+    stable_agent_session_id: Option<&str>,
+    stable_run_id: Option<&str>,
+) -> RunRequest {
+    build_run_request_with_context_and_agent_session(
+        prompt,
+        resolved,
+        images,
+        request_id,
+        custom_system_prompt,
+        continuation,
+        mcp_tools,
+        None,
+        stable_agent_session_id,
+        stable_run_id,
+    )
+}
+
+/// Build an AgentRunRequest with an optional opening `RequestContext`.
+///
+/// Desktop Sand sends the context on the initial `UserMessageAction` (tag 2),
+/// not only as a later `ExecServerMessage.request_context_args` handshake.  A
+/// missing opening context makes managed-local runs start with an empty
+/// workspace/skill view and can make native tools appear unavailable until a
+/// reconnect.  Keep the context optional so legacy buffered callers retain
+/// their byte-for-byte shape while live requests can attach the context they
+/// already assembled from the Anthropic body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_run_request_with_context_and_agent_session(
+    prompt: &str,
+    resolved: &CursorModelResolution,
+    images: &[CursorSelectedImage],
+    request_id: &str,
+    custom_system_prompt: Option<&str>,
+    continuation: &super::conversation::RunContinuation,
+    mcp_tools: Option<proto::McpTools>,
+    opening_request_context: Option<&proto::RequestContext>,
+    stable_agent_session_id: Option<&str>,
+    stable_run_id: Option<&str>,
+) -> RunRequest {
     let selected_images: Vec<proto::SelectedImage> = images
         .iter()
         .filter_map(|img| {
@@ -1656,6 +1969,14 @@ pub(crate) fn build_run_request_with_continuation(
         })
         .collect();
 
+    // The desktop schema uses lifecycle IDs independently from both the
+    // transport request ID and conversation binding.  Preserve supplied IDs
+    // verbatim, except that whitespace-only values must not become explicit
+    // protobuf strings.  In particular, never derive either value from an
+    // account token or other credential.
+    let agent_session_id = nonempty_wire_identity(stable_agent_session_id);
+    let run_id = nonempty_wire_identity(stable_run_id);
+
     RunRequest {
         // Empty bytes = fresh ConversationState {}; otherwise opaque Structure.
         conversation_state: Some(continuation.conversation_state.clone()),
@@ -1670,14 +1991,43 @@ pub(crate) fn build_run_request_with_continuation(
                         Some(proto::SelectedContext { selected_images })
                     },
                     mode: resolved.mode.as_proto_enum(),
+                    is_simulated_msg: None,
+                    best_of_n_group_id: None,
+                    try_use_best_of_n_promotion: None,
+                    rich_text: None,
+                    simulated_msg_reason: None,
+                    conversation_state_blob_id: Vec::new(),
+                    subagent_system_reminder: None,
+                    triggering_user_info: None,
+                    execute_plan_info: None,
+                    simulated_message_metadata: None,
+                    prompt_reference_id: None,
+                    thread_id: None,
+                    text_blob_id: None,
+                    rich_text_blob_id: None,
+                    hook_additional_contexts: Vec::new(),
+                    custom_mode_intent: None,
                 }),
+                request_context: opening_request_context.cloned(),
+                send_to_interaction_listener: None,
+                prepend_user_messages: Vec::new(),
+                interrupted_pending_tool_call_resolutions: None,
+                conversation_history: None,
             }),
             resume_action: None,
+            ..Default::default()
         }),
         model_details: Some(proto::ModelDetails {
             model_id: Some(resolved.model_id.clone()),
+            thinking_details: None,
             display_model_id: Some(resolved.model_id.clone()),
             display_name: Some(resolved.model_id.clone()),
+            display_name_short: Some(resolved.model_id.clone()),
+            aliases: vec![resolved.model_id.clone()],
+            max_mode: None,
+            api_key_credentials: None,
+            azure_credentials: None,
+            bedrock_credentials: None,
         }),
         mcp_tools,
         conversation_id: continuation.conversation_id.clone(),
@@ -1691,6 +2041,11 @@ pub(crate) fn build_run_request_with_continuation(
             model_id: resolved.model_id.clone(),
             max_mode: None,
             parameters: super::model::requested_model_parameters(&resolved.model_id),
+            api_key_credentials: None,
+            azure_credentials: None,
+            bedrock_credentials: None,
+            built_in_model: Some(true),
+            is_variant_string_representation: Some(false),
         }),
         // Server rejects exclude_workspace_context=true for many accounts/models:
         // "Workspace context exclusion is not allowed for this user, team, or selected model".
@@ -1722,16 +2077,67 @@ pub(crate) fn build_run_request_with_continuation(
         conversation_group_id: None,
         pre_fetched_blobs,
         client_supports_inline_images: Some(true),
+        mcp_file_system_options: None,
+        skill_options: None,
+        suggest_next_prompt: Some(false),
+        subagent_type_name: None,
+        selected_subagent_model_details: vec![],
+        dev_raw_model_slug: None,
+        subagent_model_overrides: vec![],
+        can_create_cloud_subagents: Some(false),
+        suppress_subagent_progress_update_tool: Some(false),
+        client_supports_send_to_user: Some(true),
+        computer_use_coordinate_mode: None,
+        run_id,
+        agent_session_id,
+        // The proxy does not implement these desktop-only RPC/event arms, so
+        // explicitly decline them instead of advertising a capability that
+        // would leave a server request unanswered.
+        client_supports_prompt_context_usage_rpc: Some(false),
+        client_supports_routed_model_update: Some(false),
+        system_prompt_spec: None,
+        client_llm_gateway_credential: None,
+        client_supports_preview_card: Some(false),
+        started_as_new_project: None,
     }
+}
+
+fn nonempty_wire_identity(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Mid-turn reconnect: Cursor CLI sends `ResumeAction` with the latest
 /// conversation checkpoint after a transport stall/disconnect (no new user text).
+#[allow(dead_code)] // Compatibility wrapper; live Sand path uses the stable-id variant.
 pub(crate) fn build_resume_run_request(
+    resolved: &CursorModelResolution,
+    request_id: &str,
+    continuation: &super::conversation::RunContinuation,
+    mcp_tools: Option<proto::McpTools>,
+) -> RunRequest {
+    build_resume_run_request_with_agent_session(
+        resolved,
+        request_id,
+        continuation,
+        mcp_tools,
+        None,
+        Some(request_id),
+    )
+}
+
+/// Resume a run with an explicitly stable Agent Host session identity.  See
+/// [`build_run_request_with_continuation_and_agent_session`] for why this must
+/// not be derived from a newly generated request id after a conversation
+/// rotation.
+pub(crate) fn build_resume_run_request_with_agent_session(
     resolved: &CursorModelResolution,
     _request_id: &str,
     continuation: &super::conversation::RunContinuation,
     mcp_tools: Option<proto::McpTools>,
+    stable_agent_session_id: Option<&str>,
+    stable_run_id: Option<&str>,
 ) -> RunRequest {
     let pre_fetched_blobs: Vec<proto::PreFetchedBlob> = continuation
         .pre_fetched_blobs
@@ -1741,6 +2147,8 @@ pub(crate) fn build_resume_run_request(
             value: value.clone(),
         })
         .collect();
+    let agent_session_id = nonempty_wire_identity(stable_agent_session_id);
+    let run_id = nonempty_wire_identity(stable_run_id);
 
     RunRequest {
         conversation_state: Some(continuation.conversation_state.clone()),
@@ -1749,11 +2157,19 @@ pub(crate) fn build_resume_run_request(
             resume_action: Some(proto::ResumeAction {
                 request_context: Some(proto::RequestContext::default()),
             }),
+            ..Default::default()
         }),
         model_details: Some(proto::ModelDetails {
             model_id: Some(resolved.model_id.clone()),
+            thinking_details: None,
             display_model_id: Some(resolved.model_id.clone()),
             display_name: Some(resolved.model_id.clone()),
+            display_name_short: Some(resolved.model_id.clone()),
+            aliases: vec![resolved.model_id.clone()],
+            max_mode: None,
+            api_key_credentials: None,
+            azure_credentials: None,
+            bedrock_credentials: None,
         }),
         mcp_tools,
         conversation_id: continuation.conversation_id.clone(),
@@ -1762,6 +2178,11 @@ pub(crate) fn build_resume_run_request(
             model_id: resolved.model_id.clone(),
             max_mode: None,
             parameters: super::model::requested_model_parameters(&resolved.model_id),
+            api_key_credentials: None,
+            azure_credentials: None,
+            bedrock_credentials: None,
+            built_in_model: Some(true),
+            is_variant_string_representation: Some(false),
         }),
         exclude_workspace_context: match std::env::var("CCP_CURSOR_EXCLUDE_WORKSPACE") {
             Ok(raw)
@@ -1790,6 +2211,25 @@ pub(crate) fn build_resume_run_request(
         conversation_group_id: None,
         pre_fetched_blobs,
         client_supports_inline_images: Some(true),
+        mcp_file_system_options: None,
+        skill_options: None,
+        suggest_next_prompt: Some(false),
+        subagent_type_name: None,
+        selected_subagent_model_details: vec![],
+        dev_raw_model_slug: None,
+        subagent_model_overrides: vec![],
+        can_create_cloud_subagents: Some(false),
+        suppress_subagent_progress_update_tool: Some(false),
+        client_supports_send_to_user: Some(true),
+        computer_use_coordinate_mode: None,
+        run_id,
+        agent_session_id,
+        client_supports_prompt_context_usage_rpc: Some(false),
+        client_supports_routed_model_update: Some(false),
+        system_prompt_spec: None,
+        client_llm_gateway_credential: None,
+        client_supports_preview_card: Some(false),
+        started_as_new_project: None,
     }
 }
 
@@ -1936,11 +2376,74 @@ pub fn decode_frame_payload(
 // Error type
 // ---------------------------------------------------------------------------
 
+/// Cursor's Sand identity is supported by the HTTP/2 BiDi AgentService/Run
+/// endpoint, but not by the HTTP/1 RunSSE compatibility endpoint.
+#[inline]
+fn client_type_requires_h2(client_type: &str) -> bool {
+    client_type.trim().eq_ignore_ascii_case("sand")
+}
+
+/// Cursor's Sand identity is a lowercase wire value. Keep ordinary custom
+/// client types byte-for-byte compatible while normalizing explicit `SAND`
+/// overrides so route selection and headers cannot disagree.
+#[inline]
+fn canonicalize_client_type(client_type: String) -> String {
+    if client_type_requires_h2(&client_type) {
+        "sand".to_string()
+    } else {
+        client_type
+    }
+}
+
 /// Buffered `/Run` uses HTTP/1 RunSSE when *this client* is pinned, not when
 /// the process env happens to say so. `CursorHttpClient::new()` already applied
 /// `CCP_CURSOR_HTTP1`; retry clients pass `with_prefer_http1(true)`.
 pub(crate) fn buffered_run_use_http1_sse(use_bidi: bool, client_prefers_http1: bool) -> bool {
     use_bidi && client_prefers_http1
+}
+
+/// Select the buffered transport for one request without allowing the
+/// process-wide HTTP/1 preference to leak into a Sand run.  Cursor's Sand
+/// identity is rejected by `AgentService/RunSSE`; it must stay on the H2
+/// `AgentService/Run` endpoint even when the shared client was built with an
+/// HTTP/1 pin for CLI/IDE traffic.
+pub(crate) fn buffered_run_use_http1_sse_for_client(
+    use_bidi: bool,
+    client_prefers_http1: bool,
+    client_type: &str,
+) -> bool {
+    buffered_run_use_http1_sse(use_bidi, client_prefers_http1)
+        && !client_type_requires_h2(client_type)
+}
+
+/// Select whether a buffered HTTPS Run should keep its request body open as a
+/// BiDi stream. Sand traffic is H2/BiDi-only even when the process-wide toggle
+/// disables BiDi for ordinary CLI/IDE requests. Cleartext loopback fixtures
+/// stay finite-body because their mock servers do not consume an open stream.
+#[inline]
+fn buffered_run_use_bidi_for_client(
+    base_url: &str,
+    bidi_configured: bool,
+    client_type: &str,
+) -> bool {
+    !base_url.starts_with("http://") && (bidi_configured || client_type_requires_h2(client_type))
+}
+
+/// Decide whether a buffered retry may switch to the HTTP/1 RunSSE
+/// compatibility endpoint.  Keep this guard next to the transport selectors
+/// rather than relying solely on the caller's initial route: a late retry can
+/// otherwise resurrect a dormant HTTP/1 branch after a Sand request has
+/// already started on HTTP/2.  Cursor rejects `x-cursor-client-type: sand` on
+/// RunSSE with a deterministic 400, so Sand is always H2-only.
+pub(crate) fn buffered_retry_can_use_http1(
+    client_type: &str,
+    already_http1: bool,
+    finish_reason: &str,
+    useful: bool,
+    body_empty: bool,
+) -> bool {
+    !client_type_requires_h2(client_type)
+        && run_agent_should_retry_http1(already_http1, finish_reason, useful, body_empty)
 }
 
 pub(crate) fn run_agent_should_retry_http1(
@@ -2245,6 +2748,37 @@ mod tests {
     }
 
     #[test]
+    fn classify_frame_marks_agent_host_metadata_without_text_or_tool() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{AgentServerMessage, RoutedModelUpdate, TtftBreakdown};
+        use prost::Message;
+
+        for message in [
+            AgentServerMessage {
+                ttft_breakdown: Some(TtftBreakdown::default()),
+                ..Default::default()
+            },
+            AgentServerMessage {
+                interaction_update: Some(super::super::proto::InteractionUpdate {
+                    routed_model: Some(RoutedModelUpdate::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            let frame = ConnectFrameDecoder::new()
+                .push(encode_connect_frame(message.encode_to_vec(), 0))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let class = classify_frame(&frame);
+            assert!(class.has_metadata_progress);
+            assert!(!class.has_text);
+            assert!(!class.has_tool_call);
+        }
+    }
+
+    #[test]
     fn setup_idle_does_not_start_a_second_http1_run() {
         assert!(!run_agent_should_retry_http1(
             false,
@@ -2270,6 +2804,32 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn buffered_retry_guard_keeps_sand_on_h2() {
+        // Keep the assertion independent from the current retry policy (which
+        // is fail-closed for ambiguous streams): if that policy is widened in
+        // the future, Sand must still never reach RunSSE.
+        assert!(!buffered_retry_can_use_http1(
+            "sand",
+            false,
+            "transport_reset",
+            false,
+            true
+        ));
+        assert!(!buffered_retry_can_use_http1(
+            " SAND ",
+            true,
+            "transport_reset",
+            true,
+            false
+        ));
+        // Non-Sand identities retain the existing decision function exactly.
+        assert_eq!(
+            buffered_retry_can_use_http1("cli", false, "setup_idle", false, true),
+            run_agent_should_retry_http1(false, "setup_idle", false, true)
+        );
     }
 
     #[test]
@@ -2348,6 +2908,97 @@ mod tests {
             "an H2 client must not take RunSSE just because CCP_CURSOR_HTTP1 might be set elsewhere"
         );
         assert!(!buffered_run_use_http1_sse(false, true));
+    }
+
+    #[test]
+    fn buffered_sand_run_never_selects_runsse_even_when_client_is_h1_pinned() {
+        assert!(!buffered_run_use_http1_sse_for_client(true, true, "sand"));
+        assert!(!buffered_run_use_http1_sse_for_client(true, true, " SAND "));
+        assert!(buffered_run_use_http1_sse_for_client(true, true, "cli"));
+        assert!(buffered_run_use_http1_sse_for_client(true, true, "ide"));
+        assert!(!buffered_run_use_http1_sse_for_client(false, true, "sand"));
+    }
+
+    #[test]
+    fn explicit_sand_client_type_is_canonicalized_for_wire_headers() {
+        assert_eq!(canonicalize_client_type(" SAND ".to_string()), "sand");
+        assert_eq!(canonicalize_client_type("sand".to_string()), "sand");
+        assert_eq!(canonicalize_client_type("CLI".to_string()), "CLI");
+    }
+
+    #[test]
+    fn sand_identity_headers_include_desktop_local_runtime_markers() {
+        let client = reqwest::Client::new();
+        let request = apply_cursor_identity_headers_for_client_type(
+            client.get("https://cursor.test/agent"),
+            "TOKEN",
+            Some(" SAND "),
+        )
+        .build()
+        .expect("build request");
+        let headers = request.headers();
+        assert_eq!(
+            headers
+                .get("x-cursor-client-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("sand")
+        );
+        assert_eq!(
+            headers
+                .get("local-client-mode")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            headers
+                .get("x-cursor-client-device-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("desktop")
+        );
+        assert!(headers.contains_key("x-cursor-client-os"));
+        assert!(headers.contains_key("x-cursor-client-arch"));
+    }
+
+    #[test]
+    fn cli_identity_does_not_gain_sand_local_marker_by_default() {
+        let client = reqwest::Client::new();
+        let request = apply_cursor_identity_headers_for_client_type(
+            client.get("https://cursor.test/agent"),
+            "TOKEN",
+            Some("cli"),
+        )
+        .build()
+        .expect("build request");
+        assert!(!request.headers().contains_key("local-client-mode"));
+    }
+
+    #[test]
+    fn buffered_sand_https_run_keeps_bidi_when_global_toggle_is_off() {
+        assert!(buffered_run_use_bidi_for_client(
+            "https://api2.cursor.sh",
+            false,
+            "sand"
+        ));
+        assert!(buffered_run_use_bidi_for_client(
+            "https://api2.cursor.sh",
+            false,
+            " SAND "
+        ));
+        assert!(!buffered_run_use_bidi_for_client(
+            "https://api2.cursor.sh",
+            false,
+            "cli"
+        ));
+        assert!(buffered_run_use_bidi_for_client(
+            "https://api2.cursor.sh",
+            true,
+            "cli"
+        ));
+        assert!(!buffered_run_use_bidi_for_client(
+            "http://127.0.0.1:43127",
+            false,
+            "sand"
+        ));
     }
 
     #[test]
@@ -2444,13 +3095,27 @@ mod tests {
             models: vec![
                 proto::ModelDetails {
                     model_id: Some("composer-2.5".into()),
+                    thinking_details: None,
+                    display_name_short: Some("Composer".into()),
                     display_model_id: None,
                     display_name: Some("Composer".into()),
+                    aliases: vec![],
+                    max_mode: None,
+                    api_key_credentials: None,
+                    azure_credentials: None,
+                    bedrock_credentials: None,
                 },
                 proto::ModelDetails {
                     model_id: None,
+                    thinking_details: None,
+                    display_name_short: None,
                     display_model_id: Some("gpt-5.5".into()),
                     display_name: None,
+                    aliases: vec![],
+                    max_mode: None,
+                    api_key_credentials: None,
+                    azure_credentials: None,
+                    bedrock_credentials: None,
                 },
             ],
         };
@@ -2492,6 +3157,84 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_id_can_outlive_conversation_rotation() {
+        let resolved = crate::providers::cursor::model::resolve_cursor_model("fable").unwrap();
+        let old = super::super::conversation::RunContinuation {
+            conversation_id: Some("conv-old".into()),
+            conversation_state: vec![0x08, 0x01],
+            pre_fetched_blobs: vec![],
+            has_checkpoint: true,
+        };
+        let rotated = super::super::conversation::RunContinuation {
+            conversation_id: Some("conv-new".into()),
+            conversation_state: vec![],
+            pre_fetched_blobs: vec![],
+            has_checkpoint: false,
+        };
+        let initial = build_run_request_with_continuation_and_agent_session(
+            "hello",
+            &resolved,
+            &[],
+            "req-initial",
+            None,
+            &old,
+            None,
+            Some("stable-worker"),
+            Some("stable-run"),
+        );
+        let resumed = build_resume_run_request_with_agent_session(
+            &resolved,
+            "req-resume",
+            &rotated,
+            None,
+            Some("stable-worker"),
+            Some("stable-run"),
+        );
+        assert_ne!(initial.conversation_id, resumed.conversation_id);
+        assert_eq!(initial.agent_session_id.as_deref(), Some("stable-worker"));
+        assert_eq!(resumed.agent_session_id.as_deref(), Some("stable-worker"));
+        assert_eq!(initial.run_id.as_deref(), Some("stable-run"));
+        assert_eq!(resumed.run_id.as_deref(), Some("stable-run"));
+        let mut initial_bytes = Vec::new();
+        initial.encode(&mut initial_bytes).unwrap();
+        let mut resumed_bytes = Vec::new();
+        resumed.encode(&mut resumed_bytes).unwrap();
+        assert!(initial_bytes.windows(2).any(|w| w == [0xca, 0x01]));
+        assert!(initial_bytes.windows(2).any(|w| w == [0xd2, 0x01]));
+        assert!(resumed_bytes.windows(2).any(|w| w == [0xca, 0x01]));
+        assert!(resumed_bytes.windows(2).any(|w| w == [0xd2, 0x01]));
+    }
+
+    #[test]
+    fn blank_stable_agent_session_falls_back_without_wire_empty_string() {
+        let resolved = crate::providers::cursor::model::resolve_cursor_model("fable").unwrap();
+        let cont = super::super::conversation::RunContinuation {
+            conversation_id: Some("conv".into()),
+            ..Default::default()
+        };
+        let req = build_run_request_with_continuation_and_agent_session(
+            "hello",
+            &resolved,
+            &[],
+            "req",
+            None,
+            &cont,
+            None,
+            Some("  "),
+            Some("\t"),
+        );
+        // Blank lifecycle ids are accepted for API compatibility but never
+        // become explicit empty strings in the AgentRunRequest.
+        let mut bytes = Vec::new();
+        req.encode(&mut bytes).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(req.agent_session_id.is_none());
+        assert!(req.run_id.is_none());
+        assert!(!bytes.windows(2).any(|w| w == [0xca, 0x01]));
+        assert!(!bytes.windows(2).any(|w| w == [0xd2, 0x01]));
+    }
+
+    #[test]
     fn cursor_http_bypass_proxy_parses_truthy_flags() {
         assert!(!cursor_http_bypass_proxy(None));
         assert!(!cursor_http_bypass_proxy(Some("")));
@@ -2522,6 +3265,39 @@ mod tests {
             cursor_reqwest_mode(true, true),
             CursorReqwestMode::CleartextH2PriorKnowledge
         );
+    }
+
+    #[test]
+    fn transport_variant_preserves_custom_endpoint_and_timeout() {
+        let original = CursorHttpClient::with_base_url_timeout_and_prefer_http1(
+            "https://custom.cursor.test:43127".into(),
+            17,
+            true,
+        );
+        let h2 = original.with_transport_mode(false);
+        assert_eq!(h2.base_url, original.base_url);
+        assert_eq!(h2.timeout_secs, 17);
+        assert!(!h2.prefers_http1());
+
+        let h1 = h2.with_transport_mode(true);
+        assert_eq!(h1.base_url, original.base_url);
+        assert_eq!(h1.timeout_secs, 17);
+        assert!(h1.prefers_http1());
+
+        let cleartext = CursorHttpClient::with_base_url_timeout_and_prefer_http1(
+            "http://127.0.0.1:43127".into(),
+            19,
+            false,
+        );
+        assert_eq!(cleartext.base_url, "http://127.0.0.1:43127");
+        assert_eq!(cleartext.timeout_secs, 19);
+        assert!(!cleartext.prefers_http1());
+
+        let sand = original.with_sand_transport_mode();
+        assert!(!sand.prefers_http1());
+        assert!(sand.prefers_http2_only());
+        assert_eq!(sand.base_url, original.base_url);
+        assert_eq!(sand.timeout_secs, original.timeout_secs);
     }
 
     async fn collect_preface(mode: CursorReqwestMode) -> Vec<u8> {
@@ -2573,6 +3349,22 @@ mod tests {
         assert!(
             preface.starts_with(b"PRI * HTTP/2.0"),
             "cleartext mock path must keep h2 prior knowledge, got {:?}",
+            String::from_utf8_lossy(&preface)
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_h2_mode_sends_pri_preface_for_cleartext_sand_variant() {
+        let client = CursorHttpClient::with_base_url_timeout_and_mode(
+            "http://127.0.0.1:43127".into(),
+            1,
+            CursorReqwestMode::Http2Only,
+        );
+        assert!(client.prefers_http2_only());
+        let preface = collect_preface(CursorReqwestMode::Http2Only).await;
+        assert!(
+            preface.starts_with(b"PRI * HTTP/2.0"),
+            "strict H2 mode must send the HTTP/2 preface, got {:?}",
             String::from_utf8_lossy(&preface)
         );
     }

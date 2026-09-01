@@ -127,6 +127,66 @@ fn cursor_auth_list_reads_multi_account_registry() -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn cursor_sand_status_reports_managed_local_markers_without_network()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Sand status is intentionally a local diagnostic: it must be useful
+    // before login and must not spend quota just to inspect the route.
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
+    let output = cmd
+        .args(["cursor", "sand-status"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_CURSOR_SAND_MODELS", "gemini-3.1-pro,claude-fable-5")
+        .env("CCP_CURSOR_CLI_KEYCHAIN_FALLBACK", "0")
+        .env_remove("CCP_CURSOR_AUTH_TOKEN")
+        .env_remove("CURSOR_AUTH_TOKEN")
+        .output()?;
+    assert!(output.status.success(), "{:?}", output);
+    let text = String::from_utf8(output.stdout)?;
+    assert!(text.contains("SandClientMode status"));
+    assert!(text.contains("routing: enabled"));
+    assert!(text.contains("managed-local: ready"));
+    assert!(text.contains("local-runtime: ready"));
+    assert!(text.contains("direct-stream: ready"));
+    assert!(text.contains("transport: h2-only"));
+    assert!(!text.contains("accessToken"));
+    assert!(!text.contains("refreshToken"));
+    Ok(())
+}
+
+#[test]
+fn cursor_sand_status_json_exposes_policy_and_account_free_cache_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-cursor-proxy")?;
+    let output = cmd
+        .args(["cursor", "sand-status", "--json"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_CURSOR_SAND_MODELS", "gemini-3.6-flash")
+        .env("CCP_CURSOR_BASE_URL", "http://127.0.0.1:1")
+        .env("CCP_CURSOR_CLI_KEYCHAIN_FALLBACK", "0")
+        .env_remove("CCP_CURSOR_AUTH_TOKEN")
+        .env_remove("CURSOR_AUTH_TOKEN")
+        .output()?;
+    assert!(output.status.success(), "{:?}", output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["protocol"], "sand-client-mode");
+    assert_eq!(value["enabled"], true);
+    assert_eq!(value["modelPatterns"][0], "gemini-3.6-flash");
+    assert_eq!(value["markers"]["managedLocalRoute"], true);
+    assert_eq!(value["markers"]["localRuntimeLoad"], true);
+    assert_eq!(value["markers"]["directStream"], true);
+    assert_eq!(value["transport"], "h2-prior-knowledge");
+    assert_eq!(value["accounts"].as_array().map(Vec::len), Some(0));
+    assert!(value["usageCachePath"].as_str().is_some());
+    // The JSON report is safe to log: no credential fields or bearer values.
+    let encoded = serde_json::to_string(&value)?;
+    assert!(!encoded.contains("accessToken"));
+    assert!(!encoded.contains("refreshToken"));
+    Ok(())
+}
+
+#[test]
 fn cursor_auth_use_switches_legacy_active_file() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let auth_dir = temp.path().join("cursor");

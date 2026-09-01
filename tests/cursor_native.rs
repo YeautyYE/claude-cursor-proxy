@@ -18,6 +18,21 @@ use std::sync::Mutex;
 
 static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prost roundtrip
 // ---------------------------------------------------------------------------
@@ -48,10 +63,14 @@ fn prost_roundtrip_preserves_cursor_server_message() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut bytes = Vec::new();
     msg.encode(&mut bytes).unwrap();
@@ -77,9 +96,31 @@ fn prost_roundtrip_preserves_client_message() {
                         message_id: "msg-id".into(),
                         selected_context: None,
                         mode: 1, // AGENT_MODE_AGENT
+                        is_simulated_msg: None,
+                        best_of_n_group_id: None,
+                        try_use_best_of_n_promotion: None,
+                        rich_text: None,
+                        simulated_msg_reason: None,
+                        conversation_state_blob_id: Vec::new(),
+                        subagent_system_reminder: None,
+                        triggering_user_info: None,
+                        execute_plan_info: None,
+                        simulated_message_metadata: None,
+                        prompt_reference_id: None,
+                        thread_id: None,
+                        text_blob_id: None,
+                        rich_text_blob_id: None,
+                        hook_additional_contexts: vec![],
+                        custom_mode_intent: None,
                     }),
+                    request_context: None,
+                    send_to_interaction_listener: None,
+                    prepend_user_messages: vec![],
+                    interrupted_pending_tool_call_resolutions: None,
+                    conversation_history: None,
                 }),
                 resume_action: None,
+                ..Default::default()
             }),
             model_details: None,
             mcp_tools: None,
@@ -92,6 +133,11 @@ fn prost_roundtrip_preserves_client_message() {
                     id: "context".into(),
                     value: "128k".into(),
                 }],
+                api_key_credentials: None,
+                azure_credentials: None,
+                bedrock_credentials: None,
+                built_in_model: None,
+                is_variant_string_representation: None,
             }),
             exclude_workspace_context: Some(false),
             harness: None,
@@ -99,12 +145,15 @@ fn prost_roundtrip_preserves_client_message() {
             conversation_group_id: None,
             pre_fetched_blobs: vec![],
             client_supports_inline_images: Some(true),
+            ..RunRequest::default()
         }),
         exec_client_message: None,
         kv_client_message: None,
+        conversation_action: None,
         exec_client_control_message: None,
         interaction_response: None,
         client_heartbeat: None,
+        prewarm_request: None,
     };
 
     let mut bytes = Vec::new();
@@ -285,7 +334,7 @@ fn cursor_error_display_works() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
-    use axum::{Router, routing::post};
+    use axum::{Router, body::Body, extract::Request, http::Version, routing::post};
     use claude_cursor_proxy::providers::cursor::client::CursorHttpClient;
     use claude_cursor_proxy::providers::cursor::connect::{
         ConnectFrameDecoder, encode_connect_frame,
@@ -299,11 +348,35 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     struct ObservedRequest {
         headers: axum::http::HeaderMap,
         body: Vec<u8>,
+        version: Version,
     }
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore_env = RestoreEnv(
+        [
+            "CCP_CONFIG_DIR",
+            "CCP_CURSOR_BASE_URL",
+            "CCP_CURSOR_CLIENT_VERSION",
+            "CCP_CURSOR_CLIENT_TYPE",
+            "CCP_CURSOR_SAND_CLIENT_VERSION",
+            "CCP_CURSOR_CLIENT_OS",
+            "CCP_CURSOR_CLIENT_ARCH",
+            "CCP_CURSOR_NEW_ONBOARDING_COMPLETED",
+            "CCP_CURSOR_MACHINE_ID",
+            "CCP_CURSOR_MAC_MACHINE_ID",
+            "CCP_CURSOR_CHECKSUM_MODE",
+            "CCP_CURSOR_LOCAL_CLIENT_MODE",
+            "CCP_CURSOR_HTTP1",
+            "CCP_CURSOR_SAND_MODELS",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect(),
+    );
     let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
     let observed_handler = Arc::clone(&observed);
+    let runsse_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runsse_hits_handler = Arc::clone(&runsse_hits);
 
     let response_body = {
         let msg = AgentServerMessage {
@@ -325,10 +398,14 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
                     cache_write_tokens: Some(0),
                     reasoning_tokens: None,
                 }),
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -337,16 +414,22 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         body
     };
 
-    let app = Router::new().route(
-        "/agent.v1.AgentService/Run",
-        post(
-            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+    let app = Router::new()
+        .route(
+            "/agent.v1.AgentService/Run",
+            post(move |request: Request<Body>| {
                 let response_body = response_body.clone();
                 let observed_handler = Arc::clone(&observed_handler);
                 async move {
+                    let version = request.version();
+                    let headers = request.headers().clone();
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("read mock request body");
                     *observed_handler.lock().unwrap() = Some(ObservedRequest {
                         headers,
                         body: body.to_vec(),
+                        version,
                     });
                     (
                         [(
@@ -356,18 +439,43 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
                         response_body,
                     )
                 }
-            },
-        ),
-    );
+            }),
+        )
+        // A Sand request must never reach the compatibility endpoint. Keep a
+        // handler so an accidental fallback is observable rather than becoming a
+        // generic 404 that hides the transport regression.
+        .route(
+            "/agent.v1.AgentService/RunSSE",
+            post(move || {
+                let runsse_hits_handler = Arc::clone(&runsse_hits_handler);
+                async move {
+                    runsse_hits_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "RunSSE is not valid for Sand",
+                    )
+                }
+            }),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mock_url = format!("http://{}", addr);
+    let config_dir = tempfile::tempdir().expect("temporary Sand fixture config");
 
     unsafe {
+        std::env::set_var("CCP_CONFIG_DIR", config_dir.path());
         std::env::set_var("CCP_CURSOR_BASE_URL", &mock_url);
         std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "test-client-version");
         std::env::set_var("CCP_CURSOR_CLIENT_TYPE", "cli");
+        std::env::set_var("CCP_CURSOR_SAND_CLIENT_VERSION", "sand-test-version");
+        std::env::set_var("CCP_CURSOR_CLIENT_OS", "test-os");
+        std::env::set_var("CCP_CURSOR_CLIENT_ARCH", "test-arch");
+        std::env::set_var("CCP_CURSOR_NEW_ONBOARDING_COMPLETED", "0");
+        std::env::set_var("CCP_CURSOR_MACHINE_ID", "MACHINE");
+        std::env::set_var("CCP_CURSOR_MAC_MACHINE_ID", "MAC");
+        std::env::set_var("CCP_CURSOR_CHECKSUM_MODE", "storage");
+        std::env::remove_var("CCP_CURSOR_LOCAL_CLIENT_MODE");
         std::env::remove_var("CCP_CURSOR_SAND_MODELS");
     }
 
@@ -492,8 +600,12 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
 
     unsafe {
         std::env::set_var("CCP_CURSOR_SAND_MODELS", "cursor:gpt-5.5");
+        // Construct a fresh client while the process prefers HTTP/1. Sand
+        // must still select the H2 Run endpoint; the explicit H1-pinned
+        // selector has a focused unit contract alongside this wire fixture.
+        std::env::set_var("CCP_CURSOR_HTTP1", "1");
     }
-    client
+    CursorHttpClient::new()
         .run_agent("wire-token", "sand prompt", "cursor:gpt-5.5", &[], None)
         .await
         .expect("sand mock upstream request should succeed");
@@ -502,6 +614,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         .unwrap()
         .clone()
         .expect("sand request captured");
+    assert_eq!(sand_observed.version, Version::HTTP_2);
     assert_eq!(
         sand_observed
             .headers
@@ -509,13 +622,60 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
             .and_then(|v| v.to_str().ok()),
         Some("sand")
     );
-
-    unsafe {
-        std::env::remove_var("CCP_CURSOR_BASE_URL");
-        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
-        std::env::remove_var("CCP_CURSOR_CLIENT_TYPE");
-        std::env::remove_var("CCP_CURSOR_SAND_MODELS");
-    }
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-cursor-client-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("sand-test-version")
+    );
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("local-client-mode")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-cursor-client-device-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("desktop")
+    );
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-cursor-client-os")
+            .and_then(|v| v.to_str().ok()),
+        Some("test-os")
+    );
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-cursor-client-arch")
+            .and_then(|v| v.to_str().ok()),
+        Some("test-arch")
+    );
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-new-onboarding-completed")
+            .and_then(|v| v.to_str().ok()),
+        Some("false")
+    );
+    assert!(
+        sand_observed
+            .headers
+            .get("x-cursor-checksum")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|value| value.ends_with("MACHINE/MAC"))
+    );
+    assert_eq!(
+        runsse_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "Sand must remain on AgentService/Run over HTTP/2"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -547,10 +707,14 @@ fn response_decode_extracts_text_and_usage() {
             partial_tool_call: None,
             tool_call_delta: None,
             turn_ended: None,
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -576,10 +740,14 @@ fn response_decode_extracts_text_and_usage() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -627,10 +795,14 @@ fn sse_parses_event_names_and_data() {
             partial_tool_call: None,
             tool_call_delta: None,
             turn_ended: None,
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -655,10 +827,14 @@ fn sse_parses_event_names_and_data() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -725,10 +901,14 @@ fn sse_message_delta_contains_usage() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -791,10 +971,14 @@ fn sse_thinking_has_no_progress_message_delta_but_keeps_final_usage() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -893,10 +1077,14 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
             partial_tool_call: None,
             tool_call_delta: None,
             turn_ended: None,
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -921,10 +1109,14 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -1038,10 +1230,14 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
                 cache_write_tokens: Some(0),
                 reasoning_tokens: None,
             }),
+
+            ..Default::default()
         }),
         kv_server_message: None,
         interaction_query: None,
+        exec_server_control_message: None,
         exec_server_message: None,
+        ..Default::default()
     };
     let mut payload = Vec::new();
     msg.encode(&mut payload).unwrap();
@@ -1161,10 +1357,14 @@ async fn gemini_compaction_helper_isolated_and_reasoning_is_visible() {
                     cache_write_tokens: Some(0),
                     reasoning_tokens: Some(8),
                 }),
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
@@ -1297,10 +1497,14 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         };
         let mut text_payload = Vec::new();
         text_msg.encode(&mut text_payload).unwrap();
@@ -1324,10 +1528,14 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
                     cache_write_tokens: Some(0),
                     reasoning_tokens: None,
                 }),
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         };
         let mut usage_payload = Vec::new();
         usage_msg.encode(&mut usage_payload).unwrap();
@@ -1576,6 +1784,7 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
             interaction_update: None,
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id: 41,
                 exec_id: Some("exec-read-1".into()),
@@ -1595,6 +1804,8 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                 pi_write_args: None,
                 pi_edit_args: None,
             }),
+
+            ..Default::default()
         })
     }
 
@@ -1631,10 +1842,14 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         })
     }
 
@@ -1654,10 +1869,14 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         })
     }
 
@@ -1681,10 +1900,14 @@ async fn cursor_proxy_continues_tool_result_on_the_same_bidi_run() {
                     cache_write_tokens: Some(2),
                     reasoning_tokens: None,
                 }),
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         })
     }
 
@@ -2146,6 +2369,7 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
         server_frame(AgentServerMessage {
             conversation_checkpoint_update: None,
             interaction_update: None,
+            exec_server_control_message: None,
             exec_server_message: Some(ExecServerMessage {
                 id,
                 exec_id: Some(exec_id.into()),
@@ -2167,6 +2391,8 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
             }),
             kv_server_message: None,
             interaction_query: None,
+
+            ..Default::default()
         })
     }
 
@@ -2186,10 +2412,15 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         })
     }
 
@@ -2213,10 +2444,15 @@ async fn cursor_proxy_batches_two_execs_and_accepts_reverse_tool_results_on_same
                     cache_write_tokens: Some(0),
                     reasoning_tokens: None,
                 }),
+
+                ..Default::default()
             }),
+            exec_server_control_message: None,
             exec_server_message: None,
             kv_server_message: None,
+
             interaction_query: None,
+            ..Default::default()
         })
     }
 
@@ -3074,10 +3310,14 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
                 partial_tool_call: None,
                 tool_call_delta: None,
                 turn_ended: None,
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         })
     }
 
@@ -3102,10 +3342,14 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
                     cache_write_tokens: None,
                     reasoning_tokens: None,
                 }),
+
+                ..Default::default()
             }),
             kv_server_message: None,
             interaction_query: None,
+            exec_server_control_message: None,
             exec_server_message: None,
+            ..Default::default()
         }));
         bytes.extend_from_slice(&encode_connect_frame([], FLAG_END));
         Bytes::from(bytes)
