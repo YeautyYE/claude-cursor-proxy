@@ -11,16 +11,21 @@
 //! ```
 //!
 //! Machine ids: Cursor Desktop first uses the abuse-service machine ids and
-//! falls back to the telemetry ids persisted in `storage.json`.  A proxy does
-//! not have the Desktop abuse service, so persisted ids are the closest stable
-//! identity and are preferred whenever available.  Token-derived ids remain a
-//! deterministic last resort for headless installations (and preserve
-//! compatibility with older CLI clients).
+//! falls back to telemetry ids persisted in `storage.json` or `state.vscdb`.
+//! A proxy does not have the Desktop abuse service, so persisted ids are the
+//! closest stable identity and are preferred whenever available. Token-derived
+//! ids remain a deterministic last resort for headless installations (and
+//! preserve compatibility with older CLI clients).
 
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const STATE_DB_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Rolling obfuscation matching Cursor's `acf` helper.
 pub fn acf_obfuscate(input: &[u8]) -> Vec<u8> {
@@ -34,14 +39,12 @@ pub fn acf_obfuscate(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn b64_url_no_pad(bytes: &[u8]) -> String {
+fn b64_standard_no_pad(bytes: &[u8]) -> String {
     use base64::Engine;
-    // Cursor's desktop `Vzg`/`ccf` helper uses the URL-safe alphabet and
-    // strips padding (`base64url(...).replace(/=+$/, "")`).  Six-byte
-    // timestamps happen to need no `=` padding, but `+` and `/` still occur
-    // for some epochs; using STANDARD there makes the checksum fail header
-    // validation on those timestamps.
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    // The Sand Stream client uses standard RFC 4648 Base64 for the six-byte
+    // timestamp prefix. Six bytes encode to eight characters, so stripping
+    // padding is a no-op but keeps this helper correct for arbitrary inputs.
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
 /// `sha256(input + salt)` hex, as in cursor-free-vip `generate_hashed64_hex`.
@@ -79,7 +82,7 @@ pub fn build_cursor_checksum(machine_id: &str, mac_machine_id: Option<&str>) -> 
         (e & 0xff) as u8,
     ];
     let hashed = acf_obfuscate(&raw);
-    let prefix = b64_url_no_pad(&hashed);
+    let prefix = b64_standard_no_pad(&hashed);
     match mac_machine_id.filter(|s| !s.is_empty()) {
         Some(mac) => format!("{prefix}{machine_id}/{mac}"),
         None => format!("{prefix}{machine_id}"),
@@ -178,6 +181,14 @@ pub fn load_cursor_machine_ids() -> CursorMachineIds {
         }
     }
 
+    // Cursor 3.x can keep telemetry ids in the SQLite state database instead
+    // of (or in addition to) storage.json.  Read it as a best-effort fallback
+    // and cache the result: checksum construction happens on every request,
+    // while these ids are stable for the lifetime of a Cursor profile.
+    if ids.machine_id.is_none() || ids.mac_machine_id.is_none() {
+        ids = merge_machine_ids(ids, cached_state_db_machine_ids());
+    }
+
     // Fallback: Application Support/Cursor/machineid (UUID-ish device id)
     if ids.machine_id.is_none() {
         for path in cursor_machineid_file_candidates() {
@@ -194,12 +205,56 @@ pub fn load_cursor_machine_ids() -> CursorMachineIds {
     ids
 }
 
+static STATE_DB_MACHINE_IDS: OnceLock<CursorMachineIds> = OnceLock::new();
+
+fn cached_state_db_machine_ids() -> CursorMachineIds {
+    // An explicit path is commonly used by tests and portable installs. Read
+    // it directly so a previous/default profile cannot leak into that lookup.
+    if std::env::var_os("CCP_CURSOR_STATE_DB").is_some() {
+        return cursor_state_db_candidates()
+            .into_iter()
+            .find_map(|path| read_state_db_machine_ids(&path))
+            .unwrap_or_default();
+    }
+    if let Some(ids) = STATE_DB_MACHINE_IDS.get() {
+        return ids.clone();
+    }
+    for path in cursor_state_db_candidates() {
+        if let Some(ids) = read_state_db_machine_ids(&path) {
+            // Cache only a positive lookup. If Cursor creates its profile
+            // after the proxy starts, a later request gets another chance.
+            let _ = STATE_DB_MACHINE_IDS.set(ids.clone());
+            return ids;
+        }
+    }
+    CursorMachineIds::default()
+}
+
 fn cursor_storage_json_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = dirs_home() {
         out.push(home.join("Library/Application Support/Cursor/User/globalStorage/storage.json"));
         out.push(home.join(".config/Cursor/User/globalStorage/storage.json"));
         out.push(home.join("AppData/Roaming/Cursor/User/globalStorage/storage.json"));
+    }
+    out
+}
+
+fn cursor_state_db_candidates() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("CCP_CURSOR_STATE_DB") {
+        let path = PathBuf::from(path);
+        return (!path.as_os_str().is_empty())
+            .then_some(path)
+            .into_iter()
+            .collect();
+    }
+    let mut out = Vec::new();
+    if let Some(home) = dirs_home() {
+        // Keep all platform layouts here.  This also makes cross-compiled
+        // binaries useful when a state directory is mounted from another OS.
+        out.push(home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb"));
+        out.push(home.join(".config/Cursor/User/globalStorage/state.vscdb"));
+        out.push(home.join("AppData/Roaming/Cursor/User/globalStorage/state.vscdb"));
     }
     out
 }
@@ -239,6 +294,119 @@ fn read_storage_json(path: &std::path::Path) -> Option<CursorMachineIds> {
     })
 }
 
+/// Read telemetry identities from Cursor's read-only `state.vscdb`.
+///
+/// We intentionally invoke the platform sqlite CLI instead of linking a
+/// SQLite library: the database may be actively opened by Cursor, and the
+/// existing CLI gives us a bounded, read-only snapshot without adding a large
+/// native dependency to the proxy binary.  A locked/missing database simply
+/// returns `None` and callers continue with storage.json or token ids.
+fn read_state_db_machine_ids(path: &std::path::Path) -> Option<CursorMachineIds> {
+    if !path.is_file() {
+        return None;
+    }
+    let sqlite = sqlite_binary()?;
+    let queries = [
+        "SELECT hex(key), hex(value) FROM ItemTable WHERE key IN ('telemetry.machineId','telemetry.macMachineId','telemetry.devDeviceId');",
+        "SELECT hex(key), hex(value) FROM cursorDiskKV WHERE key IN ('telemetry.machineId','telemetry.macMachineId','telemetry.devDeviceId');",
+    ];
+    let mut ids = CursorMachineIds::default();
+    for query in queries {
+        let Some(output) = run_sqlite_query(sqlite, path, query) else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        ids = merge_machine_ids(ids, parse_state_db_rows(&output.stdout));
+        if ids.machine_id.is_some() && ids.mac_machine_id.is_some() {
+            break;
+        }
+    }
+    (ids.machine_id.is_some() || ids.mac_machine_id.is_some() || ids.dev_device_id.is_some())
+        .then_some(ids)
+}
+
+fn parse_state_db_rows(raw: &[u8]) -> CursorMachineIds {
+    let mut ids = CursorMachineIds::default();
+    for line in String::from_utf8_lossy(raw).lines() {
+        let Some((encoded_key, encoded_value)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(key) = decode_hex_text(encoded_key) else {
+            continue;
+        };
+        let Some(value) = decode_hex_text(encoded_value)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        match key.as_str() {
+            "telemetry.machineId" if ids.machine_id.is_none() => ids.machine_id = Some(value),
+            "telemetry.macMachineId" if ids.mac_machine_id.is_none() => {
+                ids.mac_machine_id = Some(value)
+            }
+            "telemetry.devDeviceId" if ids.dev_device_id.is_none() => {
+                ids.dev_device_id = Some(value)
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
+fn sqlite_binary() -> Option<&'static str> {
+    [
+        "/usr/bin/sqlite3",
+        "/opt/homebrew/bin/sqlite3",
+        "/usr/local/bin/sqlite3",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).is_file())
+    .or(Some("sqlite3"))
+}
+
+fn run_sqlite_query(sqlite: &str, path: &std::path::Path, query: &str) -> Option<Output> {
+    let mut child = Command::new(sqlite)
+        .args(["-readonly", "-batch", "-noheader", "-separator", "\t"])
+        .arg(path)
+        .arg(query)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + STATE_DB_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn decode_hex_text(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for index in (0..raw.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&raw[index..index + 2], 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,11 +436,10 @@ mod tests {
     }
 
     #[test]
-    fn checksum_prefix_uses_cursor_url_safe_base64() {
-        // Cursor's desktop helper uses base64url without padding. These
-        // vectors exercise both alphabet substitutions (`+` → `-`, `/` → `_`).
-        assert_eq!(b64_url_no_pad(&[0xfb, 0xef, 0xbe]), "----");
-        assert_eq!(b64_url_no_pad(&[0xff, 0xff, 0xff]), "____");
+    fn checksum_prefix_uses_standard_base64() {
+        // Sand Stream uses the standard `+`/`/` alphabet.
+        assert_eq!(b64_standard_no_pad(&[0xfb, 0xef, 0xbe]), "++++");
+        assert_eq!(b64_standard_no_pad(&[0xff, 0xff, 0xff]), "////");
     }
 
     #[test]
@@ -327,5 +494,30 @@ mod tests {
         assert_eq!(ids.machine_id.as_deref(), Some("env-machine"));
         assert_eq!(ids.mac_machine_id.as_deref(), Some("storage-mac"));
         assert_eq!(ids.dev_device_id.as_deref(), Some("storage-device"));
+    }
+
+    #[test]
+    fn state_db_rows_supply_cursor_telemetry_identity() {
+        fn hex_text(value: &str) -> String {
+            value
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        let rows = format!(
+            "{}\t{}\n{}\t{}\n{}\t{}\nmalformed\n",
+            hex_text("telemetry.machineId"),
+            hex_text("machine-from-db"),
+            hex_text("telemetry.macMachineId"),
+            hex_text("mac-from-db"),
+            hex_text("telemetry.devDeviceId"),
+            hex_text("device-from-db"),
+        );
+        let ids = parse_state_db_rows(rows.as_bytes());
+        assert_eq!(ids.machine_id.as_deref(), Some("machine-from-db"));
+        assert_eq!(ids.mac_machine_id.as_deref(), Some("mac-from-db"));
+        assert_eq!(ids.dev_device_id.as_deref(), Some("device-from-db"));
     }
 }
