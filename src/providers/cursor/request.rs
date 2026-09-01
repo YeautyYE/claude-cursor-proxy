@@ -2035,7 +2035,9 @@ fn render_tool_result_block(block: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn message_blocks(message: &crate::anthropic::schema::Message) -> Vec<serde_json::Value> {
+pub(crate) fn message_blocks(
+    message: &crate::anthropic::schema::Message,
+) -> Vec<serde_json::Value> {
     match &message.content {
         serde_json::Value::String(s) => {
             vec![serde_json::json!({"type": "text", "text": s})]
@@ -2098,7 +2100,7 @@ fn collect_image_blocks(block: &serde_json::Value, images: &mut Vec<CursorSelect
 /// `input_image`/`image_url` forms emitted by newer Claude Code clients.
 /// Remote URLs are intentionally returned to the normalizer and skipped there;
 /// the proxy only forwards bytes it received in the request.
-fn image_candidate(block: &serde_json::Value) -> Option<(&str, Option<&str>)> {
+pub(crate) fn image_candidate(block: &serde_json::Value) -> Option<(&str, Option<&str>)> {
     let block_type = block.get("type").and_then(|value| value.as_str())?;
     match block_type {
         "image" => {
@@ -2162,7 +2164,10 @@ fn image_candidate(block: &serde_json::Value) -> Option<(&str, Option<&str>)> {
 /// Decode a base64 image, accepting a data URI, whitespace/newline-wrapped
 /// payloads, URL-safe alphabets, and missing padding. The returned Base64 is
 /// canonical so the protobuf layer always receives the exact image bytes.
-fn normalize_image_data(raw: &str, hinted_mime: Option<&str>) -> Option<(String, String)> {
+pub(crate) fn normalize_image_data(
+    raw: &str,
+    hinted_mime: Option<&str>,
+) -> Option<(String, String)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;

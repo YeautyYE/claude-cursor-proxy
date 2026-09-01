@@ -1335,6 +1335,19 @@ async fn gemini_compaction_helper_isolated_and_reasoning_is_visible() {
     use std::sync::{Arc, Mutex};
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore_env = RestoreEnv(
+        [
+            "CCP_CURSOR_BASE_URL",
+            "CCP_CURSOR_AUTH_TOKEN",
+            "CCP_CURSOR_CLIENT_VERSION",
+            "CCP_CURSOR_BIDI",
+            "CCP_CURSOR_SAND_MODELS",
+            "CCP_CURSOR_CLIENT_TYPE",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect(),
+    );
     let observed = Arc::new(Mutex::new(None::<Vec<u8>>));
     let observed_handler = Arc::clone(&observed);
 
@@ -1404,6 +1417,12 @@ async fn gemini_compaction_helper_isolated_and_reasoning_is_visible() {
         std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "gemini-compaction-test");
         std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "compaction-test");
         std::env::set_var("CCP_CURSOR_BIDI", "0");
+        // This fixture exercises the legacy AgentService compaction adapter.
+        // Keep the test independent from a user's persisted Sand policy,
+        // which would otherwise route Gemini to InferenceService/Stream and
+        // make the Agent-only mock return 404.
+        std::env::set_var("CCP_CURSOR_SAND_MODELS", "");
+        std::env::set_var("CCP_CURSOR_CLIENT_TYPE", "cli");
     }
 
     let provider = CursorProvider::new();
@@ -1455,13 +1474,6 @@ async fn gemini_compaction_helper_isolated_and_reasoning_is_visible() {
         run.mcp_tools.is_none(),
         "compaction must not register MCP tools"
     );
-
-    unsafe {
-        std::env::remove_var("CCP_CURSOR_BASE_URL");
-        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
-        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
-        std::env::remove_var("CCP_CURSOR_BIDI");
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3381,6 +3393,11 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
             "CCP_CURSOR_LIVE_RESUME_RESERVE",
             "CCP_CURSOR_LIVE_INTERACTIVE_RESERVE",
             "CCP_CURSOR_H2_SHARDS",
+            // The integration fixture exercises AgentService admission.  An
+            // operator's persisted Sand model policy must not silently route
+            // the Gemini probe to InferenceService instead.
+            "CCP_CURSOR_SAND_MODELS",
+            "CCP_CURSOR_CLIENT_TYPE",
         ]
         .into_iter()
         .map(|key| (key, std::env::var_os(key)))
@@ -3470,6 +3487,11 @@ async fn cursor_live_generations_admit_normal_fanout_across_h2_shards() {
         std::env::set_var("CCP_CURSOR_LIVE_RESUME_RESERVE", "4");
         std::env::set_var("CCP_CURSOR_LIVE_INTERACTIVE_RESERVE", "8");
         std::env::set_var("CCP_CURSOR_H2_SHARDS", "4");
+        // Explicit empty policy overrides any user config read from the
+        // default config directory, while the explicit CLI identity keeps
+        // the non-Grok probe on AgentService/Run.
+        std::env::set_var("CCP_CURSOR_SAND_MODELS", "");
+        std::env::set_var("CCP_CURSOR_CLIENT_TYPE", "cli");
     }
 
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

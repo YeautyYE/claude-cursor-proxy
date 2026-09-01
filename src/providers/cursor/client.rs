@@ -247,6 +247,11 @@ impl CursorHttpClient {
         let mode = if self.base_url.starts_with("http://") {
             CursorReqwestMode::CleartextH2PriorKnowledge
         } else {
+            // Reqwest's HTTP/2-only preference still negotiates TLS through
+            // ALPN (the `prior_knowledge` name only affects cleartext
+            // h2c). Keeping the strict mode here prevents an intermediary
+            // from silently downgrading Sand traffic to HTTP/1, which the
+            // InferenceService rejects before reading the Connect frame.
             CursorReqwestMode::Http2Only
         };
         Self::with_base_url_timeout_and_mode(self.base_url.clone(), self.timeout_secs, mode)

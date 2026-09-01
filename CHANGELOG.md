@@ -3,6 +3,23 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.98 (2026-09-02)
+
+- Move Sand traffic to Cursor's current `aiserver.v1.InferenceService/Stream`
+  endpoint using Connect JSON over HTTP/2, with the desktop identity headers,
+  checksum, and request-scoped lifecycle ids expected by the current client.
+- Keep Sand and CLI routing in one `serve` process. The monitor TUI remains the
+  preferred control surface for per-model `[sand]`/`[cli]` selection and
+  per-model account assignment; no second Sand binary is required.
+- Show account names/emails and cached API, Auto, Bot/Sand, cost, and event
+  usage in the TUI and `cursor sand-status`, including the last successful
+  fetch time.
+- Add bounded open/stream recovery for H2 resets, idle stalls, transient 5xx,
+  empty END frames, stale image ids, and tool-result continuations without
+  replaying client-visible output or duplicating tool calls.
+- Preserve Claude Code native tools, thinking/usage events, images, inline
+  documents/files, and fragmented tool arguments across Sand streams.
+
 ## v0.1.97 (2026-09-01)
 
 - Keep the `x-cursor-streaming` marker restricted to the HTTP/1 `RunSSE`

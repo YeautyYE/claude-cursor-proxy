@@ -192,7 +192,10 @@ pub fn snapshot() -> SandStatusSnapshot {
     } else {
         "config"
     };
-    let base_url = config::cursor_base_url();
+    // Report the same endpoint the Sand client actually uses.  A deployment
+    // may intentionally keep ordinary AgentService traffic on one gateway
+    // while routing InferenceService/Stream through a Sand-specific host.
+    let base_url = config::cursor_sand_base_url();
     let cleartext = base_url.starts_with("http://");
     let markers = SandProtocolMarkers::current();
     let desktop_bundle = inspect_desktop_bundle();

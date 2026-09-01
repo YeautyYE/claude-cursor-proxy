@@ -13,6 +13,7 @@ pub(crate) mod operation_ledger;
 pub mod proto;
 pub mod request;
 pub mod response;
+pub mod sand_inference;
 pub mod sand_status;
 pub mod sse;
 #[cfg(test)]
@@ -24,7 +25,7 @@ pub mod usage;
 use async_trait::async_trait;
 use axum::Json;
 use axum::response::{IntoResponse, Response};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use http::StatusCode;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -75,9 +76,13 @@ use crate::providers::cursor::response::{
     decode_cursor_upstream_with_allowed, decode_upstream_response_with_allowed,
     estimate_rendered_prompt_tokens, estimate_request_input_tokens,
 };
+use crate::providers::cursor::sand_inference::{
+    SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
+    messages_from_anthropic, stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
+};
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
-    start_cursor_tool_bridge,
+    resolve_advertised_name, start_cursor_tool_bridge,
 };
 
 // ---------------------------------------------------------------------------
@@ -965,6 +970,524 @@ fn live_sse_recording_usage(
         monitor,
         compaction_mode,
     )
+}
+
+/// Dispatch a request through Cursor Desktop's current Sand transport.
+///
+/// Sand is intentionally stateless from the proxy's point of view: every
+/// request carries the complete rendered Anthropic history and gets fresh
+/// conversation/invocation ids.  This keeps retries and Claude Code's
+/// `/compact` requests independent from the AgentService live-run registry,
+/// whose resumable stream semantics do not apply to InferenceService.
+async fn sand_direct_response(
+    body: &MessagesRequest,
+    ctx: &RequestContext,
+    token: &str,
+    message_id: String,
+    wire_model: String,
+    model: &str,
+    compaction_mode: bool,
+) -> Response {
+    // Keep the local hosted search/fetch shortcuts available on Sand.  These
+    // handlers are provider-agnostic and must run after auth (the caller has
+    // already selected/validated the Cursor account).
+    if is_hosted_web_search_request(body) {
+        let query = extract_web_search_query(body).unwrap_or_default();
+        if query.trim().is_empty() {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "web_search requires a non-empty query",
+            );
+        }
+        let (hits, error) = match search_web(&query).await {
+            Ok(hits) => (hits, None),
+            Err(err) => (Vec::new(), Some(err)),
+        };
+        if body.stream {
+            return hosted_web_search_sse_response(message_id, wire_model, query, hits, error);
+        }
+        return hosted_web_search_json_response(message_id, wire_model, query, hits, error);
+    }
+    if let Some(resp) = maybe_handle_hosted_web_fetch(body, &message_id, &wire_model).await {
+        return resp;
+    }
+
+    let parts = render_cursor_prompt_parts_with(
+        body,
+        CursorPromptOptions {
+            // Compaction is summary-only.  Omitting tool schemas also prevents
+            // a Sand model from emitting a tool call while Claude is waiting
+            // for a compacted context response.
+            omit_tools: compaction_mode,
+            delta_only: false,
+        },
+    );
+    // Use the native InferenceCoreMessage representation for Sand.  The
+    // renderer above remains useful for system-field policy and token
+    // estimates, but its XML/text form is only a fallback for old Agent runs.
+    // In particular, preserve every Anthropic role and tool/image block here.
+    let mut messages = messages_from_anthropic(body, compaction_mode);
+    if let Some(system) = parts
+        .custom_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        && !messages
+            .iter()
+            .any(|message| message.role == sand_inference::ROLE_SYSTEM)
+    {
+        messages.insert(0, SandInferenceMessage::system(system));
+    }
+    // Requests with no representable blocks still need one valid message.
+    // InferenceService expects at least one message.  An empty Anthropic
+    // payload is unusual but can be produced by a client-side retry; preserve
+    // the request rather than turning it into a malformed Connect body.
+    if messages.is_empty() {
+        messages.push(SandInferenceMessage::user(parts.user_text.clone()));
+    }
+
+    // The new endpoint accepts UUID identifiers and does not use the
+    // AgentService session registry.  Fresh ids also prevent an abandoned
+    // Desktop invocation from poisoning the next Claude Code turn.
+    let request = SandInferenceRequest::new(
+        model.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        messages,
+    )
+    .with_max_mode(model.to_ascii_lowercase().contains("max"))
+    .with_max_tokens(body.max_tokens.map(u64::from))
+    .with_tools(tools_from_anthropic(body, compaction_mode));
+
+    let client = SandInferenceClient::new();
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.upstream_started(&ctx.req_id);
+    }
+
+    let stream = match open_sand_with_retries(&client, token, &request).await {
+        Ok(stream) => stream,
+        Err(error) => return map_cursor_error_to_response(&error),
+    };
+
+    let allowed = if compaction_mode {
+        Some(BTreeSet::new())
+    } else {
+        advertised_tool_names(body)
+    };
+    let (tx, rx) = mpsc::channel::<LiveEventResult>(128);
+    let idle_secs = sand_stream_idle_timeout_secs();
+    let retry_client = client.clone();
+    let retry_token = token.to_string();
+    let retry_request = request.clone();
+    tokio::spawn(async move {
+        drive_sand_stream_with_retries(
+            retry_client,
+            retry_token,
+            retry_request,
+            stream,
+            allowed,
+            compaction_mode,
+            idle_secs,
+            tx,
+        )
+        .await;
+    });
+
+    let estimated_input = estimate_rendered_prompt_tokens(&parts);
+    if body.stream {
+        let events = if let Some(session_id) = ctx.session_id.as_deref() {
+            tap_session_usage(session_id.to_string(), rx)
+        } else {
+            rx
+        };
+        return live_sse_response(
+            events,
+            message_id,
+            wire_model,
+            estimated_input,
+            ctx.monitor
+                .clone()
+                .map(|monitor| (monitor, ctx.req_id.clone())),
+            compaction_mode,
+        );
+    }
+
+    match collect_live_events_to_json(
+        rx,
+        &message_id,
+        &wire_model,
+        estimated_input,
+        compaction_mode,
+    )
+    .await
+    {
+        Ok(json) => {
+            let input_tokens = json.pointer("/usage/input_tokens").and_then(|v| v.as_u64());
+            remember_input_tokens(ctx.session_id.as_deref(), input_tokens);
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.usage_updated(
+                    &ctx.req_id,
+                    input_tokens,
+                    json.pointer("/usage/output_tokens")
+                        .and_then(|v| v.as_u64()),
+                );
+            }
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        Err(error) => json_error_from_cursor_message(error),
+    }
+}
+
+async fn open_sand_with_retries(
+    client: &SandInferenceClient,
+    token: &str,
+    request: &SandInferenceRequest,
+) -> Result<crate::providers::cursor::sand_inference::SandInferenceStream, CursorError> {
+    let max_retries = std::env::var("CCP_CURSOR_SAND_OPEN_RETRIES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+        .min(8);
+    let mut attempt = 0;
+    loop {
+        // A connect/open failure is ambiguous: the gateway may have accepted
+        // the frame before the local socket failed. Replaying the same
+        // lifecycle ids then looks like a duplicate live invocation and can
+        // produce a persistent 503 "already active" response. Keep the first
+        // attempt's ids for normal diagnostics, but rotate both ids before
+        // every subsequent open.
+        let attempt_request = if attempt == 0 {
+            request.clone()
+        } else {
+            request.clone().with_fresh_ids()
+        };
+        match client.open(token, &attempt_request).await {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if attempt < max_retries
+                    && crate::retry::should_retry_upstream(
+                        error.status,
+                        &error.client_message(),
+                    ) =>
+            {
+                let delay =
+                    crate::retry::compute_backoff_delay(attempt, error.retry_after.as_deref())
+                        .wait_ms;
+                create_logger("cursor").warn(
+                    "sand_open_retry",
+                    Some(serde_json::Map::from_iter([
+                        ("attempt".into(), serde_json::json!(attempt + 1)),
+                        ("status".into(), serde_json::json!(error.status)),
+                        ("delayMs".into(), serde_json::json!(delay)),
+                    ])),
+                );
+                crate::retry::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Drain one Sand response and replay it when the transport dies before any
+/// client-visible output.  InferenceService requests carry the complete
+/// history and do not share AgentService's live-run registry, so a fresh UUID
+/// request is safe at this point.  Once text or a tool call is committed, the
+/// stream is fail-closed to avoid duplicating partial output in Claude Code.
+#[allow(clippy::too_many_arguments)]
+async fn drive_sand_stream_with_retries(
+    client: SandInferenceClient,
+    token: String,
+    request: SandInferenceRequest,
+    initial_stream: SandInferenceStream,
+    allowed: Option<BTreeSet<String>>,
+    compaction_mode: bool,
+    idle_secs: u64,
+    tx: mpsc::Sender<LiveEventResult>,
+) {
+    let max_retries = stream_retry_limit();
+    let mut retries = 0u32;
+    let mut next_stream = Some(initial_stream);
+    let mut buffered = Vec::new();
+    let mut committed = false;
+
+    loop {
+        let mut stream = if let Some(stream) = next_stream.take() {
+            stream
+        } else {
+            let retry_request = request.clone().with_fresh_ids();
+            match open_sand_with_retries(&client, &token, &retry_request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if !committed && retries < max_retries && stream_error_is_retryable(&error) {
+                        // The failed attempt may have queued thinking/usage
+                        // control events without exposing visible output.
+                        // A replay carries the full history and will produce
+                        // a fresh set; retaining these frames would duplicate
+                        // usage accounting and hidden reasoning on the client.
+                        discard_sand_replay_buffer(&mut buffered);
+                        let delay = crate::retry::compute_backoff_delay(
+                            retries,
+                            error.retry_after.as_deref(),
+                        )
+                        .wait_ms;
+                        create_logger("cursor").warn(
+                            "sand_stream_retry_open",
+                            Some(serde_json::Map::from_iter([
+                                ("attempt".into(), serde_json::json!(retries + 1)),
+                                ("status".into(), serde_json::json!(error.status)),
+                                ("delayMs".into(), serde_json::json!(delay)),
+                            ])),
+                        );
+                        crate::retry::sleep(delay).await;
+                        retries += 1;
+                        continue;
+                    }
+                    if !committed {
+                        discard_sand_replay_buffer(&mut buffered);
+                    }
+                    send_sand_buffered_error(&tx, &mut buffered, error).await;
+                    return;
+                }
+            }
+        };
+
+        let stream_error: Option<CursorError>;
+        // Compaction's downstream contract allows a reasoning-only summary,
+        // but it is only authoritative once the stream reaches End. Keep
+        // that signal separate from `committed`: ordinary reasoning/usage is
+        // speculative and must remain replayable until visible text or a
+        // native tool has been observed.
+        let mut compaction_thinking = false;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(idle_secs), stream.next()).await;
+            match next {
+                Ok(Some(Ok(event))) => {
+                    let Some(event) = normalize_sand_stream_event(event, allowed.as_ref()) else {
+                        continue;
+                    };
+                    if matches!(
+                        &event,
+                        CursorStreamEvent::ThinkingDelta { text } if compaction_mode && !text.is_empty()
+                    ) {
+                        compaction_thinking = true;
+                    }
+                    match classify_sand_stream_event(
+                        &event,
+                        committed,
+                        compaction_mode,
+                        compaction_thinking,
+                    ) {
+                        SandStreamEventAction::Buffer => buffered.push(event),
+                        SandStreamEventAction::Commit => {
+                            buffered.push(event);
+                            committed = true;
+                            if !send_sand_buffered_events(&tx, &mut buffered).await {
+                                return;
+                            }
+                        }
+                        SandStreamEventAction::Complete => {
+                            buffered.push(event);
+                            if !send_sand_buffered_events(&tx, &mut buffered).await {
+                                return;
+                            }
+                            return;
+                        }
+                        SandStreamEventAction::HollowEnd => {
+                            // A payload-less END (or an END carrying only
+                            // thinking/usage/session metadata) is not a
+                            // successful assistant turn. Treat it like a
+                            // transport hollow response so the bounded fresh
+                            // UUID replay can recover a delayed model worker.
+                            stream_error = Some(CursorError::new(
+                                502,
+                                "Sand stream ended without useful progress",
+                                None,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Err(error))) => {
+                    stream_error = Some(error);
+                    break;
+                }
+                Ok(None) => {
+                    // A clean EOF without text/tool/end is treated as a
+                    // retryable hollow response.  Sand gateways occasionally
+                    // close after a control frame without FLAG_END.
+                    if committed {
+                        // SandInferenceStream normally synthesizes End at
+                        // EOF, but keep this guard at the retry boundary as
+                        // well.  A wrapper/proxy can consume the synthetic
+                        // marker or report EOF after a committed frame; in
+                        // that case closing the downstream channel without
+                        // End makes the Anthropic SSE adapter emit
+                        // "stream ended without turn_ended".  Flush any
+                        // post-commit usage/metadata before the local End.
+                        buffered.push(CursorStreamEvent::End);
+                        if !send_sand_buffered_events(&tx, &mut buffered).await {
+                            return;
+                        }
+                        return;
+                    } else {
+                        stream_error = Some(CursorError::new(
+                            502,
+                            "Sand stream ended without useful progress",
+                            None,
+                        ));
+                    }
+                    break;
+                }
+                Err(_) => {
+                    stream_error = Some(CursorError::new(
+                        504,
+                        format!(
+                            "Sand stream idle timeout after {idle_secs}s with no useful progress"
+                        ),
+                        None,
+                    ));
+                    break;
+                }
+            }
+        }
+
+        let Some(error) = stream_error else {
+            // A committed stream that cleanly EOF'd has already flushed its
+            // events.  No synthetic error is needed here.
+            return;
+        };
+        if !committed && retries < max_retries && stream_error_is_retryable(&error) {
+            // Do not carry pre-commit events from the abandoned stream into a
+            // full-history replay. In particular, duplicate Usage events can
+            // make Claude Code's context meter jump after a transient reset.
+            discard_sand_replay_buffer(&mut buffered);
+            let delay =
+                crate::retry::compute_backoff_delay(retries, error.retry_after.as_deref()).wait_ms;
+            create_logger("cursor").warn(
+                "sand_stream_retry",
+                Some(serde_json::Map::from_iter([
+                    ("attempt".into(), serde_json::json!(retries + 1)),
+                    ("status".into(), serde_json::json!(error.status)),
+                    ("delayMs".into(), serde_json::json!(delay)),
+                ])),
+            );
+            crate::retry::sleep(delay).await;
+            retries += 1;
+            continue;
+        }
+        // Thinking/usage/session frames are speculative when no visible text
+        // or tool committed. Do not leak them alongside the terminal error
+        // after the replay budget is exhausted; the client should see one
+        // coherent retryable API error rather than a partial answer.
+        if !committed {
+            discard_sand_replay_buffer(&mut buffered);
+        }
+        send_sand_buffered_error(&tx, &mut buffered, error).await;
+        return;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandStreamEventAction {
+    /// Keep transport metadata/reasoning buffered until a commit boundary.
+    Buffer,
+    /// A visible text/tool event commits the attempt, but the stream may
+    /// continue until its terminal End marker.
+    Commit,
+    /// A valid terminal boundary was observed and can be delivered now.
+    Complete,
+    /// End arrived without a client-visible result and must be replayed.
+    HollowEnd,
+}
+
+/// Classify one normalized Sand event without conflating a transport End with
+/// useful model output. Compaction is the one intentional exception: a
+/// reasoning-only summary becomes authoritative at End because its SSE/JSON
+/// adapters promote it to text only at that boundary.
+fn classify_sand_stream_event(
+    event: &CursorStreamEvent,
+    committed: bool,
+    compaction_mode: bool,
+    compaction_thinking: bool,
+) -> SandStreamEventAction {
+    match event {
+        CursorStreamEvent::End => {
+            if committed || (compaction_mode && compaction_thinking) {
+                SandStreamEventAction::Complete
+            } else {
+                SandStreamEventAction::HollowEnd
+            }
+        }
+        CursorStreamEvent::TextDelta { text } if !text.is_empty() => SandStreamEventAction::Commit,
+        CursorStreamEvent::NativeTool { .. } => SandStreamEventAction::Commit,
+        _ => SandStreamEventAction::Buffer,
+    }
+}
+
+fn normalize_sand_stream_event(
+    event: CursorStreamEvent,
+    allowed: Option<&BTreeSet<String>>,
+) -> Option<CursorStreamEvent> {
+    match event {
+        CursorStreamEvent::NativeTool {
+            tool_use_id,
+            name,
+            input,
+        } => {
+            // Never expose a native tool that Claude Code did not advertise.
+            // Resolve aliases before applying the strict client schema adapter.
+            let name = resolve_advertised_name(&name, allowed)?;
+            let input =
+                crate::providers::cursor::native_tools::adapt_tool_input_for_client(&name, input);
+            Some(CursorStreamEvent::NativeTool {
+                tool_use_id,
+                name,
+                input,
+            })
+        }
+        other => Some(other),
+    }
+}
+
+async fn send_sand_buffered_events(
+    tx: &mpsc::Sender<LiveEventResult>,
+    buffered: &mut Vec<CursorStreamEvent>,
+) -> bool {
+    for event in buffered.drain(..) {
+        if tx.send(Ok(LiveRunEvent::Cursor(event))).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn send_sand_buffered_error(
+    tx: &mpsc::Sender<LiveEventResult>,
+    buffered: &mut Vec<CursorStreamEvent>,
+    error: CursorError,
+) {
+    let _ = send_sand_buffered_events(tx, buffered).await;
+    let _ = tx.send(Err(error.client_message())).await;
+}
+
+/// Drop events observed before a Sand replay becomes necessary. Sand retries
+/// carry the complete history, so the replacement stream will regenerate
+/// those control events (thinking/usage) and forwarding both copies would
+/// double-count them downstream.
+#[inline]
+fn discard_sand_replay_buffer(buffered: &mut Vec<CursorStreamEvent>) {
+    buffered.clear();
+}
+
+fn sand_stream_idle_timeout_secs() -> u64 {
+    std::env::var("CCP_CURSOR_SAND_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(crate::config::cursor_request_timeout_secs)
+        .clamp(15, 3600)
 }
 
 enum LiveStartPeek {
@@ -5263,6 +5786,7 @@ impl Provider for CursorProvider {
         // Cursor client.  It checks both the public alias and the concrete
         // catalog id, which is important for Fable's `[1m]`/thinking aliases.
         let client_type = crate::config::cursor_client_type_for_model(model);
+        let uses_sand = client_type.trim().eq_ignore_ascii_case("sand");
         // The server records the incoming model before provider-specific effort
         // aliases are applied. Publish the final request-scoped route here as
         // well so the TUI reflects the identity actually sent to Cursor.
@@ -5270,14 +5794,16 @@ impl Provider for CursorProvider {
             monitor.client_type_resolved(&ctx.req_id, &client_type);
         }
 
-        let resolved = resolve_cursor_model(model);
-        if let Err(e) = resolved {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Model \"{model}\" is not supported: {e}"),
-            );
-        }
+        let resolved = match resolve_cursor_model(model) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Model \"{model}\" is not supported: {e}"),
+                );
+            }
+        };
 
         // Read auth before the live-slot/SSE path so an account/model policy
         // breaker can return a real HTTP 429. If this check runs after
@@ -5330,10 +5856,34 @@ impl Provider for CursorProvider {
             }
         }
         let has_tool_results = request_has_current_tool_result(&body);
-        if !policy_preflight_can_attach_existing_run_for_account(&body, &ctx, Some(&account_key))
+        if (uses_sand
+            || !policy_preflight_can_attach_existing_run_for_account(
+                &body,
+                &ctx,
+                Some(&account_key),
+            ))
             && let Err(error) = policy_rate_limit_preflight(model, &client_type, &auth.access_token)
         {
             return map_cursor_error_to_response(&error);
+        }
+
+        // Sand is a Desktop InferenceService transport.  It is deliberately
+        // dispatched before any LiveRunRegistry admission or AgentService
+        // continuation logic: the latter endpoint now rejects
+        // `x-cursor-client-type: sand` with a deterministic 400.  Sand sends
+        // the complete rendered Anthropic history on every turn, so it does
+        // not need (and must not share) the resumable AgentService state.
+        if uses_sand {
+            return sand_direct_response(
+                &body,
+                &ctx,
+                &auth.access_token,
+                message_id,
+                wire_model,
+                &resolved.model_id,
+                xai_compact,
+            )
+            .await;
         }
 
         // True Cursor BiDi continuation: the preceding Anthropic response ended
@@ -6528,6 +7078,117 @@ mod tests {
     };
 
     static POLICY_RATE_LIMIT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn sand_replay_discards_uncommitted_metadata_events() {
+        let mut buffered = vec![
+            CursorStreamEvent::ThinkingDelta {
+                text: "draft reasoning".into(),
+            },
+            CursorStreamEvent::Usage {
+                input_tokens: 128,
+                output_tokens: 3,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        ];
+        discard_sand_replay_buffer(&mut buffered);
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn sand_end_does_not_commit_thinking_or_usage_only_turns() {
+        let thinking = CursorStreamEvent::ThinkingDelta {
+            text: "speculative reasoning".into(),
+        };
+        let usage = CursorStreamEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let end = CursorStreamEvent::End;
+
+        assert_eq!(
+            classify_sand_stream_event(&thinking, false, false, false),
+            SandStreamEventAction::Buffer
+        );
+        assert_eq!(
+            classify_sand_stream_event(&usage, false, false, false),
+            SandStreamEventAction::Buffer
+        );
+        assert_eq!(
+            classify_sand_stream_event(&end, false, false, false),
+            SandStreamEventAction::HollowEnd,
+            "an empty Sand END must enter the bounded replay path"
+        );
+        assert_eq!(
+            classify_sand_stream_event(
+                &CursorStreamEvent::TextDelta {
+                    text: String::new()
+                },
+                false,
+                false,
+                false,
+            ),
+            SandStreamEventAction::Buffer,
+            "an empty text delta is metadata, not a commit"
+        );
+    }
+
+    #[test]
+    fn sand_end_commits_text_and_native_tools_only_after_progress() {
+        let text = CursorStreamEvent::TextDelta {
+            text: "answer".into(),
+        };
+        let tool = CursorStreamEvent::NativeTool {
+            tool_use_id: "tool-1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "/tmp/a"}),
+        };
+        let end = CursorStreamEvent::End;
+
+        assert_eq!(
+            classify_sand_stream_event(&text, false, false, false),
+            SandStreamEventAction::Commit
+        );
+        assert_eq!(
+            classify_sand_stream_event(&tool, false, false, false),
+            SandStreamEventAction::Commit
+        );
+        assert_eq!(
+            classify_sand_stream_event(&end, true, false, false),
+            SandStreamEventAction::Complete
+        );
+        assert_eq!(
+            classify_sand_stream_event(&end, false, false, true),
+            SandStreamEventAction::HollowEnd,
+            "the compaction reasoning flag must not affect ordinary turns"
+        );
+    }
+
+    #[test]
+    fn sand_compaction_reasoning_only_end_is_a_valid_summary() {
+        let thinking = CursorStreamEvent::ThinkingDelta {
+            text: "summary from reasoning".into(),
+        };
+        let end = CursorStreamEvent::End;
+
+        assert_eq!(
+            classify_sand_stream_event(&thinking, false, true, true),
+            SandStreamEventAction::Buffer,
+            "compaction reasoning stays buffered until its terminal boundary"
+        );
+        assert_eq!(
+            classify_sand_stream_event(&end, false, true, true),
+            SandStreamEventAction::Complete
+        );
+        assert_eq!(
+            classify_sand_stream_event(&end, false, true, false),
+            SandStreamEventAction::HollowEnd,
+            "an empty compaction END still needs replay"
+        );
+    }
 
     #[test]
     fn xai_compact_request_ids_are_detected_without_matching_other_operations() {

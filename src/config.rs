@@ -73,6 +73,11 @@ struct CodexConfig {
 struct CursorConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
+    /// Base URL for the Desktop Sand `InferenceService/Stream` route.  Keep
+    /// this separate from the ordinary AgentService URL because deployments
+    /// may front the two services with different gateways.
+    #[serde(rename = "sandBaseUrl")]
+    pub sand_base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
     #[serde(rename = "clientType")]
@@ -1466,6 +1471,34 @@ pub fn cursor_base_url() -> String {
     "https://api2.cursor.sh".to_string()
 }
 
+/// URL used by the current Sand inference transport.  Sand moved from the
+/// AgentService endpoint to `aiserver.v1.InferenceService/Stream`; an explicit
+/// override is useful for regional gateways and local protocol fixtures while
+/// leaving normal CLI/IDE traffic on `cursor_base_url()`.
+pub fn cursor_sand_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_SAND_BASE_URL") {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(url) = cursor.sand_base_url
+    {
+        let value = url.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    // Keep the ordinary endpoint as the fallback so existing
+    // `CCP_CURSOR_BASE_URL` fixtures and regional overrides continue to work
+    // when no Sand-specific URL is configured.
+    cursor_base_url()
+}
+
 pub fn cursor_client_version() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
@@ -2677,6 +2710,44 @@ mod tests {
             cursor_client_type_for_model("gemini-3.1-pro-preview-high"),
             "cli",
             "only a trailing preview marker is an alias; effort variants stay explicit"
+        );
+    }
+
+    #[test]
+    fn arbitrary_sand_policy_model_is_cursor_routable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"aliasProvider":"codex","cursor":{"sandModels":["vendor-sand-*"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        let model = "vendor-sand-2026-09";
+        assert_eq!(cursor_client_type_for_model(model), "sand");
+
+        // Sand policy entries are declarations of Cursor ownership even when
+        // the id is not in a built-in family or a just-fetched catalog.
+        let resolved = crate::providers::cursor::model::resolve_cursor_model(model)
+            .expect("arbitrary Sand model should resolve without a hardcoded list");
+        assert_eq!(resolved.model_id, model);
+
+        let registry = crate::registry::Registry::new(AliasProvider::Codex);
+        assert_eq!(
+            registry
+                .provider_for_model(model, None)
+                .expect("Sand policy model should select Cursor")
+                .name(),
+            "cursor"
+        );
+        assert!(
+            registry
+                .provider_for_model("vendor-cli-only", None)
+                .is_none(),
+            "an unrelated opaque id must remain unknown"
         );
     }
 

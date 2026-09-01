@@ -41,9 +41,9 @@ pub fn acf_obfuscate(input: &[u8]) -> Vec<u8> {
 
 fn b64_standard_no_pad(bytes: &[u8]) -> String {
     use base64::Engine;
-    // The Sand Stream client uses standard RFC 4648 Base64 for the six-byte
-    // timestamp prefix. Six bytes encode to eight characters, so stripping
-    // padding is a no-op but keeps this helper correct for arbitrary inputs.
+    // Sand Stream's desktop helper uses the standard RFC 4648 alphabet
+    // (`+`/`/`) and strips padding. The six-byte timestamp naturally has no
+    // padding, while keeping the no-pad encoder correct for other inputs.
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn checksum_prefix_uses_standard_base64() {
-        // Sand Stream uses the standard `+`/`/` alphabet.
+        // Sand's checksum helper uses the standard `+`/`/` alphabet.
         assert_eq!(b64_standard_no_pad(&[0xfb, 0xef, 0xbe]), "++++");
         assert_eq!(b64_standard_no_pad(&[0xff, 0xff, 0xff]), "////");
     }
