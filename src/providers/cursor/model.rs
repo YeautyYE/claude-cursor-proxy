@@ -209,6 +209,19 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
                 });
             }
 
+            // A Sand rule is also an explicit Cursor routing declaration.  A
+            // managed-local catalog can introduce an otherwise opaque model
+            // id before this process has refreshed `GetUsableModels`; honor
+            // the configured rule without requiring a hardcoded family
+            // prefix.  Use the direct matcher (rather than `matches_model`)
+            // to avoid recursing through this resolver's alias walk.
+            if crate::config::cursor_sand_policy().matches(other) {
+                return Ok(CursorModelResolution {
+                    model_id: other.to_string(),
+                    mode: CursorAgentMode::Agent,
+                });
+            }
+
             // Keep known catalog families usable before the live catalog has
             // been fetched (startup/offline fallback).
             if other.starts_with("claude-")
@@ -663,7 +676,15 @@ fn current_account_live_catalog_model(model: &str) -> Option<String> {
         .snapshots
         .values()
         .flat_map(|snapshot| snapshot.models.iter())
-        .find(|id| id.as_str() == model)
+        .find(|id| {
+            // Claude Code may append a context-window marker to a model that
+            // Cursor's catalog stores without it (and a few catalog responses
+            // do the inverse).  Strip only that presentation suffix while
+            // retaining the exact, case-sensitive upstream id otherwise.
+            id.as_str() == model
+                || strip_anthropic_context_suffix(id.as_str()) == model
+                || strip_anthropic_context_suffix(model) == id.as_str()
+        })
         .cloned()
 }
 
@@ -1207,6 +1228,36 @@ mod tests {
         assert!(
             resolve_cursor_model("frontier-account-model").is_err(),
             "switching accounts must immediately retire account A's dynamic ids"
+        );
+        clear_live_usable_models_account();
+    }
+
+    #[test]
+    fn arbitrary_sand_catalog_id_routes_through_registry() {
+        let _guard = cache_test_guard();
+
+        clear_live_usable_models_account();
+        let generation = observe_live_usable_models_account("sand-catalog-token");
+        store_live_usable_models_for_account_and_identity_at_generation(
+            "sand-catalog-token",
+            "sand",
+            generation,
+            vec!["vendor.sand.model.v9".into()],
+        );
+
+        let registry = crate::registry::Registry::new(crate::config::AliasProvider::Codex);
+        assert_eq!(
+            registry
+                .provider_for_model("vendor.sand.model.v9", None)
+                .expect("server-discovered Sand id should select Cursor")
+                .name(),
+            "cursor"
+        );
+        assert_eq!(
+            resolve_cursor_model("vendor.sand.model.v9")
+                .expect("server-discovered Sand id should resolve")
+                .model_id,
+            "vendor.sand.model.v9"
         );
         clear_live_usable_models_account();
     }

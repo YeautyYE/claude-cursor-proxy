@@ -173,6 +173,16 @@ impl Registry {
         {
             return self.handlers.get("cursor").cloned();
         }
+        // Sand policy entries are provider declarations too.  Keep this after
+        // the static/live catalog lookup so an overlapping concrete id such
+        // as `gpt-5.5` remains owned by Codex; only otherwise-unclaimed ids
+        // are promoted to Cursor.  The direct matcher supports arbitrary
+        // server model ids and wildcards without a hardcoded model list.
+        if self.handlers.contains_key("cursor")
+            && crate::config::cursor_sand_policy().matches(&normalized)
+        {
+            return self.handlers.get("cursor").cloned();
+        }
         None
     }
 
