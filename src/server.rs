@@ -285,6 +285,16 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
         }
     }
 
+    // Exact Sand policy entries are user-declared Cursor routes and should be
+    // discoverable even when the live catalog probe is unavailable.  Keep
+    // wildcard rules out of the catalog (they are matchers, not model ids),
+    // and preserve native ownership for ids already claimed by another
+    // provider such as `gpt-5.5`.
+    let sand_policy = crate::config::cursor_sand_policy();
+    for id in configured_cursor_sand_models(&state.registry, &sand_policy) {
+        push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
+    }
+
     // Insert explicit model/account routes before the static registry so an
     // Anthropic alias bound to Cursor can override a same-named alias exposed
     // by the process-wide `aliasProvider` (the dedupe set preserves the first
@@ -347,6 +357,42 @@ fn configured_cursor_route_models(
             // explicit account route intentionally overrides aliasProvider;
             // otherwise-unclaimed literals are Cursor declarations by
             // definition.
+            let static_provider = registry
+                .provider_for_model_without_account_routes(&normalized, None)
+                .map(|provider| provider.name());
+            if static_provider.is_some_and(|name| name != "cursor")
+                && !crate::registry::is_anthropic_alias(&normalized)
+                && !crate::registry::is_cursor_model(&normalized)
+            {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect::<Vec<_>>();
+    models.sort_unstable();
+    models.dedup();
+    models
+}
+
+/// Return literal Sand-policy entries that can be represented in the model
+/// catalog.  A wildcard policy is intentionally not expanded because doing so
+/// would advertise a model id that was never returned by Cursor.  The static
+/// provider table remains authoritative for overlapping ids; callers can use
+/// an explicit `cursor:` prefix when they need to force such an id to Cursor.
+fn configured_cursor_sand_models(
+    registry: &Registry,
+    policy: &crate::config::SandRoutingPolicy,
+) -> Vec<String> {
+    let mut models = policy
+        .patterns()
+        .iter()
+        .filter(|pattern| !pattern.chars().any(|ch| matches!(ch, '*' | '?')))
+        .filter_map(|pattern| {
+            let normalized = normalize_incoming_model(pattern);
+            if normalized.is_empty() {
+                return None;
+            }
             let static_provider = registry
                 .provider_for_model_without_account_routes(&normalized, None)
                 .map(|provider| provider.name());
@@ -1941,10 +1987,10 @@ fn set_mode(path: &Path, mode: u32) {
 mod tests {
     use super::{
         RequestMonitorGuard, advertised_surface_model, claude_code_headers_from,
-        configured_cursor_route_models, derive_fallback_session_id, enable_accepted_tcp_nodelay,
-        header_text_all, monitor_response_body, parse_advertised_models,
-        resolve_responses_session_id, resolve_session_id, session_id_from_headers,
-        wrap_anthropic_as_responses,
+        configured_cursor_route_models, configured_cursor_sand_models, derive_fallback_session_id,
+        enable_accepted_tcp_nodelay, header_text_all, monitor_response_body,
+        parse_advertised_models, resolve_responses_session_id, resolve_session_id,
+        session_id_from_headers, wrap_anthropic_as_responses,
     };
     use crate::anthropic::error::json_error;
     use crate::anthropic::schema::MessagesRequest;
@@ -2430,6 +2476,24 @@ mod tests {
         ]);
         let models = configured_cursor_route_models(&registry, &policy);
         assert_eq!(models, vec!["claude-fable-5", "frontier-custom"]);
+    }
+
+    #[test]
+    fn exact_sand_policy_models_are_added_to_discovery_but_wildcards_are_not() {
+        let registry = Registry::new(crate::config::AliasProvider::Codex);
+        let policy = crate::config::SandRoutingPolicy::new([
+            "frontier-sand-model",
+            "cursor:another-sand-model[1m]",
+            "vendor-*",
+            // Static provider ownership remains authoritative for discovery.
+            "gpt-5.5",
+        ]);
+        let models = configured_cursor_sand_models(&registry, &policy);
+        assert_eq!(
+            models,
+            vec!["another-sand-model", "frontier-sand-model"],
+            "only exact, otherwise-unclaimed Sand entries belong in the catalog"
+        );
     }
 
     #[test]
