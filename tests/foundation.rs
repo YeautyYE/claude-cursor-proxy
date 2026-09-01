@@ -16,7 +16,17 @@ use serde_json::Map;
 use serde_json::json;
 use std::collections::HashMap;
 use std::env;
+use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 #[test]
 fn messages_fixture_and_sse_parsing() {
@@ -118,6 +128,8 @@ fn logging_redaction_and_truncation() {
 
 #[test]
 fn traffic_capture_helpers() {
+    let _env_guard = env_lock();
+    let original_traffic_log = env::var_os("CCP_TRAFFIC_LOG");
     let mut env = HashMap::new();
     env.insert("CCP_TRAFFIC_LOG".into(), "1".into());
     assert!(traffic_capture_enabled_for_env(&env));
@@ -196,7 +208,10 @@ fn traffic_capture_helpers() {
     assert!(transcript.len() <= MAX_SSE_CAPTURE_BYTES);
     assert!(!transcript.contains("secret"));
     unsafe {
-        env::remove_var("CCP_TRAFFIC_LOG");
+        match original_traffic_log {
+            Some(value) => env::set_var("CCP_TRAFFIC_LOG", value),
+            None => env::remove_var("CCP_TRAFFIC_LOG"),
+        }
     }
 }
 
@@ -229,7 +244,9 @@ async fn auth_store_read_write_and_logout() {
 
 #[test]
 fn config_env_precedence_and_defaults() {
+    let _env_guard = env_lock();
     let original = env::var("PORT").ok();
+    let original_alias_provider = env::var_os("CCP_ALIAS_PROVIDER");
     unsafe {
         env::remove_var("PORT");
     }
@@ -257,12 +274,16 @@ fn config_env_precedence_and_defaults() {
     }
     assert!(matches!(load_config().alias_provider, AliasProvider::Kimi));
     unsafe {
-        env::remove_var("CCP_ALIAS_PROVIDER");
+        match original_alias_provider {
+            Some(value) => env::set_var("CCP_ALIAS_PROVIDER", value),
+            None => env::remove_var("CCP_ALIAS_PROVIDER"),
+        }
     }
 }
 
 #[test]
 fn alias_provider_has_expected_default() {
+    let _env_guard = env_lock();
     assert!(matches!(
         load_config().alias_provider,
         AliasProvider::Cursor

@@ -539,12 +539,11 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
             .and_then(|v| v.to_str().ok()),
         Some("test-client-version")
     );
-    assert_eq!(
-        cli_observed
-            .headers
-            .get("x-cursor-streaming")
-            .and_then(|v| v.to_str().ok()),
-        Some("true")
+    // The native AgentService/Run H2 request is already streaming. Cursor's
+    // `x-cursor-streaming` marker belongs only to the HTTP/1 RunSSE path.
+    assert!(
+        !cli_observed.headers.contains_key("x-cursor-streaming"),
+        "H2 AgentService/Run must not advertise the RunSSE marker"
     );
     let request_id = cli_observed
         .headers
@@ -628,6 +627,10 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
             .get("x-cursor-client-version")
             .and_then(|v| v.to_str().ok()),
         Some("sand-test-version")
+    );
+    assert!(
+        !sand_observed.headers.contains_key("x-cursor-streaming"),
+        "Sand H2 AgentService/Run must not advertise the RunSSE marker"
     );
     assert_eq!(
         sand_observed

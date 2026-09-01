@@ -734,7 +734,7 @@ impl CursorHttpClient {
 
         // Official CLI Agent interceptor (index.js):
         //   authorization, x-ghost-mode, x-cursor-client-version, x-cursor-client-type,
-        //   x-request-id, x-cursor-streaming, User-Agent connect-es/1.6.1
+        //   x-request-id, User-Agent connect-es/1.6.1
         let mut req = self
             .client
             .post(&url)
@@ -747,8 +747,16 @@ impl CursorHttpClient {
             .header("x-cursor-client-version", &client_version)
             .header("x-ghost-mode", ghost_mode)
             .header("x-request-id", &request_id)
-            .header("x-cursor-streaming", "true")
             .header("x-original-request-id", &request_id);
+
+        // `x-cursor-streaming` is a RunSSE/HTTP/1 method marker. The native
+        // CLI AgentService/Run request is already a Connect H2 stream and
+        // does not send this header; advertising it on H2 can make gateways
+        // classify the request as the legacy SSE surface. Keep the marker
+        // limited to the buffered HTTP/1 compatibility branch.
+        if use_http1_sse {
+            req = req.header("x-cursor-streaming", "true");
+        }
 
         if ide_profile || sand_profile {
             req = req

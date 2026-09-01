@@ -3,6 +3,15 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.97 (2026-09-01)
+
+- Keep the `x-cursor-streaming` marker restricted to the HTTP/1 `RunSSE`
+  compatibility path. Native H2 `AgentService/Run`, including Sand, now uses
+  the same header surface as Cursor's current client and avoids legacy-route
+  misclassification.
+- Serialize environment-mutating integration tests and restore their original
+  values so parallel CI workers cannot make the default provider test flaky.
+
 ## v0.1.96 (2026-09-01)
 
 - Rework Sand as a request-scoped, HTTP/2-only `AgentService/Run` route. A
