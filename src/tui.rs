@@ -3516,6 +3516,109 @@ fn account_route_display_name(
     account.display_name().to_string()
 }
 
+/// Cursor exposes independent quota lanes for its two request surfaces.  The
+/// dashboard's `apiPercentUsed` applies to normal CLI requests, while the Sand
+/// endpoint reports its own Grok Bot meter.  Keep this decision beside the
+/// model-account picker so a low Bot percentage is never presented as usable
+/// capacity for a model that will actually leave through the CLI/API lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountQuotaLane {
+    CliApi,
+    SandBot,
+}
+
+impl AccountQuotaLane {
+    fn for_model(model: &str) -> Self {
+        if config::cursor_model_uses_sand(model) {
+            Self::SandBot
+        } else {
+            Self::CliApi
+        }
+    }
+
+    fn surface(self) -> &'static str {
+        match self {
+            Self::CliApi => "CLI",
+            Self::SandBot => "Sand",
+        }
+    }
+
+    fn meter(self) -> &'static str {
+        match self {
+            Self::CliApi => "CLI/API",
+            Self::SandBot => "Sand/Bot",
+        }
+    }
+
+    fn other_meter(self) -> &'static str {
+        match self {
+            Self::CliApi => "Sand/Bot",
+            Self::SandBot => "CLI/API",
+        }
+    }
+
+    fn value(self, snapshot: &crate::monitor::AccountUsageSnapshot) -> Option<f64> {
+        match self {
+            Self::CliApi => snapshot.api_percent,
+            Self::SandBot => snapshot.grok_bot_percent,
+        }
+    }
+
+    fn other_value(self, snapshot: &crate::monitor::AccountUsageSnapshot) -> Option<f64> {
+        match self {
+            Self::CliApi => snapshot.grok_bot_percent,
+            Self::SandBot => snapshot.api_percent,
+        }
+    }
+}
+
+fn quota_meter_status(label: &str, percent: Option<f64>) -> String {
+    let Some(percent) = percent.filter(|value| value.is_finite()) else {
+        return format!("{label} unavailable");
+    };
+    let state = if percent >= 100.0 {
+        "exhausted"
+    } else if percent >= 90.0 {
+        "near limit"
+    } else {
+        "available"
+    };
+    format!("{label} {} used ({state})", format_usage_percent(percent))
+}
+
+fn account_route_quota_hint(
+    lane: AccountQuotaLane,
+    state: Option<&crate::monitor::AccountUsageState>,
+) -> String {
+    let snapshot = state.and_then(|state| match state {
+        crate::monitor::AccountUsageState::Ready(snapshot) => Some(snapshot),
+        _ => None,
+    });
+    let primary = quota_meter_status(lane.meter(), snapshot.and_then(|s| lane.value(s)));
+    let other = quota_meter_status(
+        lane.other_meter(),
+        snapshot.and_then(|s| lane.other_value(s)),
+    );
+    format!("lane {} -> {primary}; {other}", lane.surface())
+}
+
+fn account_route_selected_account_id(
+    selected: usize,
+    model: &str,
+    policy: &config::CursorAccountRoutingPolicy,
+    accounts: &[crate::providers::cursor::auth::CursorAccountProfile],
+) -> Option<String> {
+    let index = if selected == 0 {
+        account_route_account_index(policy, model, accounts)
+            .checked_sub(1)
+            .or_else(|| accounts.iter().position(|account| account.active))
+            .or_else(|| (!accounts.is_empty()).then_some(0))
+    } else {
+        selected.checked_sub(1)
+    }?;
+    accounts.get(index).map(|account| account.id.clone())
+}
+
 fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let (models, policy, selected, account_selected, pane, input, route_message) = {
         let ui = account_route_ui_lock();
@@ -3619,6 +3722,15 @@ fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
         pane == AccountRoutePane::Models,
     );
     let model = models.get(selected).map(String::as_str).unwrap_or("-");
+    let lane = AccountQuotaLane::for_model(model);
+    // When the account pane is on `automatic`, explain the active account's
+    // lane as well.  This keeps the diagnostic useful before a user pins a
+    // concrete account and avoids comparing the wrong meter by eye.
+    let selected_account_id =
+        account_route_selected_account_id(account_selected, model, &policy, &accounts);
+    let selected_usage = selected_account_id
+        .as_deref()
+        .and_then(|account_id| usage.get(account_id));
     render_account_route_accounts(
         frame,
         panes[1],
@@ -3634,24 +3746,38 @@ fn render_account_routes_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
         },
     );
 
-    let status = match (route_message, usage_message) {
-        (Some(route), Some(usage)) => Some(format!("{route}  |  {usage}")),
-        (Some(message), None) | (None, Some(message)) => Some(message),
-        (None, None) => None,
-    };
-    let status_lines = status
-        .map(|message| {
-            vec![Line::from(Span::styled(
-                format!(" {message}"),
-                Style::default().fg(YELLOW),
-            ))]
-        })
-        .unwrap_or_else(|| {
-            vec![Line::from(Span::styled(
+    let quota_hint = account_route_quota_hint(lane, selected_usage);
+    let status = [route_message, usage_message]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    // Keep the lane diagnosis on its own row.  Combining it with a worker
+    // status can push the useful part past the panel width, especially while
+    // all-account usage is refreshing.  The lane text is deliberately muted:
+    // a full API meter is a routing diagnosis, not a TUI failure.
+    let status_lines = if status.is_empty() {
+        vec![
+            Line::from(Span::styled(
                 " Select a model, then choose an account or automatic.",
                 Style::default().fg(DIM),
-            ))]
-        });
+            )),
+            Line::from(Span::styled(
+                format!(" {quota_hint}"),
+                Style::default().fg(DIM_WHITE),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                format!(" {}", status.join("  |  ")),
+                Style::default().fg(YELLOW),
+            )),
+            Line::from(Span::styled(
+                format!(" {quota_hint}"),
+                Style::default().fg(DIM_WHITE),
+            )),
+        ]
+    };
     frame.render_widget(
         Paragraph::new(status_lines)
             .style(Style::default().bg(BG))
@@ -3700,7 +3826,16 @@ fn render_account_route_models(
             } else {
                 Style::default().fg(DIM_WHITE)
             };
-            let route = account_route_display_name(policy.account_for_model(model), accounts);
+            // Show the request surface next to the account assignment.  A
+            // model may have a healthy Sand/Bot meter while its CLI/API meter
+            // is exhausted (or vice versa); the lane marker makes that split
+            // visible before the account is selected.
+            let lane = AccountQuotaLane::for_model(model);
+            let route = format!(
+                "{} · {}",
+                account_route_display_name(policy.account_for_model(model), accounts),
+                lane.surface()
+            );
             let marker = if row_selected { "> " } else { "  " };
             let model_width = width.saturating_sub(3 + 18).max(1);
             let route_width = width.saturating_sub(3 + model_width).max(1);
@@ -3769,10 +3904,14 @@ fn render_account_route_accounts(
     } else {
         ""
     };
+    let lane = AccountQuotaLane::for_model(model);
     let automatic_detail = if accounts.is_empty() {
-        "  no saved accounts — add one with cursor auth add"
+        "  no saved accounts — add one with cursor auth add".to_string()
     } else {
-        "  active account + normal failover"
+        format!(
+            "  active account + normal failover · {} quota",
+            lane.meter()
+        )
     };
     groups.push(vec![
         Line::from(vec![
@@ -5871,6 +6010,82 @@ mod tests {
 
         *account_ui_lock() = AccountUiState::default();
         *account_route_ui_lock() = AccountRouteUiState::default();
+    }
+
+    #[test]
+    fn account_route_quota_hint_uses_the_selected_models_surface() {
+        let state =
+            crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+                email: None,
+                membership: None,
+                auto_percent: Some(100.0),
+                api_percent: Some(100.0),
+                total_percent: Some(100.0),
+                plan_used_usd: None,
+                plan_limit_usd: None,
+                on_demand_used_usd: None,
+                on_demand_limit_usd: None,
+                grok_bot_percent: Some(0.1),
+                grok_bot_period_start: None,
+                grok_bot_reset: None,
+                total_cost_usd: None,
+                usage_event_count: None,
+                usage_events: Vec::new(),
+                fetched_at: SystemTime::now(),
+            });
+
+        let cli = account_route_quota_hint(AccountQuotaLane::CliApi, Some(&state));
+        assert!(
+            cli.starts_with("lane CLI -> CLI/API 100.0% used (exhausted)"),
+            "{cli}"
+        );
+        assert!(cli.contains("Sand/Bot 0.1% used (available)"), "{cli}");
+
+        let sand = account_route_quota_hint(AccountQuotaLane::SandBot, Some(&state));
+        assert!(
+            sand.starts_with("lane Sand -> Sand/Bot 0.1% used (available)"),
+            "{sand}"
+        );
+        assert!(sand.contains("CLI/API 100.0% used (exhausted)"), "{sand}");
+    }
+
+    #[test]
+    fn account_route_selected_account_prefers_bound_then_active_for_automatic() {
+        let account =
+            |id: &str, active: bool| crate::providers::cursor::auth::CursorAccountProfile {
+                id: id.to_string(),
+                label: Some(id.to_string()),
+                auth: crate::providers::cursor::auth::CursorAuth {
+                    access_token: format!("token-{id}"),
+                    refresh_token: None,
+                    api_key: None,
+                    expires: None,
+                    user_id: None,
+                    email: None,
+                    source: "test".to_string(),
+                },
+                active,
+            };
+        let accounts = vec![account("active", true), account("bound", false)];
+        let policy =
+            config::CursorAccountRoutingPolicy::new([config::CursorModelAccountRule::new(
+                "grok-4.6", "bound",
+            )]);
+
+        assert_eq!(
+            account_route_selected_account_id(0, "grok-4.6", &policy, &accounts).as_deref(),
+            Some("bound")
+        );
+        assert_eq!(
+            account_route_selected_account_id(
+                0,
+                "gemini-3.1-pro",
+                &config::CursorAccountRoutingPolicy::default(),
+                &accounts,
+            )
+            .as_deref(),
+            Some("active")
+        );
     }
 
     #[test]
