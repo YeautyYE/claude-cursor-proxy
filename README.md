@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.101 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.102 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -263,6 +263,17 @@ that matches the Sand policy, the proxy sends Cursor's
 your configured `CCP_CURSOR_CLIENT_TYPE`) identity. Mixed routing happens in
 the same `claude-cursor-proxy serve` process; a second Sand binary is not
 needed.
+
+`grok-bot` is the name of Cursor's server-side Bot/Sand product and entitlement;
+it is **not** a local process that must be started before the proxy. On a
+first-use account, complete Cursor's one-time Bot onboarding in a browser:
+<https://cursor.com/bot/onboarding?product=grok-bot>. After the account has
+the entitlement, keep only `claude-cursor-proxy serve` running. If the account
+was just onboarded, run `cursor auth login`/`cursor auth usage` once to refresh
+the stored session and quota snapshot. A response such as `Sand traffic is not
+supported on this endpoint` means an old client/route was used; the current
+proxy must use `InferenceService/Stream` (shown as `direct-stream: ready` by
+`cursor sand-status`).
 The policy applies only to requests resolved to the Cursor provider; Codex,
 Kimi, and native Grok routes keep their normal providers by default. There is
 one intentional Grok exception: an explicit `cursor.modelAccounts` rule for a

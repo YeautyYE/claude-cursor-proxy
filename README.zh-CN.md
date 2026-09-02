@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.101 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.102 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -247,6 +247,14 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 发送 `x-cursor-client-type: sand`；其他 Cursor 请求继续使用普通的 `cli`
 （或你设置的 `CCP_CURSOR_CLIENT_TYPE`）身份。混合路由由同一个
 `claude-cursor-proxy serve` 进程完成，不需要再启动第二个 Sand 二进制。
+这里的 `grok-bot` 是 Cursor 服务端的 Bot/Sand 产品与资格名称，**不是**需要
+预先启动的本地进程。首次使用某个账号时，按需在浏览器完成一次 Bot 开通：
+<https://cursor.com/bot/onboarding?product=grok-bot>。账号获得资格后，只需保持
+`claude-cursor-proxy serve` 运行；刚开通时可执行一次 `cursor auth login` 或
+`cursor auth usage`，让本地会话和额度缓存更新。若看到
+`Sand traffic is not supported on this endpoint`，说明仍有旧客户端/旧路由；
+当前代理应走 `InferenceService/Stream`，可用 `cursor sand-status` 中的
+`direct-stream: ready` 检查。
 这套规则只作用于最终路由到 Cursor 的请求；原生 Codex、Kimi 和 Grok 默认
 仍走各自的后端。Grok 有一个明确的例外：为 `grok-*` 名称配置
 `cursor.modelAccounts` 后，该名称会进入 Cursor 的账号路由。这样同一个公开

@@ -3,6 +3,18 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.102 (2026-09-03)
+
+- Harden Sand/CLI recovery when Cursor wraps a temporary provider connection
+  outage in an outer `400`/`429`: retry it as a bounded `503` transport event
+  without cooling down or rotating a healthy account.
+- Keep fresh non-tool requests (including `stream:false` Responses calls) out
+  of the short nested-resume probe, preventing the old 1.5-second 503 storm
+  behind a still-running Grok turn.
+- Clarify that `grok-bot` is Cursor's server-side Sand/Bot entitlement and
+  onboarding product, not a local daemon. The proxy sends the Sand
+  `InferenceService/Stream` request directly from the single `serve` process.
+
 ## v0.1.101 (2026-09-03)
 
 - Keep `claude-fable-5[1m]` on the built-in Sand/Bot route for every saved Cursor

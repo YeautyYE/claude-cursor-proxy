@@ -483,6 +483,13 @@ impl ConnectEndError {
     /// True for the provider rejection shape observed in Cursor's current
     /// Sand/CLI responses: outer resource exhaustion, inner deterministic 4xx.
     pub fn is_non_retryable_provider_error(&self) -> bool {
+        // Cursor occasionally reuses the same inner 400 envelope for a short
+        // provider outage.  The human diagnostic is more useful than the
+        // outer status in that case; keep the outage on the transport retry
+        // path instead of treating it as an account-specific allowance.
+        if is_transient_provider_error_message(&format!("{} {}", self.message, self.detail)) {
+            return false;
+        }
         self.provider_error_code
             .as_deref()
             .is_some_and(|code| code.eq_ignore_ascii_case("ERROR_PROVIDER_ERROR"))
@@ -493,10 +500,103 @@ impl ConnectEndError {
     }
 }
 
+/// Detect Cursor's provider-connectivity diagnostic after an error has crossed
+/// a transport/string boundary.
+///
+/// The provider adapter has emitted this text with several outer statuses
+/// (`400`, `429`, and `502`) and with both JSON and flattened key/value
+/// metadata.  The outer status is therefore not sufficient to classify it.
+/// Require a provider marker plus temporary connectivity wording, while
+/// explicitly excluding quota, billing, and capacity-shed language.  This
+/// helper is intentionally shared by the Connect parser, retry classifier,
+/// account breaker, Sand stream, and Agent live paths.
+pub fn is_transient_provider_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+
+    // Do not classify ordinary `ERROR_OPENAI: Unable to reach the model
+    // provider` messages here. Those already have the generic transport
+    // retry semantics. This helper is for the newer nested provider adapter
+    // envelope, whose stable marker is `ERROR_PROVIDER_ERROR` (or its
+    // flattened `providerErrorCode` spelling).
+    let provider_marker = lower.contains("error_provider_error")
+        || lower.contains("providererrorcode=error_provider_error")
+        || lower.contains("providererrorcode\":\"error_provider_error")
+        || lower.contains("provider_error_code=error_provider_error");
+    if !provider_marker {
+        return false;
+    }
+
+    // These markers describe an account/plan or a deliberate capacity shed;
+    // retrying the same account does not repair them even if the envelope
+    // also contains "try again" wording.
+    let terminal_policy = [
+        "out of usage",
+        "usage limit",
+        "quota",
+        "rate limit exceeded",
+        "rate_limited",
+        "resource exhausted by",
+        "unpaid invoice",
+        "pay your invoice",
+        "billing",
+        "entitlement",
+        "free plans",
+        "upgrade plan",
+        "increase limits",
+        "switch to auto",
+        "high load",
+        "high demand",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if terminal_policy {
+        return false;
+    }
+
+    // Keep the list explicit so generic model text containing the word
+    // "temporary" cannot disable account policy handling.
+    let temporary_connectivity = [
+        "provider unavailable",
+        "provider is unavailable",
+        "provider temporarily unavailable",
+        "temporarily unavailable",
+        "temporary provider",
+        "temporary trouble connecting",
+        "trouble connecting to the model provider",
+        "trouble connecting to provider",
+        "unable to reach the model provider",
+        "unable to connect to the model provider",
+        "upstream connection failed",
+        "upstream connection reset",
+        "upstream connection closed",
+        "upstream connection unavailable",
+        "upstream connection",
+        "connection to the model provider",
+        "provider connection",
+        "temporary outage",
+        "temporarily unable to reach",
+        "try again in a moment",
+        "try again later",
+    ];
+    temporary_connectivity
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Backwards-compatible spelling used by a few transport-specific callers.
+/// Keep the implementation in `is_transient_provider_error_message` so all
+/// paths share exactly the same policy precedence.
+pub fn is_temporary_provider_error_message(message: &str) -> bool {
+    is_transient_provider_error_message(message)
+}
+
 /// Detect the same provider diagnostic after an error has crossed a string
 /// boundary (for example `CursorError::client_message`). This intentionally
 /// accepts both camelCase and snake_case JSON spellings and tolerates spaces.
 pub fn is_non_retryable_provider_error_message(message: &str) -> bool {
+    if is_transient_provider_error_message(message) {
+        return false;
+    }
     let compact = message
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
@@ -844,8 +944,9 @@ mod tests {
         );
         assert_eq!(error.provider_status_code, Some(400));
         assert_eq!(error.provider_is_retryable, Some(false));
-        assert!(error.is_non_retryable_provider_error());
-        assert!(is_non_retryable_provider_error_message(&error.detail));
+        assert!(is_transient_provider_error_message(&error.detail));
+        assert!(!error.is_non_retryable_provider_error());
+        assert!(!is_non_retryable_provider_error_message(&error.detail));
     }
 
     #[test]
@@ -867,6 +968,36 @@ mod tests {
         assert!(is_non_retryable_provider_error_message(
             deterministic_forbidden
         ));
+    }
+
+    #[test]
+    fn transient_provider_connectivity_diagnostic_overrides_outer_429() {
+        let messages = [
+            r#"{"error":{"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"detail":"temporary trouble connecting to the model provider","additionalInfo":{"providerStatusCode":400},"isRetryable":false}}}]}}"#,
+            "Connect error 429: ERROR_PROVIDER_ERROR: Provider Error — provider unavailable [providerStatusCode=400,isRetryable=false]",
+            "Cursor error 400: ERROR_PROVIDER_ERROR upstream connection reset; try again in a moment",
+        ];
+        for message in messages {
+            assert!(is_transient_provider_error_message(message), "{message}");
+            assert!(
+                !is_non_retryable_provider_error_message(message),
+                "temporary provider failures must not trip the account breaker: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_policy_wording_wins_over_temporary_connectivity_hint() {
+        for message in [
+            "Connect error 429: ERROR_PROVIDER_ERROR: provider unavailable; you're out of usage",
+            "ERROR_PROVIDER_ERROR temporary trouble connecting; unpaid invoice",
+            "ERROR_PROVIDER_ERROR provider unavailable; High Load — switch to Auto",
+        ] {
+            assert!(
+                !is_transient_provider_error_message(message),
+                "policy wording must remain terminal: {message}"
+            );
+        }
     }
 
     #[test]

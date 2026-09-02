@@ -48,6 +48,7 @@ use crate::providers::cursor::auth::{
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::connect::{
     cursor_connect_error_is_missing_image, is_non_retryable_provider_error_message,
+    is_transient_provider_error_message,
 };
 use crate::providers::cursor::exec_results::PendingCursorExec;
 use crate::providers::cursor::hosted_web_search::{
@@ -83,7 +84,8 @@ use crate::providers::cursor::response::{
 };
 use crate::providers::cursor::sand_inference::{
     SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
-    messages_from_anthropic, stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
+    accepted_unadvertised_tool_names_from_anthropic, messages_from_anthropic,
+    stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
@@ -1155,6 +1157,9 @@ async fn sand_direct_response(
     // The new endpoint accepts UUID identifiers and does not use the
     // AgentService session registry.  Fresh ids also prevent an abandoned
     // Desktop invocation from poisoning the next Claude Code turn.
+    let sand_tools = tools_from_anthropic(body, compaction_mode);
+    let accepted_unadvertised_tool_names =
+        accepted_unadvertised_tool_names_from_anthropic(body, &sand_tools);
     let request = SandInferenceRequest::new(
         model.to_string(),
         uuid::Uuid::new_v4().to_string(),
@@ -1168,7 +1173,8 @@ async fn sand_direct_response(
     .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
     .with_parameter_model_id(parameter_model)
     .with_max_tokens(body.max_tokens.map(u64::from))
-    .with_tools(tools_from_anthropic(body, compaction_mode));
+    .with_tools(sand_tools)
+    .with_accepted_unadvertised_tool_names(accepted_unadvertised_tool_names);
 
     let client = SandInferenceClient::new();
     if let Some(monitor) = ctx.monitor.as_ref() {
@@ -2374,8 +2380,17 @@ fn defer_fresh_stream_admission(
 /// has generation-bound conflict/replacement handling; let both streaming
 /// surfaces use it.  Tool-result continuations remain on the bounded resume
 /// path because their payload must be matched to the exact pending batch.
-fn fresh_stream_can_skip_resume_probe(want_stream: bool, has_tool_results: bool) -> bool {
-    want_stream && !has_tool_results
+fn fresh_stream_can_skip_resume_probe(_want_stream: bool, has_tool_results: bool) -> bool {
+    // A non-streaming Responses caller has no SSE envelope/heartbeat while it
+    // waits in the pre-admission phase.  Sending such requests through the
+    // short nested-resume probe (1.5s) turns an otherwise normal queued turn
+    // into a client-visible 503 storm whenever the preceding Grok generation
+    // is still running.  Fresh requests without tool results are safe to let
+    // the normal single-flight start loop queue; that loop has the longer
+    // conflict deadline and can attach/replay an identical operation.  Tool
+    // result requests stay on the exact bounded probe because their ids are
+    // generation-scoped.
+    !has_tool_results
 }
 
 fn live_probe_cursor_error(message: String) -> CursorError {
@@ -2527,6 +2542,12 @@ fn account_failover_swap_limit(profiles: &[CursorAccountProfile]) -> u32 {
 /// deployment), so rotating credentials cannot make them succeed and would
 /// needlessly fan one client error across every stored account.
 fn is_account_failover_policy_error(message: &str) -> bool {
+    // A temporary provider outage can carry an outer rate-limit/resource
+    // marker. It must stay on the bounded transport retry path and never
+    // rotate or cool down an otherwise healthy account.
+    if is_transient_provider_error_message(message) {
+        return false;
+    }
     if crate::retry::is_billing_block(message) {
         return false;
     }
@@ -5731,7 +5752,8 @@ fn env_u64_millis(name: &str, default: u64) -> u64 {
 /// retrying the latter only delays a useful error and may amplify a shed.
 fn is_transient_resource_exhausted(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    (lower.contains("error_resource_exhausted")
+    (is_transient_provider_error_message(message)
+        || lower.contains("error_resource_exhausted")
         || (lower.contains("unable to reach the model provider")
             && lower.contains("resource_exhausted")))
         && !is_non_retryable_provider_error_message(message)
@@ -8375,6 +8397,9 @@ mod tests {
             r#"Cursor error 429: {"error":{"details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":400},"isRetryable":false}}}]}}"#
         ));
         assert!(!is_account_failover_policy_error(
+            "Cursor error 429: ERROR_PROVIDER_ERROR provider unavailable; temporary trouble connecting to the model provider [providerStatusCode=400,isRetryable=false]"
+        ));
+        assert!(!is_account_failover_policy_error(
             "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice"
         ));
         assert!(!is_account_failover_policy_error(
@@ -10361,6 +10386,18 @@ mod tests {
             "Responses callers must retain JSON-before-open semantics"
         );
         assert!(!defer_fresh_stream_admission(false, false, false));
+    }
+
+    #[test]
+    fn every_fresh_request_without_tool_results_skips_short_nested_probe() {
+        // This includes `stream:false` Responses calls. They cannot emit a
+        // heartbeat before the response body exists, so the 1.5s nested
+        // probe would turn a healthy queue behind a long Grok generation into
+        // repeated local 503s.
+        assert!(fresh_stream_can_skip_resume_probe(false, false));
+        assert!(fresh_stream_can_skip_resume_probe(true, false));
+        assert!(!fresh_stream_can_skip_resume_probe(false, true));
+        assert!(!fresh_stream_can_skip_resume_probe(true, true));
     }
 
     #[test]

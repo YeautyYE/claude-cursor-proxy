@@ -24,7 +24,7 @@ use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorUpst
 use crate::providers::cursor::connect::{
     ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP, connect_error_status,
     decode_gzip_frame, encode_connect_frame, is_non_retryable_provider_error_message,
-    parse_connect_error,
+    is_transient_provider_error_message, parse_connect_error,
 };
 use crate::providers::cursor::request::{
     image_candidate, is_model_visible_tool_definition, message_blocks, normalize_image_data,
@@ -73,6 +73,13 @@ pub fn stream_error_is_retryable(error: &CursorError) -> bool {
         || lower.contains("outdated client")
     {
         return false;
+    }
+
+    // The nested provider adapter can report a temporary connectivity outage
+    // as an outer 400/429. Keep it on Sand's bounded replay path even though
+    // the embedded status itself is not retryable.
+    if is_transient_provider_error_message(&message) {
+        return true;
     }
 
     // Sand's stream can report a stale invocation as 409/"already active";
@@ -334,6 +341,10 @@ pub fn tools_from_anthropic(request: &MessagesRequest, omit_tools: bool) -> Vec<
         // forwarding them here lets Sand call tools that the downstream client
         // will later discard and can leave the turn waiting forever.
         .filter(|tool| is_model_visible_tool_definition(tool))
+        // Cursor's desktop runtime keeps dynamic execution-only tools out of
+        // `modelVisibleTools`; mirror that split when a client forwards the
+        // metadata through the Anthropic extension map.
+        .filter(|tool| !tool_is_execution_only(tool))
         .filter_map(|tool| {
             let name = tool.get("name").and_then(Value::as_str)?.trim();
             if name.is_empty() {
@@ -355,6 +366,144 @@ pub fn tools_from_anthropic(request: &MessagesRequest, omit_tools: bool) -> Vec<
             }))
         })
         .collect()
+}
+
+/// Return the names of executable tools that are intentionally not included
+/// in the model-visible `tools` catalog.
+///
+/// Cursor's desktop agent keeps these two sets separate: `modelVisibleTools`
+/// is serialized as `tools`, while dynamic/client-local entries are sent in
+/// `acceptedUnadvertisedToolNames`.  Claude Code normally exposes a flat
+/// Anthropic tool array, but newer clients may preserve the desktop metadata
+/// (or an explicit execution-set object) in the flattened extension fields.
+/// Honor those forms without guessing that every Claude-local tool is
+/// executable.  This is important for hidden hooks: adding all names here can
+/// make the model emit calls that the downstream bridge cannot fulfill.
+pub fn accepted_unadvertised_tool_names_from_anthropic(
+    request: &MessagesRequest,
+    model_tools: &[Value],
+) -> Vec<String> {
+    let model_names: HashSet<String> = model_tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut names = Vec::new();
+
+    // Preserve an explicit list when a desktop-compatible client forwards it
+    // through the Anthropic extension map. Both protobuf-JSON and Rust-style
+    // snake_case spellings have appeared in integrations.
+    for key in [
+        "acceptedUnadvertisedToolNames",
+        "accepted_unadvertised_tool_names",
+    ] {
+        collect_tool_names(request.extra.get(key), &mut names);
+    }
+    // Some clients forward the complete execution set instead of the derived
+    // name list. Accept both the camelCase and snake_case forms, including a
+    // nested `toolExecutionSet` envelope.
+    for key in ["additionalExecutableTools", "additional_executable_tools"] {
+        collect_tool_names(request.extra.get(key), &mut names);
+    }
+    for key in ["toolExecutionSet", "tool_execution_set"] {
+        let Some(value) = request.extra.get(key) else {
+            continue;
+        };
+        for nested in ["additionalExecutableTools", "additional_executable_tools"] {
+            collect_tool_names(value.get(nested), &mut names);
+        }
+    }
+
+    // When metadata is attached to individual tool definitions, only treat a
+    // definition as unadvertised when the client explicitly marks it as an
+    // execution-only/dynamic entry. A `dynamicToolMetaRole=invocation` entry
+    // is the spelling used by Cursor's current agent runtime.
+    if let Some(tools) = request.extra.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if model_names.contains(name) || !tool_is_execution_only(tool) {
+                continue;
+            }
+            names.push(name.to_string());
+        }
+    }
+
+    // Keep the wire deterministic and discard entries that are already in the
+    // visible catalog. The server treats this as a repeated set in practice;
+    // preserving first-seen order makes request snapshots stable for tests.
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .filter(|name| !model_names.contains(name))
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+fn collect_tool_names(value: Option<&Value>, out: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(name) => out.push(name.clone()),
+                    Value::Object(object) => {
+                        for key in ["name", "toolName", "tool_name"] {
+                            if let Some(name) = object.get(key).and_then(Value::as_str) {
+                                out.push(name.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::String(name) => out.push(name.clone()),
+        Value::Object(object) => {
+            for key in ["name", "toolName", "tool_name"] {
+                if let Some(name) = object.get(key).and_then(Value::as_str) {
+                    out.push(name.to_string());
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_is_execution_only(tool: &Value) -> bool {
+    for key in [
+        "additionalExecutable",
+        "additional_executable",
+        "isAdditionalExecutable",
+        "is_additional_executable",
+        "executionOnly",
+        "execution_only",
+        "modelInvisible",
+        "model_invisible",
+    ] {
+        if tool.get(key).and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+    }
+    if tool
+        .get("modelVisible")
+        .or_else(|| tool.get("model_visible"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return true;
+    }
+    tool.get("dynamicToolMetaRole")
+        .or_else(|| tool.get("dynamic_tool_meta_role"))
+        .and_then(Value::as_str)
+        .is_some_and(|role| role.eq_ignore_ascii_case("invocation"))
 }
 
 fn content_message(
@@ -575,6 +724,11 @@ pub struct SandInferenceRequest {
     pub max_mode: bool,
     pub max_tokens: Option<u64>,
     pub tools: Vec<Value>,
+    /// Names of executable tools that are intentionally absent from
+    /// `tools`. Cursor's InferenceService uses this repeated field for
+    /// dynamic/client-local tools (the desktop runtime calls it
+    /// `acceptedUnadvertisedToolNames`).
+    pub accepted_unadvertised_tool_names: Vec<String>,
     /// Forward-compatible fields supplied by a newer desktop build.  Keeping
     /// these as JSON avoids baking unstable protobuf-generated fields into the
     /// proxy and lets callers pass tool/config metadata when available.
@@ -597,6 +751,7 @@ impl SandInferenceRequest {
             max_mode: false,
             max_tokens: None,
             tools: Vec::new(),
+            accepted_unadvertised_tool_names: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -628,6 +783,25 @@ impl SandInferenceRequest {
 
     pub fn with_tools(mut self, tools: Vec<Value>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Set the execution-only tool names accepted by the Sand gateway.
+    /// Empty/duplicate names are removed while preserving first-seen order so
+    /// snapshots and diagnostics remain deterministic.
+    pub fn with_accepted_unadvertised_tool_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut seen = HashSet::new();
+        self.accepted_unadvertised_tool_names = names
+            .into_iter()
+            .map(Into::into)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .filter(|name| seen.insert(name.clone()))
+            .collect();
         self
     }
 
@@ -684,6 +858,18 @@ impl SandInferenceRequest {
         // contract explicit while staying within the current schema.
         object.insert("tools".into(), Value::Array(self.tools.clone()));
         object.insert("providerDefinedTools".into(), Value::Array(Vec::new()));
+        if !self.accepted_unadvertised_tool_names.is_empty() {
+            object.insert(
+                "acceptedUnadvertisedToolNames".into(),
+                Value::Array(
+                    self.accepted_unadvertised_tool_names
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
         if let Some(max_tokens) = self.max_tokens {
             object.insert("modelConfig".into(), json!({ "maxTokens": max_tokens }));
         }
@@ -1196,6 +1382,23 @@ fn json_error_direct(value: &Value) -> Option<CursorError> {
         .filter(|value| !value.trim().is_empty())
         .or_else(|| value_as_string(error))
         .unwrap_or_else(|| "Sand inference upstream error".into());
+
+    // InferenceService may put the useful provider diagnosis (for example
+    // "temporary trouble connecting") inside ErrorDetails while leaving the
+    // direct `message` as a generic "Error". Reuse the Connect parser's
+    // normalized detail so retry/account classification sees the same text
+    // on both END frames and regular JSON stream frames.
+    if let Ok(bytes) = serde_json::to_vec(value)
+        && let Some(parsed) = parse_connect_error(&bytes)
+        && parsed.provider_error_code.is_some()
+        && !parsed.message.trim().is_empty()
+        && !message
+            .to_ascii_lowercase()
+            .contains(&parsed.message.to_ascii_lowercase())
+    {
+        message.push_str(" — ");
+        message.push_str(&parsed.message);
+    }
     if let Some(error_type) = error_type.as_deref()
         && !message
             .to_ascii_lowercase()
@@ -1941,6 +2144,59 @@ mod tests {
             params
                 .iter()
                 .any(|value| { value["id"] == "effort" && value["value"] == "max" })
+        );
+    }
+
+    #[test]
+    fn request_serializes_accepted_unadvertised_tool_names() {
+        let request = SandInferenceRequest::new(
+            "claude-fable-5",
+            "conv-1",
+            "invoke-1",
+            vec![SandInferenceMessage::user("hello")],
+        )
+        .with_accepted_unadvertised_tool_names([
+            "mcp__claude-local__Workflow",
+            "mcp__claude-local__Workflow",
+            " ",
+            "Task",
+        ]);
+        assert_eq!(
+            request.to_json_value()["acceptedUnadvertisedToolNames"],
+            json!(["mcp__claude-local__Workflow", "Task"])
+        );
+    }
+
+    #[test]
+    fn accepted_unadvertised_names_use_explicit_execution_metadata_only() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {"name": "Read", "input_schema": {"type": "object"}},
+                {
+                    "name": "dynamic_lookup",
+                    "dynamicToolMetaRole": "invocation",
+                    "modelVisible": false,
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "name": "ordinary_dynamic",
+                    "dynamic": true,
+                    "input_schema": {"type": "object"}
+                }
+            ],
+            "additionalExecutableTools": [{"name": "mcp__claude-local__Workflow"}],
+            "acceptedUnadvertisedToolNames": ["Task", "Read"]
+        }))
+        .unwrap();
+        let model_tools = tools_from_anthropic(&request, false);
+        let accepted = accepted_unadvertised_tool_names_from_anthropic(&request, &model_tools);
+        // `Read` is visible and therefore removed from the execution-only set;
+        // an unmarked dynamic flag is not enough to opt a tool in.
+        assert_eq!(
+            accepted,
+            vec!["Task", "mcp__claude-local__Workflow", "dynamic_lookup"]
         );
     }
 

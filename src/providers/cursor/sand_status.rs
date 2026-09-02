@@ -14,6 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{config, paths};
 
+/// Cursor's one-time browser flow for granting the account-level Bot/Sand
+/// entitlement. `grok-bot` is a server product identifier in this URL, not a
+/// local executable or daemon required by the proxy.
+pub const SAND_BOT_ONBOARDING_URL: &str = "https://cursor.com/bot/onboarding?product=grok-bot";
+
 /// Sand transport/header capabilities compiled into this proxy.
 ///
 /// These are local implementation facts, not a desktop bundle probe.  The
@@ -152,6 +157,10 @@ pub struct SandAccountStatus {
 pub struct SandStatusSnapshot {
     /// Stable identifier for scripts consuming `--json` output.
     pub protocol: &'static str,
+    /// Cursor account onboarding page for the server-side Bot/Sand product.
+    pub bot_onboarding_url: &'static str,
+    /// Always false: the direct InferenceService transport lives in `serve`.
+    pub local_bot_daemon_required: bool,
     pub markers: SandProtocolMarkers,
     /// `markers_ready` describes only this proxy's request transport.
     pub markers_ready: bool,
@@ -231,6 +240,8 @@ pub fn snapshot() -> SandStatusSnapshot {
 
     SandStatusSnapshot {
         protocol: "sand-client-mode",
+        bot_onboarding_url: SAND_BOT_ONBOARDING_URL,
+        local_bot_daemon_required: false,
         markers,
         markers_ready: markers.all_enabled(),
         desktop_bundle,
@@ -277,6 +288,10 @@ const SAND_BR_RESOURCE_BRIDGE_MARKER: &str = "/*SAND_BR_RESOURCE_BRIDGE_V1*/";
 // older SandClientMode installer. It is the same completion capability.
 const SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER: &str = "/*SAND_AGENT_EXEC_PROVIDER_BRIDGE_V1*/";
 const SAND_MOVE_EXEC_MARKER: &str = "/*SAND_MOVE_EXEC_V1*/";
+// Sand Stream Toolkit 1.2.x spells the same feature-gate bypass with the
+// longer Agent Host prefix. Keep both spellings so status recognizes bundles
+// installed by either toolkit generation.
+const SAND_AGENT_HOST_MOVE_EXEC_MARKER: &str = "/*SAND_AGENT_HOST_MOVE_EXEC_V1*/";
 const SAND_MULTITASK_ROUTE_MARKER: &str = "/*SAND_MULTITASK_ROUTE_V1*/";
 const SAND_SUBAGENT_FEATURES_MARKER: &str = "/*SAND_SUBAGENT_FEATURES_V1*/";
 const SAND_SUBAGENT_CAPTURE_MARKER: &str = "/*SAND_SUBAGENT_CAPTURE_V1*/";
@@ -298,10 +313,36 @@ const DESKTOP_TARGETS: &[&str] = &[
 ];
 
 fn inspect_desktop_bundle() -> DesktopSandPatchStatus {
-    inspect_desktop_bundle_candidates(desktop_app_candidates())
+    // `sand-status` is commonly run from a shell prompt (and by health
+    // checks), so keep the default probe bounded to the handful of files that
+    // the current Sand installers patch.  Walking every versioned Agent Host
+    // chunk can turn a read-only status request into a surprisingly expensive
+    // scan on older/larger Cursor installations.  Set the opt-in environment
+    // variable when auditing an unknown/custom bundle.
+    let deep_scan = std::env::var_os("CCP_CURSOR_SAND_DEEP_SCAN")
+        .and_then(|value| value.into_string().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    inspect_desktop_bundle_candidates_with_mode(desktop_app_candidates(), deep_scan)
 }
 
+#[cfg(test)]
 fn inspect_desktop_bundle_candidates(candidates: Vec<PathBuf>) -> DesktopSandPatchStatus {
+    // Unit tests and library callers historically exercised the full probe;
+    // retain that behaviour for this private helper while production status
+    // uses the bounded path above.
+    inspect_desktop_bundle_candidates_with_mode(candidates, true)
+}
+
+fn inspect_desktop_bundle_candidates_with_mode(
+    candidates: Vec<PathBuf>,
+    deep_scan: bool,
+) -> DesktopSandPatchStatus {
     let Some(app_root) = candidates.into_iter().find_map(resolve_desktop_app_root) else {
         return DesktopSandPatchStatus::not_detected(
             "Cursor Desktop bundle was not found; set CCP_CURSOR_APP to inspect a custom install",
@@ -316,15 +357,23 @@ fn inspect_desktop_bundle_candidates(candidates: Vec<PathBuf>) -> DesktopSandPat
     for relative in DESKTOP_TARGETS {
         scanned.push(app_root.join(relative));
     }
-    // Agent Host uses versioned chunks for some bridge code.  Scan only this
-    // known extension directory, rather than walking the whole 1GB app.
+    // Agent Host uses versioned chunks for some bridge code.  The reference
+    // Sand installers currently patch 657.js and 675.js.  In the default
+    // bounded mode inspect only those deterministic paths; deep mode keeps
+    // the legacy directory probe for custom/unknown bundle layouts.
     let chunks = app_root.join("extensions/cursor-agent-host/dist");
-    if let Ok(entries) = fs::read_dir(chunks) {
-        for entry in entries.flatten().take(512) {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("js") {
-                scanned.push(path);
+    if deep_scan {
+        if let Ok(entries) = fs::read_dir(&chunks) {
+            for entry in entries.flatten().take(512) {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("js") {
+                    scanned.push(path);
+                }
             }
+        }
+    } else {
+        for chunk in ["657.js", "675.js"] {
+            scanned.push(chunks.join(chunk));
         }
     }
 
@@ -371,11 +420,19 @@ fn inspect_desktop_bundle_candidates(candidates: Vec<PathBuf>) -> DesktopSandPat
         && counts.multitask_route > 0
         && counts.subagent_task == 4
         && counts.subagent_route == 2;
-    let diagnostic = (unreadable_files > 0).then(|| {
-        format!(
-            "{unreadable_files} Cursor Desktop target file(s) could not be read; marker readiness may be incomplete"
-        )
-    });
+    let diagnostic = match (deep_scan, unreadable_files) {
+        (false, 0) => Some(
+            "Desktop deep scan skipped; set CCP_CURSOR_SAND_DEEP_SCAN=1 to inspect all Agent Host chunks"
+                .to_string(),
+        ),
+        (false, unreadable) => Some(format!(
+            "{unreadable} Cursor Desktop target file(s) could not be read; marker readiness may be incomplete; Desktop deep scan skipped (set CCP_CURSOR_SAND_DEEP_SCAN=1 to inspect all Agent Host chunks)"
+        )),
+        (true, 0) => None,
+        (true, unreadable) => Some(format!(
+            "{unreadable} Cursor Desktop target file(s) could not be read; marker readiness may be incomplete"
+        )),
+    };
     DesktopSandPatchStatus {
         required_for_proxy: false,
         detected: true,
@@ -451,7 +508,8 @@ impl MarkerCounts {
             agent_exec_provider_bridge: content
                 .matches(SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER)
                 .count(),
-            move_exec: content.matches(SAND_MOVE_EXEC_MARKER).count(),
+            move_exec: content.matches(SAND_MOVE_EXEC_MARKER).count()
+                + content.matches(SAND_AGENT_HOST_MOVE_EXEC_MARKER).count(),
         }
     }
 
@@ -574,6 +632,15 @@ pub fn render_text(status: &SandStatusSnapshot) -> String {
         status.transport, status.sand_client_version, status.base_url
     ));
     out.push_str(&format!(
+        "  grok-bot: server-side entitlement  local daemon: {}\n  onboarding: {}\n",
+        if status.local_bot_daemon_required {
+            "required"
+        } else {
+            "not required"
+        },
+        status.bot_onboarding_url
+    ));
+    out.push_str(&format!(
         "  proxy transport: {}\n  proxy markers: managed-local: {}  local-runtime: {}  direct-stream: {}\n",
         marker(status.markers_ready),
         marker(status.markers.managed_local_route),
@@ -678,6 +745,8 @@ mod tests {
     fn text_status_is_secret_free_and_mentions_h2_transport() {
         let status = SandStatusSnapshot {
             protocol: "sand-client-mode",
+            bot_onboarding_url: SAND_BOT_ONBOARDING_URL,
+            local_bot_daemon_required: false,
             markers: SandProtocolMarkers::current(),
             markers_ready: true,
             desktop_bundle: DesktopSandPatchStatus::not_detected("test"),
@@ -703,6 +772,8 @@ mod tests {
         assert!(text.contains("SandClientMode status"));
         assert!(text.contains("h2-only"));
         assert!(text.contains("managed-local: ready"));
+        assert!(text.contains("local daemon: not required"));
+        assert!(text.contains(SAND_BOT_ONBOARDING_URL));
         assert!(text.contains("not required by proxy"));
         assert!(!text.contains("accessToken"));
         assert!(!text.contains("refreshToken"));
@@ -712,6 +783,8 @@ mod tests {
     fn global_sand_default_is_rendered_as_an_enabled_route() {
         let mut status = SandStatusSnapshot {
             protocol: "sand-client-mode",
+            bot_onboarding_url: SAND_BOT_ONBOARDING_URL,
+            local_bot_daemon_required: false,
             markers: SandProtocolMarkers::current(),
             markers_ready: true,
             desktop_bundle: DesktopSandPatchStatus::not_detected("test"),
@@ -888,5 +961,83 @@ mod tests {
         assert_eq!(status.subagent_route_markers, 2);
         assert!(!status.stream_toolkit_ready);
         assert!(!status.ready);
+    }
+
+    #[test]
+    fn bounded_desktop_scan_uses_known_toolkit_chunks_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("Cursor.app/Contents/Resources/app");
+        fs::create_dir_all(root.join("out")).expect("out");
+        fs::create_dir_all(root.join("extensions/cursor-agent-host/dist")).expect("agent host");
+        fs::write(root.join("package.json"), r#"{"version":"3.18.25"}"#).expect("package");
+        let core = format!(
+            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}",
+            SAND_DIRECT_STREAM_MARKERS[0]
+        );
+        fs::write(root.join("out/main.js"), core).expect("main");
+        // An arbitrary chunk is intentionally ignored by the bounded probe.
+        fs::write(
+            root.join("extensions/cursor-agent-host/dist/123.js"),
+            format!(
+                "{SAND_MOVE_EXEC_MARKER}{SAND_EXEC_BRIDGE_MARKER}{SAND_BR_RESOURCE_BRIDGE_MARKER}"
+            ),
+        )
+        .expect("legacy chunk");
+
+        let status = inspect_desktop_bundle_candidates_with_mode(
+            vec![temp.path().join("Cursor.app")],
+            false,
+        );
+        assert!(status.detected);
+        assert!(!status.ready);
+        assert!(!status.exec_bridge_ready);
+        assert!(
+            status
+                .diagnostic
+                .as_deref()
+                .is_some_and(|value| value.contains("CCP_CURSOR_SAND_DEEP_SCAN=1"))
+        );
+
+        // The current installer targets 675.js, which the bounded probe does
+        // inspect without enumerating the rest of the directory.
+        fs::write(
+            root.join("extensions/cursor-agent-host/dist/675.js"),
+            format!(
+                "{SAND_MOVE_EXEC_MARKER}{SAND_EXEC_BRIDGE_MARKER}{SAND_BR_RESOURCE_BRIDGE_MARKER}"
+            ),
+        )
+        .expect("known chunk");
+        let status = inspect_desktop_bundle_candidates_with_mode(
+            vec![temp.path().join("Cursor.app")],
+            false,
+        );
+        assert!(status.ready);
+        assert!(status.exec_bridge_ready);
+    }
+
+    #[test]
+    fn desktop_scan_accepts_agent_host_move_exec_marker_from_toolkit_1_2() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("Cursor.app/Contents/Resources/app");
+        fs::create_dir_all(root.join("out")).expect("out");
+        fs::create_dir_all(root.join("extensions/cursor-agent-host/dist")).expect("agent host");
+        let core = format!(
+            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}",
+            SAND_DIRECT_STREAM_MARKERS[1]
+        );
+        fs::write(root.join("out/main.js"), core).expect("main");
+        fs::write(
+            root.join("extensions/cursor-agent-host/dist/675.js"),
+            format!("{SAND_AGENT_HOST_MOVE_EXEC_MARKER}{SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER}"),
+        )
+        .expect("toolkit 1.2 chunk");
+
+        let status = inspect_desktop_bundle_candidates_with_mode(
+            vec![temp.path().join("Cursor.app")],
+            false,
+        );
+        assert!(status.ready);
+        assert!(status.exec_bridge_ready);
+        assert_eq!(status.move_exec_markers, 1);
     }
 }

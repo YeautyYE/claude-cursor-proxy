@@ -33,7 +33,8 @@ use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
     anthropic_error_type_from_live_error, cursor_connect_error_is_missing_conversation_data,
     cursor_connect_error_is_missing_image, decode_gzip_frame, encode_connect_frame,
-    is_non_retryable_provider_error_message, parse_connect_error,
+    is_non_retryable_provider_error_message, is_transient_provider_error_message,
+    parse_connect_error,
 };
 use super::exec_results::{
     CursorExecKind, PendingCursorExec, encode_control_close, encode_control_throw,
@@ -6645,12 +6646,35 @@ fn annotate_connect_end_error(
             serde_json::json!(provider_retryable),
         );
     }
+    let temporary_provider =
+        is_transient_provider_error_message(&format!("{} {}", error.message, error.detail));
     let mut text = error.to_string();
     // Cursor may wrap a deterministic provider rejection in outer
     // `resource_exhausted`/429. Preserve a compact marker so the late retry
     // pump can switch accounts after this ConnectEnd crosses into a string.
     if error.is_non_retryable_provider_error() {
-        text.push_str(" [providerStatusCode=400,isRetryable=false]");
+        let mut marker = Vec::new();
+        if let Some(code) = error.provider_error_code.as_deref() {
+            marker.push(format!("providerErrorCode={code}"));
+        }
+        if let Some(status) = error.provider_status_code {
+            marker.push(format!("providerStatusCode={status}"));
+        }
+        if let Some(retryable) = error.provider_is_retryable {
+            marker.push(format!("isRetryable={retryable}"));
+        }
+        if !marker.is_empty() {
+            text.push_str(" [");
+            text.push_str(&marker.join(","));
+            text.push(']');
+        }
+    }
+    // Some gateway revisions leave the human provider detail only in the
+    // serialized `detail` field. Preserve a compact, stable marker in the
+    // flattened live error so downstream retry/account gates see the
+    // temporary disposition instead of the outer 429/400.
+    if temporary_provider && !is_transient_provider_error_message(&text) {
+        text.push_str(" [providerErrorCode=ERROR_PROVIDER_ERROR,temporary provider unavailable]");
     }
     // Connect END's short `message` can be generic while the useful 413 KV
     // diagnostic lives only in the serialized error detail. Preserve a
@@ -7327,6 +7351,13 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if is_non_retryable_provider_error_message(message) {
         return false;
     }
+    // The newer provider adapter can encode a temporary connectivity outage
+    // as an inner 400/429 with `isRetryable=false`. It is safe to replay only
+    // while no visible output has been committed, so keep this branch ahead
+    // of the generic 4xx gate below.
+    if is_transient_provider_error_message(message) {
+        return true;
+    }
     // A KV quota rejection is a deterministic conversation-state failure. It
     // can be wrapped by the hollow/reconnect formatter with an "ambiguous"
     // suffix even though no client-visible output was committed; the bounded
@@ -7418,6 +7449,15 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
             .is_some_and(is_non_retryable_provider_error_message)
     {
         return false;
+    }
+    if is_transient_provider_error_message(&text)
+        || is_transient_provider_error_message(&err.message)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(is_transient_provider_error_message)
+    {
+        return true;
     }
     if crate::retry::is_billing_block(&text)
         || crate::retry::is_billing_block(&err.message)
@@ -17869,6 +17909,44 @@ mod tests {
         assert!(!live_error_is_same_request_retryable(detail));
         let error = CursorError::new(429, "ERROR_PROVIDER_ERROR", Some(detail.into()));
         assert!(!cursor_start_error_is_same_request_retryable(&error));
+    }
+
+    #[test]
+    fn temporary_provider_400_is_replayed_without_account_failover() {
+        let detail = r#"{"error":{"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"detail":"temporary trouble connecting to the model provider","additionalInfo":{"providerStatusCode":400},"isRetryable":false}}}]}}"#;
+        assert!(is_transient_provider_error_message(detail));
+        assert!(!is_non_retryable_provider_error_message(detail));
+        assert!(live_error_is_same_request_retryable(detail));
+        let error = CursorError::new(429, "ERROR_PROVIDER_ERROR", Some(detail.into()));
+        assert!(cursor_start_error_is_same_request_retryable(&error));
+        assert_eq!(
+            crate::retry::classify_proxy_error_status(429, &error.client_message()),
+            503
+        );
+    }
+
+    #[test]
+    fn provider_error_marker_preserves_dynamic_metadata() {
+        let text = annotate_connect_end_error(
+            "sess-provider-marker",
+            ConnectEndError {
+                status: 429,
+                code: "resource_exhausted".into(),
+                message: "ERROR_PROVIDER_ERROR: account allowance rejected".into(),
+                detail: r#"{"error":{"code":"resource_exhausted"}}"#.into(),
+                provider_error_code: Some("ERROR_PROVIDER_ERROR".into()),
+                provider_status_code: Some(403),
+                provider_is_retryable: Some(false),
+            },
+            None,
+        );
+        assert!(
+            text.contains(
+                "providerErrorCode=ERROR_PROVIDER_ERROR,providerStatusCode=403,isRetryable=false"
+            ),
+            "dynamic provider marker missing: {text}"
+        );
+        assert!(!text.contains("providerStatusCode=400"));
     }
 
     #[tokio::test]

@@ -5,6 +5,15 @@ pub const RETRY_MAX_DELAY_MS: u64 = 30_000;
 pub const RETRY_BACKOFF_FACTOR: u64 = 2;
 pub const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 
+/// Shared provider-outage classifier used by all Cursor transport paths.
+///
+/// Keep this forwarding API in the retry module as well as the Connect module
+/// so callers that only depend on retry policy do not need to know which wire
+/// parser produced the diagnostic.
+pub fn is_transient_provider_error_message(message: &str) -> bool {
+    crate::providers::cursor::connect::is_transient_provider_error_message(message)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BackoffOutcome {
     pub wait_ms: u64,
@@ -35,6 +44,13 @@ pub fn is_billing_block(message: &str) -> bool {
 /// still transient capacity and must remain eligible for the normal backoff
 /// path.
 pub fn is_provider_resource_exhausted(message: &str) -> bool {
+    // The provider adapter can put a temporary connectivity failure inside
+    // the same `resource_exhausted`/429 envelope used for account quota.
+    // Preserve the temporary provider disposition before inspecting the outer
+    // resource token so it remains eligible for bounded transport retries.
+    if crate::providers::cursor::connect::is_transient_provider_error_message(message) {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     let resource_exhausted =
         lower.contains("resource_exhausted") || lower.contains("resource exhausted");
@@ -133,6 +149,9 @@ pub fn is_policy_rate_limit(message: &str) -> bool {
     if is_billing_block(message) {
         return true;
     }
+    if crate::providers::cursor::connect::is_transient_provider_error_message(message) {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     is_provider_resource_exhausted(message)
         || lower.contains("error_rate_limited_changeable")
@@ -172,8 +191,13 @@ pub fn is_upstream_rate_limit(message: &str) -> bool {
     // normalized copy prevents a lowercase 429 from becoming a misleading
     // 502 and entering the generic transport retry loop.
     let lower = message.to_ascii_lowercase();
-    is_billing_block(message)
-        || is_provider_resource_exhausted(message)
+    if is_billing_block(message) {
+        return true;
+    }
+    if crate::providers::cursor::connect::is_transient_provider_error_message(message) {
+        return false;
+    }
+    is_provider_resource_exhausted(message)
         || lower.contains("[resource_exhausted]")
         || lower.contains("error_rate_limited")
         || lower.contains("error_resource_exhausted")
@@ -286,6 +310,13 @@ pub fn classify_proxy_error_status(status: u16, message: &str) -> u16 {
         return 409;
     }
     if is_local_admission_backpressure(message) {
+        return 503;
+    }
+    // A provider-connectivity diagnostic may be wrapped in an outer 400/429
+    // (`resource_exhausted`). Expose it as a retryable service outage rather
+    // than an account rate limit; this also makes Anthropic responses use
+    // `api_error` and lets bounded Sand/CLI retry loops run.
+    if crate::providers::cursor::connect::is_transient_provider_error_message(message) {
         return 503;
     }
     if is_upstream_rate_limit(message) || status == 429 {
@@ -583,6 +614,37 @@ mod tests {
             "transient provider exhaustion must stay retryable"
         );
         assert!(should_retry_upstream(429, transient));
+    }
+
+    #[test]
+    fn nested_temporary_provider_error_is_service_outage_not_account_quota() {
+        let messages = [
+            "Connect error 429: ERROR_PROVIDER_ERROR: Provider Error — temporary trouble connecting to the model provider [providerStatusCode=400,isRetryable=false]",
+            "Cursor error 400: ERROR_PROVIDER_ERROR provider unavailable; try again in a moment [provider_status_code=400,is_retryable=false]",
+            "{\"error\":{\"code\":\"resource_exhausted\",\"details\":[{\"debug\":{\"error\":\"ERROR_PROVIDER_ERROR\",\"details\":{\"detail\":\"upstream connection reset\",\"additionalInfo\":{\"providerStatusCode\":400},\"isRetryable\":false}}}]}}",
+        ];
+        for message in messages {
+            assert!(is_transient_provider_error_message(message), "{message}");
+            assert!(!is_provider_resource_exhausted(message), "{message}");
+            assert!(!is_policy_rate_limit(message), "{message}");
+            assert!(!is_upstream_rate_limit(message), "{message}");
+            assert_eq!(
+                classify_proxy_error_status(429, message),
+                503,
+                "temporary provider failures should be surfaced as api_error/503"
+            );
+            assert!(should_retry_upstream(429, message), "{message}");
+        }
+    }
+
+    #[test]
+    fn provider_quota_stays_terminal_even_with_provider_error_envelope() {
+        let message = "Connect error 429: ERROR_PROVIDER_ERROR provider unavailable; out of usage resource_exhausted [providerStatusCode=400,isRetryable=false]";
+        assert!(!is_transient_provider_error_message(message));
+        assert!(is_provider_resource_exhausted(message));
+        assert!(is_policy_rate_limit(message));
+        assert_eq!(classify_proxy_error_status(429, message), 429);
+        assert!(!should_retry_upstream(429, message));
     }
 
     #[test]
