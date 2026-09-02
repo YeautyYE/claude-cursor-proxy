@@ -1054,10 +1054,9 @@ fn grok_namespace_counterpart(model: &str) -> Option<String> {
     let normalized = normalize_sand_model(model);
     let (namespace, rest) = if let Some(rest) = normalized.strip_prefix("cursor-grok-") {
         ("grok-", rest)
-    } else if let Some(rest) = normalized.strip_prefix("grok-") {
-        ("cursor-grok-", rest)
     } else {
-        return None;
+        let rest = normalized.strip_prefix("grok-")?;
+        ("cursor-grok-", rest)
     };
 
     let version = rest.split('-').next().unwrap_or_default();
