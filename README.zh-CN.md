@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.100 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.101 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -363,6 +363,9 @@ claude-cursor-proxy serve              # 保持监控 TUI 打开
 或 `[cli]`；修改只影响新请求，并以原子方式写入 `config.json`。TUI 需要
 终端；`serve --no-monitor` 仍可运行代理，但不会显示设置面板。
 
+Fable 初始显示为 `[cli]`，需要在对应行显式切换为 `[sand]` 才会进入
+Sand/Bot。`[cli]` 标记表示当前请求面是 CLI；该请求面可能不支持 Fable。
+
 需要在终端只读检查 Sand 是否完整时，可运行：
 
 ```bash
@@ -413,12 +416,12 @@ export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 `cursor.sandModels`；想从 TUI 编辑文件时先取消这个环境变量。需要混合
 路由时请保留 `CCP_CURSOR_CLIENT_TYPE` 默认值 `cli`；把它设为 `sand` 会让
 未命中规则的模型也使用 Sand。
-只要 Sand 已启用，`claude-fable-5[1m]` 就会作为内建 Sand/Bot 路由保留；即使
-`cursor.sandModels` 或 `CCP_CURSOR_SAND_MODELS` 还列了其他模型，也不会把 Fable
-切回 CLI，因此所有已登录 Cursor 账号都可使用 Fable。其他模型仍可在 TUI 中
-独立设置。显式设置空数组 `cursor.sandModels: []` 或空值
-`CCP_CURSOR_SAND_MODELS=` 才会同时关闭内建 Fable 和其他 Sand 匹配；取消环境变量
-后才会重新读取 `config.json`。
+Fable 不会被自动提升到 Sand。全新配置或未命中规则的
+`claude-fable-5[1m]` 会保持配置的默认身份，通常显示为 `[cli]`；CLI 请求面
+可能不支持该模型。请在 **Sand Models** 选中 Fable 行并显式切换为 `[sand]`
+来使用 Sand/Bot。只有明确列出的模型会进入 Sand；显式空数组
+`cursor.sandModels: []` 或空值 `CCP_CURSOR_SAND_MODELS=` 会让所有模型保持默认身份，
+直到选择新的 Sand 规则。
 
 ### 模型目录从哪里来
 

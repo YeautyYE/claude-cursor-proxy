@@ -3,6 +3,15 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.101 (2026-09-03)
+
+- Make Fable Sand/Bot routing explicitly opt-in per model. Unconfigured or
+  unmatched `claude-fable-5[1m]` requests remain on the configured CLI identity
+  and are shown as `[cli]`; the TUI explains that CLI support may vary.
+- Keep the Fable family in the Sand picker so `s` plus `Space`/`Enter` selects
+  the Sand/Bot surface without changing account selection or the one-process
+  architecture.
+
 ## v0.1.100 (2026-09-02)
 
 - Route `claude-fable-5[1m]` through Cursor's Sand/Bot InferenceService path for

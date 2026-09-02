@@ -4883,6 +4883,23 @@ fn render_sand_settings_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, app:
         Span::styled("a", Style::default().fg(TEAL)),
         Span::styled(" add", Style::default().fg(DIM)),
     ]));
+    let fable_on_sand = app.sand_policy.matches_model("claude-fable-5[1m]");
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Fable route ", Style::default().fg(DIM)),
+        Span::styled(
+            if fable_on_sand { "[sand]" } else { "[cli]" },
+            Style::default().fg(if fable_on_sand { TEAL } else { YELLOW }),
+        ),
+        Span::styled(
+            if fable_on_sand {
+                ""
+            } else {
+                "  CLI support may vary"
+            },
+            Style::default().fg(DIM),
+        ),
+    ]));
     if let Some(input) = app.sand_input.as_deref() {
         lines.push(Line::from(vec![
             Span::styled("  model id: ", Style::default().fg(DIM)),

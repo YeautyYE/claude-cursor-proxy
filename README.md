@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.100 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.101 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -394,6 +394,10 @@ account usage. The list is marked `[sand]` or `[cli]`; changes apply to new
 requests and are written atomically to `config.json`. The TUI requires a
 terminal; `serve --no-monitor` keeps the proxy running without it.
 
+Fable starts as `[cli]` until you explicitly toggle its row to `[sand]`. The
+`[cli]` marker is intentional: the CLI surface may not advertise or support
+Fable, while `[sand]` selects Cursor's Bot lane.
+
 For a read-only terminal diagnostic, run:
 
 ```bash
@@ -449,12 +453,13 @@ Model matching is case-insensitive and normalizes `[1m]` plus
 always overrides `cursor.sandModels` in `config.json`; unset it to edit the
 file from the TUI. Leave `CCP_CURSOR_CLIENT_TYPE` at its default `cli` when you
 want mixed routing; setting it to `sand` makes unmatched models use Sand too.
-Whenever Sand is enabled, `claude-fable-5[1m]` remains a built-in Sand/Bot route,
-including when `cursor.sandModels` or `CCP_CURSOR_SAND_MODELS` lists other
-models. This keeps Fable available to every saved Cursor account; the TUI still
-controls the other model families. An explicitly empty `cursor.sandModels` array
-or `CCP_CURSOR_SAND_MODELS=` disables the built-in route and all other Sand
-matches until the override is removed.
+Fable is not promoted to Sand automatically. A clean install and an unmatched
+`claude-fable-5[1m]` request stay on the configured default, normally `[cli]`;
+the CLI surface may not support that Fable model. Select the Fable row in
+**Sand Models** and toggle it to `[sand]` when you want the Sand/Bot surface.
+Only explicitly listed models use Sand, and an explicitly empty
+`cursor.sandModels` array or `CCP_CURSOR_SAND_MODELS=` leaves every model on the
+configured default identity until a policy is selected.
 
 ### Model discovery
 
