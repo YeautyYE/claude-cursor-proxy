@@ -3,6 +3,13 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.103 (2026-09-03)
+
+- Recognize Cursor's `ERROR_NETWORK_ERROR` temporary provider-connectivity
+  envelope, including escaped line breaks and the current "having trouble
+  connecting" wording, while keeping quota, billing, and capacity messages
+  terminal.
+
 ## v0.1.102 (2026-09-03)
 
 - Harden Sand/CLI recovery when Cursor wraps a temporary provider connection
