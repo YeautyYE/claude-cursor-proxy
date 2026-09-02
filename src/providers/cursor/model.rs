@@ -87,6 +87,17 @@ pub fn apply_effort_to_cursor_model(model: &str, effort: Option<&str>) -> String
         };
         return format!("{tier}{marker}");
     }
+    if let Some(grok_model) = grok_effort_model(&stripped, effort) {
+        // Cursor's Agent catalog uses the `cursor-grok-*` namespace for
+        // effort variants.  Keep a mode prefix when the caller supplied one,
+        // but canonicalize the model portion so account/Sand policies see
+        // the same spelling as the live catalog and TUI.
+        let prefix = ["cursor-agent:", "cursor-plan:", "cursor-ask:", "cursor:"]
+            .iter()
+            .find_map(|prefix| model.strip_prefix(prefix).map(|_| *prefix))
+            .unwrap_or("");
+        return format!("{prefix}{grok_model}");
+    }
     if matches!(
         stripped.as_str(),
         "composer-2.5" | "cursor-composer" | "cursor" | "cursor-agent"
@@ -95,6 +106,155 @@ pub fn apply_effort_to_cursor_model(model: &str, effort: Option<&str>) -> String
         return "composer-2.5-fast".into();
     }
     model.to_string()
+}
+
+/// Map a Grok family/variant to Cursor's explicit effort slug.
+///
+/// Public Grok requests commonly use `grok-4.6` with the effort in
+/// `output_config`; Cursor's account and Sand policies, however, are keyed by
+/// concrete catalog rows such as `cursor-grok-4.6-xhigh-fast`.  Returning the
+/// Cursor namespace here makes that request-scoped setting available to the
+/// policy resolver without changing native Grok requests (this function is
+/// only reached from the Cursor provider).
+fn grok_effort_model(model: &str, effort: &str) -> Option<String> {
+    let mut id = model.trim();
+    for prefix in ["cursor-agent:", "cursor-plan:", "cursor-ask:", "cursor:"] {
+        if let Some(rest) = id.strip_prefix(prefix) {
+            id = rest.trim();
+            break;
+        }
+    }
+
+    let rest = id
+        .strip_prefix("grok-")
+        .or_else(|| id.strip_prefix("cursor-grok-"))?;
+    let version_end = rest.find('-').unwrap_or(rest.len());
+    let version = &rest[..version_end];
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+
+    let tier = match effort {
+        "low" | "fast" | "minimal" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        // Grok 4.6 exposes xhigh as its top tier. `max` is accepted by the
+        // shared Anthropic surface, so map it to the closest Cursor row.
+        "xhigh" | "max" => "xhigh",
+        _ => return None,
+    };
+    Some(format!("cursor-grok-{version}-{tier}-fast"))
+}
+
+/// Resolve a model id for the Desktop Sand `InferenceService` wire.
+///
+/// Cursor exposes two related, but distinct, model namespaces.  The CLI
+/// catalog contains one id for every effort tier (for example
+/// `gemini-3.6-flash-high` and `claude-fable-5-thinking-max`), while the
+/// Desktop/Sand composer sends the family id and puts the selected tier in
+/// `requestedModel.parameters` (for example `gemini-3.6-flash` and
+/// `claude-fable-5`).  Sending a CLI tier id to InferenceService can therefore
+/// result in `ERROR_BAD_MODEL_NAME` even though the same id is present in
+/// `GetUsableModels`.
+///
+/// Keep this conversion separate from [`resolve_cursor_model`].  The latter
+/// is used by AgentService and must continue to select explicit CLI tiers.
+/// Unknown/custom ids are preserved byte-for-byte (apart from presentation
+/// suffixes and routing prefixes), so newly added server models remain usable
+/// without a proxy release.
+pub fn resolve_sand_model_id(model: &str) -> String {
+    let mut id = strip_anthropic_context_suffix(model.trim());
+
+    // A model may arrive wrapped in one of the Cursor mode prefixes.  Sand's
+    // InferenceService has no mode-prefixed ids; mode is selected by the
+    // caller's request surface instead.
+    for prefix in ["cursor-agent:", "cursor-plan:", "cursor-ask:", "cursor:"] {
+        if let Some(rest) = id.strip_prefix(prefix) {
+            id = rest.trim().to_string();
+            break;
+        }
+    }
+    if id.is_empty() {
+        return id;
+    }
+
+    let lower = id.to_ascii_lowercase();
+
+    // Desktop's selected model ids (verified from the current Cursor
+    // renderer logs) use the short provider-family names below.  The live
+    // Agent catalog, in contrast, advertises effort variants and cursor-
+    // prefixed Grok ids.  Normalize only recognized variant suffixes; an
+    // opaque custom id is intentionally left untouched.
+    if lower == "fable" || sand_family_variant(&lower, "claude-fable-5") {
+        return "claude-fable-5".to_string();
+    }
+    // Fable 5.1 is a separate family.  Check it before the `claude-fable-5`
+    // rule above so its `-1-*` suffix is never mistaken for an effort tier.
+    if sand_family_variant(&lower, "claude-fable-5-1") {
+        return "claude-fable-5-1".to_string();
+    }
+    if sand_family_variant(&lower, "claude-opus-5") {
+        return "claude-opus-5".to_string();
+    }
+    if sand_family_variant(&lower, "claude-sonnet-5") {
+        return "claude-sonnet-5".to_string();
+    }
+    if sand_family_variant(&lower, "claude-opus-4-7") {
+        return "claude-opus-4-7".to_string();
+    }
+    if sand_family_variant(&lower, "claude-opus-4-8") {
+        return "claude-opus-4-8".to_string();
+    }
+    if sand_family_variant(&lower, "gemini-3.6-flash") {
+        return "gemini-3.6-flash".to_string();
+    }
+    if sand_family_variant(&lower, "gemini-3.7-flash") {
+        return "gemini-3.7-flash".to_string();
+    }
+    if sand_family_variant(&lower, "grok-4.5") || sand_family_variant(&lower, "cursor-grok-4.5") {
+        return "grok-4.5".to_string();
+    }
+    if sand_family_variant(&lower, "grok-4.6") || sand_family_variant(&lower, "cursor-grok-4.6") {
+        return "grok-4.6".to_string();
+    }
+
+    id
+}
+
+/// Return true when `id` is a known effort/transport variant of `base`.
+///
+/// Do not use a plain `starts_with` here: `claude-fable-5-1` is a distinct
+/// model family, and arbitrary custom model ids may legitimately contain a
+/// hyphenated suffix.
+fn sand_family_variant(id: &str, base: &str) -> bool {
+    if id == base {
+        return true;
+    }
+    let Some(rest) = id
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let mut saw_variant = false;
+    for token in rest.split('-') {
+        if token.is_empty() {
+            return false;
+        }
+        if matches!(
+            token,
+            "minimal" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "thinking" | "fast"
+        ) {
+            saw_variant = true;
+        } else {
+            return false;
+        }
+    }
+    saw_variant
 }
 
 /// Resolve a model string into a (model_id, mode) pair.
@@ -866,6 +1026,89 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(resolved.model_id, "claude-fable-5-thinking-low");
+    }
+
+    #[test]
+    fn apply_effort_remaps_grok_family_to_cursor_catalog_tier() {
+        let xhigh = apply_effort_to_cursor_model("grok-4.6", Some("xhigh"));
+        assert_eq!(xhigh, "cursor-grok-4.6-xhigh-fast");
+        assert_eq!(resolve_cursor_model(&xhigh).unwrap().model_id, xhigh);
+        assert_eq!(
+            apply_effort_to_cursor_model("grok-4.6", Some("high")),
+            "cursor-grok-4.6-high-fast"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("grok-4.6", Some("medium")),
+            "cursor-grok-4.6-medium-fast"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("grok-4.6", Some("low")),
+            "cursor-grok-4.6-low-fast"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("grok-4.6", Some("fast")),
+            "cursor-grok-4.6-low-fast"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("grok-4.6", Some("max")),
+            "cursor-grok-4.6-xhigh-fast"
+        );
+    }
+
+    #[test]
+    fn apply_effort_preserves_cursor_grok_mode_prefix_and_replaces_existing_tier() {
+        assert_eq!(
+            apply_effort_to_cursor_model("cursor:cursor-grok-4.6-high-fast", Some("xhigh")),
+            "cursor:cursor-grok-4.6-xhigh-fast"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("cursor-plan:grok-4.6", Some("high")),
+            "cursor-plan:cursor-grok-4.6-high-fast"
+        );
+        assert_eq!(
+            apply_effort_to_cursor_model("cursor-grok-4.6-xhigh-fast", Some("low")),
+            "cursor-grok-4.6-low-fast"
+        );
+    }
+
+    #[test]
+    fn sand_resolver_uses_desktop_family_ids() {
+        let cases = [
+            ("fable", "claude-fable-5"),
+            ("claude-fable-5[1m]", "claude-fable-5"),
+            ("claude-fable-5-thinking-max", "claude-fable-5"),
+            ("claude-fable-5-thinking-low[1m]", "claude-fable-5"),
+            ("gemini-3.6-flash-high", "gemini-3.6-flash"),
+            ("gemini-3.6-flash-medium", "gemini-3.6-flash"),
+            ("cursor:grok-4.6-high-fast", "grok-4.6"),
+            ("cursor-grok-4.5-high", "grok-4.5"),
+            ("claude-opus-5-thinking-high", "claude-opus-5"),
+            ("claude-sonnet-5-max", "claude-sonnet-5"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                resolve_sand_model_id(input),
+                expected,
+                "unexpected Sand id for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn sand_resolver_preserves_unknown_and_distinct_families() {
+        assert_eq!(
+            resolve_sand_model_id("vendor.custom-model-v2"),
+            "vendor.custom-model-v2"
+        );
+        // Fable 5.1 must not collapse into the Fable 5 family.
+        assert_eq!(
+            resolve_sand_model_id("claude-fable-5-1-thinking-max"),
+            "claude-fable-5-1"
+        );
+        assert_eq!(
+            resolve_sand_model_id("composer-2.5-fast"),
+            "composer-2.5-fast"
+        );
     }
 
     #[test]

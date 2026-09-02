@@ -134,6 +134,123 @@ impl Registry {
         raw_model: &str,
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
+        // Read both routing policies once per lookup.  Besides avoiding two
+        // independent config-file reads during a TUI edit, passing the
+        // snapshots into the resolver keeps provider classification
+        // deterministic when the file is atomically replaced between calls.
+        let account_routes = crate::config::cursor_account_routing_policy();
+        let sand_policy = crate::config::cursor_sand_policy();
+        self.provider_for_model_with_policies(
+            raw_model,
+            session_affinity,
+            &account_routes,
+            &sand_policy,
+        )
+    }
+
+    /// Resolve a request whose effort setting can select a concrete Cursor
+    /// catalog tier.  Provider selection happens before the Cursor provider
+    /// gets the parsed Messages body, so looking only at a bare `grok-4.6`
+    /// would incorrectly send `effort=xhigh` to the native Grok backend.
+    ///
+    /// The effective tier is promoted only when an explicit Cursor account or
+    /// Sand rule matches it (or the request already carries a Cursor prefix).
+    /// An unbound public Grok request therefore keeps its historical native
+    /// provider and quota lane.
+    pub fn resolve_model_for_request(
+        &self,
+        raw_model: &str,
+        effort: Option<&str>,
+        session_affinity: Option<&AliasProvider>,
+    ) -> Option<(String, Arc<dyn Provider>)> {
+        let account_routes = crate::config::cursor_account_routing_policy();
+        let sand_policy = crate::config::cursor_sand_policy();
+        self.resolve_model_for_request_with_policies(
+            raw_model,
+            effort,
+            session_affinity,
+            &account_routes,
+            &sand_policy,
+        )
+    }
+
+    fn resolve_model_for_request_with_policies(
+        &self,
+        raw_model: &str,
+        effort: Option<&str>,
+        session_affinity: Option<&AliasProvider>,
+        account_routes: &crate::config::CursorAccountRoutingPolicy,
+        sand_policy: &crate::config::SandRoutingPolicy,
+    ) -> Option<(String, Arc<dyn Provider>)> {
+        let normalized = normalize_incoming_model(raw_model);
+        let effective =
+            crate::providers::cursor::model::apply_effort_to_cursor_model(&normalized, effort);
+
+        // Keep the ordinary lookup as the fallback. This is important for
+        // native Grok: a model without a matching Cursor policy must not be
+        // promoted merely because its effort maps to a known Cursor slug.
+        let fallback = || {
+            self.provider_for_model_with_policies(
+                &normalized,
+                session_affinity,
+                account_routes,
+                sand_policy,
+            )
+            .map(|provider| (normalized.clone(), provider))
+        };
+
+        if effective == normalized {
+            return fallback();
+        }
+
+        let explicit_cursor_route = is_cursor_model(&normalized)
+            || account_routes.account_for_model(&effective).is_some()
+            || sand_policy.matches_model(&effective);
+        if explicit_cursor_route
+            && let Some(provider) = self.provider_for_model_with_policies(
+                &effective,
+                session_affinity,
+                account_routes,
+                sand_policy,
+            )
+            && provider.name() == "cursor"
+        {
+            return Some((effective, provider));
+        }
+
+        let fallback = fallback();
+        // A bare Grok family has a compatibility alias to Cursor's default
+        // `high-fast` row.  When the request explicitly asks for another
+        // effort, that compatibility alias is a tier mismatch rather than a
+        // valid Cursor route.  Fall back to the native Grok provider instead
+        // of consuming the wrong Cursor account allowance.  An explicit
+        // `cursor:` request remains Cursor-bound by design.
+        if is_grok_model_namespace(&normalized)
+            && !is_cursor_model(&normalized)
+            && fallback
+                .as_ref()
+                .is_some_and(|provider| provider.1.name() == "cursor")
+        {
+            return self
+                .provider_for_model_without_account_routes_normalized(&normalized, session_affinity)
+                .map(|provider| (normalized, provider));
+        }
+        fallback
+    }
+
+    /// Resolve a model with caller-supplied Cursor routing snapshots.
+    ///
+    /// The public [`provider_for_model`] method obtains these snapshots from
+    /// the process configuration.  Keeping the policy-aware part separate
+    /// makes the precedence contract testable without mutating process-global
+    /// environment variables (and avoids a race with parallel tests).
+    fn provider_for_model_with_policies(
+        &self,
+        raw_model: &str,
+        session_affinity: Option<&AliasProvider>,
+        account_routes: &crate::config::CursorAccountRoutingPolicy,
+        sand_policy: &crate::config::SandRoutingPolicy,
+    ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
         // A model-account assignment is an explicit request to use Cursor for
         // that model, even when the same Anthropic-style alias would normally
@@ -151,26 +268,38 @@ impl Registry {
             // public `claude-fable-5[1m]` alias.  A direct-only check would
             // let `aliasProvider: codex` steal that request before the
             // account-bound Cursor route had a chance to select its token.
-            let route_policy = crate::config::cursor_account_routing_policy();
-            if route_policy.account_for_model(&normalized).is_some() {
+            if account_routes.account_for_model(&normalized).is_some() {
                 return self.handlers.get("cursor").cloned();
             }
         }
-        // Keep the static/provider catalog authoritative when it already
-        // claims an id (for example `gpt-5.5` remains Codex even if someone
-        // adds a broad account rule).  If no provider knows the id yet,
-        // however, an explicit model→account route is itself a declaration
-        // that the id belongs to Cursor.  This is important for newly added
-        // server-side catalog ids and for the TUI's manual `a` entry: they
-        // must work before the next `GetUsableModels` refresh.
+        // `grok-4.5`/`grok-4.6` are also exposed by the native Grok
+        // provider.  An explicit `cursor.modelAccounts` binding is the
+        // unambiguous opt-in for Cursor's account-backed Grok catalog, so it
+        // must be checked before the static Grok table.  Keep this exception
+        // scoped to the Grok namespaces: a broad account rule must not steal
+        // a native Codex/Kimi id, and an unbound public Grok id keeps its
+        // historical Grok provider route.
+        if self.handlers.contains_key("cursor")
+            && is_grok_model_namespace(&normalized)
+            && account_routes.account_for_model(&normalized).is_some()
+        {
+            return self.handlers.get("cursor").cloned();
+        }
+        // Keep the static/provider catalog authoritative for all non-Grok
+        // ids (for example `gpt-5.5` remains Codex even if someone adds a
+        // broad account rule).  Grok has one intentional exception above:
+        // an explicit model→account route opts into Cursor's account-backed
+        // Grok catalog.  If no provider knows an id yet, an explicit route
+        // is also a declaration that the id belongs to Cursor.  This is
+        // important for newly added server-side catalog ids and for the
+        // TUI's manual `a` entry: they must work before the next
+        // `GetUsableModels` refresh.
         if let Some(provider) =
             self.provider_for_model_without_account_routes_normalized(&normalized, session_affinity)
         {
             return Some(provider);
         }
-        if self.handlers.contains_key("cursor")
-            && crate::config::cursor_model_account_route_matches(&normalized)
-        {
+        if self.handlers.contains_key("cursor") && account_routes.matches_direct(&normalized) {
             return self.handlers.get("cursor").cloned();
         }
         // Sand policy entries are provider declarations too.  Keep this after
@@ -178,9 +307,7 @@ impl Registry {
         // as `gpt-5.5` remains owned by Codex; only otherwise-unclaimed ids
         // are promoted to Cursor.  The direct matcher supports arbitrary
         // server model ids and wildcards without a hardcoded model list.
-        if self.handlers.contains_key("cursor")
-            && crate::config::cursor_sand_policy().matches(&normalized)
-        {
+        if self.handlers.contains_key("cursor") && sand_policy.matches(&normalized) {
             return self.handlers.get("cursor").cloned();
         }
         None
@@ -237,6 +364,21 @@ impl Registry {
         }
         format!("Supported: {}.", parts.join("; "))
     }
+}
+
+/// Return whether a normalized request belongs to one of Cursor's Grok model
+/// namespaces.  The public registry and xAI clients use `grok-*`, while
+/// Cursor's live catalog uses `cursor-grok-*`; mode prefixes are routing
+/// controls and are ignored for this classification.
+fn is_grok_model_namespace(model: &str) -> bool {
+    let mut id = model.trim();
+    for prefix in ["cursor-agent:", "cursor-plan:", "cursor-ask:", "cursor:"] {
+        if let Some(rest) = id.strip_prefix(prefix) {
+            id = rest.trim();
+            break;
+        }
+    }
+    id.starts_with("grok-") || id.starts_with("cursor-grok-")
 }
 
 pub fn normalize_incoming_model(model: &str) -> String {
@@ -549,5 +691,152 @@ mod tests {
                 .name(),
             "cursor"
         );
+    }
+
+    #[test]
+    fn unbound_public_grok_models_keep_native_grok_provider() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let empty_accounts = crate::config::CursorAccountRoutingPolicy::empty();
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
+        for model in ["grok-4.5", "grok-4.6"] {
+            let provider = registry
+                .provider_for_model_with_policies(model, None, &empty_accounts, &empty_sand)
+                .expect("native Grok model should remain routable");
+            assert_eq!(provider.name(), "grok", "{model} must not be promoted");
+        }
+    }
+
+    #[test]
+    fn explicit_grok_account_routes_preempt_native_provider() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let account_routes = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new("grok-4.6", "family-account"),
+            crate::config::CursorModelAccountRule::new("cursor-grok-4.6-high-fast", "high-account"),
+            crate::config::CursorModelAccountRule::new(
+                "cursor-grok-4.6-xhigh-fast",
+                "xhigh-account",
+            ),
+        ]);
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
+
+        for model in [
+            // Public family id and its Cursor catalog spelling.
+            "grok-4.6",
+            "cursor-grok-4.6",
+            // Explicit effort variants must resolve through the same-tier
+            // account binding, including a mode prefix from Claude clients.
+            "grok-4.6-high-fast",
+            "cursor:grok-4.6-high-fast",
+            "grok-4.6-xhigh-fast",
+            "cursor:cursor-grok-4.6-xhigh-fast",
+        ] {
+            let provider = registry
+                .provider_for_model_with_policies(model, None, &account_routes, &empty_sand)
+                .expect("explicit Grok account route should be routable");
+            assert_eq!(provider.name(), "cursor", "{model} must use Cursor");
+        }
+    }
+
+    #[test]
+    fn grok_wildcard_account_route_is_an_explicit_cursor_opt_in() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let account_routes = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new("grok-*", "grok-account"),
+        ]);
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
+        for model in ["grok-4.5", "grok-4.6"] {
+            let provider = registry
+                .provider_for_model_with_policies(model, None, &account_routes, &empty_sand)
+                .expect("wildcard Grok route should be routable");
+            assert_eq!(provider.name(), "cursor", "{model} wildcard route");
+        }
+    }
+
+    #[test]
+    fn account_route_does_not_preempt_native_codex_model() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let account_routes = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new("*", "fallback-account"),
+        ]);
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
+        let provider = registry
+            .provider_for_model_with_policies("gpt-5.5", None, &account_routes, &empty_sand)
+            .expect("known Codex model should remain routable");
+        assert_eq!(provider.name(), "codex");
+    }
+
+    #[test]
+    fn bare_grok_effort_uses_matching_cursor_tier_account() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let account_routes = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new(
+                "cursor-grok-4.6-xhigh-fast",
+                "xhigh-account",
+            ),
+        ]);
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
+        let (model, provider) = registry
+            .resolve_model_for_request_with_policies(
+                "grok-4.6",
+                Some("xhigh"),
+                None,
+                &account_routes,
+                &empty_sand,
+            )
+            .expect("xhigh account route should promote Grok to Cursor");
+        assert_eq!(model, "cursor-grok-4.6-xhigh-fast");
+        assert_eq!(provider.name(), "cursor");
+    }
+
+    #[test]
+    fn bare_grok_effort_uses_matching_sand_tier_without_crossing_high() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let empty_accounts = crate::config::CursorAccountRoutingPolicy::empty();
+        let sand = crate::config::SandRoutingPolicy::new(["cursor-grok-4.6-xhigh-fast"]);
+        let (model, provider) = registry
+            .resolve_model_for_request_with_policies(
+                "grok-4.6",
+                Some("xhigh"),
+                None,
+                &empty_accounts,
+                &sand,
+            )
+            .expect("xhigh Sand rule should promote Grok to Cursor");
+        assert_eq!(model, "cursor-grok-4.6-xhigh-fast");
+        assert_eq!(provider.name(), "cursor");
+
+        let high_only = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new("cursor-grok-4.6-high-fast", "high-account"),
+        ]);
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
+        let provider = registry
+            .resolve_model_for_request_with_policies(
+                "grok-4.6",
+                Some("xhigh"),
+                None,
+                &high_only,
+                &empty_sand,
+            )
+            .expect("native Grok remains available without xhigh Cursor route");
+        assert_eq!(provider.1.name(), "grok");
+        assert_eq!(provider.0, "grok-4.6");
+
+        let xhigh_only = crate::config::CursorAccountRoutingPolicy::new([
+            crate::config::CursorModelAccountRule::new(
+                "cursor-grok-4.6-xhigh-fast",
+                "xhigh-account",
+            ),
+        ]);
+        let provider = registry
+            .resolve_model_for_request_with_policies(
+                "grok-4.6",
+                Some("high"),
+                None,
+                &xhigh_only,
+                &empty_sand,
+            )
+            .expect("native Grok remains available without high Cursor route");
+        assert_eq!(provider.1.name(), "grok");
+        assert_eq!(provider.0, "grok-4.6");
     }
 }

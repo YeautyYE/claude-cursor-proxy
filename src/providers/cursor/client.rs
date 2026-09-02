@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::config;
 use crate::logging::create_logger;
 use crate::paths;
+use crate::providers::cursor::catalog::{self, CatalogModel};
 use crate::providers::cursor::connect::{
     ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
     cursor_connect_error_is_missing_conversation_data, cursor_connect_error_is_missing_image,
@@ -301,6 +302,17 @@ impl CursorHttpClient {
             self.clone()
         };
 
+        // Warm the richer AiService catalog alongside GetUsableModels.  The
+        // latter only contains legacy variant slugs; Sand needs the family ↔
+        // variant/parameter relationship published by AvailableModels.  A
+        // failed metadata probe must not make the ordinary model list fail —
+        // heuristic resolution remains available as an offline fallback.
+        if catalog::cached_for_account(token, &client_type).is_none() {
+            let _ = request_client
+                .fetch_available_models_for_client_type(token, &client_type)
+                .await;
+        }
+
         // Capture the account generation before the network request. Auth can
         // be hot-swapped by another process while this request is in flight;
         // the generation-aware store below then drops a stale completion.
@@ -338,6 +350,84 @@ impl CursorHttpClient {
                 account_generation,
                 models.clone(),
             );
+        }
+        Ok(models)
+    }
+
+    /// Fetch Cursor's richer `aiserver.v1.AiService/AvailableModels` catalog.
+    ///
+    /// Unlike `GetUsableModels`, this response contains canonical family ids,
+    /// legacy CLI slugs, aliases, and parameterized variant strings.  Keep
+    /// the snapshot partitioned by account and request identity because the
+    /// managed-local Sand entitlement set can differ from the CLI set.
+    pub async fn fetch_available_models_for_client_type(
+        &self,
+        token: &str,
+        client_type: &str,
+    ) -> Result<Vec<CatalogModel>, CursorError> {
+        let client_type = canonicalize_client_type(client_type.trim().to_string());
+        if let Some(cached) = catalog::cached_for_account(token, &client_type) {
+            return Ok(cached);
+        }
+        let request_client = if client_type_requires_h2(&client_type) && !self.prefers_http2_only()
+        {
+            self.with_sand_transport_mode()
+        } else {
+            self.clone()
+        };
+        let url = format!(
+            "{}/aiserver.v1.AiService/AvailableModels",
+            request_client.base_url.trim_end_matches('/')
+        );
+        // Keep all request knobs explicit.  `useModelParameters` is the
+        // switch that makes Cursor include variants/parameterValues; without
+        // it the endpoint often returns only display names.
+        let body = serde_json::json!({
+            "isNightly": false,
+            "includeLongContextModels": true,
+            "excludeMaxNamedModels": false,
+            "additionalModelNames": [],
+            "useModelParameters": true,
+            "includeHiddenModels": false,
+            "doNotUseMarkdown": true,
+            "variantsWillBeShownInExplodedList": false,
+            "forAutomations": false,
+            "useReactModelPicker": true,
+            "useCloudAgentEffortModes": true,
+        });
+        let mut req = request_client
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(30))
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .header("connect-protocol-version", "1")
+            .header("user-agent", "connect-es/1.6.1")
+            .body(body.to_string());
+        req = apply_cursor_identity_headers_for_client_type(req, token, Some(&client_type));
+        let response = req
+            .send()
+            .await
+            .map_err(|error| CursorError::from_reqwest(error, 30))?;
+        let status = response.status().as_u16();
+        let retry_after = retry_after_header(response.headers());
+        let body = response
+            .text()
+            .await
+            .map_err(|error| CursorError::from_reqwest(error, 30))?;
+        if !(200..300).contains(&status) {
+            return Err(CursorError::new(
+                status,
+                format!("AvailableModels JSON failed with HTTP {status}"),
+                Some(body.chars().take(1000).collect()),
+            )
+            .with_retry_after(retry_after));
+        }
+        let models = catalog::parse_json(&body).map_err(|error| {
+            CursorError::new(502, "AvailableModels JSON parse failed", Some(error))
+        })?;
+        if !models.is_empty() {
+            catalog::store_for_account(token, &client_type, models.clone());
         }
         Ok(models)
     }

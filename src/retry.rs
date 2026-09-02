@@ -56,7 +56,14 @@ pub fn is_policy_rate_limit(message: &str) -> bool {
         || (lower.contains("error_rate_limited")
             && (lower.contains("free plans")
                 || lower.contains("upgrade plans")
-                || lower.contains("increase limits")))
+                || lower.contains("increase limits")
+                // Cursor's generic policy response is currently emitted as
+                // `ERROR_RATE_LIMITED: You're out of usage. Switch to Auto`.
+                // It omits the older plan/quota wording, but still denotes a
+                // terminal account meter. Treating it as transient causes
+                // every Claude Code retry to open another empty Run.
+                || lower.contains("out of usage")
+                || lower.contains("switch to auto")))
 }
 
 pub fn should_retry_upstream(status: u16, message: &str) -> bool {
@@ -403,6 +410,13 @@ mod tests {
         let limits = "Connect error 429: ERROR_RATE_LIMITED: Increase limits for faster responses at cursor.com/dashboard [resource_exhausted]";
         assert!(is_policy_rate_limit(limits));
         assert!(!should_retry_upstream(429, limits));
+
+        // Cursor's newer generic wording does not mention a plan or an
+        // explicit `increase limits` action. It is still the same terminal
+        // account meter and must not enter the transport retry loop.
+        let generic_out_of_usage = "Connect error 429: ERROR_RATE_LIMITED: You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue. [resource_exhausted]";
+        assert!(is_policy_rate_limit(generic_out_of_usage));
+        assert!(!should_retry_upstream(429, generic_out_of_usage));
 
         let invoice = "You have an unpaid invoice — pay your invoice to continue";
         assert!(is_policy_rate_limit(invoice), "billing blocks are a subset");

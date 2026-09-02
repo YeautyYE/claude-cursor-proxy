@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.98 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.99 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -247,10 +247,87 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 发送 `x-cursor-client-type: sand`；其他 Cursor 请求继续使用普通的 `cli`
 （或你设置的 `CCP_CURSOR_CLIENT_TYPE`）身份。混合路由由同一个
 `claude-cursor-proxy serve` 进程完成，不需要再启动第二个 Sand 二进制。
-这套规则只作用于最终路由到 Cursor 的请求；Codex、Kimi、Grok 路由不受影响。
+这套规则只作用于最终路由到 Cursor 的请求；原生 Codex、Kimi 和 Grok 默认
+仍走各自的后端。Grok 有一个明确的例外：为 `grok-*` 名称配置
+`cursor.modelAccounts` 后，该名称会进入 Cursor 的账号路由。这样同一个公开
+名称可以选择原生 Grok 或 Cursor 账号，但两条路径的登录态和额度桶不同。
 
 Sand 选择和账号选择相互独立。例如，可以先按 `s` 把 `gemini-3.1-pro` 设为
 `[sand]`，再按 `m` 指定它使用某个 Cursor 账号，两项设置会同时应用到请求。
+
+### Cursor 额度通道（Grok 返回 429 时先看这里）
+
+Cursor 提供两个相互独立的额度通道。`modelAccounts` 只决定使用**哪个账号**，
+不会把请求从一个通道切换到另一个通道：
+
+| TUI 标记 | Cursor 请求面 | Dashboard 指标 | 含义 |
+| --- | --- | --- | --- |
+| `[cli]` | AgentService / `x-cursor-client-type: cli` | CLI/API（`apiPercentUsed`，以及 Auto/Total） | 普通 Cursor CLI 请求 |
+| `[sand]` | Desktop InferenceService / `x-cursor-client-type: sand` | Sand/Grok Bot（`usagePercent`） | Sand 请求，包括 Cursor Grok |
+
+百分比表示**已使用比例**：`100%` 就是该通道已耗尽。Sand/Bot 较低不会补回
+已耗尽的 CLI/API；CLI/API 满额也不代表 Sand 不可用。账号面板和 `m` 模型-账号
+编辑器会同时显示两个指标，并把当前模型对应的通道放在前面。按 `u` 刷新一个
+账号，按 `U` 并行刷新全部账号；排查前先看 `Updated` 时间，避免把旧缓存当成
+当前额度。
+
+代理不会把策略/额度 429 静默改投到另一通道或另一个账号；那样可能意外消耗
+其他账号额度，也会让重试变得不可预测。请在 TUI 调整模型的 `[cli]`/`[sand]`
+选择或账号绑定，然后发送新的请求。
+
+#### Grok 4.6：原生路由与 Cursor Sand
+
+`grok-4.6` 是两个后端都使用的名称：
+
+* 没有 Cursor 模型-账号绑定时，`grok-4.6` 走原生 **Grok** 后端，使用
+  `grok auth login` 的凭据，不消耗 Cursor CLI/Sand 额度。
+* 为 `grok-4.6` 配置 `cursor.modelAccounts`（或直接使用
+  `cursor-grok-4.6-*` catalog id）后，才会走 Cursor，并使用绑定的
+  `cursor auth login` / `cursor auth add` 账号。
+* 要使用 Sand/Grok Bot 通道，必须在 TUI 中把精确 Cursor 模型标记为
+  `[sand]`。`high` 和 `xhigh` 是独立的 catalog 行，可以绑定不同账号；账号
+  余额不同的时候不要只写一个宽泛通配规则。
+
+使用 Cursor Grok 4.6 的推荐 TUI 流程：
+
+1. 按 `s`，必要时按 `a` 添加/选择 `cursor-grok-4.6-xhigh-fast`，再切换为
+   `[sand]`。
+2. 按 `m` 回到同一模型行，选择 Sand/Bot 余额充足的账号并按回车保存。
+3. 让 grok-build（或 Claude Code）使用这个精确 id。grok-build 配置示例：
+
+   ```toml
+   [model.cursor-grok-sand]
+   model = "cursor-grok-4.6-xhigh-fast"
+   base_url = "http://127.0.0.1:18765/v1"
+   api_backend = "responses"
+   api_key = "unused"
+   ```
+
+   ```bash
+   grok --model cursor-grok-sand
+   ```
+
+如果 Events/Requests 面板显示 `cursor-grok-4.6-xhigh-fast [cli]`，说明请求
+正在消耗 CLI/API，即使绑定账号仍有 Sand/Bot 余额；请在 TUI 把同一行切换为
+`[sand]`。如果已经显示 `[sand]` 且 Sand 指标有余额，再核对选中的账号名称、
+邮箱和 `Updated` 时间后重试。原生 `grok --model grok-4.6` 配置仍会走 Grok
+后端，除非明确为它设置 Cursor 账号绑定。
+
+需要确认映射时，直接查看代理的结构化日志并发送一条请求。若要启动诊断实例，
+请在启动 `serve` 前设置日志变量并使用空闲端口；已有 `serve` 进程保持不动：
+
+```bash
+CCP_LOG_STDERR=1 CCP_LOG_VERBOSE=1 claude-cursor-proxy serve --no-monitor --port 18766
+```
+
+让诊断客户端指向 `http://127.0.0.1:18766`；继续使用原端口时，直接查看它的
+`proxy.log` 即可。
+
+`cursor_account_selected` 记录包含 `accountBinding`；这两类记录都会包含截断后的
+`accountId`、解析后的 `model`、`clientType`、`quotaLane`，以及缓存的
+`apiPercent`/`botPercent`。不会记录 bearer token。把这些字段与请求徽标、账号行的
+`Updated` 时间对照：字段不一致说明路由/配置有问题；字段一致可确认实际尝试的
+账号和通道，但 Cursor 仍可能因策略或容量判定返回 429。
 
 `SandClientMode` 和 `SandStreamToolkit` 是绑定特定 Cursor Desktop 版本的
 bundle 补丁工具。本代理不会安装、修改或依赖打过补丁的 `Cursor.app`，而是让
@@ -341,10 +418,14 @@ export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 ### 模型目录从哪里来
 
 代码内置的 Cursor 列表只是启动和离线时的兜底目录。已登录 Cursor 时，
-代理启动会调用 `GetUsableModels`，请求 `GET /v1/models` 时也会刷新；账号
-返回的实时 catalog 会合并到 TUI 和模型列表。你仍可以按 `a` 填写任意精确
-ID，或直接写入环境变量，但当前 Cursor 账号必须在上游目录中提供该模型。
-热切换账号或登出会立即清掉旧目录；切换前账号的并发目录请求完成后也不会回写。
+代理启动会调用 `GetUsableModels`，请求 `GET /v1/models` 时也会刷新；在可用时
+还会探测 `aiserver.v1.AiService/AvailableModels`，该目录提供规范 family id、
+别名和 effort 变体，用于把 `gemini-3.6-flash-high` 之类的 CLI slug 映射到
+Sand 所需的 `gemini-3.6-flash`。目录快照按账号**和请求身份**（`cli` / `sand`）
+隔离，并在短 TTL 后过期，因此一个账号或通道的模型权限不会泄漏到另一个账号。
+实时 catalog 会合并到 TUI 和模型列表。你仍可以按 `a` 填写任意精确 ID，或直接
+写入环境变量，但当前 Cursor 账号必须在上游目录中提供该模型。热切换账号或登出
+会立即清掉旧目录；切换前账号的并发目录请求完成后也不会回写。
 
 ### 账号用量
 
@@ -545,6 +626,7 @@ takeover。这属于本地 Lobster/会话生命周期问题，不是 Cursor 推�
 | 附带图片立即报 502 `Image not found [internal]` | 升级到 ≥0.1.83 并重启 `serve`。代理会保留原始内联图片字节，只轮换一次图片 id，并在新的 Cursor conversation 中重试；上游持续报错时会直接返回，不再形成无限重试波次。 |
 | grok-build 返回 413 `Cursor KV blob store limit exceeded`（`blobs=4097` / 约 64 MiB） | 升级到 ≥0.1.84 并重启 `serve`。代理会在下一回合前轮换接近上限的 Cursor conversation；如果上游先返回 413，会在全量 Anthropic 历史和新图片 id 上进行一次有界的新会话重试，不需手动 `/compact` 或新建聊天。 |
 | Gemini/Fable 在 Sand 下返回 `ERROR_PRO_USER_RATE_LIMIT_EXCEEDED`，但切 CLI 正常 | Sand 与 CLI 是 Cursor 的两个请求身份和额度桶。请在 TUI 按 `s`，选中模型并切换为 `[cli]`；代理会保留清晰的 Sand 429，不会静默消耗 CLI/API 额度。 |
+| `grok-build`/Claude Code 对 `grok-4.6` 或 `cursor-grok-*` 返回 HTTP 429 `You're out of usage`，但绑定账号仍有 Sand/Bot 余额 | 先看请求徽标：`[cli]` 消耗账号的 CLI/API 指标，`[sand]` 消耗 Sand/Grok Bot。模型-账号绑定只选择凭据，不会切换通道。要让 Cursor Grok 使用 Bot 额度，请在 **Sand Models** 添加精确的 `cursor-grok-4.6-*`，切换为 `[sand]`，再用 `m` 给同一行绑定账号；用 `u`/`U` 刷新并核对 `Updated` 时间。裸 `grok-4.6` 默认仍走原生 Grok，除非明确为它配置 Cursor 账号绑定。 |
 | grok-build 在未付款账单或不支持的国家/区域时报 `Server error (500) - Something went wrong on our side` | 升级到 ≥0.1.47 并重启 serve。未付款是 HTTP 429 并带发票原文；地区限制是 HTTP 403 并带国家/区域原文。 |
 | grok-build 在 `Cursor live open timed out` 后报 `Server error (500)` / 重复开 Cursor Run | 升级到 ≥0.1.57 并重启 serve。没有响应、接受状态不明的 live open 会 fail-closed 为 HTTP 409；本地打开槽饱和改为带抖动的 HTTP 503。 |
 | Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。 |

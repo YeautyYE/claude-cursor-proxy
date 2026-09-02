@@ -237,12 +237,13 @@ impl CursorAccountRoutingPolicy {
     /// custom model id, and calling [`account_for_model`] here would recurse
     /// through model resolution for unknown ids.
     pub fn matches_direct(&self, model: &str) -> bool {
-        let normalized = normalize_sand_model(model);
-        !normalized.is_empty()
-            && self
-                .routes
-                .iter()
-                .any(|rule| sand_pattern_matches(&rule.model, &normalized))
+        let candidates = account_route_model_candidates(model);
+        !candidates.is_empty()
+            && self.routes.iter().any(|rule| {
+                candidates
+                    .iter()
+                    .any(|candidate| sand_pattern_matches(&rule.model, candidate))
+            })
     }
 
     /// Return the concrete model spellings that represent the same logical
@@ -329,7 +330,7 @@ impl CursorAccountRoutingPolicy {
         let mut candidate = normalized_model
             .strip_suffix("-preview")
             .map(str::to_string)
-            .unwrap_or(normalized_model);
+            .unwrap_or_else(|| normalized_model.clone());
         push_unique_candidate(&mut candidates, candidate.clone());
         for _ in 0..2 {
             let Some(resolved) =
@@ -352,6 +353,17 @@ impl CursorAccountRoutingPolicy {
         {
             for alias in ["claude-fable-5", "fable"] {
                 push_unique_candidate(&mut candidates, alias.to_string());
+            }
+        }
+        // Cursor's live catalog uses `cursor-grok-*` ids while the public
+        // registry and Claude Code commonly send `grok-*` (and vice versa).
+        // Treat the two spellings as one account-route target.  Walk every
+        // presentation/resolution candidate so a trailing `-preview` marker
+        // is handled symmetrically as well; the helper keeps effort tiers
+        // distinct (xhigh must never be treated as high).
+        for source in candidates.clone() {
+            for candidate in account_route_model_candidates(&source) {
+                push_unique_candidate(&mut candidates, candidate);
             }
         }
         candidates
@@ -423,6 +435,131 @@ fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
     if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
         candidates.push(candidate);
     }
+}
+
+/// Return model spellings that Cursor uses interchangeably for account
+/// routing.  The public registry exposes `grok-4.6`, while the Cursor live
+/// catalog and older TUI snapshots use `cursor-grok-4.6-high-fast` (or an
+/// `xhigh-fast` variant).  A route written using either namespace must select
+/// the same account when a request arrives through the other one.
+///
+/// The first item is always the normalized input. For an explicit effort tier,
+/// aliases include only the same tier in the other namespace plus the bare
+/// family names. For a bare family, aliases include Cursor's default
+/// `high-fast` spelling. We intentionally never collapse `high-fast` and
+/// `xhigh-fast`: those rows can be assigned to different accounts.
+fn account_route_model_candidates(model: &str) -> Vec<String> {
+    let normalized = normalize_sand_model(model);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = vec![normalized.clone()];
+
+    // Keep preview as a presentation marker on generated aliases. Matching
+    // still accepts the base spelling through `sand_pattern_matches`, while
+    // retaining an explicit `*-preview` route when one was persisted.
+    let (base, preview) = normalized
+        .strip_suffix("-preview")
+        .map_or((normalized.as_str(), ""), |base| (base, "-preview"));
+
+    // `cursor-grok-*` is a catalog prefix, not a distinct model family.
+    let (namespace, rest) = if let Some(rest) = base.strip_prefix("cursor-grok-") {
+        ("cursor", rest)
+    } else if let Some(rest) = base.strip_prefix("grok-") {
+        ("public", rest)
+    } else {
+        return candidates;
+    };
+
+    // The rest starts with a version (`4.5`, `4.6`, ...), followed by an
+    // optional effort/transport suffix. Keep this parser conservative: an
+    // opaque future `grok-*` id is still matched in its original namespace,
+    // but we do not collapse unrelated hyphenated names into one account.
+    let Some(version_end) = rest.find('-') else {
+        // Bare `grok-4.6`/`cursor-grok-4.6`: add the counterpart and the
+        // catalog's default high-fast spelling below.
+        let counterpart = if namespace == "cursor" {
+            format!("grok-{rest}{preview}")
+        } else {
+            format!("cursor-grok-{rest}{preview}")
+        };
+        push_unique_candidate(&mut candidates, counterpart);
+        let family = format!("grok-{rest}");
+        let cursor_family = format!("cursor-grok-{rest}");
+        // Bare family ids resolve to Cursor's normal high-fast catalog tier.
+        // Do not add xhigh/medium/etc here: a bare request has no effort
+        // signal and must not steal a deliberately pinned tier account.
+        push_unique_candidate(&mut candidates, format!("{family}{preview}"));
+        push_unique_candidate(&mut candidates, format!("{cursor_family}{preview}"));
+        push_grok_default_variants(&mut candidates, &family, &cursor_family, preview);
+        return candidates;
+    };
+    let version = &rest[..version_end];
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return candidates;
+    }
+
+    let suffix = &rest[version_end + 1..];
+    let public_family = format!("grok-{version}");
+    let cursor_family = format!("cursor-grok-{version}");
+    let public_variant = if suffix.is_empty() {
+        public_family.clone()
+    } else {
+        format!("grok-{version}-{suffix}")
+    };
+    let cursor_variant = if suffix.is_empty() {
+        cursor_family.clone()
+    } else {
+        format!("cursor-grok-{version}-{suffix}")
+    };
+
+    // Same-tier counterpart first. This handles, for example,
+    // `grok-4.6-xhigh-fast` -> `cursor-grok-4.6-xhigh-fast` without changing
+    // a deliberate high/xhigh account split.
+    push_unique_candidate(
+        &mut candidates,
+        if namespace == "cursor" {
+            format!("{public_variant}{preview}")
+        } else {
+            format!("{cursor_variant}{preview}")
+        },
+    );
+    // A configured bare family is a useful fallback for every explicit tier,
+    // but no *other* explicit tier is an alias. This is what keeps a high
+    // request from selecting an xhigh account (and vice versa).
+    push_unique_candidate(&mut candidates, format!("{public_family}{preview}"));
+    push_unique_candidate(&mut candidates, format!("{cursor_family}{preview}"));
+
+    if suffix.is_empty() {
+        // The parsed form is a bare family (the `rest.find('-')` branch above
+        // handles the common numeric-only case); keep this guard for a future
+        // catalog spelling whose version parser yields an empty suffix.
+        push_grok_default_variants(&mut candidates, &public_family, &cursor_family, preview);
+    }
+    candidates
+}
+
+/// Add the default Cursor catalog tier for a bare Grok family. The helper is
+/// deliberately narrow: callers handling an explicit `xhigh-fast` (or any
+/// other tier) must not receive unrelated account-route candidates.
+fn push_grok_default_variants(
+    candidates: &mut Vec<String>,
+    public_family: &str,
+    cursor_family: &str,
+    preview: &str,
+) {
+    // Keep the default order deterministic across namespaces. Append the
+    // presentation marker *after* the tier (`...-high-fast-preview`), which
+    // mirrors Cursor catalog responses and lets `sand_pattern_matches` strip
+    // it safely when a base rule was persisted.
+    let public = format!("{public_family}-high-fast{preview}");
+    let cursor = format!("{cursor_family}-high-fast{preview}");
+    push_unique_candidate(candidates, public);
+    push_unique_candidate(candidates, cursor);
 }
 
 fn model_pattern_has_wildcards(pattern: &str) -> bool {
@@ -723,11 +860,27 @@ impl SandRoutingPolicy {
 
     pub fn matches(&self, model: &str) -> bool {
         let model = normalize_sand_model(model);
-        !model.is_empty()
-            && self
-                .patterns
+        if model.is_empty() {
+            return false;
+        }
+
+        // Cursor exposes Grok through two equivalent namespaces: the public
+        // `grok-*` spelling used by Claude Code/grok-build and the
+        // `cursor-grok-*` spelling returned by the Cursor catalog.  Match the
+        // exact same tier in either namespace, but never collapse effort
+        // tiers (in particular `high` and `xhigh`) into one another.  Keeping
+        // the alias list to the original id plus its namespace counterpart
+        // also means a bare family does not silently enable a variant tier.
+        let mut candidates = vec![model.clone()];
+        if let Some(counterpart) = grok_namespace_counterpart(&model) {
+            push_unique_candidate(&mut candidates, counterpart);
+        }
+
+        self.patterns.iter().any(|pattern| {
+            candidates
                 .iter()
-                .any(|pattern| sand_pattern_matches(pattern, &model))
+                .any(|candidate| sand_pattern_matches(pattern, candidate))
+        })
     }
 
     pub fn matches_model(&self, model: &str) -> bool {
@@ -886,6 +1039,36 @@ fn sand_pattern_matches(pattern: &str, model: &str) -> bool {
     model
         .strip_suffix("-preview")
         .is_some_and(|candidate| glob_matches(pattern, candidate))
+}
+
+/// Return the same Grok model spelling in Cursor's alternate namespace.
+///
+/// The public Grok provider uses ids such as `grok-4.6-xhigh-fast`, whereas
+/// Cursor's live catalog commonly calls that row
+/// `cursor-grok-4.6-xhigh-fast`.  Namespace conversion is intentionally
+/// conservative: only a numeric version (`4.5`, `4.6`, or a future dotted
+/// version) is converted, and the suffix is copied verbatim.  As a result,
+/// `high` can only match `high`, `xhigh` can only match `xhigh`, and opaque
+/// unrelated ids are never promoted into Sand aliases.
+fn grok_namespace_counterpart(model: &str) -> Option<String> {
+    let normalized = normalize_sand_model(model);
+    let (namespace, rest) = if let Some(rest) = normalized.strip_prefix("cursor-grok-") {
+        ("grok-", rest)
+    } else if let Some(rest) = normalized.strip_prefix("grok-") {
+        ("cursor-grok-", rest)
+    } else {
+        return None;
+    };
+
+    let version = rest.split('-').next().unwrap_or_default();
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    Some(format!("{namespace}{rest}"))
 }
 
 /// Resolve the current model policy. The env var is an explicit override,
@@ -2254,6 +2437,51 @@ mod tests {
     }
 
     #[test]
+    fn sand_policy_matches_grok_namespace_counterpart_at_same_tier() {
+        let high = SandRoutingPolicy::new(["cursor-grok-4.6-high-fast"]);
+        assert!(high.matches_model("cursor-grok-4.6-high-fast"));
+        assert!(high.matches_model("grok-4.6-high-fast"));
+        assert!(high.matches_model("cursor:grok-4.6-high-fast"));
+        assert!(high.matches_model("cursor:cursor-grok-4.6-high-fast"));
+
+        // The namespace alias must not turn a high-tier rule into an xhigh
+        // rule (or vice versa).  These rows may be assigned to different
+        // accounts and consume distinct quota entries upstream.
+        assert!(!high.matches_model("grok-4.6-xhigh-fast"));
+        assert!(!high.matches_model("cursor-grok-4.6-xhigh-fast"));
+
+        let xhigh = SandRoutingPolicy::new(["grok-4.6-xhigh-fast"]);
+        assert!(xhigh.matches_model("cursor-grok-4.6-xhigh-fast"));
+        assert!(xhigh.matches_model("cursor:grok-4.6-xhigh-fast"));
+        assert!(!xhigh.matches_model("cursor-grok-4.6-high-fast"));
+    }
+
+    #[test]
+    fn sand_policy_matches_bare_grok_namespaces_without_enabling_variants() {
+        let policy = SandRoutingPolicy::new(["grok-4.6"]);
+        assert!(policy.matches_model("grok-4.6"));
+        assert!(policy.matches_model("cursor-grok-4.6"));
+        assert!(policy.matches_model("cursor:grok-4.6"));
+
+        // A bare family selector is not an implicit wildcard.  Variant rows
+        // must be selected explicitly so a high/xhigh account or quota lane
+        // cannot be chosen accidentally.
+        assert!(!policy.matches_model("grok-4.6-high-fast"));
+        assert!(!policy.matches_model("cursor-grok-4.6-xhigh-fast"));
+        assert!(!policy.matches_model("cursor-grok-4.5"));
+    }
+
+    #[test]
+    fn sand_policy_grok_glob_alias_is_scoped_to_grok_namespace() {
+        let policy = SandRoutingPolicy::new(["cursor-grok-4.6-*"]);
+        assert!(policy.matches_model("grok-4.6-high-fast"));
+        assert!(policy.matches_model("grok-4.6-xhigh-fast"));
+        assert!(!policy.matches_model("grok-4.5-high-fast"));
+        assert!(!policy.matches_model("gemini-4.6-high-fast"));
+        assert!(!policy.matches_model("cursor-sonnet-4.6-high-fast"));
+    }
+
+    #[test]
     fn sand_policy_reads_config_and_env_overrides_it() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
@@ -2299,6 +2527,83 @@ mod tests {
             Some("fable-exact")
         );
         assert_eq!(policy.account_for_model("grok-4.6"), Some("fallback"));
+    }
+
+    #[test]
+    fn account_policy_matches_public_and_cursor_grok_namespaces() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("cursor-grok-4.6-high-fast", "high-account"),
+            CursorModelAccountRule::new("cursor-grok-4.6-xhigh-fast", "xhigh-account"),
+        ]);
+
+        // A Claude Code request may use the public model id while the TUI
+        // persisted the catalog spelling. The same-tier alias must select the
+        // pinned account in either direction.
+        assert_eq!(
+            policy.account_for_model("grok-4.6-high-fast"),
+            Some("high-account")
+        );
+        assert_eq!(
+            policy.account_for_model("cursor-grok-4.6-high-fast"),
+            Some("high-account")
+        );
+        assert_eq!(
+            policy.account_for_model("grok-4.6-xhigh-fast"),
+            Some("xhigh-account")
+        );
+        assert_eq!(
+            policy.account_for_model("cursor:grok-4.6-xhigh-fast"),
+            Some("xhigh-account")
+        );
+    }
+
+    #[test]
+    fn account_policy_bare_grok_uses_default_catalog_alias_when_needed() {
+        let policy = CursorAccountRoutingPolicy::new([CursorModelAccountRule::new(
+            "cursor-grok-4.6-high-fast",
+            "default-account",
+        )]);
+        assert_eq!(
+            policy.account_for_model("grok-4.6"),
+            Some("default-account")
+        );
+        assert!(policy.matches_direct("grok-4.6"));
+        assert!(policy.matches_direct("cursor:grok-4.6"));
+    }
+
+    #[test]
+    fn account_policy_keeps_grok_effort_bindings_distinct() {
+        let policy = CursorAccountRoutingPolicy::new([
+            CursorModelAccountRule::new("grok-4.6-high-fast", "high-account"),
+            CursorModelAccountRule::new("grok-4.6-xhigh-fast", "xhigh-account"),
+        ]);
+        assert_eq!(
+            policy.account_for_model("cursor-grok-4.6-high-fast"),
+            Some("high-account")
+        );
+        assert_eq!(
+            policy.account_for_model("cursor-grok-4.6-xhigh-fast"),
+            Some("xhigh-account")
+        );
+        // A bare family has Cursor's high-fast default only. It must not
+        // silently select the xhigh account when the high row is absent.
+        let xhigh_only = CursorAccountRoutingPolicy::new([CursorModelAccountRule::new(
+            "cursor-grok-4.6-xhigh-fast",
+            "xhigh-account",
+        )]);
+        assert_eq!(xhigh_only.account_for_model("grok-4.6"), None);
+
+        // Editing one tier removes its namespace/bare aliases but keeps the
+        // other effort tier intact. This guards the TUI assignment path.
+        let edited = policy.with_model_assignment("grok-4.6-high-fast", Some("new-high"));
+        assert_eq!(
+            edited.account_for_model("grok-4.6-high-fast"),
+            Some("new-high")
+        );
+        assert_eq!(
+            edited.account_for_model("grok-4.6-xhigh-fast"),
+            Some("xhigh-account")
+        );
     }
 
     #[test]
@@ -2710,6 +3015,36 @@ mod tests {
             cursor_client_type_for_model("gemini-3.1-pro-preview-high"),
             "cli",
             "only a trailing preview marker is an alias; effort variants stay explicit"
+        );
+    }
+
+    #[test]
+    fn sand_route_matches_cursor_grok_namespace_at_the_selected_effort() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["cursor-grok-4.6-xhigh-fast"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        assert_eq!(
+            cursor_client_type_for_model("cursor-grok-4.6-xhigh-fast"),
+            "sand",
+            "the exact Cursor catalog spelling must select the Sand lane"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("grok-4.6-xhigh-fast"),
+            "sand",
+            "public and Cursor Grok namespace spellings must share the Sand lane"
+        );
+        assert_eq!(
+            cursor_client_type_for_model("cursor-grok-4.6-high-fast"),
+            "cli",
+            "an xhigh Sand rule must not enable the high tier"
         );
     }
 

@@ -638,6 +638,17 @@ impl MonitorApp {
     fn merge_cached_sand_models(&mut self) {
         self.sand_models
             .extend(crate::providers::cursor::model::cursor_supported_models());
+        // A model-account route is also a user-declared Cursor model id. The
+        // live catalog can lag behind that edit (or be unavailable while the
+        // account is refreshing), so keep exact route literals visible in the
+        // Sand picker instead of forcing users to retype them with `a`.
+        self.sand_models.extend(
+            config::cursor_account_routing_policy()
+                .routes()
+                .iter()
+                .filter(|rule| !rule.model.contains(['*', '?']))
+                .map(|rule| rule.model.clone()),
+        );
         self.sand_models.extend(
             self.sand_policy
                 .patterns()
@@ -2204,6 +2215,16 @@ fn apply_account_usage_result_for_wave(
 fn sand_model_choices(registry: &Registry) -> Vec<String> {
     let mut models = registry.supported_models_for("cursor");
     models.extend(crate::providers::cursor::model::cursor_supported_models());
+    // Include exact model ids from account bindings even when the active
+    // account's live catalog has not returned them yet. This keeps the first
+    // Sand configuration step possible for a freshly added Grok catalog row.
+    models.extend(
+        config::cursor_account_routing_policy()
+            .routes()
+            .iter()
+            .filter(|rule| !rule.model.contains(['*', '?']))
+            .map(|rule| rule.model.clone()),
+    );
     models.sort_unstable();
     models.dedup();
     models

@@ -497,20 +497,50 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
             ),
         );
     };
-    let normalized_model = normalize_incoming_model(&model);
-    let provider = match state.registry.provider_for_model(&normalized_model, None) {
-        Some(provider) => provider,
-        None => {
+    let requested_model = normalize_incoming_model(&model);
+    // Validate Responses effort before provider selection. Cursor converts
+    // Responses into Messages and would catch this later, but Grok's
+    // Responses path intentionally forwards the original body, so letting an
+    // invalid value through here would make validation provider-dependent.
+    let effort = match value.pointer("/reasoning/effort") {
+        Some(Value::String(value)) => {
+            match crate::providers::translate_shared::parse_effort_str(value) {
+                Ok(value) => Some(value.to_string()),
+                Err(error) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!(
-                    "Unknown model \"{normalized_model}\". {}",
-                    state.registry.unknown_model_message()
-                ),
+                "Invalid reasoning.effort: must be a string",
             );
         }
     };
+    let (normalized_model, provider) =
+        match state
+            .registry
+            .resolve_model_for_request(&requested_model, effort.as_deref(), None)
+        {
+            Some((model, provider)) => (model, provider),
+            None => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "Unknown model \"{requested_model}\". {}",
+                        state.registry.unknown_model_message()
+                    ),
+                );
+            }
+        };
     log.info(
         "request",
         Some(serde_json::Map::from_iter([
@@ -555,7 +585,7 @@ async fn dispatch_responses(state: Arc<AppState>, req: Request<Body>) -> Respons
         EndpointKind::Messages,
     );
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.provider_selected(&req_id, provider.name(), &normalized_model, None);
+        monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort.clone());
         if provider.name() == "cursor" {
             monitor.client_type_resolved(
                 &req_id,
@@ -1131,36 +1161,42 @@ async fn dispatch_request(
         }
     };
 
-    let normalized_model = normalize_incoming_model(model);
-    body.model = Some(normalized_model.clone());
+    let requested_model = normalize_incoming_model(model);
+    // Resolve effort before provider selection.  Cursor's Grok catalog uses
+    // explicit tier ids, while native Grok uses the bare family id; choosing
+    // a provider from the bare id first can send a Sand/Bot request into the
+    // exhausted CLI/API lane and surface a misleading 429.
+    let effort = crate::providers::translate_shared::read_effort(&body)
+        .ok()
+        .flatten()
+        .map(str::to_string);
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
     } else {
         None
     };
 
-    let provider = state.registry.provider_for_model(
-        &normalized_model,
+    let (normalized_model, provider) = match state.registry.resolve_model_for_request(
+        &requested_model,
+        effort.as_deref(),
         session_state
             .as_ref()
             .and_then(|state| state.affinity_provider.as_ref()),
-    );
-
-    let provider = match provider {
-        Some(provider) => provider,
+    ) {
+        Some((model, provider)) => (model, provider),
         None => {
             log.warn(
                 "unknown model",
                 Some(serde_json::Map::from_iter([
                     ("reqId".to_string(), json!(&req_id)),
-                    ("model".to_string(), json!(&normalized_model)),
+                    ("model".to_string(), json!(&requested_model)),
                 ])),
             );
             let response = json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 format!(
-                    "Unknown model \"{normalized_model}\". {}",
+                    "Unknown model \"{requested_model}\". {}",
                     state.registry.unknown_model_message()
                 ),
             );
@@ -1169,7 +1205,7 @@ async fn dispatch_request(
                 RequestLogContext {
                     req_id: &req_id,
                     provider: None,
-                    model: Some(&normalized_model),
+                    model: Some(&requested_model),
                     count_tokens,
                     status: response.status(),
                     started_at,
@@ -1180,7 +1216,7 @@ async fn dispatch_request(
                 FailedResponseLogContext {
                     req_id: &req_id,
                     provider: None,
-                    model: Some(&normalized_model),
+                    model: Some(&requested_model),
                     count_tokens,
                     started_at,
                 },
@@ -1199,11 +1235,8 @@ async fn dispatch_request(
             return response;
         }
     };
+    body.model = Some(normalized_model.clone());
 
-    let effort = crate::providers::translate_shared::read_effort(&body)
-        .ok()
-        .flatten()
-        .map(str::to_string);
     let current = session::record_session_request(
         session_id.as_deref(),
         session_state.as_ref(),

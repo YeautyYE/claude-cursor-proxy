@@ -563,6 +563,11 @@ fn assistant_tool_names(request: &MessagesRequest) -> HashMap<String, String> {
 pub struct SandInferenceRequest {
     pub messages: Vec<SandInferenceMessage>,
     pub model_id: String,
+    /// Optional CLI/catalog id used only to derive Desktop model parameters.
+    /// The Sand wire `model_id` remains the canonical family id, while effort
+    /// and thinking settings can still be inherited from the request's
+    /// resolved CLI variant (for example Fable's `thinking-max`).
+    pub parameter_model_id: Option<String>,
     pub conversation_id: String,
     pub invocation_id: String,
     pub max_mode: bool,
@@ -584,6 +589,7 @@ impl SandInferenceRequest {
         Self {
             messages,
             model_id: model_id.into(),
+            parameter_model_id: None,
             conversation_id: conversation_id.into(),
             invocation_id: invocation_id.into(),
             max_mode: false,
@@ -595,6 +601,16 @@ impl SandInferenceRequest {
 
     pub fn with_max_mode(mut self, enabled: bool) -> Self {
         self.max_mode = enabled;
+        self
+    }
+
+    /// Derive `requestedModel.parameters` from a catalog/CLI variant while
+    /// keeping `requestedModel.modelId` on the Sand family namespace.
+    pub fn with_parameter_model_id(mut self, model_id: impl Into<String>) -> Self {
+        let model_id = model_id.into();
+        if !model_id.trim().is_empty() {
+            self.parameter_model_id = Some(model_id);
+        }
         self
     }
 
@@ -636,6 +652,10 @@ impl SandInferenceRequest {
                     .collect(),
             ),
         );
+        let parameter_model_id = self
+            .parameter_model_id
+            .as_deref()
+            .unwrap_or(self.model_id.as_str());
         object.insert(
             "requestedModel".into(),
             json!({
@@ -646,7 +666,7 @@ impl SandInferenceRequest {
                 // managed-local runtime reads it with `.map(...)` while
                 // constructing the provider attempt, so keep the array
                 // explicit even when a model has no effort parameters.
-                "parameters": requested_model_parameters_json(&self.model_id),
+                "parameters": requested_model_parameters_json(parameter_model_id),
                 "isVariantStringRepresentation": false,
             }),
         );
@@ -1883,6 +1903,33 @@ mod tests {
             vec![SandInferenceMessage::user("hello")],
         );
         let value = request.to_json_value();
+        let params = value["requestedModel"]["parameters"]
+            .as_array()
+            .expect("parameters array");
+        assert!(
+            params
+                .iter()
+                .any(|value| { value["id"] == "thinking" && value["value"] == "true" })
+        );
+        assert!(
+            params
+                .iter()
+                .any(|value| { value["id"] == "effort" && value["value"] == "max" })
+        );
+    }
+
+    #[test]
+    fn request_can_keep_canonical_sand_id_and_catalog_parameters_separate() {
+        let request = SandInferenceRequest::new(
+            "claude-fable-5",
+            "conv-1",
+            "invoke-1",
+            vec![SandInferenceMessage::user("hello")],
+        )
+        .with_parameter_model_id("claude-fable-5-thinking-max");
+        let value = request.to_json_value();
+        assert_eq!(value["modelId"], "claude-fable-5");
+        assert_eq!(value["requestedModel"]["modelId"], "claude-fable-5");
         let params = value["requestedModel"]["parameters"]
             .as_array()
             .expect("parameters array");

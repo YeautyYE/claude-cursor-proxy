@@ -3,6 +3,18 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.99 (2026-09-02)
+
+- Keep Cursor Grok account bindings and Sand/CLI quota lanes independent, with
+  exact `grok-*` / `cursor-grok-*` namespace matching and strict effort-tier
+  separation.
+- Include exact model-account route entries in the TUI Sand picker, so a
+  freshly mapped Grok model can be switched to `[sand]` even before a live
+  catalog refresh.
+- Add structured account, route, quota-lane, and cached-meter diagnostics for
+  Cursor policy 429s; classify Cursor's generic `out of usage` response as a
+  terminal policy limit instead of a transport retry.
+
 ## v0.1.98 (2026-09-02)
 
 - Move Sand traffic to Cursor's current `aiserver.v1.InferenceService/Stream`

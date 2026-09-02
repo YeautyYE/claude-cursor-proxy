@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod catalog;
 pub mod client;
 pub mod connect;
 pub mod conversation;
@@ -64,7 +65,9 @@ use crate::providers::cursor::live::{
     live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
     live_start_error_seals_tombstone, local_overload_retry_after, same_request_retry_wait_ms,
 };
-use crate::providers::cursor::model::{anthropic_wire_model, resolve_cursor_model};
+use crate::providers::cursor::model::{
+    anthropic_wire_model, resolve_cursor_model, resolve_sand_model_id,
+};
 use crate::providers::cursor::request::{
     CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, current_user_blocks,
     cursor_request_context, is_reactive_compact_prompt, latest_user_is_only_tool_results,
@@ -109,6 +112,99 @@ const POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES: usize = 1024;
 const POLICY_RATE_LIMIT_PROBE_WINDOW_DEFAULT_MS: u64 = 30_000;
 const POLICY_RATE_LIMIT_PROBE_WINDOW_MIN_MS: u64 = 25;
 const POLICY_RATE_LIMIT_PROBE_WINDOW_MAX_MS: u64 = 120_000;
+
+/// The two Cursor allowance buckets exposed by the dashboard.  The labels are
+/// intentionally aligned with the TUI so a policy 429 can be diagnosed from
+/// logs without inspecting a request payload or bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorQuotaLane {
+    CliApi,
+    SandBot,
+}
+
+impl CursorQuotaLane {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CliApi => "CLI/API",
+            Self::SandBot => "Sand/Bot",
+        }
+    }
+}
+
+/// Map the effective Cursor transport to the dashboard allowance bucket.  A
+/// missing/unknown client type follows the historical AgentService path and
+/// therefore belongs to the named-model CLI/API meter.
+fn quota_lane_for_client_type(client_type: &str) -> CursorQuotaLane {
+    if client_type.trim().eq_ignore_ascii_case("sand") {
+        CursorQuotaLane::SandBot
+    } else {
+        CursorQuotaLane::CliApi
+    }
+}
+
+/// Keep account identifiers useful for correlating logs while avoiding a full
+/// bearer-derived digest (or a hand-authored account id) in every line.  IDs
+/// shorter than the display budget are retained verbatim; long IDs keep both
+/// ends so adjacent account rows remain easy to distinguish.
+fn truncate_account_id(account_id: &str) -> String {
+    const PREFIX_CHARS: usize = 8;
+    const SUFFIX_CHARS: usize = 4;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return "unknown".to_string();
+    }
+    let chars: Vec<char> = account_id.chars().collect();
+    let keep = PREFIX_CHARS + SUFFIX_CHARS;
+    if chars.len() <= keep {
+        return account_id.to_string();
+    }
+    let prefix: String = chars[..PREFIX_CHARS].iter().collect();
+    let suffix: String = chars[chars.len() - SUFFIX_CHARS..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
+/// Build account/route/quota diagnostics shared by account-selection and
+/// policy-limit events.  The raw token is deliberately accepted only to look
+/// up in-memory evidence; it is never inserted into the returned fields.
+fn quota_diagnostic_fields(
+    account_id: &str,
+    token: &str,
+    model: &str,
+    client_type: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let lane = quota_lane_for_client_type(client_type);
+    let mut fields = serde_json::Map::from_iter([
+        (
+            "accountId".to_string(),
+            serde_json::json!(truncate_account_id(account_id)),
+        ),
+        ("model".to_string(), serde_json::json!(model)),
+        ("clientType".to_string(), serde_json::json!(client_type)),
+        ("quotaLane".to_string(), serde_json::json!(lane.as_str())),
+    ]);
+
+    // Include both meters when available.  `quotaPercent` is the meter that
+    // corresponds to the selected lane and makes the diagnosis obvious even
+    // when the other bucket happens to be exhausted as well.
+    let api_percent = crate::providers::cursor::usage::cached_api_usage_evidence(token)
+        .map(|evidence| evidence.usage_percent);
+    let bot_percent = crate::providers::cursor::usage::cached_sand_usage_evidence(token)
+        .map(|evidence| evidence.usage_percent);
+    if let Some(value) = api_percent {
+        fields.insert("apiPercent".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = bot_percent {
+        fields.insert("grokBotPercent".to_string(), serde_json::json!(value));
+    }
+    let selected_percent = match lane {
+        CursorQuotaLane::CliApi => api_percent,
+        CursorQuotaLane::SandBot => bot_percent,
+    };
+    if let Some(value) = selected_percent {
+        fields.insert("quotaPercent".to_string(), serde_json::json!(value));
+    }
+    fields
+}
 
 // Cursor account/model policy 429s are deterministic for the current login.
 // Without a local breaker, a Claude Code retry wave can open hundreds of
@@ -497,6 +593,10 @@ fn note_policy_rate_limit(
     }
     let retry_after_secs = policy_rate_limit_cooldown_secs(message, retry_after);
     let key = policy_rate_limit_key(model, client_type, token);
+    // Resolve the profile id only for diagnostics.  The helper falls back to
+    // the stable bearer digest when the request uses an environment/legacy
+    // credential; neither path emits the raw token.
+    let account_id = cursor_account_key_for_token(token);
     let now = Instant::now();
     let state = PolicyRateLimitState {
         until: now + Duration::from_secs(retry_after_secs),
@@ -540,14 +640,12 @@ fn note_policy_rate_limit(
     {
         gate.reset_after_policy_limit();
     }
-    create_logger("cursor").warn(
-        "policy_rate_limit_breaker_open",
-        Some(serde_json::Map::from_iter([
-            ("model".into(), serde_json::json!(model)),
-            ("clientType".into(), serde_json::json!(client_type)),
-            ("retryAfterSecs".into(), serde_json::json!(retry_after_secs)),
-        ])),
+    let mut fields = quota_diagnostic_fields(&account_id, token, model, client_type);
+    fields.insert(
+        "retryAfterSecs".to_string(),
+        serde_json::json!(retry_after_secs),
     );
+    create_logger("cursor").warn("policy_rate_limit_breaker_open", Some(fields));
 }
 
 fn policy_rate_limit_breaker_state(
@@ -979,6 +1077,7 @@ fn live_sse_recording_usage(
 /// conversation/invocation ids.  This keeps retries and Claude Code's
 /// `/compact` requests independent from the AgentService live-run registry,
 /// whose resumable stream semantics do not apply to InferenceService.
+#[allow(clippy::too_many_arguments)]
 async fn sand_direct_response(
     body: &MessagesRequest,
     ctx: &RequestContext,
@@ -986,6 +1085,7 @@ async fn sand_direct_response(
     message_id: String,
     wire_model: String,
     model: &str,
+    parameter_model: &str,
     compaction_mode: bool,
 ) -> Response {
     // Keep the local hosted search/fetch shortcuts available on Sand.  These
@@ -1056,7 +1156,12 @@ async fn sand_direct_response(
         uuid::Uuid::new_v4().to_string(),
         messages,
     )
-    .with_max_mode(model.to_ascii_lowercase().contains("max"))
+    // `maxMode` belongs to the selected model configuration, not the
+    // canonical family id sent on the Sand wire.  Keep deriving it from the
+    // resolved CLI/catalog variant so Fable/Opus aliases retain their default
+    // mode after canonicalization.
+    .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
+    .with_parameter_model_id(parameter_model)
     .with_max_tokens(body.max_tokens.map(u64::from))
     .with_tools(tools_from_anthropic(body, compaction_mode));
 
@@ -2484,14 +2589,18 @@ fn account_failover_replacement_token(
             .find(|profile| profile.auth.access_token == token)
             .and_then(|profile| profile.email())
             .unwrap_or("unknown");
-        create_logger("cursor").info(
-            "live_account_failover",
-            Some(serde_json::Map::from_iter([
-                ("email".into(), serde_json::json!(email)),
-                ("model".into(), serde_json::json!(model)),
-                ("clientType".into(), serde_json::json!(client_type)),
-            ])),
-        );
+        let replacement_id = profiles
+            .iter()
+            .find(|profile| profile.auth.access_token == token)
+            .map(|profile| profile.id.clone())
+            .unwrap_or_else(|| cursor_account_key_for_token(token));
+        let mut fields = quota_diagnostic_fields(&replacement_id, token, model, client_type);
+        // Keep the existing email correlation for operators who already use
+        // it, while making the stable/truncated id and selected quota lane the
+        // primary account-routing diagnostics.
+        fields.insert("email".to_string(), serde_json::json!(email));
+        fields.insert("selection".to_string(), serde_json::json!("failover"));
+        create_logger("cursor").info("live_account_failover", Some(fields));
     }
     replacement
 }
@@ -5835,6 +5944,37 @@ impl Provider for CursorProvider {
             .account_id
             .clone()
             .unwrap_or_else(|| cursor_account_digest(&auth_selection.auth.access_token));
+        let mut selection_fields = quota_diagnostic_fields(
+            &account_key,
+            &auth_selection.auth.access_token,
+            model,
+            &client_type,
+        );
+        selection_fields.insert(
+            "accountSource".to_string(),
+            serde_json::json!(if auth_selection.account_id.is_some() {
+                "registry"
+            } else {
+                "legacy-or-environment"
+            }),
+        );
+        selection_fields.insert(
+            "accountBinding".to_string(),
+            serde_json::json!(
+                if crate::config::cursor_account_for_model(model).is_some() {
+                    "model"
+                } else if auth_selection.account_id.is_some() {
+                    "active"
+                } else {
+                    "environment-or-legacy"
+                }
+            ),
+        );
+        selection_fields.insert(
+            "active".to_string(),
+            serde_json::json!(auth_selection.active),
+        );
+        create_logger("cursor").info("cursor_account_selected", Some(selection_fields));
         let mut auth = auth_selection.auth;
 
         // Near expiry: refresh first. A rotated token represents a fresh
@@ -5874,12 +6014,14 @@ impl Provider for CursorProvider {
         // the complete rendered Anthropic history on every turn, so it does
         // not need (and must not share) the resumable AgentService state.
         if uses_sand {
+            let sand_model = resolve_sand_model_id(&resolved.model_id);
             return sand_direct_response(
                 &body,
                 &ctx,
                 &auth.access_token,
                 message_id,
                 wire_model,
+                &sand_model,
                 &resolved.model_id,
                 xai_compact,
             )
@@ -7339,6 +7481,63 @@ mod tests {
             claude_code: crate::provider::ClaudeCodeAgentHeaders::default(),
             hold_http_until_live_open: false,
         }
+    }
+
+    #[test]
+    fn quota_lane_follows_effective_cursor_transport() {
+        assert_eq!(quota_lane_for_client_type("sand"), CursorQuotaLane::SandBot);
+        assert_eq!(quota_lane_for_client_type("SAND"), CursorQuotaLane::SandBot);
+        assert_eq!(quota_lane_for_client_type("cli"), CursorQuotaLane::CliApi);
+        assert_eq!(quota_lane_for_client_type("agent"), CursorQuotaLane::CliApi);
+        assert_eq!(quota_lane_for_client_type(""), CursorQuotaLane::CliApi);
+        assert_eq!(CursorQuotaLane::SandBot.as_str(), "Sand/Bot");
+        assert_eq!(CursorQuotaLane::CliApi.as_str(), "CLI/API");
+    }
+
+    #[test]
+    fn account_id_diagnostic_truncation_is_stable_and_bounded() {
+        assert_eq!(truncate_account_id(""), "unknown");
+        assert_eq!(truncate_account_id("short-id"), "short-id");
+        assert_eq!(truncate_account_id("1234567890abcdef"), "12345678…cdef");
+        // Unicode IDs are bounded by characters rather than byte offsets.
+        assert_eq!(
+            truncate_account_id("账户账户账户账户账户账户账户账户"),
+            "账户账户账户账户…账户账户"
+        );
+    }
+
+    #[test]
+    fn quota_diagnostics_include_both_account_lanes_without_bearer() {
+        let token = format!("quota-diagnostic-token-{}", uuid::Uuid::new_v4());
+        crate::providers::cursor::usage::store_api_usage_evidence_for_test(
+            &token,
+            100.0,
+            Some("2099-09-02T20:12:42Z"),
+        );
+        crate::providers::cursor::usage::store_sand_usage_evidence_for_test(
+            &token,
+            2.5,
+            Some(true),
+            Some("2099-09-02T20:12:42Z"),
+        );
+        let fields = quota_diagnostic_fields(
+            "stable-account-1234567890",
+            &token,
+            "cursor-grok-4.6-xhigh-fast",
+            "cli",
+        );
+        assert_eq!(fields["accountId"], "stable-a…7890");
+        assert_eq!(fields["model"], "cursor-grok-4.6-xhigh-fast");
+        assert_eq!(fields["clientType"], "cli");
+        assert_eq!(fields["quotaLane"], "CLI/API");
+        assert_eq!(fields["apiPercent"], 100.0);
+        assert_eq!(fields["grokBotPercent"], 2.5);
+        assert_eq!(fields["quotaPercent"], 100.0);
+        let serialized = serde_json::Value::Object(fields).to_string();
+        assert!(
+            !serialized.contains(&token),
+            "diagnostic fields must never contain the bearer"
+        );
     }
 
     #[test]

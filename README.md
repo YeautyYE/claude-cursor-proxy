@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.98 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.99 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -264,11 +264,99 @@ your configured `CCP_CURSOR_CLIENT_TYPE`) identity. Mixed routing happens in
 the same `claude-cursor-proxy serve` process; a second Sand binary is not
 needed.
 The policy applies only to requests resolved to the Cursor provider; Codex,
-Kimi, and Grok routes are unchanged.
+Kimi, and native Grok routes keep their normal providers by default. There is
+one intentional Grok exception: an explicit `cursor.modelAccounts` rule for a
+`grok-*` name opts that name into Cursor's account-backed Grok catalog. This
+lets the same public id be used either for the native Grok provider or for a
+Cursor account, but the two paths have different logins and quota meters.
 
 Sand selection and account selection are independent. For example,
 `gemini-3.1-pro` can be marked `[sand]` with `s` and assigned to a specific
 Cursor account with `m`; both settings are applied to the same request.
+
+### Cursor quota lanes (important for Grok 429s)
+
+Cursor exposes two independent allowance lanes. The account selected by
+`modelAccounts` only chooses **which account** is used; it does not switch a
+request between these lanes:
+
+| TUI marker | Cursor surface | Dashboard meter | Meaning |
+| --- | --- | --- | --- |
+| `[cli]` | AgentService / `x-cursor-client-type: cli` | CLI/API (`apiPercentUsed`, plus Auto/Total) | Normal Cursor CLI requests |
+| `[sand]` | Desktop InferenceService / `x-cursor-client-type: sand` | Sand/Grok Bot (`usagePercent`) | Sand requests, including Cursor Grok |
+
+The percentages are **used** percentages: `100%` means that lane is
+exhausted. A low Sand/Bot value does not replenish an exhausted CLI/API lane,
+and a full CLI/API meter does not mean Sand is unavailable. The account panel
+and the `m` model-account editor show both meters; the selected model's lane is
+shown first. Use `u` for one account or `U` for all accounts to refresh a
+stale snapshot, then check the `Updated` timestamp.
+
+The proxy deliberately does not turn a policy/quota 429 into a silent
+cross-lane or cross-account fallback: doing so could spend a different account's
+allowance and make retries non-deterministic. Change the model's `[cli]`/
+`[sand]` selection or its account binding in the TUI, then send a new request.
+
+#### Grok 4.6: native route versus Cursor Sand
+
+`grok-4.6` is a name shared by two providers:
+
+* With no Cursor model-account rule, `grok-4.6` uses the native **Grok**
+  provider and the `grok auth login` credential. Cursor CLI/Sand quotas do not
+  apply.
+* A `cursor.modelAccounts` rule for `grok-4.6` (or an explicit
+  `cursor-grok-4.6-*` catalog id) selects the Cursor provider and the mapped
+  Cursor account. `cursor auth login` / `cursor auth add` manage that account.
+* To spend the Sand/Grok Bot meter, mark the exact Cursor model as `[sand]` in
+  the TUI. `high` and `xhigh` catalog ids are separate rows and can be mapped
+  to different accounts; do not rely on a broad rule when the tiers have
+  different balances.
+
+Recommended TUI flow for a Cursor Grok 4.6 request:
+
+1. Press `s`, press `a` if needed, and add/select
+   `cursor-grok-4.6-xhigh-fast`; toggle it to `[sand]`.
+2. Press `m`, select the same model row, choose the account with the desired
+   Sand/Bot balance, and press `Enter`.
+3. Point grok-build (or Claude Code) at that exact id. For grok-build:
+
+   ```toml
+   [model.cursor-grok-sand]
+   model = "cursor-grok-4.6-xhigh-fast"
+   base_url = "http://127.0.0.1:18765/v1"
+   api_backend = "responses"
+   api_key = "unused"
+   ```
+
+   ```bash
+   grok --model cursor-grok-sand
+   ```
+
+If the Events/Requests pane shows `cursor-grok-4.6-xhigh-fast [cli]`, the
+request is spending CLI/API quota even when the mapped account still has
+Sand/Bot capacity; toggle that exact row to `[sand]`. If it shows `[sand]` and
+the Sand meter is available, inspect the selected account name/email and the
+`Updated` time before retrying. A native `grok --model grok-4.6` profile remains
+on the native Grok provider unless it is explicitly account-bound to Cursor.
+
+For a definitive mapping check, inspect the structured proxy log while sending
+one request. For a future diagnostic launch, enable the flags before `serve`
+and use a spare port; leave an existing `serve` process untouched:
+
+```bash
+CCP_LOG_STDERR=1 CCP_LOG_VERBOSE=1 claude-cursor-proxy serve --no-monitor --port 18766
+```
+
+Point the diagnostic client at `http://127.0.0.1:18766`; otherwise keep using
+the existing port and inspect its `proxy.log`.
+
+The `cursor_account_selected` record includes `accountBinding`; both it and
+`policy_rate_limit_breaker_open` include the truncated `accountId`, resolved
+`model`, `clientType`, `quotaLane`, and cached `apiPercent`/`botPercent` values.
+No bearer token is included. Compare those fields with the model badge and the
+account row's `Updated` time. A mismatch identifies a routing/configuration
+issue; matching fields confirm which account and lane were attempted, while
+Cursor may still reject that lane for a policy or capacity decision.
 
 `SandClientMode` and `SandStreamToolkit` are version-locked Cursor Desktop
 bundle patchers. This proxy does not install, modify, or require a patched
@@ -366,11 +454,17 @@ the variable is unset.
 
 The built-in Cursor catalog is only an offline/startup fallback. With a Cursor
 login, the proxy fetches `GetUsableModels` at startup and refreshes it when
-`GET /v1/models` is requested. The returned account catalog is merged into the
-TUI and the model list. You can still add an exact id with `a` or set it in the
-environment, but the signed-in Cursor account must expose that model upstream.
-The catalog is invalidated on a hot account switch/logout, and an in-flight
-response from the previous account is discarded.
+`GET /v1/models` is requested. It also probes Cursor's
+`aiserver.v1.AiService/AvailableModels` catalog when available; that response
+contains canonical family ids, aliases, and effort variants needed to map a
+CLI slug such as `gemini-3.6-flash-high` to the Sand family id
+`gemini-3.6-flash`. Catalog snapshots are scoped by account **and** request
+identity (`cli` versus `sand`) and expire after a short TTL, so one account or
+lane cannot leak model entitlements into another. The returned account catalog
+is merged into the TUI and model list. You can still add an exact id with `a`
+or set it in the environment, but the signed-in Cursor account must expose that
+model upstream. The catalog is invalidated on a hot account switch/logout, and
+an in-flight response from the previous account is discarded.
 
 ### Account usage
 
@@ -595,6 +689,7 @@ Use this order:
 | Image attachment immediately fails with 502 `Image not found [internal]` | Update to ≥0.1.83 and restart `serve`. The proxy keeps the original inline bytes, rotates the selected-image id once, and retries on a fresh Cursor conversation; a persistent upstream error is then surfaced instead of opening an unbounded retry loop. |
 | grok-build returns 413 `Cursor KV blob store limit exceeded` (`blobs=4097` / about 64 MiB) | Update to ≥0.1.84 and restart `serve`. The proxy rotates a near-limit Cursor conversation before the next turn; an upstream 413 receives one bounded fresh-conversation retry with the complete Anthropic history and refreshed image ids. No manual `/compact` or new chat is needed. |
 | Gemini/Fable Sand returns `ERROR_PRO_USER_RATE_LIMIT_EXCEEDED` while the same model works as CLI | Sand and CLI are separate Cursor request identities and quota buckets. In the TUI press `s`, select the model, and toggle it to `[cli]`; the proxy keeps Sand 429s visible and does not silently spend the CLI/API allowance. |
+| `grok-build`/Claude Code gets HTTP 429 `You're out of usage` for `grok-4.6` or `cursor-grok-*` while the mapped account still has Sand/Bot balance | Check the request badge first. `[cli]` uses the account's CLI/API meter; `[sand]` uses Sand/Grok Bot. A model→account binding selects a credential but does not change the lane. For Cursor Grok, add the exact `cursor-grok-4.6-*` id in **Sand Models**, toggle `[sand]`, then bind that same row with `m`; refresh with `u`/`U` and verify `Updated`. Bare `grok-4.6` remains the native Grok provider unless explicitly account-bound to Cursor. |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
 | grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.57 and restart serve. Response-less live opens fail closed as HTTP 409; local open-slot saturation is jittered HTTP 503. |
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |
