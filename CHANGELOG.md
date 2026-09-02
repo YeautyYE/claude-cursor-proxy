@@ -5,12 +5,10 @@ Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-prox
 
 ## v0.1.101 (2026-09-03)
 
-- Make Fable Sand/Bot routing explicitly opt-in per model. Unconfigured or
-  unmatched `claude-fable-5[1m]` requests remain on the configured CLI identity
-  and are shown as `[cli]`; the TUI explains that CLI support may vary.
-- Keep the Fable family in the Sand picker so `s` plus `Space`/`Enter` selects
-  the Sand/Bot surface without changing account selection or the one-process
-  architecture.
+- Keep `claude-fable-5[1m]` on the built-in Sand/Bot route for every saved Cursor
+  account, including when other Sand models are selected. An explicitly empty
+  policy remains the deliberate opt-out; account-pool failover handles
+  account-scoped allowance errors without changing the one-process workflow.
 
 ## v0.1.100 (2026-09-02)
 

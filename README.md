@@ -394,9 +394,11 @@ account usage. The list is marked `[sand]` or `[cli]`; changes apply to new
 requests and are written atomically to `config.json`. The TUI requires a
 terminal; `serve --no-monitor` keeps the proxy running without it.
 
-Fable starts as `[cli]` until you explicitly toggle its row to `[sand]`. The
-`[cli]` marker is intentional: the CLI surface may not advertise or support
-Fable, while `[sand]` selects Cursor's Bot lane.
+Fable is a built-in Sand/Bot route. On a clean install, and whenever any
+non-empty Sand policy is saved, `claude-fable-5[1m]` is marked `[sand]` and
+uses Cursor's Bot lane for the selected account. An explicitly empty policy
+(`cursor.sandModels: []` or `CCP_CURSOR_SAND_MODELS=`) is the only opt-out and
+keeps every model on the configured default identity.
 
 For a read-only terminal diagnostic, run:
 
@@ -453,13 +455,12 @@ Model matching is case-insensitive and normalizes `[1m]` plus
 always overrides `cursor.sandModels` in `config.json`; unset it to edit the
 file from the TUI. Leave `CCP_CURSOR_CLIENT_TYPE` at its default `cli` when you
 want mixed routing; setting it to `sand` makes unmatched models use Sand too.
-Fable is not promoted to Sand automatically. A clean install and an unmatched
-`claude-fable-5[1m]` request stay on the configured default, normally `[cli]`;
-the CLI surface may not support that Fable model. Select the Fable row in
-**Sand Models** and toggle it to `[sand]` when you want the Sand/Bot surface.
-Only explicitly listed models use Sand, and an explicitly empty
-`cursor.sandModels` array or `CCP_CURSOR_SAND_MODELS=` leaves every model on the
-configured default identity until a policy is selected.
+Fable is retained as a built-in Sand/Bot route whenever the policy is
+non-empty, including when the TUI lists other models. This makes
+`claude-fable-5[1m]` available through every saved Cursor account; account
+selection and quota failover remain independent. Use an explicitly empty
+`cursor.sandModels` array or `CCP_CURSOR_SAND_MODELS=` only when you want to
+disable the built-in route and keep all models on the configured default.
 
 ### Model discovery
 
