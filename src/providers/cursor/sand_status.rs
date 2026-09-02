@@ -262,11 +262,20 @@ pub fn snapshot() -> SandStatusSnapshot {
 
 const SAND_MANAGED_LOCAL_ROUTE_MARKER: &str = "/*SAND_MANAGED_LOCAL_ROUTE_V1*/";
 const SAND_LOCAL_RUNTIME_LOAD_MARKER: &str = "/*SAND_LOCAL_RUNTIME_LOAD_V1*/";
-const SAND_DIRECT_STREAM_MARKER: &str = "/*SAND_DIRECT_INFERENCE_STREAM_V1*/";
+// Sand Stream Toolkit 1.2.5 moved the direct-stream injection to V2 while
+// retaining V1 in older bundles. Probe both spellings so `sand-status` agrees
+// with the installer that produced the Desktop patch.
+const SAND_DIRECT_STREAM_MARKERS: &[&str] = &[
+    "/*SAND_DIRECT_INFERENCE_STREAM_V1*/",
+    "/*SAND_DIRECT_INFERENCE_STREAM_V2*/",
+];
 const SAND_AGENT_HOST_ENABLEMENT_MARKER: &str = "/*SAND_AGENT_HOST_ENABLEMENT_V1*/";
 const SAND_AGENT_HOST_IDENTITY_MARKER: &str = "/*SAND_AGENT_HOST_IDENTITY_V1*/";
 const SAND_EXEC_BRIDGE_MARKER: &str = "/*SAND_EXEC_BRIDGE_V1*/";
 const SAND_BR_RESOURCE_BRIDGE_MARKER: &str = "/*SAND_BR_RESOURCE_BRIDGE_V1*/";
+// Sand Stream Toolkit 1.2.x names the provider bridge differently from the
+// older SandClientMode installer. It is the same completion capability.
+const SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER: &str = "/*SAND_AGENT_EXEC_PROVIDER_BRIDGE_V1*/";
 const SAND_MOVE_EXEC_MARKER: &str = "/*SAND_MOVE_EXEC_V1*/";
 const SAND_MULTITASK_ROUTE_MARKER: &str = "/*SAND_MULTITASK_ROUTE_V1*/";
 const SAND_SUBAGENT_FEATURES_MARKER: &str = "/*SAND_SUBAGENT_FEATURES_V1*/";
@@ -355,7 +364,8 @@ fn inspect_desktop_bundle_candidates(candidates: Vec<PathBuf>) -> DesktopSandPat
     // completion markers. The older installer adds exec/resource bridges;
     // v1.3.2 adds the full multitask/subagent route instead. Do not require
     // both, otherwise a healthy Toolkit installation is reported as partial.
-    let exec_bridge_ready = counts.move_exec > 0 && counts.exec_bridge >= 2;
+    let exec_bridge_ready =
+        counts.move_exec > 0 && (counts.exec_bridge >= 2 || counts.agent_exec_provider_bridge > 0);
     let stream_toolkit_ready = stream_mode_ready
         && counts.move_exec > 0
         && counts.multitask_route > 0
@@ -401,6 +411,7 @@ struct MarkerCounts {
     subagent_task: usize,
     subagent_route: usize,
     exec_bridge: usize,
+    agent_exec_provider_bridge: usize,
     move_exec: usize,
 }
 
@@ -409,7 +420,10 @@ impl MarkerCounts {
         Self {
             managed_local_route: content.matches(SAND_MANAGED_LOCAL_ROUTE_MARKER).count(),
             local_runtime_load: content.matches(SAND_LOCAL_RUNTIME_LOAD_MARKER).count(),
-            direct_stream: content.matches(SAND_DIRECT_STREAM_MARKER).count(),
+            direct_stream: SAND_DIRECT_STREAM_MARKERS
+                .iter()
+                .map(|marker| content.matches(marker).count())
+                .sum(),
             agent_host_enablement: content.matches(SAND_AGENT_HOST_ENABLEMENT_MARKER).count(),
             agent_host_identity: content.matches(SAND_AGENT_HOST_IDENTITY_MARKER).count(),
             multitask_route: content.matches(SAND_MULTITASK_ROUTE_MARKER).count(),
@@ -430,7 +444,13 @@ impl MarkerCounts {
             .map(|marker| content.matches(marker).count())
             .sum(),
             exec_bridge: content.matches(SAND_EXEC_BRIDGE_MARKER).count()
-                + content.matches(SAND_BR_RESOURCE_BRIDGE_MARKER).count(),
+                + content.matches(SAND_BR_RESOURCE_BRIDGE_MARKER).count()
+                + content
+                    .matches(SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER)
+                    .count(),
+            agent_exec_provider_bridge: content
+                .matches(SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER)
+                .count(),
             move_exec: content.matches(SAND_MOVE_EXEC_MARKER).count(),
         }
     }
@@ -460,6 +480,7 @@ impl std::ops::AddAssign for MarkerCounts {
         self.subagent_task += other.subagent_task;
         self.subagent_route += other.subagent_route;
         self.exec_bridge += other.exec_bridge;
+        self.agent_exec_provider_bridge += other.agent_exec_provider_bridge;
         self.move_exec += other.move_exec;
     }
 }
@@ -745,7 +766,8 @@ mod tests {
         fs::create_dir_all(root.join("extensions/cursor-agent-host/dist")).expect("agent host");
         fs::write(root.join("package.json"), r#"{"version":"1.2.3"}"#).expect("package");
         let main = format!(
-            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{SAND_DIRECT_STREAM_MARKER}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}"
+            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}",
+            SAND_DIRECT_STREAM_MARKERS[0]
         );
         let bridge = format!(
             "{SAND_MOVE_EXEC_MARKER}{SAND_EXEC_BRIDGE_MARKER}{SAND_BR_RESOURCE_BRIDGE_MARKER}"
@@ -771,6 +793,37 @@ mod tests {
     }
 
     #[test]
+    fn desktop_scan_accepts_sand_stream_toolkit_v2_installer_markers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("Cursor.app/Contents/Resources/app");
+        fs::create_dir_all(root.join("out")).expect("out");
+        fs::create_dir_all(root.join("extensions/cursor-agent-host/dist")).expect("agent host");
+        fs::write(root.join("package.json"), r#"{"version":"3.18.25"}"#).expect("package");
+        let main = format!(
+            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}",
+            SAND_DIRECT_STREAM_MARKERS[1]
+        );
+        // sand_stream_installer.py 1.2.5 uses the provider-bridge marker,
+        // rather than the two older SandClientMode exec/resource markers.
+        let bridge = format!("{SAND_MOVE_EXEC_MARKER}{SAND_AGENT_EXEC_PROVIDER_BRIDGE_MARKER}");
+        fs::write(root.join("out/main.js"), &main).expect("main");
+        fs::write(
+            root.join("extensions/cursor-agent-host/dist/123.js"),
+            &bridge,
+        )
+        .expect("bridge");
+
+        let status = inspect_desktop_bundle_candidates(vec![temp.path().join("Cursor.app")]);
+        assert!(status.ready);
+        assert!(status.stream_mode_ready);
+        assert!(status.exec_bridge_ready);
+        assert!(!status.stream_toolkit_ready);
+        assert_eq!(status.direct_stream_markers, 1);
+        assert_eq!(status.exec_bridge_markers, 1);
+        assert_eq!(status.move_exec_markers, 1);
+    }
+
+    #[test]
     fn desktop_scan_accepts_complete_sand_stream_toolkit_v1_3_2_markers() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().join("Cursor.app/Contents/Resources/app");
@@ -778,7 +831,8 @@ mod tests {
         fs::create_dir_all(root.join("extensions/cursor-agent-host/dist")).expect("agent host");
         fs::write(root.join("package.json"), r#"{"version":"3.18.9"}"#).expect("package");
         let core = format!(
-            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{SAND_DIRECT_STREAM_MARKER}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}"
+            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}",
+            SAND_DIRECT_STREAM_MARKERS[0]
         );
         // This is the exact v1.3.2 set recovered from the Windows bundle's
         // PatchStatus.stream_mode_installed property. It deliberately has no
@@ -814,7 +868,8 @@ mod tests {
         fs::create_dir_all(root.join("out")).expect("out");
         fs::create_dir_all(root.join("extensions/cursor-agent-host/dist")).expect("agent host");
         let core = format!(
-            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{SAND_DIRECT_STREAM_MARKER}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}"
+            "{SAND_MANAGED_LOCAL_ROUTE_MARKER}{SAND_LOCAL_RUNTIME_LOAD_MARKER}{}{SAND_AGENT_HOST_ENABLEMENT_MARKER}{SAND_AGENT_HOST_IDENTITY_MARKER}",
+            SAND_DIRECT_STREAM_MARKERS[0]
         );
         // Five task markers do not meet the Toolkit's exact `== 4` check.
         let incomplete_toolkit = format!(
