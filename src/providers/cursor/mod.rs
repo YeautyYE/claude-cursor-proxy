@@ -6132,12 +6132,9 @@ impl Provider for CursorProvider {
         let sand_account_failover_state =
             Arc::new(Mutex::new(AccountFailoverState::new(&auth.access_token)));
         if uses_sand {
-            loop {
-                let Err(error) =
-                    policy_rate_limit_preflight(model, &client_type, &auth.access_token)
-                else {
-                    break;
-                };
+            while let Err(error) =
+                policy_rate_limit_preflight(model, &client_type, &auth.access_token)
+            {
                 if !is_account_failover_policy_error(&error.client_message()) {
                     return map_cursor_error_to_response(&error);
                 }
