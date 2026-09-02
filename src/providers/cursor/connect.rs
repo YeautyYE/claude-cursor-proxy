@@ -506,12 +506,18 @@ impl ConnectEndError {
 /// The provider adapter has emitted this text with several outer statuses
 /// (`400`, `429`, and `502`) and with both JSON and flattened key/value
 /// metadata.  The outer status is therefore not sufficient to classify it.
-/// Require a provider marker plus temporary connectivity wording, while
-/// explicitly excluding quota, billing, and capacity-shed language.  This
-/// helper is intentionally shared by the Connect parser, retry classifier,
+/// Require a provider marker (or Cursor's strong current connectivity
+/// sentence) plus temporary wording, while explicitly excluding quota,
+/// billing, and capacity-shed language.  This helper is intentionally shared
+/// by the Connect parser, retry classifier,
 /// account breaker, Sand stream, and Agent live paths.
 pub fn is_transient_provider_error_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
+    // Error text crosses several serialization boundaries before it reaches
+    // the retry policy (Connect JSON -> a flattened Cursor diagnostic -> an
+    // SSE/Responses string).  Normalize case, escaped line breaks, and
+    // repeated whitespace once so a line-wrapped provider sentence is treated
+    // the same as the one-line message emitted by Cursor.
+    let lower = normalize_provider_error_text(message);
 
     // Do not classify ordinary `ERROR_OPENAI: Unable to reach the model
     // provider` messages here. Those already have the generic transport
@@ -522,19 +528,20 @@ pub fn is_transient_provider_error_message(message: &str) -> bool {
         || lower.contains("providererrorcode=error_provider_error")
         || lower.contains("providererrorcode\":\"error_provider_error")
         || lower.contains("provider_error_code=error_provider_error");
-    if !provider_marker {
-        return false;
-    }
 
     // These markers describe an account/plan or a deliberate capacity shed;
     // retrying the same account does not repair them even if the envelope
     // also contains "try again" wording.
     let terminal_policy = [
         "out of usage",
+        "usage exhausted",
+        "usage has been exhausted",
         "usage limit",
+        "usage-limit",
         "quota",
         "rate limit exceeded",
         "rate_limited",
+        "rate-limit exceeded",
         "resource exhausted by",
         "unpaid invoice",
         "pay your invoice",
@@ -562,7 +569,11 @@ pub fn is_transient_provider_error_message(message: &str) -> bool {
         "temporarily unavailable",
         "temporary provider",
         "temporary trouble connecting",
+        // Cursor's current provider adapter wording (the leading "having"
+        // is present in the live error but was absent from older fixtures).
+        "having trouble connecting to the model provider",
         "trouble connecting to the model provider",
+        "trouble connecting with the model provider",
         "trouble connecting to provider",
         "unable to reach the model provider",
         "unable to connect to the model provider",
@@ -577,10 +588,43 @@ pub fn is_transient_provider_error_message(message: &str) -> bool {
         "temporarily unable to reach",
         "try again in a moment",
         "try again later",
+        "might be temporary",
+        "may be temporary",
     ];
-    temporary_connectivity
+    let has_temporary_connectivity = temporary_connectivity
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| lower.contains(marker));
+
+    if !has_temporary_connectivity {
+        return false;
+    }
+
+    // The nested provider adapter normally supplies ERROR_PROVIDER_ERROR.
+    // A few Cursor revisions instead expose the legacy ERROR_OPENAI wrapper
+    // (or only a `Connect error <status>` prefix) around the same sentence.
+    // Accept those *specific* strong connectivity phrases, but do not turn a
+    // generic `ERROR_OPENAI: Unable to reach ...` response into this class;
+    // that path already has its own retry handling and must retain existing
+    // quota semantics.
+    provider_marker
+        || lower.contains("having trouble connecting to the model provider")
+        || lower.contains("trouble connecting to the model provider")
+        || lower.contains("trouble connecting with the model provider")
+}
+
+/// Lower-case and collapse transport/JSON formatting differences in a Cursor
+/// provider diagnostic.  `str::to_ascii_lowercase` is sufficient for the
+/// stable English markers, while replacing escaped control sequences makes a
+/// serialized `detail` field match the original multi-line diagnostic.
+fn normalize_provider_error_text(message: &str) -> String {
+    message
+        .to_ascii_lowercase()
+        .replace("\\r", " ")
+        .replace("\\n", " ")
+        .replace("\\t", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Backwards-compatible spelling used by a few transport-specific callers.
@@ -976,6 +1020,12 @@ mod tests {
             r#"{"error":{"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"detail":"temporary trouble connecting to the model provider","additionalInfo":{"providerStatusCode":400},"isRetryable":false}}}]}}"#,
             "Connect error 429: ERROR_PROVIDER_ERROR: Provider Error — provider unavailable [providerStatusCode=400,isRetryable=false]",
             "Cursor error 400: ERROR_PROVIDER_ERROR upstream connection reset; try again in a moment",
+            // Current Cursor wording, including the legacy ERROR_OPENAI
+            // wrapper, must stay on the bounded provider-retry path.
+            "Connect error 502: ERROR_OPENAI: Unable to reach the model provider — We're having trouble connecting to the model provider. This might be temporary - please try again in a moment. [unavailable]",
+            // `detail` is sometimes passed as serialized JSON, where line
+            // breaks become escaped `\\n` sequences.
+            r#"{"error":"ERROR_PROVIDER_ERROR: We're having trouble connecting to the\nmodel provider. This might be temporary - please try again in a moment."}"#,
         ];
         for message in messages {
             assert!(is_transient_provider_error_message(message), "{message}");
@@ -992,6 +1042,8 @@ mod tests {
             "Connect error 429: ERROR_PROVIDER_ERROR: provider unavailable; you're out of usage",
             "ERROR_PROVIDER_ERROR temporary trouble connecting; unpaid invoice",
             "ERROR_PROVIDER_ERROR provider unavailable; High Load — switch to Auto",
+            "ERROR_PROVIDER_ERROR: We're having trouble connecting to the model provider; usage exhausted",
+            "ERROR_PROVIDER_ERROR: We're having trouble connecting to the model provider; usage limit reached",
         ] {
             assert!(
                 !is_transient_provider_error_message(message),
