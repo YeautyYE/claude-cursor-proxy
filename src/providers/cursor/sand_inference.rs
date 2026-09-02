@@ -23,7 +23,8 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorUpstreamResponse};
 use crate::providers::cursor::connect::{
     ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP, connect_error_status,
-    decode_gzip_frame, encode_connect_frame, parse_connect_error,
+    decode_gzip_frame, encode_connect_frame, is_non_retryable_provider_error_message,
+    parse_connect_error,
 };
 use crate::providers::cursor::request::{
     image_candidate, is_model_visible_tool_definition, message_blocks, normalize_image_data,
@@ -63,7 +64,8 @@ pub fn stream_error_is_retryable(error: &CursorError) -> bool {
 
     // Account/entitlement and model validation errors are deterministic.  Do
     // not turn these into a retry storm, even when a gateway labels them 502.
-    if crate::retry::is_billing_block(&message)
+    if is_non_retryable_provider_error_message(&message)
+        || crate::retry::is_billing_block(&message)
         || crate::retry::is_policy_rate_limit(&message)
         || crate::retry::is_capacity_shed(&message)
         || lower.contains("sand traffic is not supported")
@@ -1222,13 +1224,37 @@ fn json_error_direct(value: &Value) -> Option<CursorError> {
     // Preserve the old concise `code` detail and add `errorType` when it
     // carries independent classification. CursorError::client_message then
     // exposes both without dumping an arbitrarily large error envelope.
-    let detail = match (raw_code, error_type) {
+    let mut detail = match (raw_code, error_type) {
         (Some(code), Some(error_type)) => format!("code={code}; errorType={error_type}"),
         (Some(code), None) => code,
         (None, Some(error_type)) => format!("errorType={error_type}"),
         (None, None) => code,
     };
+    // Current Cursor Sand responses can wrap an account-specific provider
+    // 4xx in an outer `resource_exhausted` envelope. Keep the small inner
+    // diagnostic fields in the client message so the request router can
+    // rotate accounts even when the error arrived after HTTP 200.
+    if let Some(provider) = sand_provider_error_metadata(value) {
+        detail.push_str("; ");
+        detail.push_str(&provider);
+    }
     Some(CursorError::new(status, message, Some(detail)))
+}
+
+fn sand_provider_error_metadata(value: &Value) -> Option<String> {
+    let bytes = serde_json::to_vec(value).ok()?;
+    let parsed = parse_connect_error(&bytes)?;
+    let mut fields = Vec::new();
+    if let Some(code) = parsed.provider_error_code {
+        fields.push(format!("providerErrorCode={code}"));
+    }
+    if let Some(status) = parsed.provider_status_code {
+        fields.push(format!("providerStatusCode={status}"));
+    }
+    if let Some(retryable) = parsed.provider_is_retryable {
+        fields.push(format!("isRetryable={retryable}"));
+    }
+    (!fields.is_empty()).then(|| fields.join(" "))
 }
 
 fn value_as_string(value: &Value) -> Option<String> {
@@ -2522,6 +2548,32 @@ mod tests {
         assert_eq!(error.status, 503);
         assert!(error.message.contains("ERROR_OVERLOADED"));
         assert!(error.client_message().contains("ERROR_OVERLOADED"));
+    }
+
+    #[test]
+    fn sand_json_error_keeps_provider_metadata_for_account_failover() {
+        let value = json!({
+            "error": {
+                "code": "resource_exhausted",
+                "message": "provider rejected request",
+                "details": [{
+                    "debug": {
+                        "error": "ERROR_PROVIDER_ERROR",
+                        "details": {
+                            "additionalInfo": {"providerStatusCode": 400},
+                            "isRetryable": false
+                        }
+                    }
+                }]
+            }
+        });
+        let error = json_error(&value).expect("provider error");
+        assert_eq!(error.status, 429, "outer quota envelope remains visible");
+        let message = error.client_message();
+        assert!(message.contains("ERROR_PROVIDER_ERROR"), "{message}");
+        assert!(message.contains("providerStatusCode=400"), "{message}");
+        assert!(message.contains("isRetryable=false"), "{message}");
+        assert!(is_non_retryable_provider_error_message(&message));
     }
 
     #[test]

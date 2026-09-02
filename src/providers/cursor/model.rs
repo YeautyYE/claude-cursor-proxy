@@ -247,7 +247,16 @@ fn sand_family_variant(id: &str, base: &str) -> bool {
         }
         if matches!(
             token,
-            "minimal" | "none" | "low" | "medium" | "high" | "xhigh" | "max" | "thinking" | "fast"
+            "minimal"
+                | "none"
+                | "low"
+                | "medium"
+                | "high"
+                | "xhigh"
+                | "max"
+                | "thinking"
+                | "fast"
+                | "preview"
         ) {
             saw_variant = true;
         } else {
@@ -459,12 +468,14 @@ pub fn anthropic_list_model_id(catalog_or_alias: &str) -> String {
 }
 
 fn is_fable_family(model: &str) -> bool {
-    let m = model.trim();
-    m == "fable"
-        || m == "claude-fable-5"
-        || m.starts_with("claude-fable-5-")
-        || m.starts_with("cursor:claude-fable-5")
-        || m.starts_with("cursor-agent:claude-fable-5")
+    let mut m = model.trim().to_ascii_lowercase();
+    for prefix in ["cursor-agent:", "cursor-plan:", "cursor-ask:", "cursor:"] {
+        if let Some(rest) = m.strip_prefix(prefix) {
+            m = rest.to_string();
+            break;
+        }
+    }
+    m == "fable" || sand_family_variant(&m, "claude-fable-5")
 }
 
 /// Strip Claude Code long-context suffixes (`[1m]`, `[2m]`, `(1M context)`) so
@@ -1101,10 +1112,15 @@ mod tests {
             "vendor.custom-model-v2"
         );
         // Fable 5.1 must not collapse into the Fable 5 family.
+        let fable_51 = "claude-fable-5-1-thinking-max";
+        assert_eq!(resolve_sand_model_id(fable_51), "claude-fable-5-1");
         assert_eq!(
-            resolve_sand_model_id("claude-fable-5-1-thinking-max"),
-            "claude-fable-5-1"
+            apply_effort_to_cursor_model(fable_51, Some("low")),
+            fable_51,
+            "effort remapping must not turn Fable 5.1 into Fable 5"
         );
+        assert_eq!(anthropic_wire_model(fable_51), fable_51);
+        assert_eq!(anthropic_list_model_id(fable_51), fable_51);
         assert_eq!(
             resolve_sand_model_id("composer-2.5-fast"),
             "composer-2.5-fast"

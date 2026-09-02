@@ -268,7 +268,13 @@ impl Registry {
             // public `claude-fable-5[1m]` alias.  A direct-only check would
             // let `aliasProvider: codex` steal that request before the
             // account-bound Cursor route had a chance to select its token.
-            if account_routes.account_for_model(&normalized).is_some() {
+            // Sand is another explicit Cursor ownership declaration. Check
+            // it before the process-wide Anthropic alias provider so the
+            // built-in Fable Sand/Bot default (and any TUI-selected alias)
+            // actually reaches Cursor's InferenceService transport.
+            if sand_policy.matches_model(&normalized)
+                || account_routes.account_for_model(&normalized).is_some()
+            {
                 return self.handlers.get("cursor").cloned();
             }
         }
@@ -613,8 +619,17 @@ mod tests {
     #[test]
     fn claude_5_aliases_route_to_configured_provider() {
         let registry = Registry::new(AliasProvider::Codex);
+        let empty_accounts = crate::config::CursorAccountRoutingPolicy::empty();
+        // Keep this alias-provider contract independent of the runtime's
+        // built-in Fable Sand default.
+        let empty_sand = crate::config::SandRoutingPolicy::empty();
         for model in ["claude-sonnet-5", "fable", "claude-fable-5"] {
-            let p = registry.provider_for_model(model, None);
+            let p = registry.provider_for_model_with_policies(
+                model,
+                None,
+                &empty_accounts,
+                &empty_sand,
+            );
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");
         }
@@ -634,6 +649,20 @@ mod tests {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "cursor");
+        }
+    }
+
+    #[test]
+    fn sand_policy_routes_fable_alias_before_global_alias_provider() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let account_routes = crate::config::CursorAccountRoutingPolicy::empty();
+        let sand_policy = crate::config::SandRoutingPolicy::new(["claude-fable-5"]);
+
+        for model in ["fable", "claude-fable-5", "claude-fable-5[1m]"] {
+            let provider = registry
+                .provider_for_model_with_policies(model, None, &account_routes, &sand_policy)
+                .expect("Sand-selected Fable alias should be routable");
+            assert_eq!(provider.name(), "cursor", "{model} must use Cursor Sand");
         }
     }
 

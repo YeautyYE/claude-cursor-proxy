@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.99 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.100 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -292,10 +292,12 @@ and the `m` model-account editor show both meters; the selected model's lane is
 shown first. Use `u` for one account or `U` for all accounts to refresh a
 stale snapshot, then check the `Updated` timestamp.
 
-The proxy deliberately does not turn a policy/quota 429 into a silent
-cross-lane or cross-account fallback: doing so could spend a different account's
-allowance and make retries non-deterministic. Change the model's `[cli]`/
-`[sand]` selection or its account binding in the TUI, then send a new request.
+The proxy never silently changes the quota lane. For an account-scoped Sand
+policy/allowance error, it tries the other saved, non-cooled accounts in the
+same lane, with a per-request hard ceiling of 16 swaps; an explicit
+model-account binding keeps failover within that binding. Change the model's
+`[cli]`/`[sand]` selection or its account binding in the TUI when you need a
+different lane or a deterministic account.
 
 #### Grok 4.6: native route versus Cursor Sand
 
@@ -447,8 +449,12 @@ Model matching is case-insensitive and normalizes `[1m]` plus
 always overrides `cursor.sandModels` in `config.json`; unset it to edit the
 file from the TUI. Leave `CCP_CURSOR_CLIENT_TYPE` at its default `cli` when you
 want mixed routing; setting it to `sand` makes unmatched models use Sand too.
-An explicitly empty `CCP_CURSOR_SAND_MODELS=` disables all Sand matches until
-the variable is unset.
+Whenever Sand is enabled, `claude-fable-5[1m]` remains a built-in Sand/Bot route,
+including when `cursor.sandModels` or `CCP_CURSOR_SAND_MODELS` lists other
+models. This keeps Fable available to every saved Cursor account; the TUI still
+controls the other model families. An explicitly empty `cursor.sandModels` array
+or `CCP_CURSOR_SAND_MODELS=` disables the built-in route and all other Sand
+matches until the override is removed.
 
 ### Model discovery
 

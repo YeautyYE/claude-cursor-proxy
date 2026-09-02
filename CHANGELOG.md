@@ -3,6 +3,18 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.100 (2026-09-02)
+
+- Route `claude-fable-5[1m]` through Cursor's Sand/Bot InferenceService path for
+  every saved Cursor login, with account-pool failover for account-scoped
+  provider quota errors. Failover now covers every other saved account (up to a
+  hard ceiling of 16 swaps per request) instead of stopping after two swaps.
+- Preserve inner provider status/retry metadata from Sand error frames so
+  deterministic account failures switch accounts instead of entering a 429/503
+  retry loop.
+- Keep Fable 5 as a built-in Sand/Bot route whenever any Sand policy is enabled,
+  while retaining an explicit empty-policy opt-out.
+
 ## v0.1.99 (2026-09-02)
 
 - Keep Cursor Grok account bindings and Sand/CLI quota lanes independent, with

@@ -24,6 +24,95 @@ pub fn is_billing_block(message: &str) -> bool {
         || (lower.contains("error_rate_limited") && lower.contains("invoice"))
 }
 
+/// Cursor's provider adapter sometimes reports an account/model allowance
+/// failure as a generic provider error instead of a normal gRPC 429.  The
+/// diagnostic looks like:
+/// `ERROR_PROVIDER_ERROR providerStatusCode=400 resource_exhausted
+/// isRetryable=false`.
+///
+/// Treat only the explicit non-retryable/provider-4xx form as an account
+/// policy result.  A plain `resource_exhausted` from a 429/503 transport is
+/// still transient capacity and must remain eligible for the normal backoff
+/// path.
+pub fn is_provider_resource_exhausted(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let resource_exhausted =
+        lower.contains("resource_exhausted") || lower.contains("resource exhausted");
+    if !resource_exhausted {
+        return false;
+    }
+    // The outer Connect error may carry a generic 429/resource_exhausted
+    // status, so require the provider diagnostic itself before treating this
+    // as an account-specific policy result.  Do not infer it from a bare
+    // `providerStatusCode=400`: unrelated gateway diagnostics can contain the
+    // same number.
+    let compact = lower
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let provider_error =
+        compact.contains("error_provider_error") || compact.contains("providererror");
+    if !provider_error || !provider_status_is_non_retryable_4xx(&compact) {
+        return false;
+    }
+    true
+}
+
+/// Return whether a provider diagnostic contains an explicit non-retryable
+/// 4xx status.  Cursor has emitted JSON, `key=value`, and human-readable forms
+/// with both camelCase and snake_case field names; scan the normalized text so
+/// all of those forms share one classification path.
+fn provider_status_is_non_retryable_4xx(compact_lower: &str) -> bool {
+    let retryable_false = ["isretryable", "is_retryable"].iter().any(|key| {
+        let mut offset = 0usize;
+        while let Some(relative) = compact_lower[offset..].find(key) {
+            let start = offset + relative + key.len();
+            let tail = compact_lower[start..].trim_start_matches(|character: char| {
+                matches!(character, '"' | '\'' | ':' | '=' | ',')
+            });
+            if tail.starts_with("false")
+                && !tail
+                    .chars()
+                    .nth("false".len())
+                    .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return true;
+            }
+            offset = start;
+        }
+        false
+    });
+    if !retryable_false {
+        return false;
+    }
+
+    ["providerstatuscode", "provider_status_code"]
+        .iter()
+        .any(|key| {
+            let mut offset = 0usize;
+            while let Some(relative) = compact_lower[offset..].find(key) {
+                let start = offset + relative + key.len();
+                let tail = compact_lower[start..].trim_start_matches(|character: char| {
+                    matches!(character, '"' | '\'' | ':' | '=' | ',')
+                });
+                let digits: String = tail
+                    .chars()
+                    .take_while(|character| character.is_ascii_digit())
+                    .collect();
+                if digits.len() == 3
+                    && digits
+                        .parse::<u16>()
+                        .ok()
+                        .is_some_and(|status| (400..500).contains(&status))
+                {
+                    return true;
+                }
+                offset = start;
+            }
+            false
+        })
+}
+
 /// Cursor capacity shed: the model pool is full and the message tells the
 /// client to switch models. Same-request retries turn one 429 into a flood.
 pub fn is_capacity_shed(message: &str) -> bool {
@@ -45,7 +134,8 @@ pub fn is_policy_rate_limit(message: &str) -> bool {
         return true;
     }
     let lower = message.to_ascii_lowercase();
-    lower.contains("error_rate_limited_changeable")
+    is_provider_resource_exhausted(message)
+        || lower.contains("error_rate_limited_changeable")
         // ERROR_PRO_USER_/ERROR_FREE_USER_/ERROR_USER_RATE_LIMIT_EXCEEDED:
         // the account's own quota window, not pool capacity.
         || lower.contains("user_rate_limit_exceeded")
@@ -83,6 +173,7 @@ pub fn is_upstream_rate_limit(message: &str) -> bool {
     // 502 and entering the generic transport retry loop.
     let lower = message.to_ascii_lowercase();
     is_billing_block(message)
+        || is_provider_resource_exhausted(message)
         || lower.contains("[resource_exhausted]")
         || lower.contains("error_rate_limited")
         || lower.contains("error_resource_exhausted")
@@ -435,6 +526,56 @@ mod tests {
         assert!(is_policy_rate_limit(api_quota));
         assert!(!should_retry_upstream(429, api_quota));
         assert_eq!(classify_proxy_error_status(502, api_quota), 429);
+
+        // Newer Cursor provider responses use HTTP 400 for the same
+        // account/model meter.  The nested provider diagnostic is the only
+        // reliable signal; it must enter the policy breaker and account
+        // failover path instead of being retried as an invalid request.
+        let provider_quota =
+            "ERROR_PROVIDER_ERROR providerStatusCode=400 resource_exhausted isRetryable=false";
+        assert!(is_provider_resource_exhausted(provider_quota));
+        assert!(is_policy_rate_limit(provider_quota));
+        assert_eq!(classify_proxy_error_status(400, provider_quota), 429);
+        assert!(!should_retry_upstream(400, provider_quota));
+
+        // Deterministic provider rejections are account-specific for every
+        // HTTP 4xx, not only the observed 400 variant.
+        for status in [403, 404, 429, 499] {
+            let message = format!(
+                "{{\"error\":{{\"code\":\"resource_exhausted\",\"details\":[{{\"debug\":{{\"error\":\"ERROR_PROVIDER_ERROR\",\"details\":{{\"additionalInfo\":{{\"providerStatusCode\":{status}}},\"isRetryable\":false}}}}}}]}}}}"
+            );
+            assert!(
+                is_provider_resource_exhausted(&message),
+                "provider status {status} should be account-terminal"
+            );
+            assert!(!should_retry_upstream(status, &message));
+        }
+
+        // A retryable provider-capacity response must retain its transient
+        // semantics even when it mentions the same resource token.
+        for message in [
+            "ERROR_PROVIDER_ERROR providerStatusCode=500 resource_exhausted isRetryable=false",
+            "ERROR_PROVIDER_ERROR providerStatusCode=502 resource_exhausted isRetryable=false",
+            "ERROR_PROVIDER_ERROR providerStatusCode=503 resource_exhausted isRetryable=false",
+            "ERROR_PROVIDER_ERROR providerStatusCode=504 resource_exhausted isRetryable=false",
+            "ERROR_PROVIDER_ERROR providerStatusCode=503 resource_exhausted isRetryable=true",
+            "ERROR_PROVIDER_ERROR resource_exhausted isRetryable=false",
+        ] {
+            assert!(!is_provider_resource_exhausted(message), "{message}");
+        }
+        assert!(should_retry_upstream(
+            503,
+            "ERROR_PROVIDER_ERROR providerStatusCode=503 resource_exhausted isRetryable=false"
+        ));
+
+        // JSON and key/value spellings use the same parser. A field named
+        // `isRetryableExtra` must not be mistaken for the retry hint.
+        assert!(is_provider_resource_exhausted(
+            r#"{"error": {"code": "resource_exhausted", "details": [{"debug": {"error": "ERROR_PROVIDER_ERROR", "details": {"additional_info": {"provider_status_code": "400"}, "is_retryable": false}}}]}}"#
+        ));
+        assert!(!is_provider_resource_exhausted(
+            "ERROR_PROVIDER_ERROR providerStatusCode=400 resource_exhausted isRetryableExtra=false"
+        ));
 
         let transient = "Connect error 429: ERROR_RESOURCE_EXHAUSTED: Unable to reach the model provider [resource_exhausted]";
         assert!(

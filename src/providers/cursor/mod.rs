@@ -46,7 +46,9 @@ use crate::providers::cursor::auth::{
     missing_auth_message, run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
-use crate::providers::cursor::connect::cursor_connect_error_is_missing_image;
+use crate::providers::cursor::connect::{
+    cursor_connect_error_is_missing_image, is_non_retryable_provider_error_message,
+};
 use crate::providers::cursor::exec_results::PendingCursorExec;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
@@ -588,7 +590,9 @@ fn note_policy_rate_limit(
     message: &str,
     retry_after: Option<&str>,
 ) {
-    if !crate::retry::is_policy_rate_limit(message) {
+    if !crate::retry::is_policy_rate_limit(message)
+        && !is_non_retryable_provider_error_message(message)
+    {
         return;
     }
     let retry_after_secs = policy_rate_limit_cooldown_secs(message, retry_after);
@@ -1087,6 +1091,7 @@ async fn sand_direct_response(
     model: &str,
     parameter_model: &str,
     compaction_mode: bool,
+    account_failover_state: SharedAccountFailoverState,
 ) -> Response {
     // Keep the local hosted search/fetch shortcuts available on Sand.  These
     // handlers are provider-agnostic and must run after auth (the caller has
@@ -1170,9 +1175,54 @@ async fn sand_direct_response(
         monitor.upstream_started(&ctx.req_id);
     }
 
-    let stream = match open_sand_with_retries(&client, token, &request).await {
-        Ok(stream) => stream,
-        Err(error) => return map_cursor_error_to_response(&error),
+    // A Sand policy/allowance error can arrive as an outer 429 or as Cursor's
+    // newer `ERROR_PROVIDER_ERROR providerStatusCode=400 ...` diagnostic. The
+    // selected account is only the first candidate; before exposing a
+    // pre-output error, rotate through the saved account pool using fresh
+    // request ids. This keeps all logged accounts usable without changing a
+    // model's explicit account binding.
+    let mut effective_token = token.to_string();
+    let mut effective_request = request;
+    let stream = loop {
+        match open_sand_with_retries(&client, &effective_token, &effective_request).await {
+            Ok(stream) => break stream,
+            Err(error)
+                if is_account_failover_policy_error(&error.client_message())
+                    || is_account_failover_policy_error(&error.message)
+                    || error
+                        .detail
+                        .as_deref()
+                        .is_some_and(is_account_failover_policy_error) =>
+            {
+                let diagnostic = error.client_message();
+                note_policy_rate_limit(
+                    model,
+                    "sand",
+                    &effective_token,
+                    &diagnostic,
+                    error.retry_after.as_deref(),
+                );
+                let Some(replacement) = account_failover_replacement_token(
+                    &effective_token,
+                    model,
+                    "sand",
+                    &account_failover_state,
+                ) else {
+                    return map_cursor_error_to_response(&error);
+                };
+                effective_token = replacement;
+                effective_request = effective_request.with_fresh_ids();
+                create_logger("cursor").warn(
+                    "sand_open_account_failover",
+                    Some(serde_json::Map::from_iter([
+                        ("model".into(), serde_json::json!(model)),
+                        ("clientType".into(), serde_json::json!("sand")),
+                        ("recovery".into(), serde_json::json!("fresh_request")),
+                    ])),
+                );
+            }
+            Err(error) => return map_cursor_error_to_response(&error),
+        }
     };
 
     let allowed = if compaction_mode {
@@ -1183,8 +1233,10 @@ async fn sand_direct_response(
     let (tx, rx) = mpsc::channel::<LiveEventResult>(128);
     let idle_secs = sand_stream_idle_timeout_secs();
     let retry_client = client.clone();
-    let retry_token = token.to_string();
-    let retry_request = request.clone();
+    let retry_token = effective_token;
+    let retry_request = effective_request;
+    let retry_model = model.to_string();
+    let retry_account_failover_state = Arc::clone(&account_failover_state);
     tokio::spawn(async move {
         drive_sand_stream_with_retries(
             retry_client,
@@ -1195,6 +1247,9 @@ async fn sand_direct_response(
             compaction_mode,
             idle_secs,
             tx,
+            retry_model,
+            "sand".to_string(),
+            retry_account_failover_state,
         )
         .await;
     });
@@ -1303,13 +1358,16 @@ async fn open_sand_with_retries(
 #[allow(clippy::too_many_arguments)]
 async fn drive_sand_stream_with_retries(
     client: SandInferenceClient,
-    token: String,
-    request: SandInferenceRequest,
+    mut token: String,
+    mut request: SandInferenceRequest,
     initial_stream: SandInferenceStream,
     allowed: Option<BTreeSet<String>>,
     compaction_mode: bool,
     idle_secs: u64,
     tx: mpsc::Sender<LiveEventResult>,
+    model: String,
+    client_type: String,
+    account_failover_state: SharedAccountFailoverState,
 ) {
     let max_retries = stream_retry_limit();
     let mut retries = 0u32;
@@ -1463,6 +1521,51 @@ async fn drive_sand_stream_with_retries(
             // events.  No synthetic error is needed here.
             return;
         };
+        if !committed
+            && (is_account_failover_policy_error(&error.client_message())
+                || is_account_failover_policy_error(&error.message)
+                || error
+                    .detail
+                    .as_deref()
+                    .is_some_and(is_account_failover_policy_error))
+        {
+            // Sand's InferenceService call is full-history and UUID-scoped, so
+            // an account swap can safely replay the request while no visible
+            // text/tool has reached Claude Code. Mark the old account's
+            // cooldown before selecting a replacement; otherwise concurrent
+            // retries could keep rediscovering the same exhausted login.
+            let diagnostic = error.client_message();
+            note_policy_rate_limit(
+                &model,
+                &client_type,
+                &token,
+                &diagnostic,
+                error.retry_after.as_deref(),
+            );
+            let Some(replacement) = account_failover_replacement_token(
+                &token,
+                &model,
+                &client_type,
+                &account_failover_state,
+            ) else {
+                discard_sand_replay_buffer(&mut buffered);
+                send_sand_buffered_error(&tx, &mut buffered, error).await;
+                return;
+            };
+            token = replacement;
+            request = request.with_fresh_ids();
+            retries = 0;
+            discard_sand_replay_buffer(&mut buffered);
+            create_logger("cursor").warn(
+                "sand_stream_account_failover",
+                Some(serde_json::Map::from_iter([
+                    ("model".into(), serde_json::json!(&model)),
+                    ("clientType".into(), serde_json::json!(&client_type)),
+                    ("recovery".into(), serde_json::json!("fresh_request")),
+                ])),
+            );
+            continue;
+        }
         if !committed && retries < max_retries && stream_error_is_retryable(&error) {
             // Do not carry pre-commit events from the abandoned stream into a
             // full-history replay. In particular, duplicate Usage events can
@@ -1897,8 +2000,8 @@ impl LiveRetryStart {
         // but no client-visible text/tool event has committed at this point.
         // Move the logical request to one unused account and replay the full
         // Anthropic history on a fresh account-scoped conversation.  The
-        // shared state bounds this to the same two swaps as initial-open
-        // failover, including retries started by the replacement itself.
+        // The shared state bounds this to the number of other saved accounts
+        // (with a hard ceiling), including retries started by replacements.
         if is_account_failover_policy_error(error) {
             let current_token = self.effective_token();
             let Some(replacement) = account_failover_replacement_token(
@@ -2404,9 +2507,20 @@ fn live_ambiguous_accept_error() -> CursorError {
     )
 }
 
-/// Hot account switch failover budget per request. One swap covers the normal
-/// old-account -> new-account case; a second tolerates a rapid double switch.
-const MAX_ACCOUNT_FAILOVER_SWAPS: u32 = 2;
+/// Hard ceiling for account failover swaps in one logical request. The actual
+/// budget is derived from the saved account pool, so a pool of twelve accounts
+/// can try all eleven alternatives without allowing an unbounded retry storm.
+const MAX_ACCOUNT_FAILOVER_SWAPS: u32 = 16;
+
+fn account_failover_swap_limit(profiles: &[CursorAccountProfile]) -> u32 {
+    let account_count = profiles
+        .iter()
+        .filter(|profile| !profile.auth.access_token.trim().is_empty())
+        .count();
+    account_count
+        .saturating_sub(1)
+        .min(MAX_ACCOUNT_FAILOVER_SWAPS as usize) as u32
+}
 
 /// Only account-scoped allowance failures are candidates for pool failover.
 /// Billing blocks and generic policy responses apply to the subscription (or
@@ -2415,6 +2529,13 @@ const MAX_ACCOUNT_FAILOVER_SWAPS: u32 = 2;
 fn is_account_failover_policy_error(message: &str) -> bool {
     if crate::retry::is_billing_block(message) {
         return false;
+    }
+    // Cursor sometimes wraps a deterministic provider 4xx in an outer
+    // resource_exhausted/429. The inner `providerStatusCode=400` and
+    // `isRetryable=false` mean this account cannot serve the request; rotate
+    // to another saved account before exposing the misleading 429.
+    if is_non_retryable_provider_error_message(message) {
+        return true;
     }
     let lower = message.to_ascii_lowercase();
     lower.contains("user_rate_limit_exceeded")
@@ -2526,7 +2647,7 @@ fn take_account_failover_candidate_from_profiles(
             let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
             (state.swaps, state.attempted_accounts.clone())
         };
-        if swaps >= MAX_ACCOUNT_FAILOVER_SWAPS {
+        if swaps >= account_failover_swap_limit(profiles) {
             return None;
         }
         let candidates = account_failover_candidates_from_profiles(
@@ -2539,7 +2660,7 @@ fn take_account_failover_candidate_from_profiles(
         let candidate = candidates.into_iter().next()?;
         let digest = cursor_account_digest(&candidate);
         let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
-        if state.swaps >= MAX_ACCOUNT_FAILOVER_SWAPS {
+        if state.swaps >= account_failover_swap_limit(profiles) {
             return None;
         }
         let profile_id = profiles
@@ -3559,7 +3680,13 @@ async fn start_live_events_with_retries_with_client_type(
                     continue;
                 }
                 let policy_limited = crate::retry::is_policy_rate_limit(&error.client_message())
-                    || crate::retry::is_policy_rate_limit(&error.message);
+                    || crate::retry::is_policy_rate_limit(&error.message)
+                    || is_non_retryable_provider_error_message(&error.client_message())
+                    || is_non_retryable_provider_error_message(&error.message)
+                    || error
+                        .detail
+                        .as_deref()
+                        .is_some_and(is_non_retryable_provider_error_message);
                 if policy_limited {
                     probe_admission
                         .take()
@@ -5607,6 +5734,7 @@ fn is_transient_resource_exhausted(message: &str) -> bool {
     (lower.contains("error_resource_exhausted")
         || (lower.contains("unable to reach the model provider")
             && lower.contains("resource_exhausted")))
+        && !is_non_retryable_provider_error_message(message)
         && !crate::retry::is_billing_block(message)
         && !crate::retry::is_capacity_shed(message)
         && !crate::retry::is_policy_rate_limit(message)
@@ -5940,7 +6068,7 @@ impl Provider for CursorProvider {
         // refreshes remain in the same state partition. Environment-backed
         // credentials have no profile id; their stable bearer digest is the
         // appropriate fallback.
-        let account_key = auth_selection
+        let mut account_key = auth_selection
             .account_id
             .clone()
             .unwrap_or_else(|| cursor_account_digest(&auth_selection.auth.access_token));
@@ -5996,13 +6124,48 @@ impl Provider for CursorProvider {
             }
         }
         let has_tool_results = request_has_current_tool_result(&body);
-        if (uses_sand
-            || !policy_preflight_can_attach_existing_run_for_account(
-                &body,
-                &ctx,
-                Some(&account_key),
-            ))
-            && let Err(error) = policy_rate_limit_preflight(model, &client_type, &auth.access_token)
+        // Keep one failover state for the whole Sand request, including the
+        // preflight phase.  If the active account is already in cooldown, pick
+        // an unused saved account before opening the InferenceService stream;
+        // otherwise every Claude Code retry would fail fast on the same stale
+        // account and never reach the healthy pool.
+        let sand_account_failover_state =
+            Arc::new(Mutex::new(AccountFailoverState::new(&auth.access_token)));
+        if uses_sand {
+            loop {
+                let Err(error) =
+                    policy_rate_limit_preflight(model, &client_type, &auth.access_token)
+                else {
+                    break;
+                };
+                if !is_account_failover_policy_error(&error.client_message()) {
+                    return map_cursor_error_to_response(&error);
+                }
+                let Some(replacement) = account_failover_replacement_token(
+                    &auth.access_token,
+                    model,
+                    &client_type,
+                    &sand_account_failover_state,
+                ) else {
+                    return map_cursor_error_to_response(&error);
+                };
+                auth.access_token = replacement;
+                account_key = cursor_account_key_for_token(&auth.access_token);
+                create_logger("cursor").info(
+                    "sand_preflight_account_failover",
+                    Some(serde_json::Map::from_iter([
+                        ("model".into(), serde_json::json!(model)),
+                        ("clientType".into(), serde_json::json!(&client_type)),
+                        ("recovery".into(), serde_json::json!("fresh_request")),
+                    ])),
+                );
+            }
+        } else if !policy_preflight_can_attach_existing_run_for_account(
+            &body,
+            &ctx,
+            Some(&account_key),
+        ) && let Err(error) =
+            policy_rate_limit_preflight(model, &client_type, &auth.access_token)
         {
             return map_cursor_error_to_response(&error);
         }
@@ -6024,6 +6187,7 @@ impl Provider for CursorProvider {
                 &sand_model,
                 &resolved.model_id,
                 xai_compact,
+                sand_account_failover_state,
             )
             .await;
         }
@@ -6434,7 +6598,6 @@ impl Provider for CursorProvider {
         // Keep the selected profile id (when present) as the stable state
         // partition. It survives bearer refreshes and is updated below only
         // when bounded account failover selects a replacement credential.
-        let mut account_key = account_key;
         let account_failover_state = Arc::new(Mutex::new(AccountFailoverState::new(&token)));
 
         if let Some(events) = resumed_live_events.take() {
@@ -6802,7 +6965,12 @@ impl Provider for CursorProvider {
                 }
                 Err(e) => {
                     let policy_limited = crate::retry::is_policy_rate_limit(&e.client_message())
-                        || crate::retry::is_policy_rate_limit(&e.message);
+                        || crate::retry::is_policy_rate_limit(&e.message)
+                        || is_non_retryable_provider_error_message(&e.client_message())
+                        || is_non_retryable_provider_error_message(&e.message)
+                        || e.detail
+                            .as_deref()
+                            .is_some_and(is_non_retryable_provider_error_message);
                     if policy_limited {
                         probe_admission.mark_policy_limited(
                             model,
@@ -8065,11 +8233,19 @@ mod tests {
             "sand",
             &state,
         );
+        let fourth = take_account_failover_candidate_from_profiles(
+            &profiles,
+            third.as_deref().unwrap_or("token-current"),
+            "gemini-3.6-flash-high",
+            "sand",
+            &state,
+        );
         assert_eq!(first.as_deref(), Some("token-a"));
         assert_eq!(second.as_deref(), Some("token-b"));
-        assert!(third.is_none(), "the per-request swap budget is two");
+        assert_eq!(third.as_deref(), Some("token-c"));
+        assert!(fourth.is_none(), "all other accounts have been attempted");
         let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
-        assert_eq!(state.swaps, MAX_ACCOUNT_FAILOVER_SWAPS);
+        assert_eq!(state.swaps, account_failover_swap_limit(&profiles));
         assert!(
             state
                 .attempted_accounts
@@ -8086,6 +8262,26 @@ mod tests {
                 .contains(&cursor_account_digest("token-b"))
         );
         reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn account_failover_budget_covers_every_saved_account_with_hard_cap() {
+        let profiles = (0..12)
+            .map(|index| {
+                failover_test_profile(&format!("account-{index:02}"), &format!("token-{index:02}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(account_failover_swap_limit(&profiles), 11);
+
+        let oversized = (0..32)
+            .map(|index| {
+                failover_test_profile(&format!("account-{index:02}"), &format!("token-{index:02}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            account_failover_swap_limit(&oversized),
+            MAX_ACCOUNT_FAILOVER_SWAPS
+        );
     }
 
     #[test]
@@ -8156,7 +8352,10 @@ mod tests {
             }
         });
         let selected = selected.lock().unwrap_or_else(|poison| poison.into_inner());
-        assert_eq!(selected.len(), MAX_ACCOUNT_FAILOVER_SWAPS as usize);
+        assert_eq!(
+            selected.len(),
+            account_failover_swap_limit(&profiles) as usize
+        );
         assert_ne!(selected[0], selected[1]);
         reset_policy_rate_limit_breaker_for_test();
     }
@@ -8171,6 +8370,12 @@ mod tests {
         ));
         assert!(is_account_failover_policy_error(
             "Connect error 429: ERROR_RATE_LIMITED_CHANGEABLE: Free plans can only use Auto"
+        ));
+        assert!(is_account_failover_policy_error(
+            "Cursor error 400: ERROR_PROVIDER_ERROR providerStatusCode=400 resource_exhausted isRetryable=false"
+        ));
+        assert!(is_account_failover_policy_error(
+            r#"Cursor error 429: {"error":{"details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":400},"isRetryable":false}}}]}}"#
         ));
         assert!(!is_account_failover_policy_error(
             "Connect error 429: ERROR_RATE_LIMITED: You have an unpaid invoice"

@@ -929,9 +929,38 @@ impl SandRoutingPolicy {
 
 fn is_fable_sand_family(model: &str) -> bool {
     let normalized = normalize_sand_model(model);
-    normalized == "fable"
-        || normalized == "claude-fable-5"
-        || normalized.starts_with("claude-fable-5-")
+    if normalized == "fable" || normalized == "claude-fable-5" {
+        return true;
+    }
+    let Some(suffix) = normalized.strip_prefix("claude-fable-5-") else {
+        return false;
+    };
+    // Fable 5.1 is a separate family (`claude-fable-5-1`). Only treat
+    // recognized effort/display suffixes as variants of Fable 5.
+    let mut saw_variant = false;
+    for token in suffix.split('-') {
+        if token.is_empty() {
+            return false;
+        }
+        if matches!(
+            token,
+            "minimal"
+                | "none"
+                | "low"
+                | "medium"
+                | "high"
+                | "xhigh"
+                | "max"
+                | "thinking"
+                | "fast"
+                | "preview"
+        ) {
+            saw_variant = true;
+        } else {
+            return false;
+        }
+    }
+    saw_variant
 }
 
 /// Normalize a model id for Sand policy matching.
@@ -1074,15 +1103,50 @@ fn grok_namespace_counterpart(model: &str) -> Option<String> {
 /// including an empty value (which disables all Sand matches).
 pub fn cursor_sand_policy() -> SandRoutingPolicy {
     if let Some(raw) = std::env::var_os("CCP_CURSOR_SAND_MODELS") {
-        return SandRoutingPolicy::new(parse_sand_models_env(&raw.to_string_lossy()));
+        return sand_policy_with_builtin_fable(parse_sand_models_env(&raw.to_string_lossy()));
     }
 
-    let configured = read_file_config(&paths::config_dir())
-        .and_then(|file| file.cursor)
-        .and_then(|cursor| cursor.sand_models)
-        .map(SandModelsConfig::into_patterns)
-        .unwrap_or_default();
-    SandRoutingPolicy::new(configured)
+    let Some(cursor) = read_file_config(&paths::config_dir()).and_then(|file| file.cursor) else {
+        // Fable 5 is the primary Cursor Sand/Bot model. A clean install must
+        // be usable immediately by Claude Code, while an explicit empty
+        // `sandModels` array below still provides a deliberate opt-out.
+        return SandRoutingPolicy::new(["claude-fable-5"]);
+    };
+    let Some(models) = cursor.sand_models else {
+        // Keep the same default when a config file contains unrelated Cursor
+        // settings but has not yet opened the TUI Sand editor.
+        return SandRoutingPolicy::new(["claude-fable-5"]);
+    };
+    sand_policy_with_builtin_fable(models.into_patterns())
+}
+
+/// Keep Fable 5 available on the Desktop Sand/Bot lane whenever Sand is
+/// enabled.  The TUI lets users add other model families (Gemini, Grok, or a
+/// server-provided id), but those edits must not accidentally remove the
+/// built-in `claude-fable-5[1m]` route.  An explicitly empty policy remains a
+/// deliberate opt-out, which is useful for callers that want every request on
+/// the ordinary CLI/API identity.
+fn sand_policy_with_builtin_fable(patterns: Vec<String>) -> SandRoutingPolicy {
+    let policy = SandRoutingPolicy::new(patterns);
+    if policy.is_empty() || sand_policy_contains_fable(&policy) {
+        return policy;
+    }
+
+    let mut patterns = policy.into_patterns();
+    patterns.push("claude-fable-5".to_string());
+    SandRoutingPolicy::new(patterns)
+}
+
+/// Check Fable coverage without calling [`SandRoutingPolicy::matches_model`].
+/// That method resolves concrete Cursor aliases and can consult the process
+/// policy again for an uncached variant; using it while the policy itself is
+/// being constructed would recurse indefinitely.
+fn sand_policy_contains_fable(policy: &SandRoutingPolicy) -> bool {
+    policy.patterns().iter().any(|pattern| {
+        is_fable_sand_family(pattern)
+            || sand_pattern_matches(pattern, "claude-fable-5")
+            || sand_pattern_matches(pattern, "fable")
+    })
 }
 
 /// Alias retained for call sites that prefer the field's name.
@@ -2436,6 +2500,26 @@ mod tests {
     }
 
     #[test]
+    fn sand_policy_keeps_fable_5_1_separate_from_fable_5() {
+        let fable_51 = SandRoutingPolicy::new(["claude-fable-5-1-thinking-max"]);
+        assert!(fable_51.matches_model("claude-fable-5-1-thinking-max"));
+        assert!(!fable_51.matches_model("claude-fable-5[1m]"));
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["claude-fable-5-1-thinking-max"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let policy = cursor_sand_policy();
+        assert!(policy.matches_model("claude-fable-5[1m]"));
+        assert!(policy.matches_model("claude-fable-5-1-thinking-max"));
+    }
+
+    #[test]
     fn sand_policy_matches_grok_namespace_counterpart_at_same_tier() {
         let high = SandRoutingPolicy::new(["cursor-grok-4.6-high-fast"]);
         assert!(high.matches_model("cursor-grok-4.6-high-fast"));
@@ -2500,7 +2584,40 @@ mod tests {
         let _sand_env = EnvGuard::set("CCP_CURSOR_SAND_MODELS", "grok-*, [1m-invalid]");
         let from_env = cursor_sand_policy();
         assert!(from_env.matches("grok-4.5"));
-        assert!(!from_env.matches("claude-fable-5"));
+        // Fable is a built-in Sand/Bot route. A non-empty override can add or
+        // narrow other models, but must not make claude-fable-5 fall back to
+        // the CLI lane.
+        assert!(from_env.matches("claude-fable-5[1m]"));
+        assert!(!from_env.matches("gpt-5.4"));
+    }
+
+    #[test]
+    fn nonempty_sand_policy_keeps_fable_builtin_for_config_and_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":["gemini-3.1-pro"]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let from_file = cursor_sand_policy();
+        assert!(from_file.matches_model("gemini-3.1-pro[1m]"));
+        assert!(from_file.matches_model("claude-fable-5[1m]"));
+
+        let _sand_env = EnvGuard::set("CCP_CURSOR_SAND_MODELS", "grok-4.6-xhigh-fast");
+        let from_env = cursor_sand_policy();
+        assert!(from_env.matches_model("grok-4.6-xhigh-fast"));
+        assert!(from_env.matches_model("claude-fable-5[1m]"));
+        assert!(!from_env.matches_model("gemini-3.1-pro"));
+
+        // Empty overrides retain the explicit opt-out behavior.
+        let _empty_env = EnvGuard::set("CCP_CURSOR_SAND_MODELS", "");
+        let disabled = cursor_sand_policy();
+        assert!(disabled.is_empty());
+        assert!(!disabled.matches_model("claude-fable-5[1m]"));
     }
 
     #[test]
@@ -3138,10 +3255,45 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":[]}}"#,
+        )
+        .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "ide");
 
         assert_eq!(cursor_catalog_client_types(), vec!["ide"]);
+    }
+
+    #[test]
+    fn fable_defaults_to_sand_when_no_policy_has_been_saved() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        assert_eq!(cursor_client_type_for_model("claude-fable-5[1m]"), "sand");
+        assert_eq!(cursor_client_type_for_model("fable"), "sand");
+        assert_eq!(cursor_catalog_client_types(), vec!["cli", "sand"]);
+    }
+
+    #[test]
+    fn explicit_empty_sand_policy_disables_fable_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":[]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "cli");
+
+        assert_eq!(cursor_client_type_for_model("claude-fable-5[1m]"), "cli");
+        assert_eq!(cursor_catalog_client_types(), vec!["cli"]);
     }
 
     #[test]

@@ -33,7 +33,7 @@ use super::connect::{
     ConnectEndError, ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP,
     anthropic_error_type_from_live_error, cursor_connect_error_is_missing_conversation_data,
     cursor_connect_error_is_missing_image, decode_gzip_frame, encode_connect_frame,
-    parse_connect_error,
+    is_non_retryable_provider_error_message, parse_connect_error,
 };
 use super::exec_results::{
     CursorExecKind, PendingCursorExec, encode_control_close, encode_control_throw,
@@ -6630,7 +6630,28 @@ fn annotate_connect_end_error(
     fields.insert("status".into(), serde_json::json!(error.status));
     fields.insert("code".into(), serde_json::json!(error.code));
     fields.insert("message".into(), serde_json::json!(error.message));
+    if let Some(provider_code) = error.provider_error_code.as_deref() {
+        fields.insert("providerErrorCode".into(), serde_json::json!(provider_code));
+    }
+    if let Some(provider_status) = error.provider_status_code {
+        fields.insert(
+            "providerStatusCode".into(),
+            serde_json::json!(provider_status),
+        );
+    }
+    if let Some(provider_retryable) = error.provider_is_retryable {
+        fields.insert(
+            "providerIsRetryable".into(),
+            serde_json::json!(provider_retryable),
+        );
+    }
     let mut text = error.to_string();
+    // Cursor may wrap a deterministic provider rejection in outer
+    // `resource_exhausted`/429. Preserve a compact marker so the late retry
+    // pump can switch accounts after this ConnectEnd crosses into a string.
+    if error.is_non_retryable_provider_error() {
+        text.push_str(" [providerStatusCode=400,isRetryable=false]");
+    }
     // Connect END's short `message` can be generic while the useful 413 KV
     // diagnostic lives only in the serialized error detail. Preserve a
     // bounded copy so the outer late-retry pump can classify and recover it.
@@ -7300,6 +7321,12 @@ pub(crate) fn live_error_needs_checkpoint_continue(message: &str) -> bool {
 }
 
 pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
+    // Cursor's provider error envelope can carry an inner deterministic 4xx
+    // while the outer code is 429/resource_exhausted. It is eligible for
+    // account failover, not same-account replay.
+    if is_non_retryable_provider_error_message(message) {
+        return false;
+    }
     // A KV quota rejection is a deterministic conversation-state failure. It
     // can be wrapped by the hollow/reconnect formatter with an "ambiguous"
     // suffix even though no client-visible output was committed; the bounded
@@ -7383,6 +7410,15 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
 
 pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) -> bool {
     let text = err.client_message();
+    if is_non_retryable_provider_error_message(&text)
+        || is_non_retryable_provider_error_message(&err.message)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(is_non_retryable_provider_error_message)
+    {
+        return false;
+    }
     if crate::retry::is_billing_block(&text)
         || crate::retry::is_billing_block(&err.message)
         || crate::retry::is_capacity_shed(&text)
@@ -15824,6 +15860,9 @@ mod tests {
                 code: "invalid_argument".into(),
                 message: "Request too large (413)".into(),
                 detail: detail.into(),
+                provider_error_code: None,
+                provider_status_code: None,
+                provider_is_retryable: None,
             },
             None,
         );
@@ -17808,6 +17847,9 @@ mod tests {
                 code: "internal".into(),
                 message: "Image not found".into(),
                 detail: String::new(),
+                provider_error_code: None,
+                provider_status_code: None,
+                provider_is_retryable: None,
             },
             None,
         );
@@ -17818,6 +17860,15 @@ mod tests {
         assert!(
             !super::super::conversation::continuation_for(Some("sess-img-missing")).has_checkpoint
         );
+    }
+
+    #[test]
+    fn non_retryable_provider_400_is_not_replayed_on_same_account() {
+        let detail = r#"{"error":{"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":"400"},"isRetryable":false}}}]}}"#;
+        assert!(is_non_retryable_provider_error_message(detail));
+        assert!(!live_error_is_same_request_retryable(detail));
+        let error = CursorError::new(429, "ERROR_PROVIDER_ERROR", Some(detail.into()));
+        assert!(!cursor_start_error_is_same_request_retryable(&error));
     }
 
     #[tokio::test]

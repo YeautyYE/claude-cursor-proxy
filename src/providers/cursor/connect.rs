@@ -351,12 +351,89 @@ pub fn parse_connect_error(payload: &[u8]) -> Option<ConnectEndError> {
     let code = raw_code
         .or(raw_error_type)
         .unwrap_or_else(|| "upstream_error".to_string());
+    let provider = extract_provider_error_metadata(&parsed);
     Some(ConnectEndError {
         code,
         message,
         detail: parsed.to_string(),
         status,
+        provider_error_code: provider.error_code,
+        provider_status_code: provider.status_code,
+        provider_is_retryable: provider.is_retryable,
     })
+}
+
+/// Metadata emitted by Cursor's aiserver provider diagnostics.
+///
+/// The outer Connect error frequently says `resource_exhausted`/429 even when
+/// the provider rejected the request with a deterministic 4xx. Keeping the
+/// inner values lets the live router distinguish an account-specific provider
+/// failure from a retryable provider outage.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderErrorMetadata {
+    pub error_code: Option<String>,
+    pub status_code: Option<u16>,
+    pub is_retryable: Option<bool>,
+}
+
+fn extract_provider_error_metadata(parsed: &serde_json::Value) -> ProviderErrorMetadata {
+    let Some(details) = parsed
+        .pointer("/error/details")
+        .and_then(|value| value.as_array())
+    else {
+        return ProviderErrorMetadata::default();
+    };
+
+    for entry in details {
+        let Some(debug) = entry.get("debug") else {
+            continue;
+        };
+        let error_code = debug
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        let details = debug.get("details");
+        let status_code = details
+            .and_then(|value| {
+                value
+                    .get("additionalInfo")
+                    .or_else(|| value.get("additional_info"))
+            })
+            .and_then(|value| {
+                value
+                    .get("providerStatusCode")
+                    .or_else(|| value.get("provider_status_code"))
+            })
+            .and_then(parse_status_code_value);
+        let is_retryable = details
+            .and_then(|value| {
+                value
+                    .get("isRetryable")
+                    .or_else(|| value.get("is_retryable"))
+            })
+            .and_then(serde_json::Value::as_bool);
+
+        // A debug entry without provider metadata may describe another
+        // diagnostic (for example a region or auth error). Continue looking
+        // so a later provider entry remains authoritative.
+        if error_code.is_some() || status_code.is_some() || is_retryable.is_some() {
+            return ProviderErrorMetadata {
+                error_code,
+                status_code,
+                is_retryable,
+            };
+        }
+    }
+    ProviderErrorMetadata::default()
+}
+
+fn parse_status_code_value(value: &serde_json::Value) -> Option<u16> {
+    let number = match value {
+        serde_json::Value::Number(value) => value.as_u64()?,
+        serde_json::Value::String(value) => value.trim().parse::<u64>().ok()?,
+        _ => return None,
+    };
+    (400..600).contains(&number).then_some(number as u16)
 }
 
 fn extract_aiserver_detail(parsed: &serde_json::Value) -> Option<String> {
@@ -393,6 +470,78 @@ pub struct ConnectEndError {
     pub message: String,
     pub detail: String,
     pub status: u16,
+    /// Inner provider diagnostic code, when Cursor includes `ErrorDetails`.
+    pub provider_error_code: Option<String>,
+    /// Provider HTTP-ish status hidden inside Cursor's outer 429 envelope.
+    pub provider_status_code: Option<u16>,
+    /// Provider retry hint. `false` means retrying the same provider request
+    /// cannot repair the failure.
+    pub provider_is_retryable: Option<bool>,
+}
+
+impl ConnectEndError {
+    /// True for the provider rejection shape observed in Cursor's current
+    /// Sand/CLI responses: outer resource exhaustion, inner deterministic 4xx.
+    pub fn is_non_retryable_provider_error(&self) -> bool {
+        self.provider_error_code
+            .as_deref()
+            .is_some_and(|code| code.eq_ignore_ascii_case("ERROR_PROVIDER_ERROR"))
+            && self
+                .provider_status_code
+                .is_some_and(|status| (400..500).contains(&status))
+            && self.provider_is_retryable == Some(false)
+    }
+}
+
+/// Detect the same provider diagnostic after an error has crossed a string
+/// boundary (for example `CursorError::client_message`). This intentionally
+/// accepts both camelCase and snake_case JSON spellings and tolerates spaces.
+pub fn is_non_retryable_provider_error_message(message: &str) -> bool {
+    let compact = message
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    // The diagnostic has appeared as JSON, key=value text, and a mixture of
+    // both.  Read the first numeric provider status after either spelling so
+    // deterministic 4xx responses (not only the observed 400) can trigger
+    // account failover.
+    if compact.contains("error_provider_error")
+        && (compact.contains("isretryable\":false")
+            || compact.contains("is_retryable\":false")
+            || compact.contains("isretryable=false")
+            || compact.contains("is_retryable=false"))
+    {
+        let status_marker = compact
+            .find("providerstatuscode")
+            .or_else(|| compact.find("provider_status_code"));
+        if let Some(marker) = status_marker {
+            let digits = compact[marker..]
+                .chars()
+                .skip_while(|character| !character.is_ascii_digit())
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if digits.len() == 3
+                && digits
+                    .parse::<u16>()
+                    .ok()
+                    .is_some_and(|status| (400..500).contains(&status))
+            {
+                return true;
+            }
+        }
+    }
+    compact.contains("error_provider_error")
+        && (compact.contains("providerstatuscode\":\"400\"")
+            || compact.contains("providerstatuscode\":400")
+            || compact.contains("provider_status_code\":\"400\"")
+            || compact.contains("provider_status_code\":400")
+            || compact.contains("providerstatuscode=400")
+            || compact.contains("provider_status_code=400"))
+        && (compact.contains("isretryable\":false")
+            || compact.contains("is_retryable\":false")
+            || compact.contains("isretryable=false")
+            || compact.contains("is_retryable=false"))
 }
 
 impl std::fmt::Display for ConnectEndError {
@@ -666,6 +815,58 @@ mod tests {
             assert_eq!(error.code, "internal");
             assert!(error.message.contains(error_type));
         }
+    }
+
+    #[test]
+    fn provider_error_metadata_survives_outer_resource_exhausted_wrapper() {
+        let payload = serde_json::json!({
+            "error": {
+                "code": "resource_exhausted",
+                "details": [{
+                    "debug": {
+                        "error": "ERROR_PROVIDER_ERROR",
+                        "details": {
+                            "title": "Provider Error",
+                            "detail": "provider unavailable",
+                            "additionalInfo": {"providerStatusCode": "400"},
+                            "isRetryable": false
+                        }
+                    }
+                }],
+                "message": "Error"
+            }
+        });
+        let error = parse_connect_error(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(error.status, 429, "outer status remains observable");
+        assert_eq!(
+            error.provider_error_code.as_deref(),
+            Some("ERROR_PROVIDER_ERROR")
+        );
+        assert_eq!(error.provider_status_code, Some(400));
+        assert_eq!(error.provider_is_retryable, Some(false));
+        assert!(error.is_non_retryable_provider_error());
+        assert!(is_non_retryable_provider_error_message(&error.detail));
+    }
+
+    #[test]
+    fn provider_error_metadata_accepts_numeric_status_and_snake_case_fields() {
+        let payload = br#"{"error":{"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additional_info":{"provider_status_code":400},"is_retryable":false}}}]}}"#;
+        let error = parse_connect_error(payload).unwrap();
+        assert_eq!(error.provider_status_code, Some(400));
+        assert_eq!(error.provider_is_retryable, Some(false));
+        assert!(is_non_retryable_provider_error_message(&error.detail));
+    }
+
+    #[test]
+    fn provider_error_message_requires_deterministic_inner_status() {
+        let retryable = r#"{"error":{"details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":"400"},"isRetryable":true}}}]}}"#;
+        assert!(!is_non_retryable_provider_error_message(retryable));
+        let other_status = r#"{"error":{"details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":"503"},"isRetryable":false}}}]}}"#;
+        assert!(!is_non_retryable_provider_error_message(other_status));
+        let deterministic_forbidden = r#"{"error":{"details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":403},"isRetryable":false}}}]}}"#;
+        assert!(is_non_retryable_provider_error_message(
+            deterministic_forbidden
+        ));
     }
 
     #[test]

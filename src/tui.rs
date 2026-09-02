@@ -638,6 +638,9 @@ impl MonitorApp {
     fn merge_cached_sand_models(&mut self) {
         self.sand_models
             .extend(crate::providers::cursor::model::cursor_supported_models());
+        // The public Fable family id is valid for Sand even when the live
+        // catalog only returns effort-specific rows.
+        self.sand_models.push("claude-fable-5".to_string());
         // A model-account route is also a user-declared Cursor model id. The
         // live catalog can lag behind that edit (or be unavailable while the
         // account is refreshing), so keep exact route literals visible in the
@@ -2215,6 +2218,9 @@ fn apply_account_usage_result_for_wave(
 fn sand_model_choices(registry: &Registry) -> Vec<String> {
     let mut models = registry.supported_models_for("cursor");
     models.extend(crate::providers::cursor::model::cursor_supported_models());
+    // Keep the primary Sand/Bot family visible before the first live catalog
+    // refresh (and when a server omits the public alias from its catalog).
+    models.push("claude-fable-5".to_string());
     // Include exact model ids from account bindings even when the active
     // account's live catalog has not returned them yet. This keeps the first
     // Sand configuration step possible for a freshly added Grok catalog row.

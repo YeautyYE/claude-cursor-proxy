@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.99 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.100 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -271,9 +271,10 @@ Cursor 提供两个相互独立的额度通道。`modelAccounts` 只决定使用
 账号，按 `U` 并行刷新全部账号；排查前先看 `Updated` 时间，避免把旧缓存当成
 当前额度。
 
-代理不会把策略/额度 429 静默改投到另一通道或另一个账号；那样可能意外消耗
-其他账号额度，也会让重试变得不可预测。请在 TUI 调整模型的 `[cli]`/`[sand]`
-选择或账号绑定，然后发送新的请求。
+代理不会静默切换额度通道。遇到账号级 Sand 策略/额度错误时，会在同一通道内
+依次尝试其他未冷却的已保存账号，每个请求最多切换 16 次；如果模型显式绑定账号，
+故障转移仍限定在该绑定范围内。需要切换通道或固定账号时，请在 TUI 调整模型的
+`[cli]`/`[sand]` 选择或账号绑定。
 
 #### Grok 4.6：原生路由与 Cursor Sand
 
@@ -412,7 +413,11 @@ export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 `cursor.sandModels`；想从 TUI 编辑文件时先取消这个环境变量。需要混合
 路由时请保留 `CCP_CURSOR_CLIENT_TYPE` 默认值 `cli`；把它设为 `sand` 会让
 未命中规则的模型也使用 Sand。
-显式设置为空值 `CCP_CURSOR_SAND_MODELS=` 会关闭全部 Sand 匹配；取消该变量
+只要 Sand 已启用，`claude-fable-5[1m]` 就会作为内建 Sand/Bot 路由保留；即使
+`cursor.sandModels` 或 `CCP_CURSOR_SAND_MODELS` 还列了其他模型，也不会把 Fable
+切回 CLI，因此所有已登录 Cursor 账号都可使用 Fable。其他模型仍可在 TUI 中
+独立设置。显式设置空数组 `cursor.sandModels: []` 或空值
+`CCP_CURSOR_SAND_MODELS=` 才会同时关闭内建 Fable 和其他 Sand 匹配；取消环境变量
 后才会重新读取 `config.json`。
 
 ### 模型目录从哪里来
