@@ -1426,6 +1426,14 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             out.push("cursor.sandModels (config)".to_string());
         }
         if let Some(ref cursor) = file_cfg.cursor
+            && cursor
+                .client_type
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            out.push("cursor.clientType (config)".to_string());
+        }
+        if let Some(ref cursor) = file_cfg.cursor
             && let Some(routes) = cursor.model_accounts.as_ref()
             && !routes.clone().into_rules().is_empty()
         {
@@ -1861,7 +1869,7 @@ pub fn cursor_client_type() -> String {
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_TYPE") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return normalize_cursor_client_type(trimmed);
         }
     }
     let config_dir = paths::config_dir();
@@ -1871,10 +1879,129 @@ pub fn cursor_client_type() -> String {
     {
         let trimmed = client_type.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return normalize_cursor_client_type(trimmed);
         }
     }
     "cli".to_string()
+}
+
+fn normalize_cursor_client_type(client_type: &str) -> String {
+    if client_type.trim().eq_ignore_ascii_case("bot") {
+        "sand".to_string()
+    } else {
+        client_type.trim().to_string()
+    }
+}
+
+/// Return whether the process-wide Cursor client identity was explicitly
+/// configured.  The TUI uses this to show its transport chooser only for a
+/// fresh installation; once a user has selected a default, subsequent starts
+/// keep the normal monitor workflow and the `t` shortcut reopens the chooser.
+/// Environment variables remain authoritative and count as configured even
+/// when their value is empty.
+pub fn cursor_client_type_is_configured() -> bool {
+    if std::env::var_os("CCP_CURSOR_CLIENT_TYPE").is_some() {
+        return true;
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.cursor)
+        .and_then(|cursor| cursor.client_type)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Persist the process-wide Cursor identity selected by the TUI.
+///
+/// Model-specific `cursor.sandModels` rules remain higher priority: a model
+/// explicitly selected for Sand still uses Sand regardless of this fallback
+/// identity.  Only the two user-facing transports are accepted here; custom
+/// client identities remain available through config/env for advanced setups.
+pub fn persist_cursor_client_type(client_type: &str) -> io::Result<()> {
+    if std::env::var_os("CCP_CURSOR_CLIENT_TYPE").is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CCP_CURSOR_CLIENT_TYPE environment override is active",
+        ));
+    }
+    let normalized = match client_type.trim().to_ascii_lowercase().as_str() {
+        "cli" => "cli",
+        "sand" | "bot" => "sand",
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client type must be cli or sand",
+            ));
+        }
+    };
+
+    // Keep this lock independent from request handling: selecting a transport
+    // in the TUI must never block an in-flight Cursor stream.
+    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("config write lock poisoned"))?;
+
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut root = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid config JSON: {err}"),
+            )
+        })?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(err) => return Err(err),
+    };
+    if !root.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config root must be a JSON object",
+        ));
+    }
+    let cursor = root
+        .as_object_mut()
+        .expect("checked object above")
+        .entry("cursor")
+        .or_insert_with(|| serde_json::json!({}));
+    if !cursor.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config cursor must be a JSON object",
+        ));
+    }
+    cursor
+        .as_object_mut()
+        .expect("checked object above")
+        .insert(
+            "clientType".to_string(),
+            serde_json::Value::String(normalized.to_string()),
+        );
+
+    let encoded = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 /// Select the Cursor identity for one request. Sand routing is deliberately
@@ -3070,6 +3197,61 @@ mod tests {
     }
 
     #[test]
+    fn client_type_is_unconfigured_without_env_or_file_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(cursor_client_type(), "cli");
+        assert!(!cursor_client_type_is_configured());
+    }
+
+    #[test]
+    fn persist_client_type_preserves_other_cursor_settings() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"port":1234,"future":{"keep":true},"cursor":{"sandModels":["gemini-3.1-pro"],"clientType":"cli"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        persist_cursor_client_type("bot").unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["port"], 1234);
+        assert_eq!(value["future"]["keep"], true);
+        assert_eq!(value["cursor"]["sandModels"][0], "gemini-3.1-pro");
+        assert_eq!(value["cursor"]["clientType"], "sand");
+        assert_eq!(cursor_client_type(), "sand");
+        assert!(cursor_client_type_is_configured());
+    }
+
+    #[test]
+    fn persist_client_type_respects_environment_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        std::fs::write(&path, r#"{"cursor":{"clientType":"cli"}}"#).unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "sand");
+
+        assert!(cursor_client_type_is_configured());
+        let error = persist_cursor_client_type("cli").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(cursor_client_type(), "sand");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            r#"{"cursor":{"clientType":"cli"}}"#
+        );
+    }
+
+    #[test]
     fn sand_route_selects_gemini_aliases_without_changing_unmatched_models() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
@@ -3225,6 +3407,23 @@ mod tests {
             "ide",
             "explicit default identity remains available for other models"
         );
+    }
+
+    #[test]
+    fn bot_default_alias_uses_the_sand_wire_identity() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"cursor":{"sandModels":[]}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _client_type_env = EnvGuard::set("CCP_CURSOR_CLIENT_TYPE", "bot");
+
+        assert_eq!(cursor_client_type(), "sand");
+        assert_eq!(cursor_client_type_for_model("gemini-3.6-flash"), "sand");
     }
 
     #[test]

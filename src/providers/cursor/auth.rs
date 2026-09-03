@@ -1120,6 +1120,10 @@ pub fn save_cursor_auth_as_active(
     upsert_stored_account(&mut stored, account);
     stored.active_id = Some(id);
     save_stored_accounts(&stored)?;
+    // A fresh interactive login may change the account's entitlement set.
+    // Invalidate only this account's richer catalog; snapshots for other
+    // saved accounts remain warm for fast TUI switching.
+    crate::providers::cursor::catalog::clear_for_account(&saved.access_token);
     crate::providers::cursor::model::observe_live_usable_models_account(&saved.access_token);
     Ok(saved)
 }
@@ -1181,6 +1185,7 @@ pub fn add_cursor_auth(
         stored.active_id = Some(previous_id);
     }
     let proposed_id = stored_account_id(&auth);
+    let account_token_for_catalog = auth.access_token.clone();
     // Keep hand-authored/legacy ids stable when the bearer rotates. New
     // registry entries use the digest, while an existing entry may have a
     // shorter id from an earlier version of the proxy.
@@ -1218,6 +1223,10 @@ pub fn add_cursor_auth(
         stored.active_id = Some(id.clone());
     }
     save_stored_accounts(&stored)?;
+    // Re-adding an existing account is a credential/entitlement refresh. Do
+    // not reuse its previous AvailableModels snapshot, while preserving the
+    // catalog cache for every other account in the pool.
+    crate::providers::cursor::catalog::clear_for_account(&account_token_for_catalog);
     if first_account || replaces_active {
         let saved = file_store().save_auth(
             stored
@@ -1376,6 +1385,11 @@ pub fn remove_cursor_account(id: &str) -> anyhow::Result<Option<CursorAccountPro
         active_account = stored.accounts.first().cloned();
     }
     save_stored_accounts(&stored)?;
+    // Drop any richer catalog tied to the removed account. Other account
+    // snapshots remain available for immediate switching.
+    if let Some(account) = removed_account.as_ref() {
+        crate::providers::cursor::catalog::clear_for_account(&account.auth.access_token);
+    }
     if let Some(account) = active_account.as_ref() {
         crate::providers::cursor::model::observe_live_usable_models_account(
             &account.auth.access_token,
@@ -1431,7 +1445,10 @@ pub fn load_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
         Ok(Some(auth)) => {
             crate::providers::cursor::model::observe_live_usable_models_account(&auth.access_token);
         }
-        Ok(None) => crate::providers::cursor::model::clear_live_usable_models_account(),
+        Ok(None) => {
+            crate::providers::cursor::model::clear_live_usable_models_account();
+            crate::providers::cursor::catalog::clear();
+        }
         Err(_) => {}
     }
     result
@@ -2047,6 +2064,7 @@ pub fn clear_cursor_auth() -> anyhow::Result<()> {
         return Err(error);
     }
     crate::providers::cursor::model::clear_live_usable_models_account();
+    crate::providers::cursor::catalog::clear();
     Ok(())
 }
 

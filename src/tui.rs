@@ -107,6 +107,7 @@ fn run_monitor_loop(
     // terminal resize/restart in an embedding application). Do not inherit a
     // previous account usage fan-out into the new event loop.
     cancel_account_usage_workers();
+    reset_transport_ui();
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = MonitorApp {
@@ -180,6 +181,7 @@ fn run_monitor_events(
                         app.cancel_shutdown_confirmation()
                     }
                     _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
+                    _ if transport_ui_is_open() => handle_transport_key(key.code),
                     _ if app.show_sand_settings => app.handle_sand_key(key.code),
                     _ if app.detail == Some(DetailView::AccountRoutes) => {
                         handle_account_route_key(app, key.code)
@@ -204,6 +206,7 @@ fn run_monitor_events(
                         app.show_setup = false;
                         app.show_help = false;
                     }
+                    KeyCode::Char('t') => open_transport_settings(),
                     KeyCode::Tab => app.focus = app.focus.next(),
                     KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
                     KeyCode::Char('j') => {
@@ -449,6 +452,119 @@ fn account_route_ui_lock() -> std::sync::MutexGuard<'static, AccountRouteUiState
 
 static ACCOUNT_UI: LazyLock<Mutex<AccountUiState>> =
     LazyLock::new(|| Mutex::new(AccountUiState::default()));
+
+/// Process-wide state for the default Cursor transport chooser. Keeping this
+/// outside `MonitorApp` avoids changing the many lightweight monitor fixtures
+/// used by the renderer tests, while still making the chooser independent of
+/// request/session state.
+#[derive(Default)]
+struct TransportUiState {
+    show: bool,
+    selected: DefaultCursorTransport,
+    message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DefaultCursorTransport {
+    #[default]
+    Cli,
+    Sand,
+}
+
+static TRANSPORT_UI: LazyLock<Mutex<TransportUiState>> =
+    LazyLock::new(|| Mutex::new(TransportUiState::default()));
+
+fn transport_ui_lock() -> std::sync::MutexGuard<'static, TransportUiState> {
+    TRANSPORT_UI
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn reset_transport_ui() {
+    let mut ui = transport_ui_lock();
+    ui.selected = if matches_sand_transport(&config::cursor_client_type()) {
+        DefaultCursorTransport::Sand
+    } else {
+        DefaultCursorTransport::Cli
+    };
+    // Existing config/env values should make restarts quiet. A fresh install
+    // gets one explicit choice so the global fallback lane is intentional.
+    ui.show = !config::cursor_client_type_is_configured();
+    ui.message = if ui.show {
+        Some("Choose a default; model-specific Sand rules still take priority".to_string())
+    } else {
+        None
+    };
+}
+
+fn transport_ui_is_open() -> bool {
+    transport_ui_lock().show
+}
+
+fn open_transport_settings() {
+    let mut ui = transport_ui_lock();
+    ui.selected = if matches_sand_transport(&config::cursor_client_type()) {
+        DefaultCursorTransport::Sand
+    } else {
+        DefaultCursorTransport::Cli
+    };
+    ui.show = true;
+    ui.message = if std::env::var_os("CCP_CURSOR_CLIENT_TYPE").is_some() {
+        Some("CCP_CURSOR_CLIENT_TYPE is active; unset it to change the default".to_string())
+    } else {
+        Some("Choose a default; model-specific Sand rules still take priority".to_string())
+    };
+}
+
+fn matches_sand_transport(client_type: &str) -> bool {
+    matches!(
+        client_type.trim().to_ascii_lowercase().as_str(),
+        "sand" | "bot"
+    )
+}
+
+fn handle_transport_key(key: KeyCode) {
+    let mut ui = transport_ui_lock();
+    match key {
+        KeyCode::Esc | KeyCode::Char('t') => {
+            ui.show = false;
+            ui.message = None;
+        }
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Char('j')
+        | KeyCode::Char('k')
+        | KeyCode::Tab
+        | KeyCode::Char(' ') => {
+            ui.selected = match ui.selected {
+                DefaultCursorTransport::Cli => DefaultCursorTransport::Sand,
+                DefaultCursorTransport::Sand => DefaultCursorTransport::Cli,
+            };
+        }
+        KeyCode::Enter => {
+            if std::env::var_os("CCP_CURSOR_CLIENT_TYPE").is_some() {
+                ui.message = Some(
+                    "CCP_CURSOR_CLIENT_TYPE is active; unset it to change the default".to_string(),
+                );
+                return;
+            }
+            let value = match ui.selected {
+                DefaultCursorTransport::Cli => "cli",
+                DefaultCursorTransport::Sand => "sand",
+            };
+            match config::persist_cursor_client_type(value) {
+                Ok(()) => {
+                    ui.show = false;
+                    ui.message = None;
+                }
+                Err(error) => ui.message = Some(format!("Save failed: {error}")),
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorPhase {
@@ -2339,6 +2455,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     }
     if app.show_help {
         render_help_overlay(frame, area);
+    }
+    if transport_ui_is_open() {
+        render_transport_overlay(frame, area);
     }
     if matches!(app.detail, Some(DetailView::Accounts)) {
         render_account_delete_confirmation(frame, area);
@@ -4639,6 +4758,7 @@ fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: C
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) {
+    let default_transport = config::cursor_client_type();
     let spans = vec![
         Span::raw(" "),
         Span::styled("q", Style::default().fg(TEAL)),
@@ -4655,6 +4775,11 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" model accounts  ", Style::default().fg(DIM)),
         Span::styled("s", Style::default().fg(TEAL)),
         Span::styled(" sand models  ", Style::default().fg(DIM)),
+        Span::styled("t", Style::default().fg(TEAL)),
+        Span::styled(
+            format!(" default transport [{default_transport}]  "),
+            Style::default().fg(DIM),
+        ),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
         Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
@@ -4746,7 +4871,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     // Keep every shortcut visible after adding account-management actions.
     // Two rows are reserved for the border; narrow terminals still clamp to
     // the available height.
-    let shortcut_rows = 12u16;
+    let shortcut_rows = 13u16;
     let height = if area.height >= 10 {
         (shortcut_rows + 2).min(area.height.saturating_sub(2))
     } else {
@@ -4776,6 +4901,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("d", "delete selected Cursor account"),
         ("m", "assign models to accounts"),
         ("s", "configure Sand models"),
+        ("t", "choose default CLI / Bot transport"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
         ("Tab", "switch pane"),
@@ -4839,6 +4965,95 @@ fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: 
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" toggle setup", Style::default().fg(DIM)),
     ]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn render_transport_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let width = 68.min(area.width.saturating_sub(4)).max(36);
+    let ui = transport_ui_lock();
+    let selected_cli = ui.selected == DefaultCursorTransport::Cli;
+    let selected_sand = ui.selected == DefaultCursorTransport::Sand;
+    let cli_style = if selected_cli {
+        Style::default().fg(WHITE).bg(SELECTED_BG)
+    } else {
+        Style::default().fg(DIM_WHITE)
+    };
+    let sand_style = if selected_sand {
+        Style::default().fg(WHITE).bg(SELECTED_BG)
+    } else {
+        Style::default().fg(DIM_WHITE)
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Select the default Cursor request lane",
+            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Per-model [sand] selections override this fallback.",
+            Style::default().fg(DIM_WHITE),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(if selected_cli { "  > " } else { "    " }, cli_style),
+            Span::styled("CLI / API", cli_style),
+            Span::styled("  ordinary Cursor Agent lane", Style::default().fg(DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled(if selected_sand { "  > " } else { "    " }, sand_style),
+            Span::styled("Bot / Sand", sand_style),
+            Span::styled("  Cursor Desktop inference lane", Style::default().fg(DIM)),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(message) = ui.message.as_deref() {
+        lines.push(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(YELLOW),
+        )));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("←/→ or j/k", Style::default().fg(TEAL)),
+        Span::styled(" select  ", Style::default().fg(DIM)),
+        Span::styled("Enter", Style::default().fg(TEAL)),
+        Span::styled(" save  ", Style::default().fg(DIM)),
+        Span::styled("Esc", Style::default().fg(TEAL)),
+        Span::styled(" close  ", Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("After startup: ", Style::default().fg(DIM)),
+        Span::styled("t", Style::default().fg(TEAL)),
+        Span::styled(" opens this chooser again", Style::default().fg(DIM_WHITE)),
+    ]));
+
+    // Leave room for one wrapped line in the status/description text so the
+    // final shortcut hint is not clipped on normal terminal widths.
+    let height = (lines.len() as u16 + 4)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            " Default Transport ",
+            Style::default().fg(TEAL),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEAL))
+        .style(Style::default().bg(BG));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().bg(BG))
@@ -4999,6 +5214,7 @@ pub fn setup_text(port: u16, registry: &Registry) -> String {
     } else {
         sand_patterns
     };
+    let default_transport = config::cursor_client_type();
     let account_routes = config::cursor_account_routing_policy()
         .routes()
         .iter()
@@ -5014,6 +5230,7 @@ pub fn setup_text(port: u16, registry: &Registry) -> String {
         format!("Config: {}", paths::config_dir().display()),
         format!("Providers: {model_summary}"),
         format!("Sand models: {sand_summary}"),
+        format!("Default Cursor transport: {default_transport} (press t to change)"),
         format!("Model accounts: {account_route_summary}"),
     ];
     lines.push(format!(
@@ -5092,6 +5309,7 @@ mod tests {
     use crate::monitor::{EndpointKind, mock_state};
 
     static ACCOUNT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TRANSPORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn draw(width: u16, height: u16, render: impl FnOnce(&mut ratatui::Frame<'_>)) -> Buffer {
         let backend = TestBackend::new(width, height);
@@ -7151,6 +7369,30 @@ mod tests {
         let text = buffer_text(&header);
         assert!(text.contains("http://[::]:18765"), "{text}");
         assert!(text.contains("usage"), "{text}");
+    }
+
+    #[test]
+    fn default_transport_overlay_explains_choices_and_toggle_shortcut() {
+        let _guard = TRANSPORT_TEST_LOCK.lock().unwrap();
+        {
+            let mut ui = transport_ui_lock();
+            ui.show = true;
+            ui.selected = DefaultCursorTransport::Cli;
+            ui.message = Some("Choose a default".to_string());
+        }
+
+        let overlay = draw(90, 20, |frame| {
+            render_transport_overlay(frame, frame.area())
+        });
+        let text = buffer_text(&overlay);
+        assert!(text.contains("CLI / API"), "{text}");
+        assert!(text.contains("Bot / Sand"), "{text}");
+        assert!(text.contains("Per-model [sand]"), "{text}");
+        assert!(text.contains("t opens this chooser again"), "{text}");
+
+        let mut ui = transport_ui_lock();
+        ui.show = false;
+        ui.message = None;
     }
 
     #[test]

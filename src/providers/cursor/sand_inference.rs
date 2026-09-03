@@ -17,9 +17,11 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorUpstreamResponse};
@@ -46,6 +48,442 @@ pub const MAX_SAND_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 /// because each replay is a new upstream invocation.
 pub const DEFAULT_SAND_STREAM_RETRIES: u32 = 5;
 pub const MAX_SAND_STREAM_RETRIES: u32 = 5;
+
+// ---------------------------------------------------------------------------
+// Sand open admission and transport breaker
+// ---------------------------------------------------------------------------
+//
+// InferenceService opens are materially more expensive than reading an
+// already-established stream (TLS/H2 setup plus provider admission).  A
+// Claude Code/Grok retry wave used to let every request perform three 90s
+// opens at once.  Besides exhausting the upstream connection pool, that made
+// one stalled account look like hundreds of independent 502s.  Keep a small,
+// independent open bulkhead here; the AgentService live gate intentionally
+// does not cover Sand requests.
+const SAND_OPEN_GLOBAL_DEFAULT: usize = 32;
+const SAND_OPEN_GLOBAL_MAX: usize = 512;
+const SAND_OPEN_ACCOUNT_DEFAULT: usize = 4;
+const SAND_OPEN_ACCOUNT_MAX: usize = 64;
+const SAND_OPEN_QUEUE_DEFAULT_SECS: u64 = 15;
+const SAND_OPEN_QUEUE_MAX_SECS: u64 = 120;
+const SAND_OPEN_BREAKER_THRESHOLD_DEFAULT: u32 = 3;
+const SAND_OPEN_BREAKER_THRESHOLD_MAX: u32 = 16;
+const SAND_OPEN_BREAKER_COOLDOWN_DEFAULT_SECS: u64 = 15;
+const SAND_OPEN_BREAKER_COOLDOWN_MAX_SECS: u64 = 300;
+const SAND_OPEN_BREAKER_MAX_ENTRIES: usize = 2048;
+/// One logical Claude/Grok turn may contain an initial open plus several
+/// pre-output stream replays. Keep a single wall-clock budget across those
+/// phases so each retry cannot start another unbounded 3x90s episode.
+const SAND_LOGICAL_RETRY_DEFAULT_SECS: u64 = 600;
+const SAND_LOGICAL_RETRY_MAX_SECS: u64 = 3_600;
+
+fn bounded_env_usize(name: &str, default: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .clamp(1, max)
+}
+
+fn bounded_env_u64(name: &str, default: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .clamp(1, max)
+}
+
+fn sand_open_global_limit() -> usize {
+    bounded_env_usize(
+        "CCP_CURSOR_SAND_OPEN_CONCURRENCY",
+        SAND_OPEN_GLOBAL_DEFAULT,
+        SAND_OPEN_GLOBAL_MAX,
+    )
+}
+
+fn sand_open_account_limit() -> usize {
+    bounded_env_usize(
+        "CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY",
+        SAND_OPEN_ACCOUNT_DEFAULT,
+        SAND_OPEN_ACCOUNT_MAX,
+    )
+}
+
+pub(crate) fn sand_logical_retry_budget() -> Duration {
+    Duration::from_secs(bounded_env_u64(
+        "CCP_CURSOR_SAND_RETRY_BUDGET_SECS",
+        SAND_LOGICAL_RETRY_DEFAULT_SECS,
+        SAND_LOGICAL_RETRY_MAX_SECS,
+    ))
+}
+
+pub(crate) fn sand_open_total_budget() -> Duration {
+    Duration::from_secs(bounded_env_u64("CCP_CURSOR_SAND_OPEN_TOTAL_SECS", 180, 900).max(20))
+}
+
+pub(crate) fn sand_open_queue_secs() -> u64 {
+    bounded_env_u64(
+        "CCP_CURSOR_SAND_OPEN_QUEUE_SECS",
+        SAND_OPEN_QUEUE_DEFAULT_SECS,
+        SAND_OPEN_QUEUE_MAX_SECS,
+    )
+}
+
+fn sand_open_breaker_threshold() -> u32 {
+    bounded_env_u64(
+        "CCP_CURSOR_SAND_BREAKER_THRESHOLD",
+        u64::from(SAND_OPEN_BREAKER_THRESHOLD_DEFAULT),
+        u64::from(SAND_OPEN_BREAKER_THRESHOLD_MAX),
+    ) as u32
+}
+
+fn sand_open_breaker_cooldown() -> Duration {
+    Duration::from_secs(bounded_env_u64(
+        "CCP_CURSOR_SAND_BREAKER_COOLDOWN_SECS",
+        SAND_OPEN_BREAKER_COOLDOWN_DEFAULT_SECS,
+        SAND_OPEN_BREAKER_COOLDOWN_MAX_SECS,
+    ))
+}
+
+#[derive(Debug)]
+struct SandOpenGate {
+    global: Arc<Semaphore>,
+    account_limit: usize,
+    account_max_entries: usize,
+    account: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl SandOpenGate {
+    fn new(global_limit: usize, account_limit: usize) -> Self {
+        Self::with_account_capacity(global_limit, account_limit, SAND_OPEN_BREAKER_MAX_ENTRIES)
+    }
+
+    fn with_account_capacity(
+        global_limit: usize,
+        account_limit: usize,
+        account_max_entries: usize,
+    ) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(global_limit.clamp(1, SAND_OPEN_GLOBAL_MAX))),
+            account_limit: account_limit.clamp(1, SAND_OPEN_ACCOUNT_MAX),
+            account_max_entries: account_max_entries.max(1),
+            account: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the lane for `key`, evicting only entries that have no active
+    /// permit or waiter.  Evicting an active semaphore would let the next
+    /// request create a second lane for the same account/model and silently
+    /// bypass the configured per-account concurrency limit. If every bounded
+    /// entry is active, reject the new lane rather than growing the map
+    /// without limit; the caller surfaces a retryable 503 and existing work
+    /// remains protected.
+    fn account_gate(&self, key: &str) -> Option<Arc<Semaphore>> {
+        let mut account = self
+            .account
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(gate) = account.get(key) {
+            return Some(Arc::clone(gate));
+        }
+        // Account ids are user-controlled in multi-account mode. Keep this
+        // map bounded even when a caller rotates through a large credential
+        // pool. Existing permits/waiters hold their Arc independently, so
+        // only an idle map entry may be evicted.
+        if account.len() >= self.account_max_entries {
+            let idle = account
+                .iter()
+                .find(|(_, gate)| Arc::strong_count(gate) == 1)
+                .map(|(key, _)| key.clone());
+            if let Some(idle) = idle {
+                account.remove(&idle);
+            } else {
+                return None;
+            }
+        }
+        let gate = Arc::new(Semaphore::new(self.account_limit));
+        account.insert(key.to_string(), Arc::clone(&gate));
+        Some(gate)
+    }
+
+    async fn acquire(&self, key: &str, wait: Duration) -> Result<SandOpenPermit, CursorError> {
+        let deadline = Instant::now() + wait;
+        // Acquire the account/model lane first. If the lane is saturated,
+        // waiting callers must not hold all global permits while queued;
+        // doing so would starve unrelated healthy accounts (head-of-line
+        // blocking was a major source of cross-account 502 waves).
+        let account_gate = self
+            .account_gate(key)
+            .ok_or_else(sand_open_admission_error)?;
+        let account = match tokio::time::timeout(wait, account_gate.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => return Err(sand_open_admission_error()),
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(account);
+            return Err(sand_open_admission_error());
+        }
+        let global =
+            match tokio::time::timeout(remaining, Arc::clone(&self.global).acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    drop(account);
+                    return Err(sand_open_admission_error());
+                }
+            };
+        Ok(SandOpenPermit {
+            _global: global,
+            _account: account,
+        })
+    }
+}
+
+/// A permit is intentionally scoped to one HTTP `.send()` attempt.  Holding
+/// it while consuming model tokens would turn the open bulkhead into a global
+/// stream limit; releasing it as soon as headers arrive still protects the
+/// expensive handshake and guarantees cancellation/timeout release.
+#[derive(Debug)]
+pub(crate) struct SandOpenPermit {
+    _global: OwnedSemaphorePermit,
+    _account: OwnedSemaphorePermit,
+}
+
+static SAND_OPEN_GATE: LazyLock<SandOpenGate> =
+    LazyLock::new(|| SandOpenGate::new(sand_open_global_limit(), sand_open_account_limit()));
+
+fn sand_open_admission_error() -> CursorError {
+    let mut error = CursorError::new(
+        503,
+        "Sand open admission queue timed out; retry after upstream capacity recovers",
+        None,
+    );
+    error.retry_after = Some("2".to_string());
+    error
+}
+
+/// Acquire process and account/model-scoped capacity before one Sand open.
+/// `wait` is supplied by the caller's total retry deadline so queueing can
+/// never extend a request past its own budget.
+pub(crate) async fn admit_sand_open(
+    token: &str,
+    model: &str,
+    wait: Duration,
+) -> Result<SandOpenPermit, CursorError> {
+    let key = capability_key(token, model).0;
+    SAND_OPEN_GATE.acquire(&key, wait).await
+}
+
+#[derive(Debug, Clone)]
+struct SandOpenBreakerState {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    half_open_probe: bool,
+    last_failure: Instant,
+    /// A failure from an attempt that started before this instant is stale
+    /// and must not re-open a route that has already proved healthy.
+    last_success: Option<Instant>,
+}
+
+static SAND_OPEN_BREAKER: LazyLock<Mutex<HashMap<String, SandOpenBreakerState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn breaker_key(token: &str, model: &str) -> String {
+    capability_key(token, model).0
+}
+
+fn breaker_error(remaining: Duration) -> CursorError {
+    let retry_after = remaining.as_secs().clamp(1, 300).to_string();
+    let mut error = CursorError::new(
+        503,
+        "Sand inference temporarily unavailable; open circuit is cooling down",
+        None,
+    );
+    error.retry_after = Some(retry_after);
+    error
+}
+
+/// Check whether a request may issue a Sand open. One half-open probe is
+/// admitted after cooldown; all other callers fail fast with 503 instead of
+/// creating another synchronized retry wave.
+pub(crate) fn sand_open_breaker_admit(token: &str, model: &str) -> Result<(), CursorError> {
+    let key = breaker_key(token, model);
+    let now = Instant::now();
+    let mut breaker = SAND_OPEN_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    breaker.retain(|_, state| {
+        state.open_until.is_none_or(|until| until > now)
+            || now.saturating_duration_since(state.last_failure) < Duration::from_secs(600)
+    });
+    let Some(state) = breaker.get_mut(&key) else {
+        return Ok(());
+    };
+    if let Some(until) = state.open_until {
+        if until > now {
+            return Err(breaker_error(until.saturating_duration_since(now)));
+        }
+        if state.half_open_probe {
+            // A cancelled task can disappear before it reports success or
+            // failure. Treat a probe that has been silent for one cooldown as
+            // abandoned and allow a fresh probe; otherwise one client
+            // disconnect could permanently wedge this account/model lane.
+            if now.saturating_duration_since(state.last_failure) >= sand_open_breaker_cooldown() {
+                state.half_open_probe = false;
+            } else {
+                return Err(breaker_error(Duration::from_secs(2)));
+            }
+        }
+        state.half_open_probe = true;
+        state.last_failure = now;
+    }
+    Ok(())
+}
+
+/// Mark an accepted Sand open healthy and close any half-open circuit.
+pub(crate) fn sand_open_breaker_success(token: &str, model: &str) {
+    let key = breaker_key(token, model);
+    let now = Instant::now();
+    let mut breaker = SAND_OPEN_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if breaker.len() >= SAND_OPEN_BREAKER_MAX_ENTRIES && !breaker.contains_key(&key) {
+        if let Some(oldest) = breaker
+            .iter()
+            .min_by_key(|(_, state)| state.last_failure)
+            .map(|(key, _)| key.clone())
+        {
+            breaker.remove(&oldest);
+        }
+    }
+    let state = breaker.entry(key).or_insert_with(|| SandOpenBreakerState {
+        consecutive_failures: 0,
+        open_until: None,
+        half_open_probe: false,
+        last_failure: now,
+        last_success: None,
+    });
+    state.consecutive_failures = 0;
+    state.open_until = None;
+    state.half_open_probe = false;
+    state.last_failure = now;
+    state.last_success = Some(now);
+}
+
+/// Abort a half-open probe that never reached the upstream (for example when
+/// local open admission timed out or a deterministic capability response was
+/// returned). Without this transition the probe flag would remain set after
+/// cooldown and permanently reject every later request for that key.
+pub(crate) fn sand_open_breaker_abort(token: &str, model: &str, retryable: bool) {
+    let key = breaker_key(token, model);
+    let now = Instant::now();
+    let mut breaker = SAND_OPEN_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(state) = breaker.get_mut(&key) else {
+        return;
+    };
+    if !state.half_open_probe {
+        return;
+    }
+    state.half_open_probe = false;
+    if retryable {
+        // Keep a short cool-off after a failed half-open probe, but do not
+        // extend the full breaker cooldown indefinitely on local queue loss.
+        state.open_until = Some(now + Duration::from_secs(2));
+    } else {
+        // A non-transient response proves the route itself was reached; let
+        // the normal capability/policy classifier handle it without a stale
+        // transport circuit.
+        breaker.remove(&key);
+    }
+}
+
+fn sand_open_error_is_breaker_candidate(error: &CursorError) -> bool {
+    let message = error.client_message();
+    let lower = message.to_ascii_lowercase();
+    if crate::retry::is_policy_rate_limit(&message)
+        || is_non_retryable_provider_error_message(&message)
+        || lower.contains("sand traffic is not supported")
+        || lower.contains("bad model name")
+        || lower.contains("outdated client")
+        || lower.contains("open admission queue")
+        || lower.contains("open circuit")
+    {
+        return false;
+    }
+    is_transient_provider_error_message(&message)
+        || matches!(error.status, 408 | 425 | 500 | 502 | 503 | 504)
+        || lower.contains("connect failed")
+        || lower.contains("timed out")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+}
+
+/// Record a failed transient open. The breaker is account/model scoped so a
+/// healthy account continues serving while one exhausted route cools down.
+pub(crate) fn sand_open_breaker_failure(
+    token: &str,
+    model: &str,
+    error: &CursorError,
+    attempt_started: Instant,
+) {
+    if !sand_open_error_is_breaker_candidate(error) {
+        sand_open_breaker_abort(token, model, false);
+        return;
+    }
+    let key = breaker_key(token, model);
+    let now = Instant::now();
+    let threshold = sand_open_breaker_threshold();
+    let cooldown = sand_open_breaker_cooldown();
+    let mut breaker = SAND_OPEN_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if breaker.len() >= SAND_OPEN_BREAKER_MAX_ENTRIES && !breaker.contains_key(&key) {
+        if let Some(oldest) = breaker
+            .iter()
+            .min_by_key(|(_, state)| state.last_failure)
+            .map(|(key, _)| key.clone())
+        {
+            breaker.remove(&oldest);
+        }
+    }
+    let state = breaker.entry(key).or_insert_with(|| SandOpenBreakerState {
+        consecutive_failures: 0,
+        open_until: None,
+        half_open_probe: false,
+        last_failure: now,
+        last_success: None,
+    });
+    if state
+        .last_success
+        .is_some_and(|last_success| attempt_started <= last_success)
+    {
+        // A slower request that began before a successful concurrent probe
+        // cannot invalidate that success. Keep the healthy state intact.
+        state.last_failure = now;
+        state.half_open_probe = false;
+        return;
+    }
+    state.last_failure = now;
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    if state.consecutive_failures >= threshold {
+        state.open_until = Some(now + cooldown);
+        state.half_open_probe = false;
+    }
+}
+
+/// Test/diagnostic reset. Production state is intentionally process-local and
+/// is cleared only when the proxy exits or this explicit helper is called.
+#[cfg(test)]
+fn reset_sand_open_state_for_test() {
+    SAND_OPEN_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+}
 
 /// Sand tool support is provider/model/account specific.  Cursor can accept
 /// the same `InferenceService/Stream` request for text while rejecting a
@@ -3353,6 +3791,132 @@ mod tests {
         assert_eq!(SandToolCapability::Unknown.as_str(), "unknown");
         assert_eq!(SandToolCapability::Supported.as_str(), "supported");
         assert_eq!(SandToolCapability::Unsupported.as_str(), "unsupported");
+    }
+
+    #[test]
+    fn sand_open_breaker_is_scoped_and_recovers_after_success() {
+        reset_sand_open_state_for_test();
+        let token = "sand-breaker-account-a";
+        let model = "cursor-grok-breaker-test";
+        let other_token = "sand-breaker-account-b";
+        let transient = CursorError::new(504, "upstream timed out", None);
+
+        assert!(sand_open_breaker_admit(token, model).is_ok());
+        for _ in 0..3 {
+            sand_open_breaker_failure(token, model, &transient, Instant::now());
+        }
+        let blocked = sand_open_breaker_admit(token, model).expect_err("breaker should open");
+        assert_eq!(blocked.status, 503);
+        // A different account/model lane must remain eligible.
+        assert!(sand_open_breaker_admit(other_token, model).is_ok());
+        sand_open_breaker_success(token, model);
+        assert!(sand_open_breaker_admit(token, model).is_ok());
+        reset_sand_open_state_for_test();
+    }
+
+    #[test]
+    fn deterministic_open_error_does_not_leave_half_open_probe_stuck() {
+        reset_sand_open_state_for_test();
+        let token = "sand-breaker-half-open";
+        let model = "cursor-grok-half-open-test";
+        let transient = CursorError::new(504, "upstream timed out", None);
+        for _ in 0..3 {
+            sand_open_breaker_failure(token, model, &transient, Instant::now());
+        }
+
+        // Force the half-open transition without sleeping by directly using a
+        // short-lived test state, then feed a deterministic capability error.
+        {
+            let key = breaker_key(token, model);
+            let mut breaker = SAND_OPEN_BREAKER.lock().unwrap();
+            let state = breaker.get_mut(&key).expect("opened state");
+            state.open_until = Some(Instant::now() - Duration::from_secs(1));
+            state.half_open_probe = false;
+        }
+        assert!(sand_open_breaker_admit(token, model).is_ok());
+        let deterministic = CursorError::new(400, "bad model name", None);
+        sand_open_breaker_failure(token, model, &deterministic, Instant::now());
+        assert!(sand_open_breaker_admit(token, model).is_ok());
+        reset_sand_open_state_for_test();
+    }
+
+    #[test]
+    fn stale_failure_cannot_reopen_after_concurrent_success() {
+        reset_sand_open_state_for_test();
+        let token = "sand-breaker-stale-failure";
+        let model = "cursor-grok-stale-failure-test";
+        let request_started = Instant::now() - Duration::from_secs(1);
+        let transient = CursorError::new(504, "upstream timed out", None);
+
+        sand_open_breaker_success(token, model);
+        sand_open_breaker_failure(token, model, &transient, request_started);
+        assert!(sand_open_breaker_admit(token, model).is_ok());
+        reset_sand_open_state_for_test();
+    }
+
+    #[tokio::test]
+    async fn sand_open_gate_releases_permits_on_drop_and_keeps_accounts_fair() {
+        let gate = SandOpenGate::new(2, 1);
+        let first = gate
+            .acquire("account-a\0model", Duration::from_millis(100))
+            .await
+            .expect("first permit");
+        // A second request for the same account must wait while the first
+        // permit is held, whereas another account can use the remaining
+        // global slot immediately.
+        let same_account = gate.acquire("account-a\0model", Duration::from_millis(10));
+        assert!(same_account.await.is_err());
+        let other_account = gate
+            .acquire("account-b\0model", Duration::from_millis(100))
+            .await
+            .expect("other account should not be head-of-line blocked");
+        drop(other_account);
+        drop(first);
+        gate.acquire("account-a\0model", Duration::from_millis(100))
+            .await
+            .expect("permit must return after drop");
+    }
+
+    #[tokio::test]
+    async fn sand_open_gate_never_evicts_an_active_lane() {
+        // Use a one-entry map so the eviction path is deterministic. The
+        // active permit keeps an Arc reference to its semaphore; a new key
+        // must be rejected rather than creating a second lane that bypasses
+        // the account limit.
+        let gate = SandOpenGate::with_account_capacity(4, 1, 1);
+        let first = gate
+            .acquire("active-account\0model", Duration::from_millis(100))
+            .await
+            .expect("first permit");
+        assert!(
+            gate.acquire("new-account\0model", Duration::from_millis(5))
+                .await
+                .is_err(),
+            "a full map of active lanes must fail closed instead of bypassing limits"
+        );
+        {
+            let account = gate.account.lock().unwrap();
+            assert!(account.contains_key("active-account\0model"));
+            assert!(!account.contains_key("new-account\0model"));
+        }
+        drop(first);
+
+        // Once the old lane is idle it may be evicted and the new account can
+        // proceed. This confirms the bounded map still recovers normally.
+        let replacement = gate
+            .acquire("new-account\0model", Duration::from_millis(100))
+            .await
+            .expect("idle lane should be evictable");
+        drop(replacement);
+    }
+
+    #[test]
+    fn sand_retry_budget_is_bounded_and_configurable_shape_is_stable() {
+        // The defaults leave enough room for the normal five stream retries,
+        // while the implementation clamps hostile environment values.
+        assert!(sand_logical_retry_budget() >= Duration::from_secs(60));
+        assert!(sand_open_total_budget() >= Duration::from_secs(20));
+        assert!(sand_open_total_budget() <= Duration::from_secs(900));
     }
 
     #[tokio::test]

@@ -9,7 +9,6 @@
 //! catalog changes without a proxy release.
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -53,6 +52,13 @@ pub struct CatalogMatch {
 
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 const CATALOG_MAX_ACCOUNTS: usize = 64;
+// Invalidation epochs are deliberately kept a little larger than the live
+// snapshot bound.  They normally contain one entry per saved account; the
+// generous cap also covers opaque-token rotations before the old identities
+// are pruned.  If an unusually large credential pool exceeds it, resetting
+// the whole metadata cache is safer than dropping an epoch and allowing an
+// already-running request to repopulate stale data.
+const CATALOG_MAX_EPOCHS: usize = CATALOG_MAX_ACCOUNTS * 16;
 
 #[derive(Debug, Clone)]
 struct Snapshot {
@@ -63,6 +69,22 @@ struct Snapshot {
 #[derive(Debug, Default)]
 struct Cache {
     entries: BTreeMap<String, Snapshot>,
+    /// Per-account invalidation counters.  A clear/re-login increments the
+    /// counter, allowing an in-flight request that started before the clear
+    /// to be discarded when it eventually completes.
+    account_epochs: BTreeMap<String, u64>,
+    /// Global epoch used by `clear()`.  Keeping it separate means a late
+    /// response from any account cannot resurrect a snapshot after logout.
+    global_epoch: u64,
+}
+
+/// Opaque generation captured immediately before a catalog request.  The
+/// bearer/account identity is never retained in this value; it is only a pair
+/// of monotonic counters checked while storing the response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheGeneration {
+    global: u64,
+    account: u64,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -71,8 +93,11 @@ fn cache() -> &'static Mutex<Cache> {
 }
 
 fn cache_key(token: &str, client_type: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    format!("{digest:x}:{}", normalize_identity(client_type))
+    // Access JWTs rotate during a normal session.  Partition by Cursor's
+    // stable account identity instead of the transient bearer so a refresh
+    // does not discard a still-fresh five-minute catalog snapshot.
+    let digest = crate::providers::cursor::auth::cursor_account_digest(token);
+    format!("{digest}:{}", normalize_identity(client_type))
 }
 
 fn normalize_identity(client_type: &str) -> String {
@@ -90,31 +115,75 @@ fn prune_locked(cache: &mut Cache) {
     cache
         .entries
         .retain(|_, snapshot| snapshot.fetched_at.elapsed() < CATALOG_TTL);
-    if cache.entries.len() <= CATALOG_MAX_ACCOUNTS {
-        return;
+    if cache.entries.len() > CATALOG_MAX_ACCOUNTS {
+        let mut order: Vec<(String, Instant)> = cache
+            .entries
+            .iter()
+            .map(|(key, snapshot)| (key.clone(), snapshot.fetched_at))
+            .collect();
+        order.sort_unstable_by_key(|(_, at)| *at);
+        for (key, _) in order
+            .into_iter()
+            .take(cache.entries.len().saturating_sub(CATALOG_MAX_ACCOUNTS))
+        {
+            cache.entries.remove(&key);
+        }
     }
-    let mut order: Vec<(String, Instant)> = cache
-        .entries
-        .iter()
-        .map(|(key, snapshot)| (key.clone(), snapshot.fetched_at))
-        .collect();
-    order.sort_unstable_by_key(|(_, at)| *at);
-    for (key, _) in order
-        .into_iter()
-        .take(cache.entries.len().saturating_sub(CATALOG_MAX_ACCOUNTS))
-    {
-        cache.entries.remove(&key);
+
+    if cache.account_epochs.len() > CATALOG_MAX_EPOCHS {
+        // Do not evict an arbitrary epoch: a request may still be in flight
+        // for an account that has no snapshot yet. A global generation bump
+        // invalidates every such response before dropping the oversized map.
+        cache.global_epoch = cache.global_epoch.wrapping_add(1);
+        cache.account_epochs.clear();
+        cache.entries.clear();
     }
 }
 
-/// Store a freshly fetched catalog under the account token and request
-/// identity.  Only a digest of the token is retained in process memory.
+/// Capture the current invalidation generation for one account. The caller
+/// should invoke this after acquiring the per-key single-flight lease and
+/// immediately before starting its network request.
+pub(crate) fn generation_for_account(token: &str) -> CacheGeneration {
+    let account_key = crate::providers::cursor::auth::cursor_account_digest(token);
+    let Ok(mut guard) = cache().lock() else {
+        // A poisoned cache is treated as an unusable generation. The store
+        // path also refuses to write when it cannot lock, so this cannot let
+        // stale data through.
+        return CacheGeneration::default();
+    };
+    prune_locked(&mut guard);
+    CacheGeneration {
+        global: guard.global_epoch,
+        account: *guard.account_epochs.get(&account_key).unwrap_or(&0),
+    }
+}
+
+/// Store a freshly fetched catalog under the account identity and request
+/// identity. Only a stable digest is retained in process memory.
 pub fn store_for_account(token: &str, client_type: &str, models: Vec<CatalogModel>) {
+    let generation = generation_for_account(token);
+    store_for_account_at_generation(token, client_type, generation, models);
+}
+
+/// Store a response only when no account/global invalidation happened after
+/// the request began. This prevents a late AvailableModels response from
+/// resurrecting entitlements after re-login, account removal, or logout.
+pub(crate) fn store_for_account_at_generation(
+    token: &str,
+    client_type: &str,
+    generation: CacheGeneration,
+    models: Vec<CatalogModel>,
+) {
     if models.is_empty() {
         return;
     }
+    let account_key = crate::providers::cursor::auth::cursor_account_digest(token);
     if let Ok(mut guard) = cache().lock() {
         prune_locked(&mut guard);
+        let current_account_epoch = *guard.account_epochs.get(&account_key).unwrap_or(&0);
+        if guard.global_epoch != generation.global || current_account_epoch != generation.account {
+            return;
+        }
         guard.entries.insert(
             cache_key(token, client_type),
             Snapshot {
@@ -140,7 +209,25 @@ pub fn cached_for_account(token: &str, client_type: &str) -> Option<Vec<CatalogM
 /// its active account and in deterministic tests.
 pub fn clear() {
     if let Ok(mut guard) = cache().lock() {
+        guard.global_epoch = guard.global_epoch.wrapping_add(1);
         guard.entries.clear();
+        guard.account_epochs.clear();
+    }
+}
+
+/// Invalidate all catalog identities for one account while retaining fresh
+/// snapshots belonging to other saved accounts.  A normal re-login or account
+/// removal should not leave the just-updated account's model entitlements in
+/// the five-minute cache, but clearing the whole process cache would make
+/// multi-account TUI switching needlessly expensive.
+pub fn clear_for_account(token: &str) {
+    let account_key = crate::providers::cursor::auth::cursor_account_digest(token);
+    let prefix = format!("{account_key}:");
+    if let Ok(mut guard) = cache().lock() {
+        guard.entries.retain(|key, _| !key.starts_with(&prefix));
+        let epoch = guard.account_epochs.entry(account_key).or_default();
+        *epoch = epoch.wrapping_add(1);
+        prune_locked(&mut guard);
     }
 }
 
@@ -442,6 +529,20 @@ pub fn infer_parameters_from_variant_id(value: &str) -> Vec<CatalogParameter> {
 mod tests {
     use super::*;
 
+    // Keep cache-structure tests independent of the process-global cache. The
+    // production cache is intentionally private and process-wide, while a
+    // local value lets us exercise expiry/eviction deterministically without
+    // sleeping for the five-minute TTL.
+    fn snapshot_at(age: Duration, name: &str) -> Snapshot {
+        Snapshot {
+            fetched_at: Instant::now() - age,
+            models: vec![CatalogModel {
+                name: name.to_string(),
+                ..CatalogModel::default()
+            }],
+        }
+    }
+
     #[test]
     fn parses_family_aliases_variants_and_parameters() {
         let body = r#"{"models":[{"name":"grok-4.6","serverModelName":"grok-4.6","legacySlugs":["cursor-grok-4.6-high-fast"],"idAliases":["grok"],"variants":[{"legacySlug":"cursor-grok-4.6-high-fast","variantStringRepresentation":"grok-4.6[effort=high,fast=true]","parameterValues":[{"id":"effort","value":"high"},{"id":"fast","value":"true"}]}]}]}"#;
@@ -482,5 +583,180 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn cache_prunes_expired_snapshots_without_waiting_for_ttl() {
+        let mut local = Cache::default();
+        local.entries.insert(
+            "expired".into(),
+            snapshot_at(CATALOG_TTL + Duration::from_secs(1), "expired-model"),
+        );
+        local.entries.insert(
+            "fresh".into(),
+            snapshot_at(Duration::from_secs(0), "fresh-model"),
+        );
+
+        prune_locked(&mut local);
+
+        assert!(!local.entries.contains_key("expired"));
+        assert!(local.entries.contains_key("fresh"));
+    }
+
+    #[test]
+    fn cache_eviction_keeps_newest_entries_when_bound_is_exceeded() {
+        let mut local = Cache::default();
+        // Use sub-second ages so every entry remains inside the TTL. The
+        // oldest entry should be evicted once the bounded map is pruned.
+        for index in 0..(CATALOG_MAX_ACCOUNTS + 3) {
+            local.entries.insert(
+                format!("account-{index}"),
+                snapshot_at(
+                    Duration::from_millis(index as u64),
+                    &format!("model-{index}"),
+                ),
+            );
+        }
+
+        prune_locked(&mut local);
+
+        assert_eq!(local.entries.len(), CATALOG_MAX_ACCOUNTS);
+        assert!(local.entries.contains_key("account-0"));
+        assert!(local.entries.contains_key("account-1"));
+        assert!(local.entries.contains_key("account-2"));
+        assert!(!local.entries.contains_key("account-66"));
+    }
+
+    #[test]
+    fn cache_key_is_credential_free_and_identity_partitioned() {
+        let bearer = "catalog-secret-token";
+        let sand = cache_key(bearer, " SAND ");
+        let cli = cache_key(bearer, "cli");
+
+        assert!(!sand.contains(bearer));
+        assert!(sand.ends_with(":sand"));
+        assert!(cli.ends_with(":cli"));
+        assert_ne!(sand, cli);
+        assert_eq!(cache_key(bearer, "Sand"), sand);
+        assert_eq!(cache_key(bearer, ""), cli);
+    }
+
+    #[test]
+    fn cache_key_survives_access_token_rotation_for_same_account() {
+        use base64::Engine as _;
+
+        fn token(sub: &str, issued_at: u64) -> String {
+            let payload =
+                serde_json::json!({"sub": sub, "email": "User@Example.com", "iat": issued_at});
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).expect("JWT payload"));
+            format!("header.{encoded}.signature")
+        }
+
+        let first = token("stable-account", 1);
+        let rotated = token("stable-account", 2);
+        assert_eq!(
+            cache_key(&first, "sand"),
+            cache_key(&rotated, "sand"),
+            "a refresh-token rotation must keep the five-minute catalog entry"
+        );
+    }
+
+    #[test]
+    fn clear_for_account_keeps_other_account_snapshots() {
+        let account_a = format!("catalog-clear-a-{}", uuid::Uuid::new_v4());
+        let account_b = format!("catalog-clear-b-{}", uuid::Uuid::new_v4());
+        store_for_account(
+            &account_a,
+            "cli",
+            vec![CatalogModel {
+                name: "model-a".into(),
+                ..CatalogModel::default()
+            }],
+        );
+        store_for_account(
+            &account_b,
+            "sand",
+            vec![CatalogModel {
+                name: "model-b".into(),
+                ..CatalogModel::default()
+            }],
+        );
+
+        clear_for_account(&account_a);
+        assert!(cached_for_account(&account_a, "cli").is_none());
+        assert_eq!(
+            cached_for_account(&account_b, "sand").expect("another account must remain cached")[0]
+                .name,
+            "model-b"
+        );
+
+        // Avoid retaining this test's entry for subsequent tests.
+        clear_for_account(&account_b);
+    }
+
+    #[test]
+    fn invalidation_epoch_rejects_late_store_after_account_clear() {
+        let account_a = format!("catalog-epoch-a-{}", uuid::Uuid::new_v4());
+        let account_b = format!("catalog-epoch-b-{}", uuid::Uuid::new_v4());
+
+        // Capture the generation as if a network request had just started,
+        // then invalidate the account before its response arrives.
+        let stale_generation = generation_for_account(&account_a);
+        clear_for_account(&account_a);
+        store_for_account_at_generation(
+            &account_a,
+            "sand",
+            stale_generation,
+            vec![CatalogModel {
+                name: "stale-model".into(),
+                ..CatalogModel::default()
+            }],
+        );
+        assert!(
+            cached_for_account(&account_a, "sand").is_none(),
+            "a response started before clear_for_account must not resurrect stale data"
+        );
+
+        // The other account remains independently cacheable while account A
+        // is being refreshed.
+        let fresh_b = generation_for_account(&account_b);
+        store_for_account_at_generation(
+            &account_b,
+            "cli",
+            fresh_b,
+            vec![CatalogModel {
+                name: "fresh-model".into(),
+                ..CatalogModel::default()
+            }],
+        );
+        assert_eq!(
+            cached_for_account(&account_b, "cli")
+                .expect("unrelated account snapshot should remain available")[0]
+                .name,
+            "fresh-model"
+        );
+
+        // A request that starts after the clear gets the new generation and
+        // is allowed to populate the account normally.
+        let current_a = generation_for_account(&account_a);
+        store_for_account_at_generation(
+            &account_a,
+            "sand",
+            current_a,
+            vec![CatalogModel {
+                name: "fresh-a".into(),
+                ..CatalogModel::default()
+            }],
+        );
+        assert_eq!(
+            cached_for_account(&account_a, "sand")
+                .expect("post-clear response should be cacheable")[0]
+                .name,
+            "fresh-a"
+        );
+
+        clear_for_account(&account_a);
+        clear_for_account(&account_b);
     }
 }

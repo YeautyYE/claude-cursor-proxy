@@ -4,6 +4,7 @@ pub mod client;
 pub mod connect;
 pub mod conversation;
 pub mod exec_results;
+pub(crate) mod fetch_gate;
 pub mod hosted_web_search;
 pub mod http1;
 pub(crate) mod identity;
@@ -85,10 +86,13 @@ use crate::providers::cursor::response::{
 };
 use crate::providers::cursor::sand_inference::{
     SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
-    accepted_unadvertised_tool_names_from_anthropic, is_sand_tool_capability_error,
-    mark_sand_tools_supported, mark_sand_tools_unsupported, messages_from_anthropic,
-    sand_tool_capability_client_error, sand_tool_capability_for_token, stream_error_is_retryable,
-    stream_retry_limit, tools_from_anthropic,
+    accepted_unadvertised_tool_names_from_anthropic, admit_sand_open,
+    is_sand_tool_capability_error, mark_sand_tools_supported, mark_sand_tools_unsupported,
+    messages_from_anthropic, sand_logical_retry_budget, sand_open_breaker_abort,
+    sand_open_breaker_admit, sand_open_breaker_failure, sand_open_breaker_success,
+    sand_open_queue_secs, sand_open_total_budget, sand_tool_capability_client_error,
+    sand_tool_capability_for_token, stream_error_is_retryable, stream_retry_limit,
+    tools_from_anthropic,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, bridge_cursor_events_to_sse,
@@ -105,6 +109,13 @@ use crate::providers::cursor::tool_bridge::{
 // bounding TLS handshakes. Tune with CCP_CURSOR_H2_SHARDS.
 const CURSOR_HTTP_SHARDS_DEFAULT: usize = 16;
 const CURSOR_HTTP_SHARDS_MAX: usize = 64;
+
+/// Credential selection touches the account registry and can refresh a near-
+/// expiry token through a blocking HTTP client.  Keep that work off Tokio's
+/// request workers and cap the time a single request is willing to wait for a
+/// locked Keychain/registry.  A timed-out blocking task is detached by Tokio;
+/// the request itself fails closed and the next request can try again.
+const CURSOR_AUTH_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Bound the process-local policy breaker so a long-lived proxy cannot retain
 /// one entry forever for every historical model/account combination. Expired
@@ -1250,8 +1261,19 @@ async fn sand_direct_response(
     let mut effective_token = token.to_string();
     let mut effective_request = request;
     let mut fallback_request = fallback_request;
+    // Share one deadline between the first open and all pre-output stream
+    // replays. This prevents a retrying client from multiplying the open
+    // timeout for every transport attempt.
+    let sand_retry_deadline = Instant::now() + sand_logical_retry_budget();
     let stream = loop {
-        match open_sand_with_retries(&client, &effective_token, &effective_request).await {
+        match open_sand_with_retries_until(
+            &client,
+            &effective_token,
+            &effective_request,
+            sand_retry_deadline,
+        )
+        .await
+        {
             Ok(stream) => break stream,
             Err(error)
                 if !is_sand_tool_capability_error(&error, tool_count)
@@ -1270,12 +1292,14 @@ async fn sand_direct_response(
                     &diagnostic,
                     error.retry_after.as_deref(),
                 );
-                let Some(replacement) = account_failover_replacement_token(
-                    &effective_token,
-                    model,
-                    "sand",
-                    &account_failover_state,
-                ) else {
+                let Some(replacement) = account_failover_replacement_token_async(
+                    effective_token.clone(),
+                    model.to_string(),
+                    "sand".to_string(),
+                    Arc::clone(&account_failover_state),
+                )
+                .await
+                else {
                     return map_cursor_error_to_response(&error);
                 };
                 effective_token = replacement;
@@ -1331,6 +1355,7 @@ async fn sand_direct_response(
     let retry_tool_count = tool_count;
     let retry_tool_names = tool_names;
     let retry_account_failover_state = Arc::clone(&account_failover_state);
+    let effective_account_key = cursor_account_key_for_token_async(effective_token.clone()).await;
     let bridge_key = ctx
         .session_id
         .as_deref()
@@ -1339,7 +1364,7 @@ async fn sand_direct_response(
             live_run_key_for(live_run_identity_with_account(
                 sid,
                 ctx,
-                Some(&cursor_account_key_for_token(&effective_token)),
+                Some(&effective_account_key),
             ))
         });
     let bridge_allowed = if compaction_mode {
@@ -1369,6 +1394,7 @@ async fn sand_direct_response(
             retry_tool_count,
             retry_tool_names,
             fallback_request,
+            sand_retry_deadline,
         )
         .await;
     });
@@ -1453,18 +1479,55 @@ async fn sand_direct_response(
     }
 }
 
-async fn open_sand_with_retries(
+/// Open Sand with bounded retries without extending the caller's logical
+/// request deadline. The local per-call cap still applies, so a stream retry
+/// cannot spend the entire remaining turn budget on one stalled connection.
+async fn open_sand_with_retries_until(
     client: &SandInferenceClient,
     token: &str,
     request: &SandInferenceRequest,
+    logical_deadline: Instant,
 ) -> Result<crate::providers::cursor::sand_inference::SandInferenceStream, CursorError> {
     let max_retries = std::env::var("CCP_CURSOR_SAND_OPEN_RETRIES")
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .unwrap_or(3)
         .min(8);
+    // Bound each invocation as well as the shared logical deadline. This
+    // keeps account-failover and stream-replay opens from monopolizing a
+    // single request after the caller has already spent most of its budget.
+    let local_deadline = logical_deadline.min(Instant::now() + sand_open_total_budget());
+    let attempt_secs = std::env::var("CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(crate::config::cursor_request_timeout_secs)
+        .clamp(10, 180);
     let mut attempt = 0;
     loop {
+        let remaining = local_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CursorError::new(
+                504,
+                "Sand inference open retry budget exhausted",
+                None,
+            ));
+        }
+        // A short account/model-scoped breaker prevents many callers from
+        // probing a route that has already failed repeatedly. The half-open
+        // state admits exactly one probe after cooldown.
+        sand_open_breaker_admit(token, &request.model_id)?;
+        let queue_wait = remaining.min(Duration::from_secs(sand_open_queue_secs()));
+        let _open_permit = match admit_sand_open(token, &request.model_id, queue_wait).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                // A half-open probe can lose the local queue race before the
+                // HTTP request starts. Clear its in-flight marker so the next
+                // caller can probe after a short cool-off.
+                sand_open_breaker_abort(token, &request.model_id, true);
+                return Err(error);
+            }
+        };
         // A connect/open failure is ambiguous: the gateway may have accepted
         // the frame before the local socket failed. Replaying the same
         // lifecycle ids then looks like a duplicate live invocation and can
@@ -1476,33 +1539,55 @@ async fn open_sand_with_retries(
         } else {
             request.clone().with_fresh_ids()
         };
-        match client.open(token, &attempt_request).await {
-            Ok(stream) => return Ok(stream),
+        let per_attempt = remaining.min(Duration::from_secs(attempt_secs));
+        let attempt_started = Instant::now();
+        let result = tokio::time::timeout(per_attempt, client.open(token, &attempt_request)).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => Err(CursorError::new(
+                504,
+                format!(
+                    "Sand inference open timed out after {}s",
+                    per_attempt.as_secs()
+                ),
+                None,
+            )),
+        };
+        match result {
+            Ok(stream) => {
+                sand_open_breaker_success(token, &request.model_id);
+                return Ok(stream);
+            }
             Err(error) if is_sand_tool_capability_error(&error, request.tools.len()) => {
+                sand_open_breaker_abort(token, &request.model_id, false);
                 return Err(error);
             }
-            Err(error)
+            Err(error) => {
+                sand_open_breaker_failure(token, &request.model_id, &error, attempt_started);
                 if attempt < max_retries
-                    && crate::retry::should_retry_upstream(
-                        error.status,
-                        &error.client_message(),
-                    ) =>
-            {
-                let delay =
-                    crate::retry::compute_backoff_delay(attempt, error.retry_after.as_deref())
-                        .wait_ms;
-                create_logger("cursor").warn(
-                    "sand_open_retry",
-                    Some(serde_json::Map::from_iter([
-                        ("attempt".into(), serde_json::json!(attempt + 1)),
-                        ("status".into(), serde_json::json!(error.status)),
-                        ("delayMs".into(), serde_json::json!(delay)),
-                    ])),
-                );
-                crate::retry::sleep(delay).await;
-                attempt += 1;
+                    && crate::retry::should_retry_upstream(error.status, &error.client_message())
+                {
+                    let delay =
+                        crate::retry::compute_backoff_delay(attempt, error.retry_after.as_deref())
+                            .wait_ms;
+                    create_logger("cursor").warn(
+                        "sand_open_retry",
+                        Some(serde_json::Map::from_iter([
+                            ("attempt".into(), serde_json::json!(attempt + 1)),
+                            ("status".into(), serde_json::json!(error.status)),
+                            ("delayMs".into(), serde_json::json!(delay)),
+                        ])),
+                    );
+                    let remaining = local_deadline.saturating_duration_since(Instant::now());
+                    if remaining <= Duration::from_millis(delay) {
+                        return Err(error);
+                    }
+                    crate::retry::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         }
     }
 }
@@ -1528,6 +1613,7 @@ async fn drive_sand_stream_with_retries(
     tool_count: usize,
     tool_names: Vec<String>,
     mut fallback_request: Option<SandInferenceRequest>,
+    retry_deadline: Instant,
 ) {
     let max_retries = stream_retry_limit();
     let mut retries = 0u32;
@@ -1540,8 +1626,24 @@ async fn drive_sand_stream_with_retries(
         let mut stream = if let Some(stream) = next_stream.take() {
             stream
         } else {
+            if Instant::now() >= retry_deadline {
+                discard_sand_replay_buffer(&mut buffered);
+                send_sand_buffered_error(
+                    &tx,
+                    &mut buffered,
+                    CursorError::new(
+                        504,
+                        "Sand logical retry deadline exhausted before useful progress",
+                        None,
+                    ),
+                )
+                .await;
+                return;
+            }
             let retry_request = request.clone().with_fresh_ids();
-            match open_sand_with_retries(&client, &token, &retry_request).await {
+            match open_sand_with_retries_until(&client, &token, &retry_request, retry_deadline)
+                .await
+            {
                 Ok(stream) => stream,
                 Err(error) => {
                     if !committed && is_sand_tool_capability_error(&error, tool_count) {
@@ -1607,6 +1709,12 @@ async fn drive_sand_stream_with_retries(
                                 ("delayMs".into(), serde_json::json!(delay)),
                             ])),
                         );
+                        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+                        if remaining <= Duration::from_millis(delay) {
+                            discard_sand_replay_buffer(&mut buffered);
+                            send_sand_buffered_error(&tx, &mut buffered, error).await;
+                            return;
+                        }
                         crate::retry::sleep(delay).await;
                         retries += 1;
                         continue;
@@ -1628,7 +1736,24 @@ async fn drive_sand_stream_with_retries(
         // native tool has been observed.
         let mut compaction_thinking = false;
         loop {
-            let next = tokio::time::timeout(Duration::from_secs(idle_secs), stream.next()).await;
+            // A pre-output idle wait is part of the shared replay budget. Do
+            // not allow its final timer to outlive that budget; once output
+            // is committed, the normal per-stream idle timer remains valid.
+            let idle_wait = if committed {
+                Duration::from_secs(idle_secs)
+            } else {
+                let remaining = retry_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    stream_error = Some(CursorError::new(
+                        504,
+                        "Sand logical retry deadline exhausted before useful progress",
+                        None,
+                    ));
+                    break;
+                }
+                Duration::from_secs(idle_secs).min(remaining)
+            };
+            let next = tokio::time::timeout(idle_wait, stream.next()).await;
             match next {
                 Ok(Some(Ok(event))) => {
                     let Some(event) = normalize_sand_stream_event(event, allowed.as_ref()) else {
@@ -1716,11 +1841,20 @@ async fn drive_sand_stream_with_retries(
                     break;
                 }
                 Err(_) => {
+                    let exhausted = !committed
+                        && retry_deadline
+                            .saturating_duration_since(Instant::now())
+                            .is_zero();
                     stream_error = Some(CursorError::new(
                         504,
-                        format!(
-                            "Sand stream idle timeout after {idle_secs}s with no useful progress"
-                        ),
+                        if exhausted {
+                            "Sand logical retry deadline exhausted before useful progress"
+                                .to_string()
+                        } else {
+                            format!(
+                                "Sand stream idle timeout after {idle_secs}s with no useful progress"
+                            )
+                        },
                         None,
                     ));
                     break;
@@ -1800,12 +1934,14 @@ async fn drive_sand_stream_with_retries(
                 &diagnostic,
                 error.retry_after.as_deref(),
             );
-            let Some(replacement) = account_failover_replacement_token(
-                &token,
-                &model,
-                &client_type,
-                &account_failover_state,
-            ) else {
+            let Some(replacement) = account_failover_replacement_token_async(
+                token.clone(),
+                model.clone(),
+                client_type.clone(),
+                Arc::clone(&account_failover_state),
+            )
+            .await
+            else {
                 discard_sand_replay_buffer(&mut buffered);
                 send_sand_buffered_error(&tx, &mut buffered, error).await;
                 return;
@@ -1839,6 +1975,11 @@ async fn drive_sand_stream_with_retries(
                     ("delayMs".into(), serde_json::json!(delay)),
                 ])),
             );
+            let remaining = retry_deadline.saturating_duration_since(Instant::now());
+            if remaining <= Duration::from_millis(delay) {
+                send_sand_buffered_error(&tx, &mut buffered, error).await;
+                return;
+            }
             crate::retry::sleep(delay).await;
             retries += 1;
             continue;
@@ -2538,12 +2679,14 @@ impl LiveRetryStart {
         // (with a hard ceiling), including retries started by replacements.
         if is_account_failover_policy_error(error) {
             let current_token = self.effective_token();
-            let Some(replacement) = account_failover_replacement_token(
-                &current_token,
-                &self.model,
-                &self.client_type,
-                &self.account_failover_state,
-            ) else {
+            let Some(replacement) = account_failover_replacement_token_async(
+                current_token.clone(),
+                self.model.clone(),
+                self.client_type.clone(),
+                Arc::clone(&self.account_failover_state),
+            )
+            .await
+            else {
                 let mut terminal = CursorError::new(429, error, None);
                 terminal.retry_after =
                     policy_rate_limit_breaker_state(&self.model, &self.client_type, &current_token)
@@ -2554,7 +2697,7 @@ impl LiveRetryStart {
                 .effective_token
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) = replacement.clone();
-            account_key = cursor_account_key_for_token(&replacement);
+            account_key = cursor_account_key_for_token_async(replacement.clone()).await;
             *self
                 .account_key
                 .lock()
@@ -3275,6 +3418,23 @@ fn account_failover_replacement_token(
     replacement
 }
 
+/// Account failover reads the persistent registry under an inter-process file
+/// lock. Keep that lookup off Tokio workers; a concurrent TUI mutation or
+/// refresh must not stall unrelated inference streams.
+async fn account_failover_replacement_token_async(
+    current_token: String,
+    model: String,
+    client_type: String,
+    state: SharedAccountFailoverState,
+) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        account_failover_replacement_token(&current_token, &model, &client_type, &state)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Resolve the stable registry id for a bearer selected from the account pool.
 /// Access tokens may rotate while an account keeps the same profile id; use
 /// that id whenever the registry can be read and fall back to the digest for
@@ -3291,6 +3451,17 @@ fn cursor_account_key_for_token(token: &str) -> String {
         .unwrap_or_else(|| cursor_account_digest(token))
 }
 
+/// Async counterpart for request paths. The synchronous lookup may take the
+/// account-registry file lock while another process is switching or refreshing
+/// a profile, so never run it on a Tokio worker.
+async fn cursor_account_key_for_token_async(token: String) -> String {
+    let fallback = cursor_account_digest(&token);
+    tokio::task::spawn_blocking(move || cursor_account_key_for_token(&token))
+        .await
+        .ok()
+        .unwrap_or(fallback)
+}
+
 /// 401-recovery refresh off the async workers: the refresh HTTP call is
 /// blocking (single-flighted in auth.rs), so run it on the blocking pool.
 async fn force_refresh_cursor_auth_async(
@@ -3301,6 +3472,24 @@ async fn force_refresh_cursor_auth_async(
     {
         Ok(result) => result,
         Err(join) => Err(anyhow::anyhow!("Cursor auth refresh task failed: {join}")),
+    }
+}
+
+/// Resolve the request-scoped account without running registry/Keychain work
+/// on a Tokio worker.  `load_cursor_auth_for_model` also performs an
+/// account-aware refresh when a profile is near expiry, so this wrapper covers
+/// both the local file lock and the blocking refresh HTTP call.
+async fn load_cursor_auth_for_model_async(
+    model: String,
+) -> anyhow::Result<Option<crate::providers::cursor::auth::CursorAuthSelection>> {
+    let task = tokio::task::spawn_blocking(move || load_cursor_auth_for_model(&model));
+    match tokio::time::timeout(CURSOR_AUTH_LOAD_TIMEOUT, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join)) => Err(anyhow::anyhow!("Cursor auth selection task failed: {join}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Cursor auth selection timed out after {}s",
+            CURSOR_AUTH_LOAD_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -4070,14 +4259,17 @@ async fn start_live_events_with_retries_with_client_type(
                             // Account-bound 429: same-login retries cannot
                             // succeed. Fail over to newly stored credentials
                             // after a hot account switch, else pass through.
-                            if let Some(replacement) = account_failover_replacement_token(
-                                &token,
-                                model,
-                                client_type,
-                                &account_failover_state,
-                            ) {
+                            if let Some(replacement) = account_failover_replacement_token_async(
+                                token.clone(),
+                                model.to_string(),
+                                client_type.to_string(),
+                                Arc::clone(&account_failover_state),
+                            )
+                            .await
+                            {
                                 token = replacement;
-                                account_key = Some(cursor_account_key_for_token(&token));
+                                account_key =
+                                    Some(cursor_account_key_for_token_async(token.clone()).await);
                                 publish_effective_token(&token);
                                 can_refresh_current_account = false;
                                 // Cursor conversation/checkpoint state is
@@ -4252,16 +4444,17 @@ async fn start_live_events_with_retries_with_client_type(
                 }
                 if (is_account_failover_policy_error(&error.client_message())
                     || is_account_failover_policy_error(&error.message))
-                    && let Some(replacement) = account_failover_replacement_token(
-                        &token,
-                        model,
-                        client_type,
-                        &account_failover_state,
+                    && let Some(replacement) = account_failover_replacement_token_async(
+                        token.clone(),
+                        model.to_string(),
+                        client_type.to_string(),
+                        Arc::clone(&account_failover_state),
                     )
+                    .await
                 {
                     reservation.release();
                     token = replacement;
-                    account_key = Some(cursor_account_key_for_token(&token));
+                    account_key = Some(cursor_account_key_for_token_async(token.clone()).await);
                     publish_effective_token(&token);
                     can_refresh_current_account = false;
                     let key = live_retry_conversation_key_for_account(
@@ -6596,7 +6789,7 @@ impl Provider for CursorProvider {
         // breaker can return a real HTTP 429. If this check runs after
         // `live_sse_response`, Claude Code sees HTTP 200 plus an error event
         // and immediately fans out another retry wave.
-        let auth_selection = match load_cursor_auth_for_model(model) {
+        let auth_selection = match load_cursor_auth_for_model_async(model.to_string()).await {
             Ok(Some(selection)) => selection,
             Ok(None) => {
                 return json_error(
@@ -6688,16 +6881,18 @@ impl Provider for CursorProvider {
                 if !is_account_failover_policy_error(&error.client_message()) {
                     return map_cursor_error_to_response(&error);
                 }
-                let Some(replacement) = account_failover_replacement_token(
-                    &auth.access_token,
-                    model,
-                    &client_type,
-                    &sand_account_failover_state,
-                ) else {
+                let Some(replacement) = account_failover_replacement_token_async(
+                    auth.access_token.clone(),
+                    model.to_string(),
+                    client_type.clone(),
+                    Arc::clone(&sand_account_failover_state),
+                )
+                .await
+                else {
                     return map_cursor_error_to_response(&error);
                 };
                 auth.access_token = replacement;
-                account_key = cursor_account_key_for_token(&auth.access_token);
+                account_key = cursor_account_key_for_token_async(auth.access_token.clone()).await;
                 create_logger("cursor").info(
                     "sand_preflight_account_failover",
                     Some(serde_json::Map::from_iter([
@@ -7551,15 +7746,16 @@ impl Provider for CursorProvider {
                         );
                         if (is_account_failover_policy_error(&e.client_message())
                             || is_account_failover_policy_error(&e.message))
-                            && let Some(replacement) = account_failover_replacement_token(
-                                &token,
-                                model,
-                                &client_type,
-                                &account_failover_state,
+                            && let Some(replacement) = account_failover_replacement_token_async(
+                                token.clone(),
+                                model.to_string(),
+                                client_type.clone(),
+                                Arc::clone(&account_failover_state),
                             )
+                            .await
                         {
                             token = replacement;
-                            account_key = cursor_account_key_for_token(&token);
+                            account_key = cursor_account_key_for_token_async(token.clone()).await;
                             bridge_key = bridge_registry_key_for_account(&ctx, Some(&account_key));
                             continuation_key = session_id.map(|sid| {
                                 live_run_key_for(live_run_identity_with_account(
@@ -7807,7 +8003,7 @@ Re-running `cursor auth login` usually will not help."
             let headers = [(http::header::RETRY_AFTER, retry_after)];
             (headers, resp).into_response()
         }
-        503 => {
+        503 | 504 => {
             let retry_after = err.retry_after.as_deref().unwrap_or("1");
             let resp = json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", detail);
             let headers = [(http::header::RETRY_AFTER, retry_after)];
@@ -7832,9 +8028,16 @@ fn is_outdated_client_error(detail: &str) -> bool {
 
 fn map_cursor_decode_error_to_response(err: &CursorDecodeError) -> Response {
     let msg = err.to_string();
-    match err.status() {
-        Some(401) => json_error(StatusCode::UNAUTHORIZED, "authentication_error", msg),
-        Some(403) if is_outdated_client_error(&msg) => json_error(
+    // Connect END errors already carry a provider-derived status, but the
+    // diagnostic can still be wrapped in another status (for example an
+    // outer 429/resource_exhausted containing a temporary provider 400). Use
+    // the same classifier as the live/HTTP error path so buffered and
+    // streaming responses never turn a typed 503/429/409 into a generic 502.
+    let classified = crate::retry::classify_proxy_error_status(err.status().unwrap_or(502), &msg);
+    match classified {
+        400 => json_error(StatusCode::BAD_REQUEST, "invalid_request_error", msg),
+        401 => json_error(StatusCode::UNAUTHORIZED, "authentication_error", msg),
+        403 if is_outdated_client_error(&msg) => json_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!(
@@ -7842,12 +8045,31 @@ fn map_cursor_decode_error_to_response(err: &CursorDecodeError) -> Response {
 Upgrade cursor-agent or set CCP_CURSOR_CLIENT_VERSION."
             ),
         ),
-        Some(403) => json_error(
+        403 => json_error(
             StatusCode::FORBIDDEN,
             "permission_error",
             format!("{msg}. Permission/policy error — re-login usually will not help."),
         ),
-        Some(429) => json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg),
+        404 => json_error(StatusCode::NOT_FOUND, "not_found_error", msg),
+        409 => json_error(StatusCode::CONFLICT, "invalid_request_error", msg),
+        429 => {
+            let response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg);
+            let headers = [(http::header::RETRY_AFTER, "5")];
+            (headers, response).into_response()
+        }
+        503 | 504 => {
+            // 504 is a transport timeout rather than a stable client error.
+            // Normalize it to 503 with a short Retry-After so Claude Code and
+            // Grok clients use their transient retry path consistently.
+            let response = json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", msg);
+            let headers = [(http::header::RETRY_AFTER, "1")];
+            (headers, response).into_response()
+        }
+        other if (400..500).contains(&other) => json_error(
+            StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_REQUEST),
+            crate::retry::anthropic_error_kind_for_status(other, &msg),
+            msg,
+        ),
         _ => json_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -7953,6 +8175,12 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_selection_timeout_is_bounded() {
+        assert!(CURSOR_AUTH_LOAD_TIMEOUT <= Duration::from_secs(10));
+        assert!(CURSOR_AUTH_LOAD_TIMEOUT >= Duration::from_secs(1));
+    }
     use crate::providers::cursor::live::{
         live_error_allows_fresh_conversation, live_error_is_kv_blob_overflow,
     };
@@ -8105,6 +8333,7 @@ mod tests {
             sand_tools.len(),
             vec!["Read".to_string()],
             Some(fallback_request),
+            Instant::now() + Duration::from_secs(60),
         )
         .await;
 
@@ -11154,6 +11383,96 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn sand_open_timeout_is_retryable_503_not_502() {
+        let err = client::CursorError::new(504, "Sand inference open timed out after 90s", None);
+        let response = map_cursor_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    fn decode_connect_error(status: u16, message: &str) -> CursorDecodeError {
+        CursorDecodeError::ConnectEnd(crate::providers::cursor::connect::ConnectEndError {
+            code: "upstream_error".into(),
+            message: message.into(),
+            detail: format!("{{\"error\":{{\"message\":{message:?}}}}}"),
+            status,
+            provider_error_code: None,
+            provider_status_code: None,
+            provider_is_retryable: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn decoded_connect_503_is_service_unavailable() {
+        let response = map_cursor_decode_error_to_response(&decode_connect_error(
+            503,
+            "upstream unavailable while opening Cursor run",
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_connect_504_is_normalized_to_retryable_503() {
+        let response = map_cursor_decode_error_to_response(&decode_connect_error(
+            504,
+            "Cursor upstream timed out while opening run",
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn decoded_connect_client_statuses_are_not_collapsed_to_502() {
+        for (status, expected) in [(400, 400), (404, 404), (409, 409)] {
+            let response = map_cursor_decode_error_to_response(&decode_connect_error(
+                status,
+                "Cursor request rejected",
+            ));
+            assert_eq!(response.status().as_u16(), expected, "status={status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn undecorated_decode_rate_limit_message_gets_retry_after() {
+        let error = CursorDecodeError::Decode(
+            "Connect error 429: temporary capacity exhaustion [resource_exhausted]".into(),
+        );
+        let response = map_cursor_decode_error_to_response(&error);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
     }
 
     #[test]

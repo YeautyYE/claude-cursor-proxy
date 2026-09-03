@@ -8,8 +8,6 @@
 //!   `composer-2.5-fast` are recognized.
 //! - `cursor-agent:` is also supported for agent mode routing.
 
-use sha2::Digest;
-
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "claude-opus-4-7",
     "claude-opus-4-8",
@@ -620,7 +618,8 @@ struct LiveCatalogCache {
     active_account_key: Option<String>,
     /// Process-wide monotonic source for per-account generations.
     generation: u64,
-    /// Catalogs are keyed by a digest of the bearer, never by credential
+    /// Catalogs are keyed by a stable, credential-free account digest (subject
+    /// or email for JWTs; opaque-token fallback otherwise), never by bearer
     /// material. Each account then partitions snapshots by request identity.
     accounts: std::collections::BTreeMap<String, AccountLiveCatalog>,
     /// Compatibility snapshots written before any auth account was observed.
@@ -885,10 +884,12 @@ pub(crate) fn cached_live_usable_models_for_account_and_identity(
 }
 
 fn account_catalog_key(token: &str) -> String {
-    let digest = sha2::Sha256::digest(token.as_bytes());
-    // A compact digest is sufficient for cache partitioning and avoids
-    // retaining or logging bearer credentials in process state.
-    format!("{digest:x}")
+    // Cursor rotates access JWTs for the same login.  Keep the catalog tied to
+    // the stable account subject/email (with an opaque-token fallback) so a
+    // normal refresh does not trigger another network pull inside the TTL.
+    // The helper returns only a domain-separated SHA-256 digest; bearer
+    // material is never retained in process state.
+    crate::providers::cursor::auth::cursor_account_digest(token)
 }
 
 /// Build the list of supported Cursor model names.

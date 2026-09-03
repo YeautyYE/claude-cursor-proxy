@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.104 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.105 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -161,7 +161,10 @@ claude-cursor-proxy kimi auth login   # 或：grok auth login
 
 ### 让 grok-build 走本代理
 
-**不要**把 `GROK_CLI_CHAT_PROXY_BASE_URL` 设成本代理。那个环境变量是给 xAI 官方 chat-proxy 用的。grok-build 把本代理当成普通自定义 `base_url` 即可。
+grok-build 1.0.13 有两层 endpoint。启动阶段的账号设置和模型目录使用全局
+`GROK_CLI_CHAT_PROXY_BASE_URL`（或 `[endpoints].cli_chat_proxy_base_url`）；
+`[model.*].base_url` 只决定启动完成后的推理地址。下面的模型块和全局 endpoint
+都要指向本代理。环境变量适合临时运行，TOML 设置适合持久保存。
 
 **1. 登录（一次）并启动代理**
 
@@ -171,10 +174,22 @@ claude-cursor-proxy cursor auth login    # 只有还要走 Fable / Composer 时�
 claude-cursor-proxy serve                # 127.0.0.1:18765
 ```
 
-**2. 改 `~/.grok/config.toml`** — 覆盖官方 id，Fast 和 effort 菜单还在。Fast 就是 `reasoning.effort = "low"`。
+**2. 改 `~/.grok/config.toml`** — 先设置启动阶段的全局 endpoint，再覆盖官方
+id，Fast 和 effort 菜单还在。Fast 就是 `reasoning.effort = "low"`。
 
 ```toml
 # ~/.grok/config.toml
+
+[endpoints]
+# Grok 启动设置/模型目录请求（使用本地代理所需）：
+cli_chat_proxy_base_url = "http://127.0.0.1:18765/v1"
+# 可选：图/视频工具（也是全局 endpoint）：
+xai_api_base_url = "http://127.0.0.1:18765/v1"
+
+[auth]
+# 不让过期的 grok.com OIDC token 阻塞本地代理启动。
+# 这些请求的上游凭据由本代理自己的登录态提供。
+preferred_method = "api_key"
 
 [model.grok-4.6]
 base_url = "http://127.0.0.1:18765/v1"
@@ -201,9 +216,6 @@ api_key = "unused"
 supports_reasoning_effort = true
 reasoning_effort = "high"
 
-# 可选：图/视频工具（全局 URL，不是模型 base_url）
-[endpoints]
-xai_api_base_url = "http://127.0.0.1:18765/v1"
 ```
 
 **3. 启动 grok-build**
@@ -213,6 +225,13 @@ grok --model grok-4.6
 # 或：grok --model grok-4.5
 # 或：grok --model cursor-grok
 # 或：grok --model via-ccp
+```
+
+临时 shell/会话也可以用等价的全局覆盖：
+
+```bash
+GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:18765/v1 \
+  grok --model grok-4.6
 ```
 
 入站 `api_key` 会收下（`Authorization: Bearer …` 或 `x-api-key`；`unused`、其他占位值，以及看起来像 JWT 的 session token 视为空），但**不会**当成用户/租户身份。Grok `/v1/responses` 透传会转发会话、compaction（`x-compaction-at`、`x-compactions-remaining`）、doom-loop，以及字符集受限的 `x-grok-model-override`，不会转发 `Authorization`、`Cookie` 或 `x-grok-user-id`。
@@ -347,6 +366,12 @@ bundle 补丁工具。本代理不会安装、修改或依赖打过补丁的 `Cu
 > 下面的快捷键即可，不需要手动编辑配置文件，而且请求当前走 `[sand]` 还是
 > `[cli]` 会直接显示出来。
 
+第一次以交互方式启动时，TUI 会先打开 **默认传输方式**选择器。用方向键或
+`j`/`k` 选择 `CLI / API` 或 `Bot / Sand`，按 `Enter` 保存。它只作为未明确
+标记为 `[sand]` 的 Cursor 模型的默认通道；按模型设置的 Sand 规则优先级更高。
+保存后下次启动会沿用该选择，随时按 `t` 可重新打开并切换默认方式。如果设置了
+`CCP_CURSOR_CLIENT_TYPE`，环境变量保持最高优先级，TUI 不会覆盖它。
+
 | 按键 | 操作 |
 | --- | --- |
 | `s` | 打开 **Sand Models** 模型列表 |
@@ -356,6 +381,7 @@ bundle 补丁工具。本代理不会安装、修改或依赖打过补丁的 `Cu
 | `u` | 打开账号用量详情 |
 | `a`（主界面） | 打开 Cursor 账号面板 |
 | `m`（主界面） | 为 Cursor 模型指定已保存账号 |
+| `t` | 选择默认 `CLI / API` 或 `Bot / Sand` 通道 |
 | `Esc` / `s` | 关闭 Sand 编辑器 |
 
 ### 最快配置
@@ -440,8 +466,15 @@ export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 Sand 所需的 `gemini-3.6-flash`。目录快照按账号**和请求身份**（`cli` / `sand`）
 隔离，并在短 TTL 后过期，因此一个账号或通道的模型权限不会泄漏到另一个账号。
 实时 catalog 会合并到 TUI 和模型列表。你仍可以按 `a` 填写任意精确 ID，或直接
-写入环境变量，但当前 Cursor 账号必须在上游目录中提供该模型。热切换账号或登出
-会立即清掉旧目录；切换前账号的并发目录请求完成后也不会回写。
+写入环境变量，但当前 Cursor 账号必须在上游目录中提供该模型。热切换账号会立即
+切换当前可见目录，切换前账号的并发目录请求完成后也不会回写；其他已保存账号的
+快照仍按账号独立保留，方便在 TUI 中快速切换，登出时会清掉当前活动快照。
+
+实时目录缓存只保存在当前 proxy 进程内（不会保存凭据），TTL 为 **5 分钟**。在这段
+时间内重复的 `/v1/models` 和并发启动请求会复用同一份快照（每个账号、`cli`/`sand`
+身份各一份），刷新 access JWT 也会保留同一账号键。proxy 重启后先使用内置兜底目录，
+再在后台刷新实时目录；不会从磁盘恢复目录文件，以保证模型权限只在提供它的账号/会话
+范围内有效。
 
 ### 账号用量
 
@@ -452,6 +485,8 @@ Bot 周期用量。按 `u` 打开多行用量详情，其中包含 Sand 周期�
 监控器会只读回退到 Cursor Desktop 的 `state.vscdb`。Dashboard 没提供的字段
 会留空，不会伪造数据。无界面的 `serve --no-monitor` 会每分钟只轻量请求一次
 Sand 用量，用于把额度耗尽后的空回合识别为 HTTP 429；用量展示仍以 TUI 为准。
+完整 Dashboard 用量轮询间隔为 **60 秒**；用于识别无内容回合的 Sand/API 内存证据
+在 Dashboard 暂时请求失败时保留 **180 秒**，之后自动失效并等待下一次成功拉取。
 每个账号成功拉取的 Dashboard 快照会缓存到
 `~/.local/state/claude-cursor-proxy/cursor/account-usage.json`（Windows 使用
 平台对应的 state 目录）。缓存只保存用量和拉取时间，不保存 access/refresh token；
@@ -501,11 +536,20 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_AUTH_TOKEN` | 未设置 | 手动覆盖 Cursor 登录令牌 |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API 地址 |
 | `CCP_CURSOR_SAND_BASE_URL` | 跟随 `CCP_CURSOR_BASE_URL` | 可选的 Sand `InferenceService/Stream` 专用地址 |
-| `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头 |
+| `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头；TUI 的 `t` 选择器会把选择保存到 `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Sand InferenceService 同时建立的连接上限（1–512） |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | 单账号/模型路由同时建立的 Sand 连接上限（1–64） |
+| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `15` | Sand 连接准入槽位最多等待时间（1–120 秒） |
+| `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | 单次 Sand HTTP 建连超时（10–180 秒） |
+| `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | 一次 Sand 建连及重试总预算（20–900 秒） |
+| `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | 初始建连和无输出流重放共用的逻辑预算（60–3600 秒） |
+| `CCP_CURSOR_SAND_BREAKER_THRESHOLD` | `3` | 连续瞬时建连失败后打开账号/模型熔断（1–16 次） |
+| `CCP_CURSOR_SAND_BREAKER_COOLDOWN_SECS` | `15` | Sand 账号/模型熔断冷却时间（1–300 秒） |
 | `CCP_CURSOR_MODEL_ACCOUNTS` | 未设置 | JSON 对象或 `模型=账号` 列表；把 Cursor 模型规则绑定到账号 ID、唯一标签或邮箱，支持 `*` 和 `?` |
 | `CCP_CURSOR_STATE_DB` | macOS 默认使用 Cursor Desktop 状态路径 | TUI 用量回退读取的 `state.vscdb` 路径 |
 | `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Anthropic `haiku` 别名和桌面端小模型探针实际使用的 Cursor 模型 id |
+| `CCP_CURSOR_CATALOG_REQUEST_TIMEOUT_SECS` | `4` | 可选 `AvailableModels` 元数据探针超时（最大 30 秒） |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | 开 | 设 `0` / `false` 可关闭 Keychain 回退 |
 | `CCP_CURSOR_EMBED_SYSTEM` | 关 | 把 Anthropic `system` 塞进 Cursor（可能触发 Fable 注入防御） |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | 关 | 强制倾倒全部 tools schema；BiDi 已默认保留 `Workflow`/`Skill` 等 |

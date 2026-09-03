@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.104 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.105 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -175,7 +175,12 @@ claude-cursor-proxy kimi auth login   # or: grok auth login
 
 ### Point grok-build at the proxy
 
-Do **not** set `GROK_CLI_CHAT_PROXY_BASE_URL` to this process. That env is for xAI’s official chat-proxy. grok-build talks to this proxy as a normal custom `base_url`.
+grok-build 1.0.13 has two endpoint layers. Startup account settings and the
+model catalog use the global `GROK_CLI_CHAT_PROXY_BASE_URL` setting (or
+`[endpoints].cli_chat_proxy_base_url`); a `[model.*].base_url` only controls
+inference after startup. Point the global endpoint at this proxy as well as
+each model block below. The environment variable is convenient for a one-shot
+run; the TOML setting is persistent.
 
 **1. Log in (once) and start the proxy**
 
@@ -185,10 +190,23 @@ claude-cursor-proxy cursor auth login    # only if you also route Fable / Compos
 claude-cursor-proxy serve                # 127.0.0.1:18765
 ```
 
-**2. Edit `~/.grok/config.toml`** — override the official ids so Fast + effort menus stay enabled. Fast is `reasoning.effort = "low"`.
+**2. Edit `~/.grok/config.toml`** — set the global startup endpoint and
+override the official ids so Fast + effort menus stay enabled. Fast is
+`reasoning.effort = "low"`.
 
 ```toml
 # ~/.grok/config.toml
+
+[endpoints]
+# Grok startup settings/model-catalog requests (required for local proxy):
+cli_chat_proxy_base_url = "http://127.0.0.1:18765/v1"
+# Optional image/video tools (also a global endpoint):
+xai_api_base_url = "http://127.0.0.1:18765/v1"
+
+[auth]
+# Do not let an expired grok.com OIDC token block local-proxy startup.
+# The proxy uses its own saved upstream credential for these requests.
+preferred_method = "api_key"
 
 [model.grok-4.6]
 base_url = "http://127.0.0.1:18765/v1"
@@ -215,9 +233,6 @@ api_key = "unused"
 supports_reasoning_effort = true
 reasoning_effort = "high"
 
-# Optional: image / video tools (global URL, not the model base_url)
-[endpoints]
-xai_api_base_url = "http://127.0.0.1:18765/v1"
 ```
 
 **3. Run grok-build**
@@ -227,6 +242,13 @@ grok --model grok-4.6
 # or: grok --model grok-4.5
 # or: grok --model cursor-grok
 # or: grok --model via-ccp
+```
+
+For a temporary shell/session, the equivalent global override is:
+
+```bash
+GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:18765/v1 \
+  grok --model grok-4.6
 ```
 
 Inbound `api_key` is accepted (`Authorization: Bearer …` or `x-api-key`; `unused`, other placeholders, and JWT-looking session tokens are treated as empty) and is **not** used as a user/tenant id. Grok `/v1/responses` passthrough forwards conversation, compaction (`x-compaction-at`, `x-compactions-remaining`), doom-loop, and a charset-limited `x-grok-model-override` — never `Authorization`, `Cookie`, or `x-grok-user-id`.
@@ -380,6 +402,14 @@ The optional Desktop-bundle section in `sand-status` is informational only.
 > process running and use the shortcuts below; this avoids hand-editing
 > configuration files and makes the active request type visible immediately.
 
+On the first interactive start, the TUI opens a **Default Transport** chooser.
+Select `CLI / API` or `Bot / Sand` with the arrows or `j`/`k`, then press
+`Enter` to save. This is the fallback for Cursor models without an explicit
+`[sand]` selection; per-model Sand selections still take priority. The saved
+choice is reused on later starts. Press `t` at any time to reopen the chooser
+and switch the default. If `CCP_CURSOR_CLIENT_TYPE` is set, it remains the
+authoritative environment override and the TUI leaves it unchanged.
+
 | Key | Action |
 | --- | --- |
 | `s` | Open **Sand Models** and select the model list |
@@ -389,6 +419,7 @@ The optional Desktop-bundle section in `sand-status` is informational only.
 | `u` | Open the account-usage view |
 | `a` (main view) | Open the Cursor account panel |
 | `m` (main view) | Assign Cursor models to saved accounts |
+| `t` | Choose the default `CLI / API` or `Bot / Sand` lane |
 | `Esc` / `s` | Close the Sand editor |
 
 ### Fast setup
@@ -486,8 +517,18 @@ identity (`cli` versus `sand`) and expire after a short TTL, so one account or
 lane cannot leak model entitlements into another. The returned account catalog
 is merged into the TUI and model list. You can still add an exact id with `a`
 or set it in the environment, but the signed-in Cursor account must expose that
-model upstream. The catalog is invalidated on a hot account switch/logout, and
-an in-flight response from the previous account is discarded.
+model upstream. The active view changes immediately on an account switch, and
+an in-flight response from the previous account is discarded. Fresh snapshots
+for other saved accounts remain separately keyed for fast model/account
+switching; logout clears the active live snapshot.
+
+The live catalog cache is process-local (it never stores credentials) and its
+TTL is **5 minutes**. Within that window repeated `/v1/models` calls and
+concurrent warm-up requests reuse one snapshot (one request per account and
+`cli`/`sand` identity); a refreshed access JWT keeps the same account key.
+A proxy restart starts with the built-in fallback and refreshes the live
+catalog in the background; it does not load a catalog file from disk. This
+keeps model entitlements scoped to the account/session that supplied them.
 
 ### Account usage
 
@@ -499,7 +540,10 @@ events. `cursor auth status` shows the active login. On macOS, the monitor can
 fall back to Cursor Desktop's read-only `state.vscdb`; missing dashboard fields
 are omitted rather than invented. In headless `serve --no-monitor`, a lightweight
 poller requests only the Sand meter once per minute so an exhausted Sand turn
-can still be reported as HTTP 429; usage display remains a TUI feature.
+can still be reported as HTTP 429; usage display remains a TUI feature. The
+full dashboard poll interval is **60 seconds**; the in-memory Sand/API evidence
+used for classifying payload-less turns expires after **180 seconds** when
+dashboard requests temporarily fail.
 Successful per-account dashboard snapshots are cached at
 `~/.local/state/claude-cursor-proxy/cursor/account-usage.json` on macOS/Linux
 (or the platform state directory). The cache contains usage data and fetch
@@ -553,11 +597,20 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
 | `CCP_CURSOR_SAND_BASE_URL` | value of `CCP_CURSOR_BASE_URL` | Optional base URL for the Sand `InferenceService/Stream` route |
-| `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value |
+| `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value; the TUI `t` chooser persists the same setting in `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Maximum simultaneous Sand InferenceService opens (1–512) |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | Maximum simultaneous Sand opens per account/model lane (1–64) |
+| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `15` | Maximum wait for a Sand open admission slot (1–120s) |
+| `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | Per-attempt Sand HTTP open timeout (10–180s) |
+| `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | Total budget for one Sand open/retry episode (20–900s) |
+| `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | Shared logical budget across the initial Sand open and pre-output stream replays (60–3600s) |
+| `CCP_CURSOR_SAND_BREAKER_THRESHOLD` | `3` | Consecutive transient Sand open failures before the account/model circuit cools down (1–16) |
+| `CCP_CURSOR_SAND_BREAKER_COOLDOWN_SECS` | `15` | Sand account/model circuit cooldown (1–300s) |
 | `CCP_CURSOR_MODEL_ACCOUNTS` | unset | JSON object or `model=account` list assigning Cursor model selectors to account ids, unique labels, or emails; supports `*` and `?` |
 | `CCP_CURSOR_STATE_DB` | Cursor Desktop state path on macOS | Optional read-only state.vscdb path used by the TUI usage fallback |
 | `CCP_CURSOR_HAIKU_MODEL` | `claude-haiku-4-5` | Cursor catalog id used for Anthropic `haiku` aliases and desktop small-model probes |
+| `CCP_CURSOR_CATALOG_REQUEST_TIMEOUT_SECS` | `4` | Timeout for the optional `AvailableModels` metadata probe (capped at 30 seconds) |
 | `CCP_CURSOR_CLI_KEYCHAIN_FALLBACK` | on | Disable with `0` / `false` |
 | `CCP_CURSOR_EMBED_SYSTEM` | off | Forward Anthropic `system` into Cursor user text (can trigger Fable injection loops) |
 | `CCP_CURSOR_FORCE_TOOLS_IN_PROMPT` | off | Dump **all** tool schemas (large); BiDi already keeps Claude-local tools (`Workflow`/`Skill`/…) |

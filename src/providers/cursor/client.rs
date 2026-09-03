@@ -16,6 +16,7 @@ use crate::providers::cursor::connect::{
     cursor_connect_error_is_missing_conversation_data, cursor_connect_error_is_missing_image,
     encode_connect_frame, parse_connect_error,
 };
+use crate::providers::cursor::fetch_gate;
 use crate::providers::cursor::live::{
     ambiguous_http1_append_error, cursor_error_is_kv_blob_overflow,
 };
@@ -28,6 +29,33 @@ use crate::providers::cursor::request::CursorSelectedImage;
 use crate::providers::cursor::response::{
     CursorStreamEvent, decode_upstream_response, normalize_cursor_text_delta,
 };
+
+/// Metadata probes must finish before clients' model-discovery deadlines.
+///
+/// `AvailableModels` is optional (the static/policy catalog remains usable),
+/// so keeping its own short timeout is preferable to holding the keyed
+/// single-flight lease for the much longer inference request budget.  The
+/// value can be raised for unusually slow networks, but is capped so an
+/// accidental environment value cannot make `/v1/models` hang for minutes.
+const DEFAULT_CATALOG_REQUEST_TIMEOUT_SECS: u64 = 4;
+const MAX_CATALOG_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+fn catalog_request_timeout() -> Duration {
+    catalog_request_timeout_from(
+        std::env::var("CCP_CURSOR_CATALOG_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn catalog_request_timeout_from(raw: Option<&str>) -> Duration {
+    let seconds = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CATALOG_REQUEST_TIMEOUT_SECS)
+        .min(MAX_CATALOG_REQUEST_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
 
 /// Upstream response from the Cursor API.
 ///
@@ -302,6 +330,38 @@ impl CursorHttpClient {
             self.clone()
         };
 
+        // Keep process-wide discovery aligned with the account whose token is
+        // about to be used, even when the per-account cache is already warm.
+        // Auth normally performs this observation too, but doing it here
+        // closes the window after an external `auth use` before the next
+        // request reaches the client.
+        let account_generation = super::model::observe_live_usable_models_account(token);
+
+        // Fast path for the common case (the account catalog is still inside
+        // its five-minute TTL).  In particular, do this before probing the
+        // richer AvailableModels endpoint: `/v1/models` is called repeatedly
+        // by clients during startup and the richer probe is metadata-only but
+        // still incurs a network round trip on a cold/expired entry.
+        if let Some(cached) =
+            super::model::cached_live_usable_models_for_account_and_identity(token, &client_type)
+        {
+            return Ok(cached);
+        }
+
+        // Several startup consumers can arrive here at once (the warm-up
+        // task, `/v1/models`, and a TUI picker).  Hold one keyed lease across
+        // the complete cache fill and re-check after waiting so only the
+        // first caller contacts Cursor.  The key contains a token digest and
+        // the exact client identity (`cli` vs `sand`), preserving entitlement
+        // isolation between accounts and transports.
+        let _flight =
+            fetch_gate::acquire(fetch_gate::key("usable-models", token, &client_type)).await;
+        if let Some(cached) =
+            super::model::cached_live_usable_models_for_account_and_identity(token, &client_type)
+        {
+            return Ok(cached);
+        }
+
         // Warm the richer AiService catalog alongside GetUsableModels.  The
         // latter only contains legacy variant slugs; Sand needs the family ↔
         // variant/parameter relationship published by AvailableModels.  A
@@ -311,16 +371,6 @@ impl CursorHttpClient {
             let _ = request_client
                 .fetch_available_models_for_client_type(token, &client_type)
                 .await;
-        }
-
-        // Capture the account generation before the network request. Auth can
-        // be hot-swapped by another process while this request is in flight;
-        // the generation-aware store below then drops a stale completion.
-        let account_generation = super::model::observe_live_usable_models_account(token);
-        if let Some(cached) =
-            super::model::cached_live_usable_models_for_account_and_identity(token, &client_type)
-        {
-            return Ok(cached);
         }
 
         match request_client
@@ -392,6 +442,33 @@ impl CursorHttpClient {
         if !force_refresh && let Some(cached) = catalog::cached_for_account(token, &client_type) {
             return Ok(cached);
         }
+
+        // A model list is shared by the startup warm-up, `/v1/models`, and
+        // the Sand preflight command.  Serialize only the same account and
+        // identity, then re-check the TTL cache after waiting.  This avoids a
+        // thundering herd without allowing a CLI snapshot to satisfy Sand.
+        // Explicit preflight refreshes still bypass the cache, but they share
+        // the lease with ordinary fills so two simultaneous refreshes do not
+        // race and overwrite one another.
+        let (_flight, waited_for_existing) = fetch_gate::acquire_with_status(fetch_gate::key(
+            "available-models",
+            token,
+            &client_type,
+        ))
+        .await;
+        // A forced preflight still refreshes when it is the first caller. If
+        // it waited behind another fill/refresh, that flight has just written
+        // a fresh snapshot; reuse it rather than issuing a second request.
+        if (!force_refresh || waited_for_existing)
+            && let Some(cached) = catalog::cached_for_account(token, &client_type)
+        {
+            return Ok(cached);
+        }
+        // Capture the invalidation epoch only after the single-flight lease
+        // and cache re-check.  If account auth is replaced while this request
+        // is in flight, the epoch changes and the late response is discarded
+        // instead of repopulating the just-invalidated snapshot.
+        let catalog_generation = catalog::generation_for_account(token);
         let request_client = if client_type_requires_h2(&client_type) && !self.prefers_http2_only()
         {
             self.with_sand_transport_mode()
@@ -418,10 +495,15 @@ impl CursorHttpClient {
             "useReactModelPicker": true,
             "useCloudAgentEffortModes": true,
         });
+        let request_timeout = catalog_request_timeout();
         let mut req = request_client
             .client
             .post(&url)
-            .timeout(Duration::from_secs(30))
+            // Keep this metadata call short: `/v1/models` wraps the complete
+            // discovery path in a four-second budget, and a longer per-request
+            // timeout would let a warm-up leader retain the single-flight
+            // lease long after all interactive callers have moved on.
+            .timeout(request_timeout)
             .bearer_auth(token)
             .header("content-type", "application/json")
             .header("connect-protocol-version", "1")
@@ -431,13 +513,13 @@ impl CursorHttpClient {
         let response = req
             .send()
             .await
-            .map_err(|error| CursorError::from_reqwest(error, 30))?;
+            .map_err(|error| CursorError::from_reqwest(error, request_timeout.as_secs()))?;
         let status = response.status().as_u16();
         let retry_after = retry_after_header(response.headers());
         let body = response
             .text()
             .await
-            .map_err(|error| CursorError::from_reqwest(error, 30))?;
+            .map_err(|error| CursorError::from_reqwest(error, request_timeout.as_secs()))?;
         if !(200..300).contains(&status) {
             return Err(CursorError::new(
                 status,
@@ -450,7 +532,12 @@ impl CursorHttpClient {
             CursorError::new(502, "AvailableModels JSON parse failed", Some(error))
         })?;
         if !models.is_empty() {
-            catalog::store_for_account(token, &client_type, models.clone());
+            catalog::store_for_account_at_generation(
+                token,
+                &client_type,
+                catalog_generation,
+                models.clone(),
+            );
         }
         Ok(models)
     }
@@ -3426,6 +3513,30 @@ mod tests {
         assert_eq!(sand.timeout_secs, original.timeout_secs);
     }
 
+    #[test]
+    fn catalog_request_timeout_is_short_and_bounded() {
+        assert_eq!(
+            catalog_request_timeout_from(None),
+            Duration::from_secs(DEFAULT_CATALOG_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            catalog_request_timeout_from(Some("11")),
+            Duration::from_secs(11)
+        );
+        assert_eq!(
+            catalog_request_timeout_from(Some("999")),
+            Duration::from_secs(MAX_CATALOG_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            catalog_request_timeout_from(Some("0")),
+            Duration::from_secs(DEFAULT_CATALOG_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            catalog_request_timeout_from(Some("garbage")),
+            Duration::from_secs(DEFAULT_CATALOG_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
     async fn collect_preface(mode: CursorReqwestMode) -> Vec<u8> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3493,5 +3604,70 @@ mod tests {
             "strict H2 mode must send the HTTP/2 preface, got {:?}",
             String::from_utf8_lossy(&preface)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_available_catalog_fetches_are_single_flighted_per_account_and_identity() {
+        use axum::{Router, body::Body, extract::Request, http::StatusCode, routing::any};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let available_calls = Arc::new(AtomicUsize::new(0));
+        let available_counter = Arc::clone(&available_calls);
+        let app = Router::new().fallback(any(move |request: Request<Body>| {
+            let available_counter = Arc::clone(&available_counter);
+            async move {
+                // Deliberately hold the response open long enough for all
+                // callers to arrive at the keyed gate. Without single-flight,
+                // each caller would issue its own metadata request.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let path = request.uri().path();
+                if path.ends_with("/AvailableModels") {
+                    available_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        r#"{"models":[{"name":"gemini-3.6-flash","serverModelName":"gemini-3.6-flash","legacySlugs":["gemini-3.6-flash-high"]}]}"#,
+                    )
+                } else {
+                    (StatusCode::NOT_FOUND, [("content-type", "text/plain")], "not found")
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind catalog fixture");
+        let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("catalog fixture server");
+        });
+
+        // A unique token avoids coupling this test to another test's process
+        // global cache while still exercising account+identity keying.
+        let token = format!("catalog-single-flight-{}", uuid::Uuid::new_v4());
+        let client = CursorHttpClient::with_base_url_timeout_and_prefer_http1(url, 5, true);
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let token = token.clone();
+            tasks.push(tokio::spawn(async move {
+                client
+                    .fetch_available_models_for_client_type(&token, "cli")
+                    .await
+            }));
+        }
+        for task in tasks {
+            let models = task
+                .await
+                .expect("catalog task join")
+                .expect("catalog fetch");
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].name, "gemini-3.6-flash");
+        }
+
+        assert_eq!(available_calls.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

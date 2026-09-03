@@ -211,6 +211,41 @@ fn configured_advertised_models() -> Option<Vec<String>> {
         .and_then(|raw| parse_advertised_models(&raw))
 }
 
+/// Bound live catalog probes made by `/v1/models`.
+///
+/// Model discovery is a best-effort enhancement to the static registry.  A
+/// stalled Cursor catalog endpoint must never hold the whole response open:
+/// Grok-build performs this request during startup and retries its own request
+/// several times when it does not receive a prompt response.  Keep enough
+/// budget for a normal local/remote probe while guaranteeing that the static
+/// and configured model entries below are still returned.
+// grok-build's startup prefetch budget is about five seconds. Return the
+// static/policy catalog before that client-side deadline when the live probe
+// is slow, rather than making it retry the same request several times.
+const MODEL_CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+/// Credential discovery can invoke macOS Keychain (`security`) and SQLite
+/// fallback readers. Keep those blocking operations off Tokio's request
+/// workers and bound them so a locked Keychain cannot hold Grok's startup
+/// `/v1/models` request indefinitely.
+const MODEL_AUTH_LOAD_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn load_cursor_auth_for_models() -> Option<crate::providers::cursor::auth::CursorAuth> {
+    let task = tokio::task::spawn_blocking(
+        || match crate::providers::cursor::auth::load_cursor_auth() {
+            Ok(Some(auth)) => Some(auth),
+            Ok(None) | Err(_) => crate::providers::cursor::auth::load_cursor_desktop_auth()
+                .ok()
+                .flatten(),
+        },
+    );
+    match tokio::time::timeout(MODEL_AUTH_LOAD_TIMEOUT, task).await {
+        Ok(Ok(auth)) => auth,
+        // A timed-out task is detached by Tokio and its result is discarded;
+        // the model surface simply falls back to policy/static entries below.
+        _ => None,
+    }
+}
+
 fn advertised_surface_model(id: &str, provider: &str) -> String {
     if provider == "cursor" {
         crate::providers::cursor::model::anthropic_list_model_id(id)
@@ -257,7 +292,7 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
         }
     };
 
-    if let Ok(Some(auth)) = crate::providers::cursor::auth::load_cursor_auth() {
+    if let Some(auth) = load_cursor_auth_for_models().await {
         let client = crate::providers::cursor::client::CursorHttpClient::new();
         // Fetch every active request identity in parallel. Sand's model
         // entitlement catalog is not guaranteed to equal the ordinary CLI
@@ -268,19 +303,22 @@ async fn handler_models(State(state): State<Arc<AppState>>) -> Json<serde_json::
             let client = client.clone();
             let token = auth.access_token.clone();
             async move {
-                client
-                    .fetch_usable_models_for_client_type(&token, &client_type)
-                    .await
+                // A live catalog is optional.  Treat both an upstream error
+                // and a timeout as a cache miss, then continue assembling the
+                // response from policy and static registry entries.
+                tokio::time::timeout(
+                    MODEL_CATALOG_FETCH_TIMEOUT,
+                    client.fetch_usable_models_for_client_type(&token, &client_type),
+                )
+                .await
             }
         });
-        for ids in futures_util::future::join_all(fetches)
-            .await
-            .into_iter()
-            .flatten()
-        {
-            for id in ids {
-                // Fable catalog → …[1m]; other catalog ids unchanged.
-                push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
+        for result in futures_util::future::join_all(fetches).await {
+            if let Ok(Ok(ids)) = result {
+                for id in ids {
+                    // Fable catalog → …[1m]; other catalog ids unchanged.
+                    push(&mut data, &mut seen, anthropic_list_model_id(&id), "cursor");
+                }
             }
         }
     }
@@ -2492,6 +2530,18 @@ mod tests {
         assert_eq!(
             advertised_surface_model("gpt-5.6-sol", "codex"),
             "gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn model_catalog_timeout_stays_inside_grok_startup_budget() {
+        assert!(
+            super::MODEL_CATALOG_FETCH_TIMEOUT <= Duration::from_secs(5),
+            "a stalled live catalog must not trigger grok-build's startup retry"
+        );
+        assert!(
+            super::MODEL_AUTH_LOAD_TIMEOUT <= Duration::from_secs(2),
+            "a locked credential store must not hold the model surface open"
         );
     }
 

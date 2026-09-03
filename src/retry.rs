@@ -266,7 +266,8 @@ fn embedded_connect_http_status(message: &str) -> Option<u16> {
 /// instead of backing off.
 pub fn is_local_admission_backpressure(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("cursor live generation admission queue timed out")
+    lower.contains("sand open admission queue timed out")
+        || lower.contains("cursor live generation admission queue timed out")
         || lower.contains("cursor live run admission queue timed out")
         || lower.contains("already active for this session")
 }
@@ -501,6 +502,7 @@ mod tests {
         // classifier must map them back to 503 so clients back off instead of
         // reporting "Server error (our side)" from a 502.
         for text in [
+            "Sand open admission queue timed out; retry after upstream capacity recovers",
             "Cursor error 503: Cursor live generation admission queue timed out",
             "Cursor live generation admission queue timed out",
             "Cursor error 503: Cursor live run admission queue timed out",

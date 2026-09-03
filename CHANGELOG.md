@@ -3,6 +3,22 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.105 (2026-09-03)
+
+- Add account/model-scoped Sand open admission, bounded retries, and a half-open
+  circuit breaker so concurrent Claude Code and Grok retry waves do not amplify
+  a stalled Cursor route.
+- Share a logical Sand retry deadline across initial opens and pre-output stream
+  replays; rotate request IDs for ambiguous retries and preserve account failover.
+- Keep Cursor model discovery responsive with five-minute per-account/transport
+  caching, single-flight fills, bounded catalog probes, and invalidation epochs.
+- Preserve typed Connect END statuses and `Retry-After` headers instead of
+  collapsing upstream 400/409/429/503/504 failures into generic 502 responses.
+- Move account registry, Keychain, and refresh work off Tokio request workers and
+  document the Grok startup endpoint/auth configuration.
+- Add a first-run TUI chooser for the default Cursor `CLI / API` or `Bot / Sand`
+  lane; press `t` later to switch it without editing configuration files.
+
 ## v0.1.104 (2026-09-03)
 
 - Align Sand with the current Cursor Desktop wire: HTTP/2 Connect-JSON

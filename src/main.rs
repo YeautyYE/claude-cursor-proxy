@@ -14,6 +14,32 @@ use std::sync::mpsc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Detached model-catalog warm-up must never compete with serving startup.
+///
+/// The warm-up is best effort: `/v1/models` has its own short request budget
+/// and can populate the same process cache on demand.  Keep this task bounded
+/// because keychain reads and a remote Cursor metadata endpoint can both stall
+/// independently of the proxy listener.
+const DEFAULT_CURSOR_CATALOG_WARMUP_SECS: u64 = 8;
+const MAX_CURSOR_CATALOG_WARMUP_SECS: u64 = 60;
+
+fn cursor_catalog_warmup_timeout_from(raw: Option<&str>) -> std::time::Duration {
+    let seconds = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_CURSOR_CATALOG_WARMUP_SECS)
+        .min(MAX_CURSOR_CATALOG_WARMUP_SECS);
+    std::time::Duration::from_secs(seconds)
+}
+
+fn cursor_catalog_warmup_timeout() -> std::time::Duration {
+    cursor_catalog_warmup_timeout_from(
+        std::env::var("CCP_CURSOR_CATALOG_WARMUP_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "claude-cursor-proxy",
@@ -203,38 +229,50 @@ fn main() -> Result<()> {
 /// keeps the first `s` press useful even when the client has not queried that
 /// endpoint yet.
 fn spawn_cursor_catalog_warmup(runtime: &tokio::runtime::Runtime) {
-    runtime.spawn(async {
-        let auth =
-            tokio::task::spawn_blocking(|| match providers::cursor::auth::load_cursor_auth() {
-                Ok(Some(auth)) => Some(auth),
-                Ok(None) | Err(_) => providers::cursor::auth::load_cursor_desktop_auth()
-                    .ok()
-                    .flatten(),
-            })
+    let budget = cursor_catalog_warmup_timeout();
+    runtime.spawn(async move {
+        // Bound the complete detached task, not just each HTTP call.  A
+        // timed-out `spawn_blocking` keychain read may finish later, but its
+        // result is dropped and can never delay listener startup or populate a
+        // catalog for the wrong account.
+        let _ = tokio::time::timeout(budget, async move {
+            let auth = match tokio::time::timeout(
+                budget,
+                tokio::task::spawn_blocking(|| match providers::cursor::auth::load_cursor_auth() {
+                    Ok(Some(auth)) => Some(auth),
+                    Ok(None) | Err(_) => providers::cursor::auth::load_cursor_desktop_auth()
+                        .ok()
+                        .flatten(),
+                }),
+            )
             .await
-            .ok()
-            .flatten();
-        let Some(auth) = auth else {
-            return;
-        };
-        let client = providers::cursor::client::CursorHttpClient::new();
-        // Cursor can return a different catalog under its managed-local Sand
-        // identity than it does for the ordinary CLI identity.  Warm every
-        // identity selected by the current policy so the first TUI `s` press
-        // has the same choices as a later request turn. The HTTP client keeps
-        // these snapshots identity-scoped, so concurrent fetches cannot
-        // overwrite one another.
-        let client_types = config::cursor_catalog_client_types();
-        let fetches = client_types.into_iter().map(|client_type| {
-            let client = client.clone();
-            let token = auth.access_token.clone();
-            async move {
-                let _ = client
-                    .fetch_usable_models_for_client_type(&token, &client_type)
+            {
+                Ok(Ok(Some(auth))) => auth,
+                _ => return,
+            };
+
+            let client = providers::cursor::client::CursorHttpClient::new();
+            // Cursor can return a different catalog under its managed-local
+            // Sand identity than it does for the ordinary CLI identity. Warm
+            // every identity selected by the current policy so the first TUI
+            // `s` press has the same choices as a later request turn. The HTTP
+            // client keeps these snapshots identity-scoped, so concurrent
+            // fetches cannot overwrite one another.
+            let client_types = config::cursor_catalog_client_types();
+            let fetches = client_types.into_iter().map(|client_type| {
+                let client = client.clone();
+                let token = auth.access_token.clone();
+                async move {
+                    let _ = tokio::time::timeout(
+                        budget,
+                        client.fetch_usable_models_for_client_type(&token, &client_type),
+                    )
                     .await;
-            }
-        });
-        futures_util::future::join_all(fetches).await;
+                }
+            });
+            futures_util::future::join_all(fetches).await;
+        })
+        .await;
     });
 }
 
@@ -804,6 +842,30 @@ mod tests {
                 .unwrap()
                 .id,
             "ACCOUNT-ID"
+        );
+    }
+
+    #[test]
+    fn catalog_warmup_timeout_uses_bounded_default_and_override() {
+        assert_eq!(
+            cursor_catalog_warmup_timeout_from(None),
+            std::time::Duration::from_secs(DEFAULT_CURSOR_CATALOG_WARMUP_SECS)
+        );
+        assert_eq!(
+            cursor_catalog_warmup_timeout_from(Some("17")),
+            std::time::Duration::from_secs(17)
+        );
+        assert_eq!(
+            cursor_catalog_warmup_timeout_from(Some("999999")),
+            std::time::Duration::from_secs(MAX_CURSOR_CATALOG_WARMUP_SECS)
+        );
+        assert_eq!(
+            cursor_catalog_warmup_timeout_from(Some("0")),
+            std::time::Duration::from_secs(DEFAULT_CURSOR_CATALOG_WARMUP_SECS)
+        );
+        assert_eq!(
+            cursor_catalog_warmup_timeout_from(Some("not-a-duration")),
+            std::time::Duration::from_secs(DEFAULT_CURSOR_CATALOG_WARMUP_SECS)
         );
     }
 
