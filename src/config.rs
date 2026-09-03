@@ -113,7 +113,7 @@ fn replace_config_file(temporary_path: &Path, path: &Path) -> io::Result<()> {
     // Windows to flush the move before returning, matching the sync barrier
     // used by the Unix implementation above.
     let moved = unsafe {
-        MoveFileExW(
+        move_file_ex_w(
             temporary_wide.as_ptr(),
             path_wide.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
@@ -129,7 +129,9 @@ fn replace_config_file(temporary_path: &Path, path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    #[link_name = "MoveFileExW"]
+    fn move_file_ex_w(existing_file_name: *const u16, new_file_name: *const u16, flags: u32)
+    -> i32;
 }
 
 #[cfg(not(any(unix, windows)))]
