@@ -61,13 +61,18 @@ pub const MAX_SAND_STREAM_RETRIES: u32 = 5;
 // one stalled account look like hundreds of independent 502s.  Keep a small,
 // independent open bulkhead here; the AgentService live gate intentionally
 // does not cover Sand requests.
-const SAND_OPEN_GLOBAL_DEFAULT: usize = 512;
+// Keep the default below Cursor's per-session admission capacity.  The
+// 0.1.107 512-open default let a single active account flood
+// InferenceService while each open was waiting for headers, producing a wave
+// of 88s timeouts and downstream 503s.  Deployments that have measured a
+// higher upstream limit can still opt in through the environment override.
+const SAND_OPEN_GLOBAL_DEFAULT: usize = 32;
 const SAND_OPEN_GLOBAL_MAX: usize = 512;
-const SAND_OPEN_ACCOUNT_DEFAULT: usize = 512;
-const SAND_OPEN_ACCOUNT_MAX: usize = 512;
-// Keep the local fairness slice below Claude Code's first-byte watchdog. A
-// saturated gate is soft and bypassed after this short wait, so it cannot
-// turn a transient burst into a 15-second synchronized retry wave.
+const SAND_OPEN_ACCOUNT_DEFAULT: usize = 4;
+const SAND_OPEN_ACCOUNT_MAX: usize = 64;
+// Keep the local fairness slice short so queued callers re-check capacity
+// promptly. A saturated slice is non-terminal backpressure; callers retry it
+// without issuing an untracked upstream open.
 const SAND_OPEN_QUEUE_DEFAULT_SECS: u64 = 3;
 const SAND_OPEN_QUEUE_MAX_SECS: u64 = 120;
 const SAND_OPEN_BREAKER_THRESHOLD_DEFAULT: u32 = 3;
@@ -241,8 +246,9 @@ impl SandOpenGate {
     }
 
     /// Attempt one bounded queue slice and return `None` when the lane is
-    /// saturated. The caller may then issue a permit-less upstream open so a
-    /// local semaphore timeout cannot become a client-visible 503.
+    /// saturated. The caller keeps the logical request queued and retries the
+    /// admission slice; it must not issue a permit-less upstream open because
+    /// that would defeat the bulkhead during a retry burst.
     async fn acquire_soft(&self, key: &str, wait: Duration) -> Option<SandOpenPermit> {
         self.acquire(key, wait).await.ok()
     }
@@ -271,11 +277,10 @@ fn sand_open_admission_error() -> CursorError {
     error
 }
 
-/// Try to acquire a Sand open slot for one short fairness slice.  Admission is
-/// deliberately soft: if every slot is occupied, the request proceeds
-/// without a local permit instead of waiting until the client's stream
-/// watchdog expires or returning a proxy-generated 503.  Cursor's upstream
-/// capacity and the bounded transport retry loop remain the final backstop.
+/// Try to acquire a Sand open slot for one short fairness slice. Admission is
+/// deliberately non-terminal: if every slot is occupied, return `Ok(None)` so
+/// the caller can apply bounded backpressure without turning local queueing
+/// into a proxy-generated 503 or flooding Cursor with untracked opens.
 pub(crate) async fn admit_sand_open_until(
     token: &str,
     model: &str,
@@ -290,14 +295,10 @@ pub(crate) async fn admit_sand_open_until(
     match SAND_OPEN_GATE.acquire_soft(&key, queue_wait).await {
         Some(permit) => Ok(Some(permit)),
         None => {
-            // The old behavior surfaced this local timeout as HTTP 503. That
-            // is especially harmful for Claude Code: it immediately retries,
-            // all retries queue behind the same stalled opens, and the TUI
-            // fills with a synchronized 503 wave. A permit-less open keeps
-            // compatibility with the pre-bulkhead behavior while still
-            // limiting healthy bursts when capacity is available.
+            // A saturated slice is expected under fan-out. Keep it observable
+            // for diagnostics, but let the caller wait for a real permit.
             create_logger("cursor").debug(
-                "sand_open_admission_bypass",
+                "sand_open_admission_wait",
                 Some(serde_json::Map::from_iter([
                     ("model".into(), serde_json::json!(model)),
                     ("reason".into(), serde_json::json!("queue saturated")),
@@ -3899,10 +3900,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sand_open_gate_soft_admission_bypasses_a_saturated_slice() {
-        // A queue slice expiring must not become a terminal admission error:
-        // the caller proceeds without a local permit and lets the upstream
-        // transport apply its own capacity controls.
+    async fn sand_open_gate_soft_admission_reports_a_saturated_slice() {
+        // A queue slice expiring must not become a terminal admission error.
+        // The caller can wait and retry without opening an untracked upstream
+        // request.
         let gate = SandOpenGate::new(1, 1);
         let first = gate
             .acquire("account-a\0model", Duration::from_millis(100))
@@ -3911,7 +3912,7 @@ mod tests {
         let bypass = gate
             .acquire_soft("account-a\0model", Duration::from_millis(20))
             .await;
-        assert!(bypass.is_none(), "a saturated slice should soft-bypass");
+        assert!(bypass.is_none(), "a saturated slice should be retryable");
         drop(first);
         let second = gate
             .acquire_soft("account-a\0model", Duration::from_millis(100))
@@ -3960,6 +3961,17 @@ mod tests {
         assert!(sand_logical_retry_budget() >= Duration::from_secs(60));
         assert!(sand_open_total_budget() >= Duration::from_secs(20));
         assert!(sand_open_total_budget() <= Duration::from_secs(900));
+    }
+
+    #[test]
+    fn sand_open_defaults_bound_single_account_bursts() {
+        // Keep the production defaults aligned with the pre-0.1.107 stable
+        // profile.  The explicit environment overrides remain available for
+        // operators that have measured a larger upstream capacity.
+        assert_eq!(SAND_OPEN_GLOBAL_DEFAULT, 32);
+        assert_eq!(SAND_OPEN_ACCOUNT_DEFAULT, 4);
+        assert_eq!(SAND_OPEN_GLOBAL_MAX, 512);
+        assert_eq!(SAND_OPEN_ACCOUNT_MAX, 64);
     }
 
     #[tokio::test]

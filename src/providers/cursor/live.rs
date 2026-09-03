@@ -4367,7 +4367,7 @@ impl CursorHttpClient {
         // returns so ordinary CLI/IDE H1 requests do not allocate an unused
         // second reqwest pool.
         let h2_client = if sand_h2_only {
-            if self.prefers_http2_only() {
+            if !self.prefers_http1() {
                 self.clone()
             } else {
                 self.with_sand_transport_mode()

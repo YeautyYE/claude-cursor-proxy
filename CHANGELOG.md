@@ -3,6 +3,17 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.108 (2026-09-04)
+
+- Bound Sand `InferenceService/Stream` handshakes to a stable default of 32
+  process-wide and 4 per account/model family. Saturated callers remain in a
+  local queue instead of flooding Cursor with untracked opens and synchronized
+  503s; established streams are not limited by these open permits.
+- Keep the 512-request client fan-out independent from Sand handshake
+  admission, and document the tuning knobs and account/model lane semantics.
+- Use TLS ALPN for Sand by default so HTTPS proxies can carry large full-history
+  bodies; retain strict prior-knowledge H2 as an explicit diagnostic option.
+
 ## v0.1.107 (2026-09-04)
 
 - Restore high-concurrency Sand behavior after the v0.1.105 local bulkhead

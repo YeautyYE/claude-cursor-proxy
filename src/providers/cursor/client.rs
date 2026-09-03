@@ -117,18 +117,15 @@ pub struct CursorHttpClient {
     pub(crate) base_url: String,
     pub(crate) timeout_secs: u64,
     http1_only: bool,
-    http2_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorReqwestMode {
     Http1Only,
     Http2Alpn,
-    /// Force HTTP/2 for both TLS ALPN and the request engine.  Sand's
-    /// `x-cursor-client-type` is accepted only by AgentService/Run over H2;
-    /// allowing reqwest's normal HTTP/1 fallback can make a proxy downgrade
-    /// the request and return the deterministic "Sand traffic is not
-    /// supported on this endpoint" response.
+    /// Force HTTP/2 prior knowledge. This is an opt-in Sand diagnostic mode;
+    /// normal HTTPS Sand traffic uses `Http2Alpn` so an HTTPS proxy can
+    /// negotiate H2 while preserving request-body flow control.
     Http2Only,
     CleartextH2PriorKnowledge,
 }
@@ -213,8 +210,9 @@ impl CursorHttpClient {
 
     /// Build a client with an explicit protocol mode while retaining the
     /// endpoint and timeout.  Most callers use [`Self::with_prefer_http1`],
-    /// but Sand needs the stricter `Http2Only` mode rather than the ordinary
-    /// H2/HTTP-1 ALPN negotiation used by CLI/IDE traffic.
+    /// but Sand may need an H2-capable mode rather than the HTTP/1 pin used by
+    /// CLI/IDE traffic. HTTPS Sand uses ALPN by default; strict prior-knowledge
+    /// H2 is selected only through `CCP_CURSOR_SAND_STRICT_H2=1`.
     fn with_base_url_timeout_and_mode(
         base_url: String,
         timeout_secs: u64,
@@ -251,10 +249,6 @@ impl CursorHttpClient {
             base_url,
             timeout_secs,
             http1_only,
-            http2_only: matches!(
-                mode,
-                CursorReqwestMode::Http2Only | CursorReqwestMode::CleartextH2PriorKnowledge
-            ),
         }
     }
 
@@ -269,29 +263,29 @@ impl CursorHttpClient {
         )
     }
 
-    /// Rebuild a request client for Sand's H2-only endpoint.  This is kept
-    /// request-scoped: ordinary CLI/IDE traffic can continue using the
-    /// process-wide HTTP/1 circuit and fallback policy without affecting Sand.
+    /// Rebuild a request client for Sand's H2 endpoint. TLS uses normal ALPN
+    /// by default: strict `http2_prior_knowledge` interacts poorly with some
+    /// HTTPS proxies for large full-history bodies and can stall before the
+    /// first response byte. Set `CCP_CURSOR_SAND_STRICT_H2=1` when a private
+    /// gateway explicitly requires strict H2. Cleartext fixtures keep
+    /// prior-knowledge H2 because there is no TLS ALPN negotiation there.
     pub(crate) fn with_sand_transport_mode(&self) -> Self {
         let mode = if self.base_url.starts_with("http://") {
             CursorReqwestMode::CleartextH2PriorKnowledge
-        } else {
-            // Reqwest's HTTP/2-only preference still negotiates TLS through
-            // ALPN (the `prior_knowledge` name only affects cleartext
-            // h2c). Keeping the strict mode here prevents an intermediary
-            // from silently downgrading Sand traffic to HTTP/1, which the
-            // InferenceService rejects before reading the Connect frame.
+        } else if cursor_http_bypass_proxy(
+            std::env::var("CCP_CURSOR_SAND_STRICT_H2").ok().as_deref(),
+        ) {
             CursorReqwestMode::Http2Only
+        } else {
+            // TLS ALPN still selects H2 with Cursor's endpoint, while allowing
+            // an HTTPS proxy to handle large request-body flow control.
+            CursorReqwestMode::Http2Alpn
         };
         Self::with_base_url_timeout_and_mode(self.base_url.clone(), self.timeout_secs, mode)
     }
 
     pub(crate) fn prefers_http1(&self) -> bool {
         self.http1_only
-    }
-
-    pub(crate) fn prefers_http2_only(&self) -> bool {
-        self.http2_only
     }
 
     /// Fetch the live Cursor model catalog via `AgentService/GetUsableModels`.
@@ -314,17 +308,16 @@ impl CursorHttpClient {
     /// route can return a different model entitlement set from the ordinary
     /// CLI route for the same bearer. Keep the identity explicit all the way
     /// through the cache and headers so a prior CLI warm-up cannot satisfy a
-    /// Sand lookup. Sand also stays on the strict H2 transport used by
-    /// `AgentService/Run`; an HTTP/1 catalog probe can make a healthy Sand
-    /// runtime appear unavailable.
+    /// Sand lookup. Sand stays on an H2-capable TLS transport (ALPN by
+    /// default, strict H2 when explicitly requested); an HTTP/1 catalog probe
+    /// can make a healthy Sand runtime appear unavailable.
     pub async fn fetch_usable_models_for_client_type(
         &self,
         token: &str,
         client_type: &str,
     ) -> Result<Vec<String>, CursorError> {
         let client_type = canonicalize_client_type(client_type.trim().to_string());
-        let request_client = if client_type_requires_h2(&client_type) && !self.prefers_http2_only()
-        {
+        let request_client = if client_type_requires_h2(&client_type) && self.prefers_http1() {
             self.with_sand_transport_mode()
         } else {
             self.clone()
@@ -469,8 +462,7 @@ impl CursorHttpClient {
         // is in flight, the epoch changes and the late response is discarded
         // instead of repopulating the just-invalidated snapshot.
         let catalog_generation = catalog::generation_for_account(token);
-        let request_client = if client_type_requires_h2(&client_type) && !self.prefers_http2_only()
-        {
+        let request_client = if client_type_requires_h2(&client_type) && self.prefers_http1() {
             self.with_sand_transport_mode()
         } else {
             self.clone()
@@ -714,7 +706,7 @@ impl CursorHttpClient {
         // Rebuild an HTTP/2 client while preserving a test/custom base URL;
         // the recursive call is one hop because the replacement is not
         // HTTP/1-pinned.
-        if client_type_requires_h2(&client_type) && !self.prefers_http2_only() {
+        if client_type_requires_h2(&client_type) && self.prefers_http1() {
             let h2 = self.with_sand_transport_mode();
             return Box::pin(h2.run_agent_with_session_profile(
                 token,
@@ -3508,7 +3500,6 @@ mod tests {
 
         let sand = original.with_sand_transport_mode();
         assert!(!sand.prefers_http1());
-        assert!(sand.prefers_http2_only());
         assert_eq!(sand.base_url, original.base_url);
         assert_eq!(sand.timeout_secs, original.timeout_secs);
     }
@@ -3592,12 +3583,6 @@ mod tests {
 
     #[tokio::test]
     async fn strict_h2_mode_sends_pri_preface_for_cleartext_sand_variant() {
-        let client = CursorHttpClient::with_base_url_timeout_and_mode(
-            "http://127.0.0.1:43127".into(),
-            1,
-            CursorReqwestMode::Http2Only,
-        );
-        assert!(client.prefers_http2_only());
         let preface = collect_preface(CursorReqwestMode::Http2Only).await;
         assert!(
             preface.starts_with(b"PRI * HTTP/2.0"),

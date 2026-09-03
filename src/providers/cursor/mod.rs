@@ -1276,7 +1276,8 @@ async fn sand_direct_response(
             Ok(stream) => break stream,
             Err(error)
                 if !is_sand_tool_capability_error(&error, tool_count)
-                    && (is_account_failover_policy_error(&error.client_message())
+                    && (is_account_failover_open_error(model, &error)
+                        || is_account_failover_policy_error(&error.client_message())
                         || is_account_failover_policy_error(&error.message)
                         || error
                             .detail
@@ -1284,13 +1285,15 @@ async fn sand_direct_response(
                             .is_some_and(is_account_failover_policy_error)) =>
             {
                 let diagnostic = error.client_message();
-                note_policy_rate_limit(
-                    model,
-                    "sand",
-                    &effective_token,
-                    &diagnostic,
-                    error.retry_after.as_deref(),
-                );
+                if is_account_failover_policy_error(&diagnostic) {
+                    note_policy_rate_limit(
+                        model,
+                        "sand",
+                        &effective_token,
+                        &diagnostic,
+                        error.retry_after.as_deref(),
+                    );
+                }
                 let Some(replacement) = account_failover_replacement_token_async(
                     effective_token.clone(),
                     model.to_string(),
@@ -1308,6 +1311,14 @@ async fn sand_direct_response(
                     Some(serde_json::Map::from_iter([
                         ("model".into(), serde_json::json!(model)),
                         ("clientType".into(), serde_json::json!("sand")),
+                        (
+                            "reason".into(),
+                            serde_json::json!(if is_account_failover_open_error(model, &error) {
+                                "open_timeout"
+                            } else {
+                                "policy"
+                            }),
+                        ),
                         ("recovery".into(), serde_json::json!("fresh_request")),
                     ])),
                 );
@@ -1516,17 +1527,36 @@ async fn open_sand_with_retries_until(
         // backoff. It never rejects a caller locally: the upstream transport
         // must remain able to prove that a cooled-down route recovered.
         sand_open_breaker_admit(token, &request.model_id)?;
-        let _open_permit =
+        // A busy account/model lane is backpressure, not an upstream failure.
+        // Keep the request queued until a real open slot is available instead
+        // of bypassing the gate and creating the 503 wave seen with the old
+        // 512-open default.  The sleep is deliberately short so a released
+        // permit is observed quickly, while the logical deadline remains the
+        // final bound for a genuinely wedged upstream.
+        let _open_permit = loop {
             match admit_sand_open_until(token, &request.model_id, local_deadline).await {
-                Ok(permit) => permit,
+                Ok(Some(permit)) => break Some(permit),
+                Ok(None) => {
+                    let remaining = local_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CursorError::new(
+                            504,
+                            "Sand inference open admission deadline exhausted",
+                            None,
+                        ));
+                    }
+                    let wait = remaining.min(Duration::from_millis(250));
+                    crate::retry::sleep(wait.as_millis().max(1) as u64).await;
+                }
                 Err(error) => {
-                    // A half-open probe can lose the local queue race before the
-                    // HTTP request starts. Clear its in-flight marker so the next
-                    // caller can probe after a short cool-off.
+                    // A half-open probe can lose the local queue race before
+                    // the HTTP request starts. Clear its in-flight marker so
+                    // the next caller can probe after a short cool-off.
                     sand_open_breaker_abort(token, &request.model_id, true);
                     return Err(error);
                 }
-            };
+            }
+        };
         // The fairness slice may have consumed most of the logical budget.
         // Recompute it after admission so queue time cannot extend this HTTP
         // attempt beyond the caller's deadline.
@@ -3244,6 +3274,25 @@ fn is_account_failover_policy_error(message: &str) -> bool {
     lower.contains("user_rate_limit_exceeded")
         || lower.contains("api_rate_limit_exceeded")
         || lower.contains("error_rate_limited_changeable")
+}
+
+/// A pre-output Sand open timeout can be account-local when an unbound model
+/// is concentrated on the active profile. Rotate only explicit open timeout
+/// diagnostics, and only when the model has no account binding; generic 5xx
+/// provider outages stay on the normal transport retry path.
+fn is_account_failover_open_error(model: &str, error: &CursorError) -> bool {
+    if crate::config::cursor_account_for_model(model).is_some()
+        || crate::retry::is_billing_block(&error.client_message())
+        || crate::retry::is_policy_rate_limit(&error.client_message())
+    {
+        return false;
+    }
+    let message = error.client_message();
+    let lower = message.to_ascii_lowercase();
+    matches!(error.status, 502 | 504)
+        && (lower.contains("sand inference open timed out")
+            || lower.contains("sand inference open retry budget exhausted")
+            || lower.contains("sand inference upstream http 502"))
 }
 
 /// Account failover is state for one logical request, not one transport
@@ -9273,6 +9322,21 @@ mod tests {
         );
         assert_eq!(candidates, vec!["token-a"]);
         reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn sand_open_timeout_is_eligible_for_unbound_account_failover() {
+        let timeout = CursorError::new(504, "Sand inference open timed out after 90s", None);
+        assert!(is_account_failover_open_error(
+            "cursor-grok-account-failover-test",
+            &timeout
+        ));
+
+        let generic = CursorError::new(503, "Cursor upstream temporarily unavailable", None);
+        assert!(!is_account_failover_open_error(
+            "cursor-grok-account-failover-test",
+            &generic
+        ));
     }
 
     #[test]

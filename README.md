@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.107 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.108 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -593,11 +593,12 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
 | `CCP_CURSOR_SAND_BASE_URL` | value of `CCP_CURSOR_BASE_URL` | Optional base URL for the Sand `InferenceService/Stream` route |
+| `CCP_CURSOR_SAND_STRICT_H2` | `0` | Force strict H2 prior-knowledge for Sand; normal TLS ALPN is recommended for HTTPS proxies |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value; the TUI `t` chooser persists the same setting in `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
-| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand InferenceService opens (1–512) |
-| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand opens per account/model lane (1–512) |
-| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Short Sand admission fairness slice (1–120s); a saturated slice bypasses the local gate instead of returning proxy-generated 503 |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Maximum simultaneous Sand InferenceService opens (1–512) |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | Maximum simultaneous Sand opens per account/model lane (1–64) |
+| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand admission queue slice (1–120s); saturated requests stay queued and retry the slice without issuing unbounded upstream opens |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | Per-attempt Sand HTTP open timeout (10–180s) |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | Total budget for one Sand open/retry episode (20–900s) |
 | `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | Shared logical budget across the initial Sand open and pre-output stream replays (60–3600s) |
@@ -634,6 +635,18 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_ANTHROPIC_SSE_PING_SECS` | `5` | SSE heartbeat interval (message_delta + ping; keep below Claude Code's 10s stream watchdog) |
 | `CCP_CURSOR_NO_PROXY` | off | Skip HTTP(S)_PROXY for Cursor API (`1` / `true`) |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | unset | Debug |
+
+The two Sand open limits cover only the HTTP/2 handshake and request headers;
+the permit is released as soon as the upstream stream is established. They do
+not cap the number of model streams or client requests at four. The global
+limit is shared by the whole proxy, while the account limit is keyed by one
+Cursor account and canonical Sand model family. A 512-request fan-out can
+therefore enter the proxy and queue, while one account/model lane opens at
+most four handshakes at a time. The conservative defaults prevent a retry
+burst from flooding Cursor's admission service; raise them only after
+measuring the target account, for example with
+`CCP_CURSOR_SAND_OPEN_CONCURRENCY=64` and
+`CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY=8`.
 
 ### Claude Code (client) env / settings
 
@@ -764,7 +777,7 @@ Use this order:
 | `grok-build`/Claude Code gets HTTP 429 `You're out of usage` for `grok-4.6` or `cursor-grok-*` while the mapped account still has Sand/Bot balance | Check the request badge first. `[cli]` uses the account's CLI/API meter; `[sand]` uses Sand/Grok Bot. A model→account binding selects a credential but does not change the lane. For Cursor Grok, add the exact `cursor-grok-4.6-*` id in **Sand Models**, toggle `[sand]`, then bind that same row with `m`; refresh with `u`/`U` and verify `Updated`. Bare `grok-4.6` remains the native Grok provider unless explicitly account-bound to Cursor. |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
 | grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.57 and restart serve. Response-less live opens fail closed as HTTP 409; local open-slot saturation is jittered HTTP 503. |
-| Sand bursts show `503 Sand open admission queue timed out` | Update to the current release and restart serve. Admission is soft: after one short fairness slice, a saturated local gate lets the upstream open proceed instead of generating a proxy-side 503. Genuine upstream capacity errors still use bounded retries and `Retry-After`. |
+| Sand bursts show `503 Sand open admission queue timed out` | Update to the current release and restart serve. Admission applies bounded backpressure: saturated requests wait for a real open slot instead of flooding Cursor with untracked opens. Genuine upstream capacity errors still use bounded retries and `Retry-After`. |
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |
 | grok-build `Conflict (409) - error sending request` / `live open timed out after 20s`, or Claude Code `Agent type 'gemini-3.6-flash-high' not found` | Update to ≥0.1.57 and restart serve. Proven pre-connect misses may switch transport; response-less sends are never replayed. Agent/Task model slugs remap to `general-purpose`. |
 | grok-build dumps raw `<tool_use>` / `<parameter>` XML, or `Cursor auth failed: /usr/bin/security: Too many open files` | Update to ≥0.1.51 and restart serve. Named-parameter XML is recovered as tools; XML `spawn_subagent` waits for turn end; serve raises the macOS 256-file limit. |
