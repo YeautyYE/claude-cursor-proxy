@@ -1618,6 +1618,24 @@ fn render_tools_block(req: &MessagesRequest, mode: ToolDumpMode) -> Option<Strin
     }
 }
 
+/// Build the instruction block used when a Sand provider accepts text but
+/// rejects the native `InferenceAgentTool` catalog.  The model still needs a
+/// compact, deterministic contract for emitting calls; the proxy parses the
+/// XML envelope and exposes the call as Claude Code's normal `tool_use` block.
+///
+/// Keep this separate from [`render_cursor_prompt_parts_with`].  Sand requests
+/// retain structured Anthropic history (including images and tool results), so
+/// duplicating the complete history as one flattened user message would both
+/// inflate context usage and make image/tool-result ordering ambiguous.
+pub fn render_sand_text_tool_bridge_prompt(req: &MessagesRequest) -> Option<String> {
+    let tools = render_tools_block(req, ToolDumpMode::All)?;
+    let mut prompt = String::from(
+        "Tool calling is available through a text bridge. When a tool is needed, emit exactly this XML form (one call at a time, no Markdown fence):\n<tool_use name=\"TOOL_NAME\">{JSON_OBJECT}</tool_use>\nUse only a name and JSON object from the advertised tools below. Do not emit explanatory text inside the XML tag. After a tool result is supplied, continue the task and emit another tool_use only when needed.\n",
+    );
+    prompt.push_str(&tools);
+    Some(prompt)
+}
+
 fn write_tool_hint(tools: &[serde_json::Value]) -> String {
     let visible_names = tools.iter().filter_map(|tool| {
         if !is_model_visible_tool_definition(tool) {

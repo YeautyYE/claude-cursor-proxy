@@ -17,7 +17,9 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
+use std::sync::{LazyLock, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorUpstreamResponse};
@@ -38,6 +40,329 @@ pub const SAND_INFERENCE_STREAM_PATH: &str = "/aiserver.v1.InferenceService/Stre
 /// tiny; the generous ceiling leaves room for tool arguments while preventing
 /// a corrupt length prefix from retaining unbounded memory.
 pub const MAX_SAND_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+
+/// Default number of full-history replays after a Sand stream has opened but
+/// fails before producing visible output.  The value is deliberately bounded
+/// because each replay is a new upstream invocation.
+pub const DEFAULT_SAND_STREAM_RETRIES: u32 = 5;
+pub const MAX_SAND_STREAM_RETRIES: u32 = 5;
+
+/// Sand tool support is provider/model/account specific.  Cursor can accept
+/// the same `InferenceService/Stream` request for text while rejecting a
+/// non-empty `tools` catalog with an inner provider 400.  Keep that result in
+/// process so every Claude Code retry does not repeat a deterministic request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandToolCapability {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+impl SandToolCapability {
+    /// Stable text used by `sand-status` and JSON-adjacent diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandToolCapabilityStatus {
+    /// Stable one-way account identity; never a bearer token.
+    pub account_id: String,
+    pub model: String,
+    pub state: SandToolCapability,
+    pub tool_count: usize,
+    pub tool_names: Vec<String>,
+    pub last_error: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SandToolCapabilityRecord {
+    state: SandToolCapability,
+    tool_count: usize,
+    tool_names: Vec<String>,
+    last_error: Option<String>,
+    updated_at_ms: u64,
+    /// Wall-clock timestamps are useful to operators, but expiry must use a
+    /// monotonic clock so a system-clock adjustment cannot pin an old
+    /// Unsupported result forever.
+    observed_at: Instant,
+}
+
+const SAND_TOOL_CAPABILITY_MAX_ENTRIES: usize = 1024;
+/// Capability failures are cached briefly to stop a Claude Code retry storm,
+/// then re-probed so a Cursor provider rollout can recover without requiring a
+/// process restart. The explicit reset helpers below remain useful for a
+/// manual immediate probe.
+const SAND_TOOL_CAPABILITY_TTL: Duration = Duration::from_secs(15 * 60);
+static SAND_TOOL_CAPABILITIES: LazyLock<Mutex<HashMap<String, SandToolCapabilityRecord>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn capability_key(token: &str, model: &str) -> (String, String, String) {
+    let account_id = crate::providers::cursor::auth::cursor_account_digest(token);
+    let model = model.trim().to_ascii_lowercase();
+    (format!("{account_id}\0{model}"), account_id, model)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// Return the last observed tool capability for an account/model pair.
+pub fn sand_tool_capability_for_token(token: &str, model: &str) -> SandToolCapability {
+    let (key, _, _) = capability_key(token, model);
+    let mut cache = SAND_TOOL_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let stale = cache
+        .get(&key)
+        .is_some_and(|record| record.observed_at.elapsed() >= SAND_TOOL_CAPABILITY_TTL);
+    if stale {
+        cache.remove(&key);
+        return SandToolCapability::Unknown;
+    }
+    cache
+        .get(&key)
+        .map(|record| record.state)
+        .unwrap_or(SandToolCapability::Unknown)
+}
+
+/// Record a successful useful response for a request carrying a tool catalog.
+/// A later successful request can recover an earlier unsupported result after
+/// Cursor changes provider routing, so this is intentionally not one-way.
+pub fn mark_sand_tools_supported<I, S>(token: &str, model: &str, tool_count: usize, tool_names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    if tool_count == 0 {
+        return;
+    }
+    let (key, account_id, model) = capability_key(token, model);
+    update_sand_tool_capability(
+        key,
+        account_id,
+        model,
+        SandToolCapability::Supported,
+        tool_count,
+        tool_names,
+        None,
+    );
+}
+
+/// Record a deterministic provider rejection of a non-empty tool catalog.
+pub fn mark_sand_tools_unsupported<I, S>(
+    token: &str,
+    model: &str,
+    tool_count: usize,
+    tool_names: I,
+    error: impl Into<String>,
+) where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    if tool_count == 0 {
+        return;
+    }
+    let (key, account_id, model) = capability_key(token, model);
+    let error = error.into();
+    update_sand_tool_capability(
+        key,
+        account_id,
+        model,
+        SandToolCapability::Unsupported,
+        tool_count,
+        tool_names,
+        Some(error),
+    );
+}
+
+fn update_sand_tool_capability<I, S>(
+    key: String,
+    account_id: String,
+    model: String,
+    state: SandToolCapability,
+    tool_count: usize,
+    tool_names: I,
+    last_error: Option<String>,
+) where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut names = tool_names
+        .into_iter()
+        .map(Into::into)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names.truncate(16);
+    let mut cache = SAND_TOOL_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if cache.len() >= SAND_TOOL_CAPABILITY_MAX_ENTRIES && !cache.contains_key(&key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, record)| record.updated_at_ms)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        key,
+        SandToolCapabilityRecord {
+            state,
+            tool_count,
+            tool_names: names,
+            last_error,
+            updated_at_ms: unix_now_ms(),
+            observed_at: Instant::now(),
+        },
+    );
+    let _ = (account_id, model);
+}
+
+/// Forget one account/model observation and return whether an entry existed.
+/// The next request will probe the provider instead of trusting a stale
+/// Unsupported result.
+pub fn reset_sand_tool_capability(token: &str, model: &str) -> bool {
+    let (key, _, _) = capability_key(token, model);
+    SAND_TOOL_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&key)
+        .is_some()
+}
+
+/// Forget every in-process Sand tool observation. This is intentionally
+/// process-local: capability state is diagnostic/retry coordination, not a
+/// persisted account setting.
+pub fn reset_sand_tool_capabilities() {
+    SAND_TOOL_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+}
+
+/// Return a redacted snapshot for `sand-status` and health diagnostics.
+pub fn sand_tool_capability_statuses() -> Vec<SandToolCapabilityStatus> {
+    let mut cache = SAND_TOOL_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.retain(|_, record| record.observed_at.elapsed() < SAND_TOOL_CAPABILITY_TTL);
+    let mut rows = cache
+        .iter()
+        .filter_map(|(key, record)| {
+            let (account_id, model) = key.split_once('\0')?;
+            Some(SandToolCapabilityStatus {
+                account_id: account_id.to_string(),
+                model: model.to_string(),
+                state: record.state,
+                tool_count: record.tool_count,
+                tool_names: record.tool_names.clone(),
+                last_error: record.last_error.clone(),
+                updated_at_ms: record.updated_at_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.account_id
+            .cmp(&right.account_id)
+            .then(left.model.cmp(&right.model))
+    });
+    rows
+}
+
+/// Determine whether a stream error is the deterministic tool-catalog
+/// rejection observed from the Fable provider.  Cursor wraps it in an outer
+/// 429/resource-exhausted envelope and may include transient wording, so the
+/// request's non-empty tool count is part of the discriminator.
+pub fn is_sand_tool_capability_error(error: &CursorError, tool_count: usize) -> bool {
+    if tool_count == 0 {
+        return false;
+    }
+    let text = format!(
+        "{} {}",
+        error.message,
+        error.detail.as_deref().unwrap_or_default()
+    );
+    let lower = text.to_ascii_lowercase();
+    // The diagnostic reaches this layer as either flattened key/value text or
+    // pretty-printed JSON. Collapse whitespace before looking for the three
+    // structural markers so `providerStatusCode : 400` is treated exactly
+    // like the compact form emitted by `json_error`.
+    let compact = lower
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let provider_error = compact.contains("error_provider_error")
+        || compact.contains("providererrorcode=error_provider_error")
+        || compact.contains("provider_error_code=error_provider_error");
+    let provider_400 = compact.contains("providerstatuscode=400")
+        || compact.contains("provider_status_code=400")
+        || compact.contains("providerstatuscode:400")
+        || compact.contains("provider_status_code:400")
+        || compact.contains("providerstatuscode\":400")
+        || compact.contains("provider_status_code\":400")
+        || compact.contains("providerstatuscode\\\":400")
+        || compact.contains("provider_status_code\\\":400");
+    let non_retryable = compact.contains("isretryable=false")
+        || compact.contains("is_retryable=false")
+        || compact.contains("isretryable:false")
+        || compact.contains("is_retryable:false")
+        || compact.contains("isretryable\":false")
+        || compact.contains("is_retryable\":false")
+        || compact.contains("isretryable\\\":false")
+        || compact.contains("is_retryable\\\":false");
+    if !(provider_error && provider_400 && non_retryable) {
+        return false;
+    }
+    // Preserve account/plan/capacity classification. Those errors can carry
+    // the same nested provider marker but should still use account failover.
+    let terminal_policy = lower.contains("out of usage")
+        || lower.contains("usage exhausted")
+        || lower.contains("usage limit")
+        || lower.contains("rate limit exceeded")
+        || lower.contains("quota");
+    let transient_provider = is_transient_provider_error_message(&text);
+    !terminal_policy
+        && !crate::retry::is_billing_block(&text)
+        && (!crate::retry::is_policy_rate_limit(&text) || transient_provider)
+        && !crate::retry::is_capacity_shed(&text)
+}
+
+/// Convert a deterministic tool rejection to a stable client-facing 400.
+/// Keeping the original diagnostic in `detail` makes the status actionable
+/// without allowing it to enter the generic transient retry classifier.
+pub fn sand_tool_capability_client_error(
+    error: &CursorError,
+    model: &str,
+    tool_count: usize,
+) -> CursorError {
+    CursorError::new(
+        400,
+        format!(
+            "Sand model {} rejected the supplied tool catalog ({} tool{})",
+            model.trim(),
+            tool_count,
+            if tool_count == 1 { "" } else { "s" }
+        ),
+        Some(error.client_message()),
+    )
+}
 
 /// Wire role values used by `InferenceMessageRole`.
 pub const ROLE_USER: u32 = 1;
@@ -102,14 +427,27 @@ pub fn stream_error_is_retryable(error: &CursorError) -> bool {
 }
 
 /// Maximum number of stream-level Sand replays after an accepted response.
-/// Keep this lower than open retries: a response body may already have reached
-/// the upstream, so unbounded retries would multiply model invocations.
+/// Keep this separately bounded from open retries: a response body may already
+/// have reached the upstream, so unbounded retries would multiply model
+/// invocations.
 pub fn stream_retry_limit() -> u32 {
-    std::env::var("CCP_CURSOR_SAND_STREAM_RETRIES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .unwrap_or(2)
-        .min(5)
+    stream_retry_limit_from(
+        std::env::var("CCP_CURSOR_SAND_STREAM_RETRIES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn stream_retry_limit_from(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        // A provider error can be emitted after the HTTP stream has already
+        // been accepted. Two quick replays (the old default) ended the
+        // Claude Code turn during ordinary Cursor provider blips. Five
+        // bounded replays cover the usual recovery window while keeping the
+        // total request fan-out finite; callers can lower this with the env
+        // override for latency-sensitive deployments.
+        .unwrap_or(DEFAULT_SAND_STREAM_RETRIES)
+        .min(MAX_SAND_STREAM_RETRIES)
 }
 
 /// One message in an InferenceService request.
@@ -852,6 +1190,11 @@ impl SandInferenceRequest {
         // AgentService payload.
         object.insert("modelId".into(), json!(self.model_id));
         object.insert("conversationId".into(), json!(self.conversation_id));
+        // Cursor Desktop defaults the optional group binding to the
+        // conversation id.  Fable's tool-capable provider uses this binding
+        // when it attaches execution state; omitting it can make an otherwise
+        // valid non-empty catalog fail as a generic provider 400.
+        object.insert("conversationGroupId".into(), json!(self.conversation_id));
         object.insert("invocationId".into(), json!(self.invocation_id));
         // These are repeated fields in InferenceStreamRequest. Proto3 JSON
         // defaults omitted arrays correctly, but emitting them keeps the wire
@@ -2811,7 +3154,7 @@ mod tests {
         let value = json!({
             "error": {
                 "code": "resource_exhausted",
-                "message": "provider rejected request",
+                "message": "We're having trouble connecting to the model provider",
                 "details": [{
                     "debug": {
                         "error": "ERROR_PROVIDER_ERROR",
@@ -2829,7 +3172,8 @@ mod tests {
         assert!(message.contains("ERROR_PROVIDER_ERROR"), "{message}");
         assert!(message.contains("providerStatusCode=400"), "{message}");
         assert!(message.contains("isRetryable=false"), "{message}");
-        assert!(is_non_retryable_provider_error_message(&message));
+        assert!(!is_non_retryable_provider_error_message(&message));
+        assert!(is_sand_tool_capability_error(&error, 1));
     }
 
     #[test]
@@ -2900,6 +3244,115 @@ mod tests {
 
         let invalid = CursorError::new(400, "Sand traffic is not supported on this endpoint", None);
         assert!(!stream_error_is_retryable(&invalid));
+    }
+
+    #[test]
+    fn sand_stream_retry_default_covers_transient_provider_window() {
+        assert_eq!(DEFAULT_SAND_STREAM_RETRIES, 5);
+        assert_eq!(MAX_SAND_STREAM_RETRIES, 5);
+        assert_eq!(stream_retry_limit_from(None), 5);
+        assert_eq!(stream_retry_limit_from(Some("3")), 3);
+        // A malformed deployment cannot create an unbounded replay loop.
+        assert_eq!(stream_retry_limit_from(Some("999")), 5);
+        assert_eq!(stream_retry_limit_from(Some("not-a-number")), 5);
+    }
+
+    #[test]
+    fn sand_tool_capability_error_requires_provider_400_and_nonempty_catalog() {
+        let error = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some(
+                "providerStatusCode=400 isRetryable=false We're having trouble connecting to the model provider"
+                    .into(),
+            ),
+        );
+        assert!(is_sand_tool_capability_error(&error, 1));
+        assert!(!is_sand_tool_capability_error(&error, 0));
+
+        let retryable = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some("providerStatusCode=503 isRetryable=false".into()),
+        );
+        assert!(!is_sand_tool_capability_error(&retryable, 1));
+
+        let quota = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR out of usage",
+            Some("providerStatusCode=400 isRetryable=false".into()),
+        );
+        assert!(!is_sand_tool_capability_error(&quota, 1));
+
+        // HTTP error bodies are often pretty-printed before they reach the
+        // retry classifier. Whitespace around JSON punctuation must not turn
+        // a deterministic tool rejection back into a five-attempt replay.
+        let pretty = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some(
+                r#"{
+                    "additionalInfo": { "providerStatusCode" : 400 },
+                    "isRetryable" : false
+                }"#
+                .into(),
+            ),
+        );
+        assert!(is_sand_tool_capability_error(&pretty, 1));
+    }
+
+    #[test]
+    fn sand_tool_capability_is_scoped_to_account_and_model() {
+        let token_a = "capability-account-a";
+        let token_b = "capability-account-b";
+        let model = "claude-fable-5-capability-test";
+        reset_sand_tool_capability(token_a, model);
+        reset_sand_tool_capability(token_b, model);
+        assert_eq!(
+            sand_tool_capability_for_token(token_a, model),
+            SandToolCapability::Unknown
+        );
+        mark_sand_tools_unsupported(
+            token_a,
+            model,
+            2,
+            ["Read", "Bash"],
+            "providerStatusCode=400 isRetryable=false",
+        );
+        assert_eq!(
+            sand_tool_capability_for_token(token_a, model),
+            SandToolCapability::Unsupported
+        );
+        assert_eq!(
+            sand_tool_capability_for_token(token_b, model),
+            SandToolCapability::Unknown
+        );
+        mark_sand_tools_supported(token_a, model, 2, ["Read", "Bash"]);
+        assert_eq!(
+            sand_tool_capability_for_token(token_a, model),
+            SandToolCapability::Supported
+        );
+        let rows = sand_tool_capability_statuses();
+        let account = crate::providers::cursor::auth::cursor_account_digest(token_a);
+        assert!(rows.iter().any(|row| {
+            row.account_id == account
+                && row.model == model
+                && row.state == SandToolCapability::Supported
+                && row.tool_names == vec!["Bash".to_string(), "Read".to_string()]
+        }));
+        assert!(reset_sand_tool_capability(token_a, model));
+        assert_eq!(
+            sand_tool_capability_for_token(token_a, model),
+            SandToolCapability::Unknown
+        );
+        assert!(!reset_sand_tool_capability(token_a, model));
+    }
+
+    #[test]
+    fn sand_tool_capability_state_strings_are_stable() {
+        assert_eq!(SandToolCapability::Unknown.as_str(), "unknown");
+        assert_eq!(SandToolCapability::Supported.as_str(), "supported");
+        assert_eq!(SandToolCapability::Unsupported.as_str(), "unsupported");
     }
 
     #[tokio::test]

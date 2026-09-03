@@ -81,6 +81,10 @@ enum ProviderGroup {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+        /// Contact Cursor's zero-cost AvailableModels endpoint for every
+        /// saved account and verify the Sand session/model entitlement.
+        #[arg(long)]
+        preflight: bool,
     },
 }
 
@@ -298,18 +302,43 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
                 run_cursor_account_cli(command)
             }
         },
-        ProviderGroup::SandStatus { json } => {
+        ProviderGroup::SandStatus { json, preflight } => {
             if name != "cursor" {
                 anyhow::bail!("{name} sand-status is only available for the cursor provider");
             }
             let status = claude_cursor_proxy::providers::cursor::sand_status::snapshot();
-            if json {
+            let report = if preflight {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                Some(
+                    runtime
+                        .block_on(claude_cursor_proxy::providers::cursor::sand_status::preflight()),
+                )
+            } else {
+                None
+            };
+            if json && let Some(report) = report {
+                let value = serde_json::json!({
+                    "status": status,
+                    "preflight": report,
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 print!(
                     "{}",
                     claude_cursor_proxy::providers::cursor::sand_status::render_text(&status)
                 );
+                if let Some(report) = report {
+                    print!(
+                        "{}",
+                        claude_cursor_proxy::providers::cursor::sand_status::render_preflight_text(
+                            &report
+                        )
+                    );
+                }
             }
             Ok(())
         }

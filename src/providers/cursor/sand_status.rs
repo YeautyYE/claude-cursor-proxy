@@ -12,7 +12,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::providers::cursor::client::CursorHttpClient;
+use crate::providers::cursor::sand_inference::{
+    SandToolCapabilityStatus, sand_tool_capability_statuses,
+};
 use crate::{config, paths};
+use futures_util::{StreamExt, stream};
 
 /// Cursor's one-time browser flow for granting the account-level Bot/Sand
 /// entitlement. `grok-bot` is a server product identifier in this URL, not a
@@ -186,10 +191,234 @@ pub struct SandStatusSnapshot {
     pub accounts: Vec<SandAccountStatus>,
     pub usage_cache_path: String,
     pub usage_cache_accounts: usize,
+    /// Tool-catalog capability observations collected by live Sand requests.
+    /// An empty list means no tool probe has completed in this process yet.
+    pub tool_capabilities: Vec<SandToolCapabilityStatus>,
     /// If account discovery failed, status remains useful and reports the
     /// error here instead of turning a read-only diagnostic into a hard fail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_error: Option<String>,
+}
+
+/// Result of the optional online Sand preflight. The regular `sand-status`
+/// command remains local-only; callers opt into this report when they need to
+/// verify live account/session/model state against Cursor's current catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandPreflightModel {
+    pub configured: String,
+    pub sand_model: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_family: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandPreflightAccount {
+    pub id: String,
+    pub label: Option<String>,
+    pub email: Option<String>,
+    pub active: bool,
+    /// JWT `type` claim, redacted to the claim value only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
+    pub session_token: bool,
+    pub catalog_status: String,
+    pub catalog_models: usize,
+    pub configured_models: Vec<SandPreflightModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandPreflightReport {
+    pub checked_at_ms: u64,
+    pub endpoint: String,
+    pub client_type: &'static str,
+    pub transport: &'static str,
+    pub accounts: Vec<SandPreflightAccount>,
+    pub ready_accounts: usize,
+    pub all_ready: bool,
+}
+
+/// Contact only Cursor's zero-cost AvailableModels metadata endpoint for each
+/// saved account. This validates the session JWT, Sand identity and live model
+/// entitlement without opening an inference stream or consuming model output.
+pub async fn preflight() -> SandPreflightReport {
+    let checked_at_ms = epoch_ms(SystemTime::now()).unwrap_or_default();
+    // AvailableModels is a zero-cost metadata call, but it still needs the
+    // same strict Sand transport as inference. Build the shared HTTP client
+    // against the configured Sand base URL so an override cannot silently
+    // probe the ordinary CLI host or inherit an HTTP/1 preference.
+    let client = CursorHttpClient::with_base_url_timeout_and_prefer_http1(
+        config::cursor_sand_base_url(),
+        config::cursor_request_timeout_secs(),
+        false,
+    )
+    .with_sand_transport_mode();
+    let endpoint = format!(
+        "{}/aiserver.v1.AiService/AvailableModels",
+        config::cursor_sand_base_url().trim_end_matches('/')
+    );
+    let transport = if config::cursor_sand_base_url().starts_with("http://") {
+        "h2-prior-knowledge"
+    } else {
+        "h2-only"
+    };
+    let patterns = config::cursor_sand_policy().patterns().to_vec();
+    let profiles = match crate::providers::cursor::auth::list_cursor_accounts() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            return SandPreflightReport {
+                checked_at_ms,
+                endpoint,
+                client_type: "sand",
+                transport,
+                accounts: vec![SandPreflightAccount {
+                    id: "account-discovery".to_string(),
+                    label: None,
+                    email: None,
+                    active: false,
+                    token_type: None,
+                    session_token: false,
+                    catalog_status: "error".to_string(),
+                    catalog_models: 0,
+                    configured_models: Vec::new(),
+                    error: Some(error.to_string()),
+                }],
+                ready_accounts: 0,
+                all_ready: false,
+            };
+        }
+    };
+
+    // Keep a small concurrency cap so a large account pool does not create a
+    // burst of simultaneous catalog requests or exhaust local file/socket
+    // limits. Each request remains account/identity scoped in the client cache.
+    let checks = stream::iter(profiles.into_iter().map(|profile| {
+        let client = client.clone();
+        let patterns = patterns.clone();
+        async move { preflight_account(&client, profile, &patterns).await }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    let mut accounts = checks;
+    accounts.sort_by_key(|account| (!account.active, account.id.clone()));
+    let ready_accounts = accounts
+        .iter()
+        .filter(|account| account.catalog_status == "ok" && account.session_token)
+        .count();
+    SandPreflightReport {
+        checked_at_ms,
+        endpoint,
+        client_type: "sand",
+        transport,
+        all_ready: !accounts.is_empty() && ready_accounts == accounts.len(),
+        ready_accounts,
+        accounts,
+    }
+}
+
+async fn preflight_account(
+    client: &CursorHttpClient,
+    profile: crate::providers::cursor::auth::CursorAccountProfile,
+    patterns: &[String],
+) -> SandPreflightAccount {
+    let token_type =
+        crate::providers::cursor::auth::cursor_access_token_type(&profile.auth.access_token);
+    let session_token =
+        crate::providers::cursor::auth::cursor_access_token_is_session(&profile.auth.access_token);
+    if !session_token {
+        return SandPreflightAccount {
+            id: profile.id,
+            label: profile.label,
+            email: profile.auth.email,
+            active: profile.active,
+            token_type,
+            session_token,
+            catalog_status: "skipped".to_string(),
+            catalog_models: 0,
+            configured_models: Vec::new(),
+            error: Some("Sand stream requires a session JWT".to_string()),
+        };
+    }
+
+    match client
+        .refresh_available_models_for_client_type(&profile.auth.access_token, "sand")
+        .await
+    {
+        Ok(models) => {
+            let configured_models = patterns
+                .iter()
+                .map(|configured| preflight_model(configured, &models))
+                .collect::<Vec<_>>();
+            let all_configured_available = configured_models.iter().all(|model| model.available);
+            SandPreflightAccount {
+                id: profile.id,
+                label: profile.label,
+                email: profile.auth.email,
+                active: profile.active,
+                token_type,
+                session_token,
+                catalog_status: if all_configured_available || patterns.is_empty() {
+                    "ok".to_string()
+                } else {
+                    "model-mismatch".to_string()
+                },
+                catalog_models: models.len(),
+                configured_models,
+                error: None,
+            }
+        }
+        Err(error) => SandPreflightAccount {
+            id: profile.id,
+            label: profile.label,
+            email: profile.auth.email,
+            active: profile.active,
+            token_type,
+            session_token,
+            catalog_status: "error".to_string(),
+            catalog_models: 0,
+            configured_models: patterns
+                .iter()
+                .map(|configured| SandPreflightModel {
+                    configured: configured.clone(),
+                    sand_model: crate::providers::cursor::model::resolve_sand_model_id(configured),
+                    available: false,
+                    matched_family: None,
+                })
+                .collect(),
+            error: Some(error.client_message()),
+        },
+    }
+}
+
+fn preflight_model(
+    configured: &str,
+    models: &[crate::providers::cursor::catalog::CatalogModel],
+) -> SandPreflightModel {
+    let sand_model = crate::providers::cursor::model::resolve_sand_model_id(configured);
+    let matched = crate::providers::cursor::catalog::resolve(models, &sand_model)
+        .or_else(|| crate::providers::cursor::catalog::resolve(models, configured));
+    let available = matched.is_some()
+        || (configured.contains('*') || configured.contains('?'))
+            && models.iter().any(|model| {
+                let family = model
+                    .server_model_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or(model.name.as_str());
+                config::SandRoutingPolicy::new([configured]).matches(family)
+            });
+    SandPreflightModel {
+        configured: configured.to_string(),
+        sand_model,
+        available,
+        matched_family: matched.map(|match_| match_.family_id),
+    }
 }
 
 /// Build a status snapshot without contacting Cursor's API.
@@ -267,6 +496,7 @@ pub fn snapshot() -> SandStatusSnapshot {
         accounts,
         usage_cache_path: usage_cache_path.to_string_lossy().into_owned(),
         usage_cache_accounts: usage_cache.len(),
+        tool_capabilities: sand_tool_capability_statuses(),
         account_error,
     }
 }
@@ -697,6 +927,28 @@ pub fn render_text(status: &SandStatusSnapshot) -> String {
         status.usage_cache_accounts,
         status.usage_cache_path
     ));
+    if status.tool_capabilities.is_empty() {
+        out.push_str("  tool capability: no Sand tool probe recorded (state: unknown)\n");
+    } else {
+        out.push_str("  tool capability probes:\n");
+        for capability in &status.tool_capabilities {
+            let error = capability
+                .last_error
+                .as_deref()
+                .map(|value| format!("  error: {value}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "    {}  {}  state: {}  tools: {}  names: {}  updated: {}ms{}\n",
+                capability.account_id,
+                capability.model,
+                capability.state.as_str(),
+                capability.tool_count,
+                capability.tool_names.join(","),
+                capability.updated_at_ms,
+                error
+            ));
+        }
+    }
     for account in &status.accounts {
         let active = if account.active { '*' } else { ' ' };
         let name = account
@@ -721,6 +973,65 @@ pub fn render_text(status: &SandStatusSnapshot) -> String {
     out
 }
 
+/// Render the optional online report in a compact form suitable for a shell
+/// health check. Keep the regular status output above unchanged so scripts
+/// that already consume `sand-status` remain compatible.
+pub fn render_preflight_text(report: &SandPreflightReport) -> String {
+    let mut out = String::new();
+    out.push_str("Sand preflight (AvailableModels, no inference):\n");
+    out.push_str(&format!(
+        "  endpoint: {}  transport: {}  client: {}\n  ready accounts: {}/{}  overall: {}\n",
+        report.endpoint,
+        report.transport,
+        report.client_type,
+        report.ready_accounts,
+        report.accounts.len(),
+        if report.all_ready {
+            "ready"
+        } else {
+            "attention"
+        }
+    ));
+    for account in &report.accounts {
+        let name = account
+            .label
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(account.email.as_deref())
+            .unwrap_or(account.id.as_str());
+        out.push_str(&format!(
+            "  {}  ({})  token: {}  catalog: {} ({} models)",
+            name,
+            account.id,
+            account.token_type.as_deref().unwrap_or("unknown"),
+            account.catalog_status,
+            account.catalog_models
+        ));
+        if let Some(error) = account.error.as_deref() {
+            out.push_str(&format!("  error: {error}"));
+        }
+        out.push('\n');
+        for model in &account.configured_models {
+            out.push_str(&format!(
+                "    {} -> {}: {}{}\n",
+                model.configured,
+                model.sand_model,
+                if model.available {
+                    "available"
+                } else {
+                    "missing"
+                },
+                model
+                    .matched_family
+                    .as_deref()
+                    .map(|family| format!(" ({family})"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    out
+}
+
 fn marker(value: bool) -> &'static str {
     if value { "ready" } else { "missing" }
 }
@@ -728,6 +1039,7 @@ fn marker(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::cursor::sand_inference::SandToolCapability;
     use std::fs;
 
     #[test]
@@ -743,7 +1055,7 @@ mod tests {
 
     #[test]
     fn text_status_is_secret_free_and_mentions_h2_transport() {
-        let status = SandStatusSnapshot {
+        let mut status = SandStatusSnapshot {
             protocol: "sand-client-mode",
             bot_onboarding_url: SAND_BOT_ONBOARDING_URL,
             local_bot_daemon_required: false,
@@ -766,14 +1078,25 @@ mod tests {
             accounts: Vec::new(),
             usage_cache_path: "/tmp/account-usage.json".into(),
             usage_cache_accounts: 0,
+            tool_capabilities: Vec::new(),
             account_error: None,
         };
+        status.tool_capabilities.push(SandToolCapabilityStatus {
+            account_id: "account-digest".into(),
+            model: "claude-fable-5".into(),
+            state: SandToolCapability::Unsupported,
+            tool_count: 2,
+            tool_names: vec!["Read".into(), "Bash".into()],
+            last_error: Some("providerStatusCode=400 isRetryable=false".into()),
+            updated_at_ms: 123,
+        });
         let text = render_text(&status);
         assert!(text.contains("SandClientMode status"));
         assert!(text.contains("h2-only"));
         assert!(text.contains("managed-local: ready"));
         assert!(text.contains("local daemon: not required"));
         assert!(text.contains(SAND_BOT_ONBOARDING_URL));
+        assert!(text.contains("state: unsupported"));
         assert!(text.contains("not required by proxy"));
         assert!(!text.contains("accessToken"));
         assert!(!text.contains("refreshToken"));
@@ -804,6 +1127,7 @@ mod tests {
             accounts: Vec::new(),
             usage_cache_path: "/tmp/account-usage.json".into(),
             usage_cache_accounts: 0,
+            tool_capabilities: Vec::new(),
             account_error: None,
         };
         assert!(render_text(&status).contains("routing: enabled (global default: sand)"));

@@ -365,8 +365,31 @@ impl CursorHttpClient {
         token: &str,
         client_type: &str,
     ) -> Result<Vec<CatalogModel>, CursorError> {
+        self.fetch_available_models_for_client_type_inner(token, client_type, false)
+            .await
+    }
+
+    /// Refresh the account/identity-scoped AvailableModels snapshot even when
+    /// a cached catalog exists. This is used by the explicit Sand preflight
+    /// command so an operator can distinguish a stale local catalog from the
+    /// current server entitlement without making an inference request.
+    pub async fn refresh_available_models_for_client_type(
+        &self,
+        token: &str,
+        client_type: &str,
+    ) -> Result<Vec<CatalogModel>, CursorError> {
+        self.fetch_available_models_for_client_type_inner(token, client_type, true)
+            .await
+    }
+
+    async fn fetch_available_models_for_client_type_inner(
+        &self,
+        token: &str,
+        client_type: &str,
+        force_refresh: bool,
+    ) -> Result<Vec<CatalogModel>, CursorError> {
         let client_type = canonicalize_client_type(client_type.trim().to_string());
-        if let Some(cached) = catalog::cached_for_account(token, &client_type) {
+        if !force_refresh && let Some(cached) = catalog::cached_for_account(token, &client_type) {
             return Ok(cached);
         }
         let request_client = if client_type_requires_h2(&client_type) && !self.prefers_http2_only()

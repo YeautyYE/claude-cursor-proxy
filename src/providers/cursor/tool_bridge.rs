@@ -339,6 +339,76 @@ pub fn can_bridge_cursor_native_tools(body: &MessagesRequest, session_id: Option
     advertised_tool_names(body).is_some_and(|n| !n.is_empty())
 }
 
+/// Incremental text-to-event adapter used by Sand's tool-catalog fallback.
+///
+/// Some Sand provider/model combinations accept a request only when the
+/// `tools` field is empty, while still emitting the XML tool protocol in their
+/// text stream.  The normal Cursor bridge is entered only when a native tool
+/// catalog is present, so callers on that fallback path need a small adapter
+/// that feeds text through the same parser and exposes recovered calls as
+/// structured `NativeTool` events.  Keeping this adapter here makes the
+/// allow-list and XML semantics identical to the existing Agent bridge.
+#[derive(Debug)]
+pub struct CursorXmlEventBridge {
+    parser: CursorToolUseXmlParser,
+    allowed_tool_names: Option<BTreeSet<String>>,
+}
+
+impl CursorXmlEventBridge {
+    /// Create an adapter.  `Some(set)` restricts recovered calls to the tool
+    /// names advertised by Claude Code; `None` is reserved for protocol
+    /// fixtures where the caller intentionally accepts every XML name.
+    pub fn new(allowed_tool_names: Option<BTreeSet<String>>) -> Self {
+        Self {
+            parser: CursorToolUseXmlParser::new(allowed_tool_names.clone()),
+            allowed_tool_names,
+        }
+    }
+
+    /// Decode one possibly fragmented text delta into Cursor events.
+    pub fn push(&mut self, text: &str) -> Vec<CursorStreamEvent> {
+        self.parser
+            .push(text)
+            .into_iter()
+            .map(recovered_event_to_cursor_event)
+            .collect()
+    }
+
+    /// Flush a stream at EOF, converting any complete buffered XML call and
+    /// preserving ordinary trailing text.
+    pub fn flush(&mut self) -> Vec<CursorStreamEvent> {
+        self.parser
+            .flush()
+            .into_iter()
+            .map(recovered_event_to_cursor_event)
+            .collect()
+    }
+
+    /// Whether at least one XML tool call has been recovered.
+    pub fn saw_tool_use(&self) -> bool {
+        self.parser.saw_tool_use()
+    }
+
+    /// Discard buffered text and recovered-call state before replaying a
+    /// failed upstream attempt.  The allow-list remains unchanged, while the
+    /// new parser receives fresh IDs and cannot join a partial XML tag from
+    /// the abandoned stream with the replacement response.
+    pub fn reset(&mut self) {
+        self.parser = CursorToolUseXmlParser::new(self.allowed_tool_names.clone());
+    }
+}
+
+fn recovered_event_to_cursor_event(event: RecoveredCursorEvent) -> CursorStreamEvent {
+    match event {
+        RecoveredCursorEvent::Text(text) => CursorStreamEvent::TextDelta { text },
+        RecoveredCursorEvent::ToolUse(tool_use) => CursorStreamEvent::NativeTool {
+            tool_use_id: tool_use.id,
+            name: tool_use.name,
+            input: serde_json::Value::Object(tool_use.input),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Result helpers
 // ---------------------------------------------------------------------------
@@ -977,6 +1047,61 @@ pub fn start_cursor_tool_bridge(
     (sse, paused)
 }
 
+/// Convert a collected Cursor event segment into an Anthropic SSE response.
+///
+/// Sand's inference stream is often collected before the HTTP response is
+/// committed (for example while classifying a tool-capability probe).  This
+/// entry point keeps that path on the same XML recovery, tool allow-list, and
+/// pause/registry lifecycle as the normal buffered Cursor bridge.  A paused
+/// segment is retained in [`BridgeRegistry`] and can be continued with
+/// [`resume_cursor_tool_bridge`].
+///
+/// The returned boolean is `true` when a client-visible `tool_use` pause was
+/// emitted.  The event slice is borrowed so callers can safely retain their
+/// replay buffer; the bridge only stores cloned continuation events.
+pub fn bridge_cursor_events_to_sse(
+    message_id: &str,
+    model: &str,
+    session_id: &str,
+    events: &[CursorStreamEvent],
+    allowed_tool_names: Option<BTreeSet<String>>,
+) -> (Vec<u8>, bool) {
+    start_cursor_tool_bridge(
+        message_id,
+        model,
+        session_id,
+        events,
+        allowed_tool_names,
+        Box::new(|| {
+            format!(
+                "call_cursor_{}",
+                uuid::Uuid::new_v4().to_string().replace('-', "")
+            )
+        }),
+    )
+}
+
+/// Convert a complete event segment for a stateless transport such as Sand.
+///
+/// Unlike AgentService, Sand sends the full Anthropic history on every turn;
+/// its next request carries the `tool_result` directly and never enters the
+/// Cursor live-run continuation path.  Reusing [`bridge_cursor_events_to_sse`]
+/// would therefore leave a pending entry in the process-wide registry after
+/// every XML tool call.  This variant keeps the same output but removes that
+/// transient state before returning.
+pub fn bridge_cursor_events_to_sse_stateless(
+    message_id: &str,
+    model: &str,
+    session_id: &str,
+    events: &[CursorStreamEvent],
+    allowed_tool_names: Option<BTreeSet<String>>,
+) -> (Vec<u8>, bool) {
+    let result =
+        bridge_cursor_events_to_sse(message_id, model, session_id, events, allowed_tool_names);
+    BridgeRegistry::remove(session_id);
+    result
+}
+
 /// Resume a paused tool bridge session.
 ///
 /// Finds the stored state by live-run key, resolves the pending tool with
@@ -1566,6 +1691,149 @@ mod tests {
     // -----------------------------------------------------------------------
     // PendingCursorTool tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn xml_event_bridge_recovers_tool_use_without_upstream_catalog() {
+        let mut bridge = CursorXmlEventBridge::new(Some(BTreeSet::from(["Read".to_string()])));
+
+        // The fallback request carries no upstream `tools` field.  Claude
+        // Code's original allow-list still gates the text protocol locally.
+        let first = bridge.push("prefix <tool_");
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0],
+            CursorStreamEvent::TextDelta { text } if text == "prefix "
+        ));
+        let second = bridge.push(r#"use name="Read">{"file_path":"/tmp/a"}</tool_use> tail"#);
+        assert_eq!(second.len(), 2);
+        assert!(matches!(
+            &second[0],
+            CursorStreamEvent::NativeTool { tool_use_id, name, input }
+                if tool_use_id.starts_with("call_cursor_")
+                    && name == "Read"
+                    && input == &serde_json::json!({"file_path": "/tmp/a"})
+        ));
+        assert!(matches!(
+            &second[1],
+            CursorStreamEvent::TextDelta { text } if text == " tail"
+        ));
+        assert!(bridge.saw_tool_use());
+    }
+
+    #[test]
+    fn xml_event_bridge_filters_unadvertised_tool_names() {
+        let mut bridge = CursorXmlEventBridge::new(Some(BTreeSet::from(["Read".to_string()])));
+        let events =
+            bridge.push(r#"before <tool_use name="Bash">{"command":"pwd"}</tool_use> after"#);
+
+        let visible = events
+            .iter()
+            .filter_map(|event| match event {
+                CursorStreamEvent::TextDelta { text } => Some(text.as_str()),
+                CursorStreamEvent::NativeTool { .. } => None,
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, "before  after");
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, CursorStreamEvent::NativeTool { .. }))
+        );
+        assert!(!bridge.saw_tool_use());
+    }
+
+    #[test]
+    fn bridge_cursor_events_to_sse_recovers_xml_and_retains_pause_state() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+
+        let events = vec![
+            CursorStreamEvent::TextDelta {
+                text: "before <tool_".into(),
+            },
+            CursorStreamEvent::TextDelta {
+                text: r#"use name="Read">{"file_path":"/tmp/a"}</tool_use> after"#.into(),
+            },
+            CursorStreamEvent::End,
+        ];
+        let (sse, paused) = bridge_cursor_events_to_sse(
+            "msg-sand-xml",
+            "claude-fable-5",
+            "session-sand-xml",
+            &events,
+            Some(BTreeSet::from(["Read".to_string()])),
+        );
+
+        assert!(paused);
+        let body = String::from_utf8(sse).expect("Anthropic SSE must be UTF-8");
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("\"type\":\"tool_use\""));
+        assert!(body.contains("\"name\":\"Read\""));
+        assert!(body.contains("\"stop_reason\":\"tool_use\""));
+        // Text after a recovered tool call belongs to the continuation and
+        // must remain in the registry rather than being emitted twice.
+        assert!(!body.contains(" after"));
+        let pending = BridgeRegistry::pending_tool("session-sand-xml")
+            .expect("XML tool pause should be retained for Sand resume");
+        assert_eq!(pending.name(), "Read");
+        assert_eq!(pending.input_json()["file_path"], "/tmp/a");
+        BridgeRegistry::remove("session-sand-xml");
+    }
+
+    #[test]
+    fn bridge_cursor_events_to_sse_finalizes_plain_text_without_registry_entry() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+
+        let events = vec![
+            CursorStreamEvent::TextDelta {
+                text: "plain Sand answer".into(),
+            },
+            CursorStreamEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 3,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            CursorStreamEvent::End,
+        ];
+        let (sse, paused) = bridge_cursor_events_to_sse(
+            "msg-sand-text",
+            "claude-fable-5",
+            "session-sand-text",
+            &events,
+            Some(BTreeSet::new()),
+        );
+
+        assert!(!paused);
+        let body = String::from_utf8(sse).expect("Anthropic SSE must be UTF-8");
+        assert!(body.contains("plain Sand answer"));
+        assert!(body.contains("\"stop_reason\":\"end_turn\""));
+        assert!(BridgeRegistry::get("session-sand-text").is_none());
+    }
+
+    #[test]
+    fn stateless_bridge_does_not_retain_sand_tool_state() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+        let events = vec![CursorStreamEvent::TextDelta {
+            text: r#"<tool_use name="Read">{"file_path":"/tmp/a"}</tool_use>"#.into(),
+        }];
+        let (sse, paused) = bridge_cursor_events_to_sse_stateless(
+            "msg-sand-stateless",
+            "claude-fable-5",
+            "session-sand-stateless",
+            &events,
+            Some(BTreeSet::from(["Read".to_string()])),
+        );
+        assert!(paused);
+        assert!(
+            sse.windows(b"tool_use".len())
+                .any(|window| window == b"tool_use")
+        );
+        assert!(BridgeRegistry::get("session-sand-stateless").is_none());
+    }
 
     #[test]
     fn pending_read_input_matches_claude_read_tool() {

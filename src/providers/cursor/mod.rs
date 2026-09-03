@@ -75,7 +75,8 @@ use crate::providers::cursor::request::{
     CursorPromptOptions, CursorSelectedImage, claude_local_mcp_tools, current_user_blocks,
     cursor_request_context, is_reactive_compact_prompt, latest_user_is_only_tool_results,
     refresh_image_uuids, reject_orphaned_native_results_when_live_slot_is_free,
-    render_cursor_prompt, render_cursor_prompt_parts_with, request_has_client_only_tool_results,
+    render_cursor_prompt, render_cursor_prompt_parts_with, render_sand_text_tool_bridge_prompt,
+    request_has_client_only_tool_results,
 };
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_compaction,
@@ -84,12 +85,15 @@ use crate::providers::cursor::response::{
 };
 use crate::providers::cursor::sand_inference::{
     SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
-    accepted_unadvertised_tool_names_from_anthropic, messages_from_anthropic,
-    stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
+    accepted_unadvertised_tool_names_from_anthropic, is_sand_tool_capability_error,
+    mark_sand_tools_supported, mark_sand_tools_unsupported, messages_from_anthropic,
+    sand_tool_capability_client_error, sand_tool_capability_for_token, stream_error_is_retryable,
+    stream_retry_limit, tools_from_anthropic,
 };
 use crate::providers::cursor::tool_bridge::{
-    BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
-    resolve_advertised_name, start_cursor_tool_bridge,
+    BridgeRegistry, advertised_tool_names, bridge_cursor_events_to_sse,
+    can_bridge_cursor_native_tools, find_tool_result, resolve_advertised_name,
+    start_cursor_tool_bridge,
 };
 
 // ---------------------------------------------------------------------------
@@ -1160,11 +1164,39 @@ async fn sand_direct_response(
     let sand_tools = tools_from_anthropic(body, compaction_mode);
     let accepted_unadvertised_tool_names =
         accepted_unadvertised_tool_names_from_anthropic(body, &sand_tools);
+    let tool_count = sand_tools.len();
+    let tool_names = sand_tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let capability = sand_tool_capability_for_token(token, model);
+    // Fable currently accepts the InferenceService text path but rejects the
+    // ordinary `InferenceAgentTool` catalog with an inner provider 400.  Use
+    // the text bridge for that family (and for a cached account/model
+    // rejection) from the first request, avoiding a deterministic 400 retry
+    // loop. Other Sand models retain the native catalog and can fall back to
+    // the same bridge if the provider reports the rejection at stream time.
+    let text_bridge_initial = tool_count > 0
+        && !compaction_mode
+        && (sand_model_prefers_text_tool_bridge(model)
+            || matches!(capability, sand_inference::SandToolCapability::Unsupported));
+    let bridge_prompt = if tool_count > 0 && !compaction_mode {
+        render_sand_text_tool_bridge_prompt(body)
+    } else {
+        None
+    };
+    let mut request_messages = messages.clone();
+    if text_bridge_initial {
+        if let Some(prompt) = bridge_prompt.as_deref() {
+            prepend_sand_text_tool_bridge_prompt(&mut request_messages, prompt);
+        }
+    }
     let request = SandInferenceRequest::new(
         model.to_string(),
         uuid::Uuid::new_v4().to_string(),
         uuid::Uuid::new_v4().to_string(),
-        messages,
+        request_messages,
     )
     // `maxMode` belongs to the selected model configuration, not the
     // canonical family id sent on the Sand wire.  Keep deriving it from the
@@ -1173,8 +1205,36 @@ async fn sand_direct_response(
     .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
     .with_parameter_model_id(parameter_model)
     .with_max_tokens(body.max_tokens.map(u64::from))
-    .with_tools(sand_tools)
+    .with_tools(if text_bridge_initial {
+        Vec::new()
+    } else {
+        sand_tools.clone()
+    })
     .with_accepted_unadvertised_tool_names(accepted_unadvertised_tool_names);
+
+    // Keep a complete no-catalog request ready. If an otherwise native Sand
+    // model rejects the catalog after HTTP 200, the stream driver can switch
+    // once to this request and continue through the text bridge without
+    // asking Claude Code to resend the turn.
+    let fallback_request = if tool_count > 0 && !text_bridge_initial {
+        bridge_prompt.as_deref().map(|prompt| {
+            let mut fallback_messages = messages.clone();
+            prepend_sand_text_tool_bridge_prompt(&mut fallback_messages, prompt);
+            SandInferenceRequest::new(
+                model.to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                fallback_messages,
+            )
+            .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
+            .with_parameter_model_id(parameter_model)
+            .with_max_tokens(body.max_tokens.map(u64::from))
+            .with_tools(Vec::new())
+            .with_accepted_unadvertised_tool_names(Vec::<String>::new())
+        })
+    } else {
+        None
+    };
 
     let client = SandInferenceClient::new();
     if let Some(monitor) = ctx.monitor.as_ref() {
@@ -1189,16 +1249,18 @@ async fn sand_direct_response(
     // model's explicit account binding.
     let mut effective_token = token.to_string();
     let mut effective_request = request;
+    let mut fallback_request = fallback_request;
     let stream = loop {
         match open_sand_with_retries(&client, &effective_token, &effective_request).await {
             Ok(stream) => break stream,
             Err(error)
-                if is_account_failover_policy_error(&error.client_message())
-                    || is_account_failover_policy_error(&error.message)
-                    || error
-                        .detail
-                        .as_deref()
-                        .is_some_and(is_account_failover_policy_error) =>
+                if !is_sand_tool_capability_error(&error, tool_count)
+                    && (is_account_failover_policy_error(&error.client_message())
+                        || is_account_failover_policy_error(&error.message)
+                        || error
+                            .detail
+                            .as_deref()
+                            .is_some_and(is_account_failover_policy_error)) =>
             {
                 let diagnostic = error.client_message();
                 note_policy_rate_limit(
@@ -1227,6 +1289,30 @@ async fn sand_direct_response(
                     ])),
                 );
             }
+            Err(error) if is_sand_tool_capability_error(&error, tool_count) => {
+                mark_sand_tools_unsupported(
+                    &effective_token,
+                    model,
+                    tool_count,
+                    tool_names.clone(),
+                    error.client_message(),
+                );
+                if let Some(replacement) = fallback_request.take() {
+                    create_logger("cursor").warn(
+                        "sand_tools_catalog_fallback",
+                        Some(serde_json::Map::from_iter([
+                            ("model".into(), serde_json::json!(model)),
+                            ("clientType".into(), serde_json::json!("sand")),
+                            ("toolCount".into(), serde_json::json!(tool_count)),
+                            ("recovery".into(), serde_json::json!("text_bridge")),
+                        ])),
+                    );
+                    effective_request = replacement.with_fresh_ids();
+                    continue;
+                }
+                let client_error = sand_tool_capability_client_error(&error, model, tool_count);
+                return map_cursor_error_to_response(&client_error);
+            }
             Err(error) => return map_cursor_error_to_response(&error),
         }
     };
@@ -1239,10 +1325,34 @@ async fn sand_direct_response(
     let (tx, rx) = mpsc::channel::<LiveEventResult>(128);
     let idle_secs = sand_stream_idle_timeout_secs();
     let retry_client = client.clone();
-    let retry_token = effective_token;
+    let retry_token = effective_token.clone();
     let retry_request = effective_request;
     let retry_model = model.to_string();
+    let retry_tool_count = tool_count;
+    let retry_tool_names = tool_names;
     let retry_account_failover_state = Arc::clone(&account_failover_state);
+    let bridge_key = ctx
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(|sid| {
+            live_run_key_for(live_run_identity_with_account(
+                sid,
+                ctx,
+                Some(&cursor_account_key_for_token(&effective_token)),
+            ))
+        });
+    let bridge_allowed = if compaction_mode {
+        Some(BTreeSet::new())
+    } else {
+        advertised_tool_names(body)
+    };
+    // Any Sand request that carries Claude tools is framed through the same
+    // buffered bridge, even when the provider accepts its native catalog. It
+    // keeps native and XML calls on one downstream lifecycle and prevents raw
+    // `<tool_use>` text from leaking into Claude Code if a provider changes
+    // formats mid-rollout.
+    let use_tool_bridge = tool_count > 0 && !compaction_mode && bridge_key.is_some();
     tokio::spawn(async move {
         drive_sand_stream_with_retries(
             retry_client,
@@ -1256,12 +1366,33 @@ async fn sand_direct_response(
             retry_model,
             "sand".to_string(),
             retry_account_failover_state,
+            retry_tool_count,
+            retry_tool_names,
+            fallback_request,
         )
         .await;
     });
 
     let estimated_input = estimate_rendered_prompt_tokens(&parts);
     if body.stream {
+        if use_tool_bridge {
+            let Some(session_key) = bridge_key.as_deref() else {
+                unreachable!("tool bridge requires a session key")
+            };
+            return sand_tool_bridge_stream_response(
+                rx,
+                session_key.to_string(),
+                message_id,
+                wire_model,
+                body,
+                bridge_allowed,
+                estimated_input,
+                ctx.monitor
+                    .clone()
+                    .map(|monitor| (monitor, ctx.req_id.clone())),
+            )
+            .await;
+        }
         let events = if let Some(session_id) = ctx.session_id.as_deref() {
             tap_session_usage(session_id.to_string(), rx)
         } else {
@@ -1277,6 +1408,23 @@ async fn sand_direct_response(
                 .map(|monitor| (monitor, ctx.req_id.clone())),
             compaction_mode,
         );
+    }
+
+    if use_tool_bridge {
+        let Some(session_key) = bridge_key.as_deref() else {
+            unreachable!("tool bridge requires a session key")
+        };
+        return sand_tool_bridge_json_response(
+            rx,
+            session_key,
+            &message_id,
+            &wire_model,
+            body,
+            bridge_allowed,
+            estimated_input,
+            ctx.monitor.as_ref().map(|monitor| (&ctx.req_id, monitor)),
+        )
+        .await;
     }
 
     match collect_live_events_to_json(
@@ -1330,6 +1478,9 @@ async fn open_sand_with_retries(
         };
         match client.open(token, &attempt_request).await {
             Ok(stream) => return Ok(stream),
+            Err(error) if is_sand_tool_capability_error(&error, request.tools.len()) => {
+                return Err(error);
+            }
             Err(error)
                 if attempt < max_retries
                     && crate::retry::should_retry_upstream(
@@ -1374,12 +1525,16 @@ async fn drive_sand_stream_with_retries(
     model: String,
     client_type: String,
     account_failover_state: SharedAccountFailoverState,
+    tool_count: usize,
+    tool_names: Vec<String>,
+    mut fallback_request: Option<SandInferenceRequest>,
 ) {
     let max_retries = stream_retry_limit();
     let mut retries = 0u32;
     let mut next_stream = Some(initial_stream);
     let mut buffered = Vec::new();
     let mut committed = false;
+    let mut catalog_active = !request.tools.is_empty();
 
     loop {
         let mut stream = if let Some(stream) = next_stream.take() {
@@ -1389,6 +1544,49 @@ async fn drive_sand_stream_with_retries(
             match open_sand_with_retries(&client, &token, &retry_request).await {
                 Ok(stream) => stream,
                 Err(error) => {
+                    if !committed && is_sand_tool_capability_error(&error, tool_count) {
+                        mark_sand_tools_unsupported(
+                            &token,
+                            &model,
+                            tool_count,
+                            tool_names.clone(),
+                            error.client_message(),
+                        );
+                        if let Some(replacement) = fallback_request.take() {
+                            request = replacement.with_fresh_ids();
+                            catalog_active = false;
+                            retries = 0;
+                            discard_sand_replay_buffer(&mut buffered);
+                            create_logger("cursor").warn(
+                                "sand_stream_catalog_fallback",
+                                Some(serde_json::Map::from_iter([
+                                    ("model".into(), serde_json::json!(&model)),
+                                    ("clientType".into(), serde_json::json!(&client_type)),
+                                    ("toolCount".into(), serde_json::json!(tool_count)),
+                                    ("recovery".into(), serde_json::json!("text_bridge")),
+                                ])),
+                            );
+                            continue;
+                        }
+                        discard_sand_replay_buffer(&mut buffered);
+                        let client_error =
+                            sand_tool_capability_client_error(&error, &model, tool_count);
+                        send_sand_buffered_error(&tx, &mut buffered, client_error).await;
+                        create_logger("cursor").warn(
+                            "sand_tools_unsupported",
+                            Some(serde_json::Map::from_iter([
+                                (
+                                    "accountId".into(),
+                                    serde_json::json!(cursor_account_digest(&token)),
+                                ),
+                                ("model".into(), serde_json::json!(&model)),
+                                ("clientType".into(), serde_json::json!(&client_type)),
+                                ("toolCount".into(), serde_json::json!(tool_count)),
+                                ("tools".into(), serde_json::json!(&tool_names)),
+                            ])),
+                        );
+                        return;
+                    }
                     if !committed && retries < max_retries && stream_error_is_retryable(&error) {
                         // The failed attempt may have queued thinking/usage
                         // control events without exposing visible output.
@@ -1452,6 +1650,14 @@ async fn drive_sand_stream_with_retries(
                         SandStreamEventAction::Commit => {
                             buffered.push(event);
                             committed = true;
+                            if catalog_active {
+                                mark_sand_tools_supported(
+                                    &token,
+                                    &model,
+                                    tool_count,
+                                    tool_names.clone(),
+                                );
+                            }
                             if !send_sand_buffered_events(&tx, &mut buffered).await {
                                 return;
                             }
@@ -1527,6 +1733,52 @@ async fn drive_sand_stream_with_retries(
             // events.  No synthetic error is needed here.
             return;
         };
+        if !committed && is_sand_tool_capability_error(&error, tool_count) {
+            mark_sand_tools_unsupported(
+                &token,
+                &model,
+                tool_count,
+                tool_names.clone(),
+                error.client_message(),
+            );
+            if let Some(replacement) = fallback_request.take() {
+                // The catalog rejection is deterministic for this
+                // account/model, but the text-only provider path remains
+                // usable. Replace the request once and let the same bounded
+                // replay machinery deliver its XML calls through the bridge.
+                request = replacement.with_fresh_ids();
+                catalog_active = false;
+                retries = 0;
+                discard_sand_replay_buffer(&mut buffered);
+                create_logger("cursor").warn(
+                    "sand_stream_catalog_fallback",
+                    Some(serde_json::Map::from_iter([
+                        ("model".into(), serde_json::json!(&model)),
+                        ("clientType".into(), serde_json::json!(&client_type)),
+                        ("toolCount".into(), serde_json::json!(tool_count)),
+                        ("recovery".into(), serde_json::json!("text_bridge")),
+                    ])),
+                );
+                continue;
+            }
+            discard_sand_replay_buffer(&mut buffered);
+            let client_error = sand_tool_capability_client_error(&error, &model, tool_count);
+            send_sand_buffered_error(&tx, &mut buffered, client_error).await;
+            create_logger("cursor").warn(
+                "sand_tools_unsupported",
+                Some(serde_json::Map::from_iter([
+                    (
+                        "accountId".into(),
+                        serde_json::json!(cursor_account_digest(&token)),
+                    ),
+                    ("model".into(), serde_json::json!(&model)),
+                    ("clientType".into(), serde_json::json!(&client_type)),
+                    ("toolCount".into(), serde_json::json!(tool_count)),
+                    ("tools".into(), serde_json::json!(tool_names)),
+                ])),
+            );
+            return;
+        }
         if !committed
             && (is_account_failover_policy_error(&error.client_message())
                 || is_account_failover_policy_error(&error.message)
@@ -1702,6 +1954,282 @@ fn sand_stream_idle_timeout_secs() -> u64 {
         .filter(|value| *value > 0)
         .unwrap_or_else(crate::config::cursor_request_timeout_secs)
         .clamp(15, 3600)
+}
+
+fn sand_model_prefers_text_tool_bridge(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.contains("fable")
+}
+
+/// Add the text-tool contract as a single system message while retaining the
+/// structured Anthropic history. Sand's Fable provider accepts this role on
+/// its text path; unlike flattening render_cursor_prompt, it preserves image
+/// parts and assistant/tool-result boundaries for the next full-history turn.
+fn prepend_sand_text_tool_bridge_prompt(messages: &mut Vec<SandInferenceMessage>, prompt: &str) {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return;
+    }
+    if let Some(system) = messages
+        .iter_mut()
+        .find(|message| message.role == sand_inference::ROLE_SYSTEM)
+    {
+        let existing = system.text.take().unwrap_or_default();
+        system.parts.clear();
+        system.tool_calls.clear();
+        system.tool_content = None;
+        system.text = Some(if existing.trim().is_empty() {
+            prompt.to_string()
+        } else {
+            format!("{prompt}\n\n{existing}")
+        });
+    } else {
+        messages.insert(0, SandInferenceMessage::system(prompt));
+    }
+}
+
+async fn collect_sand_bridge_events(
+    mut events: mpsc::Receiver<LiveEventResult>,
+) -> Result<Vec<CursorStreamEvent>, String> {
+    let mut output = Vec::new();
+    while let Some(item) = events.recv().await {
+        match item {
+            Ok(LiveRunEvent::Cursor(event)) => output.push(event),
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                for tool in tools {
+                    output.push(CursorStreamEvent::NativeTool {
+                        tool_use_id: tool.tool_use_id,
+                        name: tool.name,
+                        input: tool.input,
+                    });
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(output)
+}
+
+fn sand_response_headers() -> [(http::header::HeaderName, &'static str); 3] {
+    [
+        (http::header::CONTENT_TYPE, "text/event-stream"),
+        (http::header::CACHE_CONTROL, "no-cache, no-transform"),
+        (http::header::CONNECTION, "keep-alive"),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sand_tool_bridge_stream_response(
+    events: mpsc::Receiver<LiveEventResult>,
+    session_key: String,
+    message_id: String,
+    wire_model: String,
+    _body: &MessagesRequest,
+    allowed: Option<BTreeSet<String>>,
+    _estimated_input: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+) -> Response {
+    let events = match collect_sand_bridge_events(events).await {
+        Ok(events) => events,
+        Err(error) => return json_error_from_cursor_message(error),
+    };
+    let (sse_bytes, _paused) =
+        bridge_cursor_events_to_sse(&message_id, &wire_model, &session_key, &events, allowed);
+    if let Some((handle, req_id)) = monitor {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+        handle.stream_progress(
+            &req_id,
+            sse_bytes.len() as u64,
+            count_sse_events(&sse_bytes),
+            input_tokens,
+            output_tokens,
+        );
+        handle.usage_updated(
+            &req_id,
+            input_tokens.filter(|value| *value > 0),
+            output_tokens.filter(|value| *value > 0),
+        );
+    }
+    (sand_response_headers(), sse_bytes).into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sand_tool_bridge_json_response(
+    events: mpsc::Receiver<LiveEventResult>,
+    session_key: &str,
+    message_id: &str,
+    wire_model: &str,
+    _body: &MessagesRequest,
+    allowed: Option<BTreeSet<String>>,
+    estimated_input: u64,
+    monitor: Option<(&String, &crate::monitor::MonitorHandle)>,
+) -> Response {
+    let events = match collect_sand_bridge_events(events).await {
+        Ok(events) => events,
+        Err(error) => return json_error_from_cursor_message(error),
+    };
+    let (sse_bytes, _paused) =
+        bridge_cursor_events_to_sse(message_id, wire_model, session_key, &events, allowed);
+    let json = match anthropic_json_from_sse(&sse_bytes, message_id, wire_model, estimated_input) {
+        Ok(json) => json,
+        Err(error) => return json_error_from_cursor_message(error),
+    };
+    let input_tokens = json
+        .pointer("/usage/input_tokens")
+        .and_then(|value| value.as_u64());
+    if let Some((req_id, handle)) = monitor {
+        handle.usage_updated(
+            req_id,
+            input_tokens,
+            json.pointer("/usage/output_tokens")
+                .and_then(|value| value.as_u64()),
+        );
+    }
+    (StatusCode::OK, Json(json)).into_response()
+}
+
+/// Decode the small Anthropic SSE segment generated by the collected bridge
+/// back into the non-streaming Messages response. This keeps stream=false on
+/// the same XML parser and pending-tool registry path as stream=true.
+fn anthropic_json_from_sse(
+    bytes: &[u8],
+    message_id: &str,
+    model: &str,
+    estimated_input: u64,
+) -> Result<serde_json::Value, String> {
+    let parsed = crate::providers::cursor::sse::parse_sse_events(&String::from_utf8_lossy(bytes));
+    let mut acc = AnthropicJsonAcc::new(estimated_input);
+    let mut tool_blocks: HashMap<i64, (String, String, String)> = HashMap::new();
+    let mut ended = false;
+    for (_, data) in parsed {
+        let kind = data
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        match kind {
+            "message_start" => {
+                if let Some(usage) = data.pointer("/message/usage") {
+                    acc.push(&CursorStreamEvent::Usage {
+                        input_tokens: json_u64_field(usage, "input_tokens"),
+                        output_tokens: json_u64_field(usage, "output_tokens"),
+                        cache_read_tokens: json_u64_field(usage, "cache_read_input_tokens"),
+                        cache_write_tokens: json_u64_field(usage, "cache_creation_input_tokens"),
+                    });
+                }
+            }
+            "content_block_start" => {
+                let index = data
+                    .get("index")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let Some(block) = data.get("content_block") else {
+                    continue;
+                };
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use") {
+                    let id = block
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    tool_blocks.insert(index, (id, name, String::new()));
+                }
+            }
+            "content_block_delta" => {
+                let index = data
+                    .get("index")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let Some(delta) = data.get("delta") else {
+                    continue;
+                };
+                match delta.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(serde_json::Value::as_str) {
+                            acc.push(&CursorStreamEvent::TextDelta {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) =
+                            delta.get("thinking").and_then(serde_json::Value::as_str)
+                        {
+                            acc.push(&CursorStreamEvent::ThinkingDelta {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some((_, _, input)) = tool_blocks.get_mut(&index) {
+                            input.push_str(
+                                delta
+                                    .get("partial_json")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or(""),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = data
+                    .get("index")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                if let Some((id, name, input)) = tool_blocks.remove(&index) {
+                    let input =
+                        serde_json::from_str(&input).unwrap_or_else(|_| serde_json::json!({}));
+                    acc.push_native_tool(id, name, input);
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = data.get("usage") {
+                    acc.push(&CursorStreamEvent::Usage {
+                        input_tokens: json_u64_field(usage, "input_tokens"),
+                        output_tokens: json_u64_field(usage, "output_tokens"),
+                        cache_read_tokens: json_u64_field(usage, "cache_read_input_tokens"),
+                        cache_write_tokens: json_u64_field(usage, "cache_creation_input_tokens"),
+                    });
+                }
+            }
+            "message_stop" => ended = true,
+            "error" => {
+                let message = data
+                    .pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Sand tool bridge returned an error");
+                return Err(message.to_string());
+            }
+            _ => {}
+        }
+    }
+    for (_, (id, name, input)) in tool_blocks {
+        let input = serde_json::from_str(&input).unwrap_or_else(|_| serde_json::json!({}));
+        acc.push_native_tool(id, name, input);
+    }
+    if !acc.has_useful() {
+        return Err("Sand tool bridge produced no useful progress".into());
+    }
+    if !ended {
+        create_logger("cursor").warn(
+            "sand_tool_bridge_missing_message_stop",
+            Some(serde_json::Map::from_iter([
+                ("messageId".into(), serde_json::json!(message_id)),
+                ("model".into(), serde_json::json!(model)),
+            ])),
+        );
+    }
+    Ok(acc.into_message_json(message_id, model))
+}
+
+fn json_u64_field(value: &serde_json::Value, key: &str) -> u64 {
+    value.get(key).and_then(|value| value.as_u64()).unwrap_or(0)
 }
 
 enum LiveStartPeek {
@@ -6189,6 +6717,29 @@ impl Provider for CursorProvider {
             return map_cursor_error_to_response(&error);
         }
 
+        // Sand is stateless and replays the complete Anthropic history on
+        // every turn. A previous text/native bridge pause therefore only
+        // needs to be acknowledged and removed before the next Sand request;
+        // the supplied tool_result is carried in that full history. Keeping
+        // the stale buffered events would replay an old tool call instead of
+        // asking the model to continue.
+        if uses_sand
+            && !xai_compact
+            && let Some(bridge_key) = bridge_registry_key_for_account(&ctx, Some(&account_key))
+            && let Some(pending) = BridgeRegistry::pending_tool(&bridge_key)
+            && find_tool_result(&body, pending.tool_use_id()).is_some()
+        {
+            BridgeRegistry::remove(&bridge_key);
+            create_logger("cursor").info(
+                "sand_tool_bridge_resumed_by_history",
+                Some(serde_json::Map::from_iter([
+                    ("model".into(), serde_json::json!(model)),
+                    ("tool".into(), serde_json::json!(pending.name())),
+                    ("recovery".into(), serde_json::json!("full_history")),
+                ])),
+            );
+        }
+
         // Sand is a Desktop InferenceService transport.  It is deliberately
         // dispatched before any LiveRunRegistry admission or AgentService
         // continuation logic: the latter endpoint now rejects
@@ -7407,6 +7958,272 @@ mod tests {
     };
 
     static POLICY_RATE_LIMIT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Exercise the complete Fable Sand tool fallback without contacting a
+    /// real Cursor account. The fixture deliberately returns the provider
+    /// diagnostic inside a successful Connect response, which is where the
+    /// production stream driver must classify a deterministic catalog
+    /// rejection and replay the same full history without `tools`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sand_tool_catalog_fallback_bridges_xml_and_replays_tool_result_history() {
+        use crate::providers::cursor::connect::{
+            ConnectFrameDecoder, FLAG_END, encode_connect_frame,
+        };
+        use crate::providers::cursor::sand_inference::{
+            SandInferenceClient, SandInferenceRequest, messages_from_anthropic,
+            reset_sand_tool_capability, tools_from_anthropic,
+        };
+        use crate::providers::cursor::tool_bridge::bridge_cursor_events_to_sse_stateless;
+        use axum::{Router, body::Body, extract::Request, routing::post};
+        use futures_util::StreamExt;
+        use serde_json::{Value, json};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token = "sand-fixture-token";
+        reset_sand_tool_capability(token, "claude-fable-5");
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count_for_handler = Arc::clone(&request_count);
+
+        let app = Router::new().route(
+            "/aiserver.v1.InferenceService/Stream",
+            post(move |request: Request<Body>| {
+                let request_log = Arc::clone(&request_log);
+                let count_for_handler = Arc::clone(&count_for_handler);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
+                        .await
+                        .expect("read Sand fixture request");
+                    let mut decoder = ConnectFrameDecoder::new();
+                    let frames = decoder.push(&body).expect("decode Sand request frame");
+                    assert_eq!(frames.len(), 1, "each fixture request has one Connect frame");
+                    let value: Value = serde_json::from_slice(&frames[0].payload)
+                        .expect("decode Sand request JSON");
+                    let attempt = count_for_handler.fetch_add(1, Ordering::SeqCst) + 1;
+                    request_log.lock().expect("request log lock").push(value);
+
+                    let payload = match attempt {
+                        1 => json!({
+                            "error": {
+                                "code": "resource_exhausted",
+                                "message": "We're having trouble connecting to the model provider",
+                                "details": [{
+                                    "debug": {
+                                        "error": "ERROR_PROVIDER_ERROR",
+                                        "details": {
+                                            "additionalInfo": {"providerStatusCode": 400},
+                                            "isRetryable": false
+                                        }
+                                    }
+                                }]
+                            }
+                        }),
+                        2 => json!({
+                            "textPart": {
+                                "text": "<tool_use name=\"Read\">{\"file_path\":\"/tmp/fixture.txt\"}</tool_use>"
+                            }
+                        }),
+                        _ => json!({"textPart": {"text": "continued after tool result"}}),
+                    };
+                    let payload = serde_json::to_vec(&payload).expect("encode fixture response");
+                    let frame = encode_connect_frame(payload, 0);
+                    let end = encode_connect_frame(Vec::new(), FLAG_END);
+                    let response_body = [frame.as_ref(), end.as_ref()].concat();
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/connect+json")],
+                        response_body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Sand fixture");
+        let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Sand fixture");
+        });
+
+        let anthropic: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "read the fixture"}],
+            "tools": [{
+                "name": "Read",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                }
+            }]
+        }))
+        .expect("Anthropic fixture request");
+        let messages = messages_from_anthropic(&anthropic, false);
+        let sand_tools = tools_from_anthropic(&anthropic, false);
+        assert_eq!(sand_tools.len(), 1);
+        let bridge_prompt =
+            render_sand_text_tool_bridge_prompt(&anthropic).expect("tool bridge prompt");
+
+        let initial_request = SandInferenceRequest::new(
+            "claude-fable-5",
+            "fixture-conversation",
+            "fixture-invocation",
+            messages.clone(),
+        )
+        .with_tools(sand_tools.clone());
+        let mut fallback_messages = messages;
+        prepend_sand_text_tool_bridge_prompt(&mut fallback_messages, &bridge_prompt);
+        let fallback_request = SandInferenceRequest::new(
+            "claude-fable-5",
+            "fixture-fallback-conversation",
+            "fixture-fallback-invocation",
+            fallback_messages,
+        );
+
+        let client = SandInferenceClient::with_base_url_timeout(url, 5).expect("Sand client");
+        let initial_stream = client
+            .open(token, &initial_request)
+            .await
+            .expect("initial catalog probe should open");
+        let (tx, mut rx) = mpsc::channel::<LiveEventResult>(32);
+        let account_state = Arc::new(Mutex::new(AccountFailoverState::new(token)));
+        drive_sand_stream_with_retries(
+            client.clone(),
+            token.to_string(),
+            initial_request,
+            initial_stream,
+            Some(BTreeSet::from(["Read".to_string()])),
+            false,
+            5,
+            tx,
+            "claude-fable-5".to_string(),
+            "sand".to_string(),
+            account_state,
+            sand_tools.len(),
+            vec!["Read".to_string()],
+            Some(fallback_request),
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item.expect("fallback stream should succeed") {
+                LiveRunEvent::Cursor(event) => events.push(event),
+                LiveRunEvent::NativeToolBatch(_) => panic!("fixture should use XML bridge"),
+            }
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CursorStreamEvent::TextDelta { text } if text.contains("<tool_use")
+        )));
+
+        let (sse, paused) = bridge_cursor_events_to_sse_stateless(
+            "fixture-message",
+            "claude-fable-5",
+            "fixture-session",
+            &events,
+            Some(BTreeSet::from(["Read".to_string()])),
+        );
+        assert!(paused, "XML tool call must pause for Claude tool_result");
+        let sse_text = String::from_utf8(sse).expect("bridge SSE is UTF-8");
+        let tool_use = sse_text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|value| {
+                (value["type"] == "content_block_start"
+                    && value["content_block"]["type"] == "tool_use")
+                    .then(|| value["content_block"].clone())
+            })
+            .expect("bridge must emit an Anthropic tool_use block");
+        assert_eq!(tool_use["name"], "Read");
+        let tool_use_id = tool_use["id"].as_str().expect("tool_use id").to_string();
+
+        // Recreate the next Claude Code turn and verify Sand receives the
+        // assistant tool call plus a role=TOOL toolContent message rather than
+        // a flattened XML transcript.
+        let continuation: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5",
+            "messages": [
+                {"role": "user", "content": "read the fixture"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/fixture.txt"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": "fixture contents"
+                }]}
+            ]
+        }))
+        .expect("continuation request");
+        let continuation_messages = messages_from_anthropic(&continuation, false);
+        assert_eq!(continuation_messages.len(), 3);
+        assert_eq!(
+            continuation_messages[1].tool_calls[0]["toolCallId"],
+            tool_use_id
+        );
+        assert_eq!(continuation_messages[2].role, sand_inference::ROLE_TOOL);
+        assert_eq!(
+            continuation_messages[2].tool_content.as_ref().unwrap()["parts"][0]["result"],
+            "fixture contents"
+        );
+
+        let continuation_request = SandInferenceRequest::new(
+            "claude-fable-5",
+            "fixture-continuation-conversation",
+            "fixture-continuation-invocation",
+            continuation_messages,
+        );
+        let mut stream = client
+            .open(token, &continuation_request)
+            .await
+            .expect("full-history continuation should open");
+        let mut continuation_events = Vec::new();
+        while let Some(event) = stream.next().await {
+            continuation_events.push(event.expect("continuation event"));
+        }
+        assert!(continuation_events.iter().any(|event| matches!(
+            event,
+            CursorStreamEvent::TextDelta { text } if text == "continued after tool result"
+        )));
+
+        let observed = requests.lock().expect("request log lock").clone();
+        assert_eq!(
+            observed.len(),
+            3,
+            "catalog, fallback, and continuation requests"
+        );
+        assert_eq!(observed[0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(observed[1]["tools"], json!([]));
+        assert!(
+            observed[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["role"] == sand_inference::ROLE_SYSTEM
+                    && message["text"].as_str().unwrap_or("").contains("tool_use"))
+        );
+        assert_eq!(observed[2]["tools"], json!([]));
+        assert_eq!(
+            observed[2]["messages"][2]["role"],
+            sand_inference::ROLE_TOOL
+        );
+        assert!(
+            observed[2]["messages"][2]["toolContent"]["parts"][0]["result"]
+                .as_str()
+                .is_some_and(|result| result == "fixture contents")
+        );
+
+        reset_sand_tool_capability(token, "claude-fable-5");
+        server.abort();
+    }
 
     #[test]
     fn sand_replay_discards_uncommitted_metadata_events() {

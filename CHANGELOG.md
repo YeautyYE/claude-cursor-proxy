@@ -3,6 +3,17 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.104 (2026-09-03)
+
+- Align Sand with the current Cursor Desktop wire: HTTP/2 Connect-JSON
+  `InferenceService/Stream`, fresh conversation/invocation IDs, and the full
+  desktop identity header set.
+- Add `cursor sand-status --preflight` to validate session JWTs and the live
+  Sand `AvailableModels` catalog per account before sending inference.
+- Keep Fable usable when a provider rejects native tool metadata by switching
+  once to the text-tool bridge, while retaining Claude Code tool-result
+  continuation semantics and bounded stream recovery.
+
 ## v0.1.103 (2026-09-03)
 
 - Recognize Cursor's `ERROR_NETWORK_ERROR` temporary provider-connectivity

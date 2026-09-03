@@ -2325,6 +2325,28 @@ pub fn cursor_account_id_for_token(token: &str) -> String {
     cursor_account_digest(token)
 }
 
+/// Return the access-token `type` claim used by Cursor's request routers.
+/// Sand's InferenceService accepts the IDE/session JWT, while a browser/web
+/// token can authenticate to website APIs but is rejected by the stream. The
+/// value is exposed for diagnostics only; the bearer itself is never returned.
+pub fn cursor_access_token_type(token: &str) -> Option<String> {
+    parse_jwt_claims(token).and_then(|claims| {
+        claims
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+/// Sand stream authentication requires a session-shaped JWT. Keep this as a
+/// small pure predicate so status checks and request admission use identical
+/// semantics without duplicating JWT parsing.
+pub fn cursor_access_token_is_session(token: &str) -> bool {
+    cursor_access_token_type(token)
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("session"))
+}
+
 fn parse_jwt_claims(token: &str) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
     let _header = parts.next()?;

@@ -272,6 +272,24 @@ pub(crate) fn format_sse_event_bytes(event: &str, data: &serde_json::Value) -> V
     out
 }
 
+/// Parse complete Anthropic SSE events from a buffered response. Comments and
+/// unknown lines are skipped; each JSON data line is returned with the most
+/// recent event name.
+pub(crate) fn parse_sse_events(sse: &str) -> Vec<(String, serde_json::Value)> {
+    let mut events = Vec::new();
+    let mut current_event = String::new();
+    for line in sse.lines() {
+        if let Some(event) = line.strip_prefix("event: ") {
+            current_event = event.to_string();
+        } else if let Some(data) = line.strip_prefix("data: ")
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(data)
+        {
+            events.push((current_event.clone(), value));
+        }
+    }
+    events
+}
+
 // ---------------------------------------------------------------------------
 // SSE Framer
 // ---------------------------------------------------------------------------
