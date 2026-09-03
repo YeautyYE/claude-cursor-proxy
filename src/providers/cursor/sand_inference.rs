@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::anthropic::schema::MessagesRequest;
+use crate::logging::create_logger;
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorUpstreamResponse};
 use crate::providers::cursor::connect::{
     ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP, connect_error_status,
@@ -60,11 +61,14 @@ pub const MAX_SAND_STREAM_RETRIES: u32 = 5;
 // one stalled account look like hundreds of independent 502s.  Keep a small,
 // independent open bulkhead here; the AgentService live gate intentionally
 // does not cover Sand requests.
-const SAND_OPEN_GLOBAL_DEFAULT: usize = 32;
+const SAND_OPEN_GLOBAL_DEFAULT: usize = 512;
 const SAND_OPEN_GLOBAL_MAX: usize = 512;
-const SAND_OPEN_ACCOUNT_DEFAULT: usize = 4;
-const SAND_OPEN_ACCOUNT_MAX: usize = 64;
-const SAND_OPEN_QUEUE_DEFAULT_SECS: u64 = 15;
+const SAND_OPEN_ACCOUNT_DEFAULT: usize = 512;
+const SAND_OPEN_ACCOUNT_MAX: usize = 512;
+// Keep the local fairness slice below Claude Code's first-byte watchdog. A
+// saturated gate is soft and bypassed after this short wait, so it cannot
+// turn a transient burst into a 15-second synchronized retry wave.
+const SAND_OPEN_QUEUE_DEFAULT_SECS: u64 = 3;
 const SAND_OPEN_QUEUE_MAX_SECS: u64 = 120;
 const SAND_OPEN_BREAKER_THRESHOLD_DEFAULT: u32 = 3;
 const SAND_OPEN_BREAKER_THRESHOLD_MAX: u32 = 16;
@@ -178,8 +182,8 @@ impl SandOpenGate {
     /// request create a second lane for the same account/model and silently
     /// bypass the configured per-account concurrency limit. If every bounded
     /// entry is active, reject the new lane rather than growing the map
-    /// without limit; the caller surfaces a retryable 503 and existing work
-    /// remains protected.
+    /// without limit; the soft admission caller can bypass the local gate and
+    /// let the upstream transport apply its own capacity policy.
     fn account_gate(&self, key: &str) -> Option<Arc<Semaphore>> {
         let mut account = self
             .account
@@ -235,6 +239,13 @@ impl SandOpenGate {
             _account: account,
         })
     }
+
+    /// Attempt one bounded queue slice and return `None` when the lane is
+    /// saturated. The caller may then issue a permit-less upstream open so a
+    /// local semaphore timeout cannot become a client-visible 503.
+    async fn acquire_soft(&self, key: &str, wait: Duration) -> Option<SandOpenPermit> {
+        self.acquire(key, wait).await.ok()
+    }
 }
 
 /// A permit is intentionally scoped to one HTTP `.send()` attempt.  Holding
@@ -252,24 +263,50 @@ static SAND_OPEN_GATE: LazyLock<SandOpenGate> =
 
 fn sand_open_admission_error() -> CursorError {
     let mut error = CursorError::new(
-        503,
-        "Sand open admission queue timed out; retry after upstream capacity recovers",
+        504,
+        "Sand open admission deadline exhausted; retry after upstream capacity recovers",
         None,
     );
-    error.retry_after = Some("2".to_string());
+    error.retry_after = Some("1".to_string());
     error
 }
 
-/// Acquire process and account/model-scoped capacity before one Sand open.
-/// `wait` is supplied by the caller's total retry deadline so queueing can
-/// never extend a request past its own budget.
-pub(crate) async fn admit_sand_open(
+/// Try to acquire a Sand open slot for one short fairness slice.  Admission is
+/// deliberately soft: if every slot is occupied, the request proceeds
+/// without a local permit instead of waiting until the client's stream
+/// watchdog expires or returning a proxy-generated 503.  Cursor's upstream
+/// capacity and the bounded transport retry loop remain the final backstop.
+pub(crate) async fn admit_sand_open_until(
     token: &str,
     model: &str,
-    wait: Duration,
-) -> Result<SandOpenPermit, CursorError> {
+    deadline: Instant,
+) -> Result<Option<SandOpenPermit>, CursorError> {
     let key = capability_key(token, model).0;
-    SAND_OPEN_GATE.acquire(&key, wait).await
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(sand_open_admission_error());
+    }
+    let queue_wait = remaining.min(Duration::from_secs(sand_open_queue_secs()));
+    match SAND_OPEN_GATE.acquire_soft(&key, queue_wait).await {
+        Some(permit) => Ok(Some(permit)),
+        None => {
+            // The old behavior surfaced this local timeout as HTTP 503. That
+            // is especially harmful for Claude Code: it immediately retries,
+            // all retries queue behind the same stalled opens, and the TUI
+            // fills with a synchronized 503 wave. A permit-less open keeps
+            // compatibility with the pre-bulkhead behavior while still
+            // limiting healthy bursts when capacity is available.
+            create_logger("cursor").debug(
+                "sand_open_admission_bypass",
+                Some(serde_json::Map::from_iter([
+                    ("model".into(), serde_json::json!(model)),
+                    ("reason".into(), serde_json::json!("queue saturated")),
+                    ("queueMs".into(), serde_json::json!(queue_wait.as_millis())),
+                ])),
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -290,20 +327,13 @@ fn breaker_key(token: &str, model: &str) -> String {
     capability_key(token, model).0
 }
 
-fn breaker_error(remaining: Duration) -> CursorError {
-    let retry_after = remaining.as_secs().clamp(1, 300).to_string();
-    let mut error = CursorError::new(
-        503,
-        "Sand inference temporarily unavailable; open circuit is cooling down",
-        None,
-    );
-    error.retry_after = Some(retry_after);
-    error
-}
-
-/// Check whether a request may issue a Sand open. One half-open probe is
-/// admitted after cooldown; all other callers fail fast with 503 instead of
-/// creating another synchronized retry wave.
+/// Record the circuit state without turning it into a proxy-side outage.
+///
+/// Sand opens are full-history, UUID-scoped requests. A local breaker that
+/// rejects every caller while cooling down creates a synchronized 503 wave and
+/// prevents a healthy upstream from proving recovery. Keep the state for
+/// diagnostics and failure accounting, but let each request reach the normal
+/// bounded transport retry path.
 pub(crate) fn sand_open_breaker_admit(token: &str, model: &str) -> Result<(), CursorError> {
     let key = breaker_key(token, model);
     let now = Instant::now();
@@ -319,21 +349,14 @@ pub(crate) fn sand_open_breaker_admit(token: &str, model: &str) -> Result<(), Cu
     };
     if let Some(until) = state.open_until {
         if until > now {
-            return Err(breaker_error(until.saturating_duration_since(now)));
+            return Ok(());
         }
-        if state.half_open_probe {
-            // A cancelled task can disappear before it reports success or
-            // failure. Treat a probe that has been silent for one cooldown as
-            // abandoned and allow a fresh probe; otherwise one client
-            // disconnect could permanently wedge this account/model lane.
-            if now.saturating_duration_since(state.last_failure) >= sand_open_breaker_cooldown() {
-                state.half_open_probe = false;
-            } else {
-                return Err(breaker_error(Duration::from_secs(2)));
-            }
-        }
-        state.half_open_probe = true;
-        state.last_failure = now;
+        // Start a fresh observation window after cooldown. Do not retain the
+        // old failure count, otherwise one transient outage can immediately
+        // reopen the state after the first recovery probe.
+        state.open_until = None;
+        state.consecutive_failures = 0;
+        state.half_open_probe = false;
     }
     Ok(())
 }
@@ -3790,7 +3813,7 @@ mod tests {
     }
 
     #[test]
-    fn sand_open_breaker_is_scoped_and_recovers_after_success() {
+    fn sand_open_breaker_is_scoped_without_client_blocking() {
         reset_sand_open_state_for_test();
         let token = "sand-breaker-account-a";
         let model = "cursor-grok-breaker-test";
@@ -3801,8 +3824,10 @@ mod tests {
         for _ in 0..3 {
             sand_open_breaker_failure(token, model, &transient, Instant::now());
         }
-        let blocked = sand_open_breaker_admit(token, model).expect_err("breaker should open");
-        assert_eq!(blocked.status, 503);
+        assert!(
+            sand_open_breaker_admit(token, model).is_ok(),
+            "an open local circuit must not synthesize a client-visible 503"
+        );
         // A different account/model lane must remain eligible.
         assert!(sand_open_breaker_admit(other_token, model).is_ok());
         sand_open_breaker_success(token, model);
@@ -3871,6 +3896,28 @@ mod tests {
         gate.acquire("account-a\0model", Duration::from_millis(100))
             .await
             .expect("permit must return after drop");
+    }
+
+    #[tokio::test]
+    async fn sand_open_gate_soft_admission_bypasses_a_saturated_slice() {
+        // A queue slice expiring must not become a terminal admission error:
+        // the caller proceeds without a local permit and lets the upstream
+        // transport apply its own capacity controls.
+        let gate = SandOpenGate::new(1, 1);
+        let first = gate
+            .acquire("account-a\0model", Duration::from_millis(100))
+            .await
+            .expect("first permit");
+        let bypass = gate
+            .acquire_soft("account-a\0model", Duration::from_millis(20))
+            .await;
+        assert!(bypass.is_none(), "a saturated slice should soft-bypass");
+        drop(first);
+        let second = gate
+            .acquire_soft("account-a\0model", Duration::from_millis(100))
+            .await
+            .expect("released slot should be reusable");
+        drop(second);
     }
 
     #[tokio::test]

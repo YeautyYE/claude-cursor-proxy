@@ -3,6 +3,19 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.107 (2026-09-04)
+
+- Restore high-concurrency Sand behavior after the v0.1.105 local bulkhead
+  regression: global and per-account/model open defaults now support 512
+  concurrent opens.
+- Make Sand admission soft. A saturated local slice bypasses the semaphore
+  instead of generating a proxy-side 503; genuine upstream failures remain on
+  the bounded retry and backoff path.
+- Keep the Sand failure breaker for diagnostics and recovery accounting without
+  rejecting every request during cooldown with a synthetic 503 wave.
+- Remove the implicit Fable Sand route. `claude-fable-5` follows the same
+  explicit model policy as every other model.
+
 ## v0.1.106 (2026-09-03)
 
 - Keep the Setup panel's default Cursor transport line synchronized after a

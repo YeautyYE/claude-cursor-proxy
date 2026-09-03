@@ -86,13 +86,12 @@ use crate::providers::cursor::response::{
 };
 use crate::providers::cursor::sand_inference::{
     SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
-    accepted_unadvertised_tool_names_from_anthropic, admit_sand_open,
+    accepted_unadvertised_tool_names_from_anthropic, admit_sand_open_until,
     is_sand_tool_capability_error, mark_sand_tools_supported, mark_sand_tools_unsupported,
     messages_from_anthropic, sand_logical_retry_budget, sand_open_breaker_abort,
     sand_open_breaker_admit, sand_open_breaker_failure, sand_open_breaker_success,
-    sand_open_queue_secs, sand_open_total_budget, sand_tool_capability_client_error,
-    sand_tool_capability_for_token, stream_error_is_retryable, stream_retry_limit,
-    tools_from_anthropic,
+    sand_open_total_budget, sand_tool_capability_client_error, sand_tool_capability_for_token,
+    stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, bridge_cursor_events_to_sse,
@@ -1513,21 +1512,33 @@ async fn open_sand_with_retries_until(
                 None,
             ));
         }
-        // A short account/model-scoped breaker prevents many callers from
-        // probing a route that has already failed repeatedly. The half-open
-        // state admits exactly one probe after cooldown.
+        // Keep account/model failure accounting for diagnostics and retry
+        // backoff. It never rejects a caller locally: the upstream transport
+        // must remain able to prove that a cooled-down route recovered.
         sand_open_breaker_admit(token, &request.model_id)?;
-        let queue_wait = remaining.min(Duration::from_secs(sand_open_queue_secs()));
-        let _open_permit = match admit_sand_open(token, &request.model_id, queue_wait).await {
-            Ok(permit) => permit,
-            Err(error) => {
-                // A half-open probe can lose the local queue race before the
-                // HTTP request starts. Clear its in-flight marker so the next
-                // caller can probe after a short cool-off.
-                sand_open_breaker_abort(token, &request.model_id, true);
-                return Err(error);
-            }
-        };
+        let _open_permit =
+            match admit_sand_open_until(token, &request.model_id, local_deadline).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    // A half-open probe can lose the local queue race before the
+                    // HTTP request starts. Clear its in-flight marker so the next
+                    // caller can probe after a short cool-off.
+                    sand_open_breaker_abort(token, &request.model_id, true);
+                    return Err(error);
+                }
+            };
+        // The fairness slice may have consumed most of the logical budget.
+        // Recompute it after admission so queue time cannot extend this HTTP
+        // attempt beyond the caller's deadline.
+        let remaining = local_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            sand_open_breaker_abort(token, &request.model_id, true);
+            return Err(CursorError::new(
+                504,
+                "Sand inference open retry budget exhausted",
+                None,
+            ));
+        }
         // A connect/open failure is ambiguous: the gateway may have accepted
         // the frame before the local socket failed. Replaying the same
         // lifecycle ids then looks like a duplicate live invocation and can

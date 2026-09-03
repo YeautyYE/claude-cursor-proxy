@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.106 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.107 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -397,10 +397,10 @@ claude-cursor-proxy serve              # 保持监控 TUI 打开
 或 `[cli]`；修改只影响新请求，并以原子方式写入 `config.json`。TUI 需要
 终端；`serve --no-monitor` 仍可运行代理，但不会显示设置面板。
 
-Fable 是内建的 Sand/Bot 路由。全新配置或保存了任意非空 Sand 策略时，
-`claude-fable-5[1m]` 会标记为 `[sand]` 并使用 Cursor Bot 通道，当前选择的
-账号都可使用。只有显式空策略（`cursor.sandModels: []` 或
-`CCP_CURSOR_SAND_MODELS=`）会关闭这条内建路由，让所有模型保持配置的默认身份。
+Fable 没有内建的 Sand 特例，和其他 Cursor 模型一样完全服从显式策略：在
+**Sand Models** 中选择 `claude-fable-5`（或 catalog 变体）才会标记为
+`[sand]`；未选择时使用配置的默认身份。空策略也是有效选择，不会自动加入
+任何模型。
 
 需要在终端只读检查 Sand 是否完整时，可运行：
 
@@ -452,10 +452,7 @@ export CCP_CURSOR_SAND_MODELS="claude-fable-5"
 `cursor.sandModels`；想从 TUI 编辑文件时先取消这个环境变量。需要混合
 路由时请保留 `CCP_CURSOR_CLIENT_TYPE` 默认值 `cli`；把它设为 `sand` 会让
 未命中规则的模型也使用 Sand。
-只要 Sand 策略非空，Fable 就会作为内建 Sand/Bot 路由保留，即使 TUI 中还选择了
-其他模型；因此所有已登录 Cursor 账号都可以使用 `claude-fable-5[1m]`，账号选择和
-额度故障切换彼此隔离。只有显式空数组 `cursor.sandModels: []` 或空值
-`CCP_CURSOR_SAND_MODELS=` 才会关闭内建路由并让所有模型保持配置的默认身份。
+模型级规则没有隐藏的 Fable 例外；账号选择和额度故障切换彼此独立。
 
 ### 模型目录从哪里来
 
@@ -538,9 +535,9 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_SAND_BASE_URL` | 跟随 `CCP_CURSOR_BASE_URL` | 可选的 Sand `InferenceService/Stream` 专用地址 |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头；TUI 的 `t` 选择器会把选择保存到 `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |
-| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Sand InferenceService 同时建立的连接上限（1–512） |
-| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | 单账号/模型路由同时建立的 Sand 连接上限（1–64） |
-| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `15` | Sand 连接准入槽位最多等待时间（1–120 秒） |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Sand InferenceService 同时建立的连接上限（1–512） |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | 单账号/模型路由同时建立的 Sand 连接上限（1–512） |
+| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand 准入公平等待片段（1–120 秒）；片段耗尽后绕过本地门控，不返回代理生成的 503 |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | 单次 Sand HTTP 建连超时（10–180 秒） |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | 一次 Sand 建连及重试总预算（20–900 秒） |
 | `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | 初始建连和无输出流重放共用的逻辑预算（60–3600 秒） |
@@ -689,6 +686,7 @@ takeover。这属于本地 Lobster/会话生命周期问题，不是 Cursor 推�
 | `grok-build`/Claude Code 对 `grok-4.6` 或 `cursor-grok-*` 返回 HTTP 429 `You're out of usage`，但绑定账号仍有 Sand/Bot 余额 | 先看请求徽标：`[cli]` 消耗账号的 CLI/API 指标，`[sand]` 消耗 Sand/Grok Bot。模型-账号绑定只选择凭据，不会切换通道。要让 Cursor Grok 使用 Bot 额度，请在 **Sand Models** 添加精确的 `cursor-grok-4.6-*`，切换为 `[sand]`，再用 `m` 给同一行绑定账号；用 `u`/`U` 刷新并核对 `Updated` 时间。裸 `grok-4.6` 默认仍走原生 Grok，除非明确为它配置 Cursor 账号绑定。 |
 | grok-build 在未付款账单或不支持的国家/区域时报 `Server error (500) - Something went wrong on our side` | 升级到 ≥0.1.47 并重启 serve。未付款是 HTTP 429 并带发票原文；地区限制是 HTTP 403 并带国家/区域原文。 |
 | grok-build 在 `Cursor live open timed out` 后报 `Server error (500)` / 重复开 Cursor Run | 升级到 ≥0.1.57 并重启 serve。没有响应、接受状态不明的 live open 会 fail-closed 为 HTTP 409；本地打开槽饱和改为带抖动的 HTTP 503。 |
+| Sand 突发出现 `503 Sand open admission queue timed out` | 升级到当前版本并重启 `serve`。准入门控现在是软背压：一个短公平等待片段后，饱和请求会直接放行上游建连，不再生成代理侧 503；真正的上游容量错误仍按有界重试和 `Retry-After` 处理。 |
 | Claude Code 报 `unexpected internal error` 随后 `live open timed out after 10s`（常见于 `gemini-3.6-flash-high`） | 升级到 ≥0.1.58 并重启 serve。H2 RST 后的 HTTP/1 ResumeAction 使用首次打开的预算，不再卡死在 10 秒。 |
 | grok-build 报 `Conflict (409) - error sending request` / `live open timed out after 20s`，或 Claude Code 报 `Agent type 'gemini-3.6-flash-high' not found` | 升级到 ≥0.1.57 并重启 serve。只有可证明尚未连接的失败才会切换传输；没有响应的 send 不再重放。Agent/Task 的模型 slug 会改写成 `general-purpose`。 |
 | grok-build 把 `<tool_use>` / `<parameter>` XML 打到正文，或报 `Cursor auth failed: /usr/bin/security: Too many open files` | 升级到 ≥0.1.51 并重启 serve。带 named parameter 的 XML 会收成工具；XML `spawn_subagent` 等到 turn 结束再一批发出；serve 会抬高 macOS 256 文件上限。 |

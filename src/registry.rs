@@ -269,9 +269,9 @@ impl Registry {
             // let `aliasProvider: codex` steal that request before the
             // account-bound Cursor route had a chance to select its token.
             // Sand is another explicit Cursor ownership declaration. Check
-            // it before the process-wide Anthropic alias provider so the
-            // built-in Fable Sand/Bot default (and any TUI-selected alias)
-            // actually reaches Cursor's InferenceService transport.
+            // it before the process-wide Anthropic alias provider so a
+            // configured Sand model rule (including a TUI-selected alias)
+            // reaches Cursor's InferenceService transport.
             if sand_policy.matches_model(&normalized)
                 || account_routes.account_for_model(&normalized).is_some()
             {
@@ -620,8 +620,8 @@ mod tests {
     fn claude_5_aliases_route_to_configured_provider() {
         let registry = Registry::new(AliasProvider::Codex);
         let empty_accounts = crate::config::CursorAccountRoutingPolicy::empty();
-        // Keep this alias-provider contract independent of the runtime's
-        // built-in Fable Sand default.
+        // Keep this alias-provider contract independent of any runtime Sand
+        // model policy.
         let empty_sand = crate::config::SandRoutingPolicy::empty();
         for model in ["claude-sonnet-5", "fable", "claude-fable-5"] {
             let p = registry.provider_for_model_with_policies(

@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.106 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.107 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -436,11 +436,11 @@ account usage. The list is marked `[sand]` or `[cli]`; changes apply to new
 requests and are written atomically to `config.json`. The TUI requires a
 terminal; `serve --no-monitor` keeps the proxy running without it.
 
-Fable is a built-in Sand/Bot route. On a clean install, and whenever any
-non-empty Sand policy is saved, `claude-fable-5[1m]` is marked `[sand]` and
-uses Cursor's Bot lane for the selected account. An explicitly empty policy
-(`cursor.sandModels: []` or `CCP_CURSOR_SAND_MODELS=`) is the only opt-out and
-keeps every model on the configured default identity.
+Fable has no built-in Sand exception. It follows the same explicit model
+policy as every other Cursor model: select `claude-fable-5` (or a catalog
+variant) in **Sand Models** to mark it `[sand]`, or leave it unselected to use
+the configured default identity. An empty policy is valid and no model is
+added implicitly.
 
 For a read-only terminal diagnostic, run:
 
@@ -497,12 +497,8 @@ Model matching is case-insensitive and normalizes `[1m]` plus
 always overrides `cursor.sandModels` in `config.json`; unset it to edit the
 file from the TUI. Leave `CCP_CURSOR_CLIENT_TYPE` at its default `cli` when you
 want mixed routing; setting it to `sand` makes unmatched models use Sand too.
-Fable is retained as a built-in Sand/Bot route whenever the policy is
-non-empty, including when the TUI lists other models. This makes
-`claude-fable-5[1m]` available through every saved Cursor account; account
-selection and quota failover remain independent. Use an explicitly empty
-`cursor.sandModels` array or `CCP_CURSOR_SAND_MODELS=` only when you want to
-disable the built-in route and keep all models on the configured default.
+Model-specific rules are authoritative and have no hidden Fable exception;
+account selection and quota failover remain independent.
 
 ### Model discovery
 
@@ -599,9 +595,9 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_SAND_BASE_URL` | value of `CCP_CURSOR_BASE_URL` | Optional base URL for the Sand `InferenceService/Stream` route |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value; the TUI `t` chooser persists the same setting in `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
-| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Maximum simultaneous Sand InferenceService opens (1–512) |
-| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | Maximum simultaneous Sand opens per account/model lane (1–64) |
-| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `15` | Maximum wait for a Sand open admission slot (1–120s) |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand InferenceService opens (1–512) |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand opens per account/model lane (1–512) |
+| `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Short Sand admission fairness slice (1–120s); a saturated slice bypasses the local gate instead of returning proxy-generated 503 |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | Per-attempt Sand HTTP open timeout (10–180s) |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | Total budget for one Sand open/retry episode (20–900s) |
 | `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | Shared logical budget across the initial Sand open and pre-output stream replays (60–3600s) |
@@ -768,6 +764,7 @@ Use this order:
 | `grok-build`/Claude Code gets HTTP 429 `You're out of usage` for `grok-4.6` or `cursor-grok-*` while the mapped account still has Sand/Bot balance | Check the request badge first. `[cli]` uses the account's CLI/API meter; `[sand]` uses Sand/Grok Bot. A model→account binding selects a credential but does not change the lane. For Cursor Grok, add the exact `cursor-grok-4.6-*` id in **Sand Models**, toggle `[sand]`, then bind that same row with `m`; refresh with `u`/`U` and verify `Updated`. Bare `grok-4.6` remains the native Grok provider unless explicitly account-bound to Cursor. |
 | grok-build `Server error (500) - Something went wrong on our side` on unpaid invoice or unsupported country/region | Update to ≥0.1.47 and restart serve. Cursor billing is HTTP 429 with the invoice text; geo/policy blocks are HTTP 403 with the country/region text. |
 | grok-build `Server error (500)` after `Cursor live open timed out` / duplicate Cursor runs | Update to ≥0.1.57 and restart serve. Response-less live opens fail closed as HTTP 409; local open-slot saturation is jittered HTTP 503. |
+| Sand bursts show `503 Sand open admission queue timed out` | Update to the current release and restart serve. Admission is soft: after one short fairness slice, a saturated local gate lets the upstream open proceed instead of generating a proxy-side 503. Genuine upstream capacity errors still use bounded retries and `Retry-After`. |
 | Claude Code `unexpected internal error` then `live open timed out after 10s` (often `gemini-3.6-flash-high`) | Update to ≥0.1.58 and restart serve. HTTP/1 ResumeAction uses the first-open budget, not a flat 10s. |
 | grok-build `Conflict (409) - error sending request` / `live open timed out after 20s`, or Claude Code `Agent type 'gemini-3.6-flash-high' not found` | Update to ≥0.1.57 and restart serve. Proven pre-connect misses may switch transport; response-less sends are never replayed. Agent/Task model slugs remap to `general-purpose`. |
 | grok-build dumps raw `<tool_use>` / `<parameter>` XML, or `Cursor auth failed: /usr/bin/security: Too many open files` | Update to ≥0.1.51 and restart serve. Named-parameter XML is recovered as tools; XML `spawn_subagent` waits for turn end; serve raises the macOS 256-file limit. |
