@@ -4868,10 +4868,26 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
 
 fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let width = 48.min(area.width.saturating_sub(4)).max(24);
+    let lines = [
+        ("q / Ctrl-C", "quit proxy"),
+        ("?", "toggle help"),
+        ("b", "toggle setup"),
+        ("u", "show account usage"),
+        ("a", "manage Cursor accounts"),
+        ("d", "delete selected Cursor account"),
+        ("m", "assign models to accounts"),
+        ("s", "configure Sand models"),
+        ("t", "choose default CLI / Bot transport"),
+        ("arrows", "navigate rows and panes"),
+        ("j / k", "previous / next row"),
+        ("Tab", "switch pane"),
+        ("Enter", "open detail"),
+        ("Esc", "close overlay / detail"),
+    ];
     // Keep every shortcut visible after adding account-management actions.
     // Two rows are reserved for the border; narrow terminals still clamp to
     // the available height.
-    let shortcut_rows = 13u16;
+    let shortcut_rows = lines.len() as u16;
     let height = if area.height >= 10 {
         (shortcut_rows + 2).min(area.height.saturating_sub(2))
     } else {
@@ -4892,22 +4908,6 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         .style(Style::default().bg(BG));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let lines = [
-        ("q / Ctrl-C", "quit proxy"),
-        ("?", "toggle help"),
-        ("b", "toggle setup"),
-        ("u", "show account usage"),
-        ("a", "manage Cursor accounts"),
-        ("d", "delete selected Cursor account"),
-        ("m", "assign models to accounts"),
-        ("s", "configure Sand models"),
-        ("t", "choose default CLI / Bot transport"),
-        ("arrows", "navigate rows and panes"),
-        ("j / k", "previous / next row"),
-        ("Tab", "switch pane"),
-        ("Enter", "open detail"),
-        ("Esc", "close overlay / detail"),
-    ];
     let content = lines
         .into_iter()
         .map(|(key, label)| {
@@ -7453,6 +7453,21 @@ mod tests {
         assert!(
             refreshed.contains("export ANTHROPIC_BASE_URL=\"http://localhost:18765\""),
             "environment hints must remain"
+        );
+    }
+
+    #[test]
+    fn help_overlay_keeps_last_shortcut_visible() {
+        let rendered = draw(80, 30, |frame| render_help_overlay(frame, frame.area()));
+        let text = buffer_text(&rendered);
+
+        assert!(
+            text.contains("Esc"),
+            "the close shortcut must be visible: {text}"
+        );
+        assert!(
+            text.contains("close overlay / detail"),
+            "the close shortcut label must be visible: {text}"
         );
     }
 
