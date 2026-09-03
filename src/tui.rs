@@ -4925,6 +4925,12 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
 }
 
 fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: &str) {
+    // `MonitorApp::setup_text` is intentionally built once at monitor start,
+    // while the `t` chooser can persist a new default transport at any time.
+    // Refresh this one line at render time so reopening Setup in the same TUI
+    // session reflects the selection immediately without rebuilding the
+    // monitor state (or disturbing the mock/setup text supplied by callers).
+    let setup_text = setup_text_with_current_transport(setup_text);
     let width = 84.min(area.width.saturating_sub(4)).max(36);
     let content_height = setup_text.lines().count() as u16;
     let height = (content_height + 4)
@@ -4971,6 +4977,33 @@ fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: 
             .wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+/// Replace the generated Setup line that reports the process-wide Cursor
+/// transport. Setup text is otherwise a startup snapshot (and may include a
+/// mock-mode preamble), so matching only this known prefix keeps all other
+/// caller-provided lines byte-for-byte intact.
+fn setup_text_with_current_transport(setup_text: &str) -> String {
+    let transport = config::cursor_client_type();
+    setup_text_with_transport(setup_text, &transport)
+}
+
+fn setup_text_with_transport(setup_text: &str, transport: &str) -> String {
+    let replacement = format!(
+        "Default Cursor transport: {} (press t to change)",
+        transport.trim()
+    );
+    setup_text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("Default Cursor transport:") {
+                replacement.as_str()
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_transport_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -7393,6 +7426,34 @@ mod tests {
         let mut ui = transport_ui_lock();
         ui.show = false;
         ui.message = None;
+    }
+
+    #[test]
+    fn setup_text_refreshes_transport_without_rewriting_other_lines() {
+        let setup = concat!(
+            "Config: /tmp/config.json\n",
+            "Default Cursor transport: cli (press t to change)\n",
+            "export ANTHROPIC_BASE_URL=\"http://localhost:18765\""
+        );
+
+        let refreshed = setup_text_with_transport(setup, "sand");
+
+        assert!(
+            refreshed.contains("Default Cursor transport: sand (press t to change)"),
+            "{refreshed}"
+        );
+        assert!(
+            !refreshed.contains("Default Cursor transport: cli"),
+            "{refreshed}"
+        );
+        assert!(
+            refreshed.contains("Config: /tmp/config.json"),
+            "unrelated setup lines must remain"
+        );
+        assert!(
+            refreshed.contains("export ANTHROPIC_BASE_URL=\"http://localhost:18765\""),
+            "environment hints must remain"
+        );
     }
 
     #[test]
