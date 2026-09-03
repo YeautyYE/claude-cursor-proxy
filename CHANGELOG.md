@@ -3,6 +3,16 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.106 (2026-09-03)
+
+- Keep the Setup panel's default Cursor transport line synchronized after a
+  live `t` switch, and size the help overlay from its actual shortcut list so
+  every control remains visible.
+- Serialize Sand, model/account, and default-transport config edits through one
+  transaction lock; use collision-safe temporary files and platform-native
+  atomic replacement (including Windows) so concurrent TUI updates cannot
+  clobber settings.
+
 ## v0.1.105 (2026-09-03)
 
 - Add account/model-scoped Sand open admission, bounded retries, and a half-open
