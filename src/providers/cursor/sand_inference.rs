@@ -193,15 +193,14 @@ impl SandOpenGate {
         // pool. Existing permits/waiters hold their Arc independently, so
         // only an idle map entry may be evicted.
         if account.len() >= self.account_max_entries {
-            let idle = account
+            let Some(idle) = account
                 .iter()
                 .find(|(_, gate)| Arc::strong_count(gate) == 1)
-                .map(|(key, _)| key.clone());
-            if let Some(idle) = idle {
-                account.remove(&idle);
-            } else {
+                .map(|(key, _)| key.clone())
+            else {
                 return None;
-            }
+            };
+            account.remove(&idle);
         }
         let gate = Arc::new(Semaphore::new(self.account_limit));
         account.insert(key.to_string(), Arc::clone(&gate));
