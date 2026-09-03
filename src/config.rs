@@ -3,9 +3,142 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::paths;
+
+/// Serialize all config read/modify/write operations in this process.
+///
+/// The TUI can update the Sand policy, model/account routes, and default
+/// client identity from different event handlers.  A lock local to each
+/// persistence function is insufficient: two handlers could both read the
+/// old JSON and then replace one another's changes.  Keeping one lock for all
+/// config mutations makes each operation a complete transaction.
+static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn config_write_lock() -> io::Result<MutexGuard<'static, ()>> {
+    CONFIG_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| io::Error::other("config write lock poisoned"))
+}
+
+/// Persist a serialized config document through a same-directory temporary
+/// file.  The temporary file is created with `create_new` and a UUID suffix,
+/// so stale files or concurrent processes cannot make us truncate another
+/// writer's file.  The temporary bytes are synced before replacement; on
+/// Unix the parent directory is synced after the rename as well.
+///
+/// `std::fs::rename` replaces an existing destination atomically on Unix, but
+/// Windows' `MoveFileEx` requires an explicit replacement flag.  Calling the
+/// native API there keeps the replacement atomic when `config.json` already
+/// exists (the normal TUI path), rather than falling back to a destructive
+/// remove-then-rename sequence.
+fn write_config_atomically(path: &Path, encoded: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("config.json"));
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    let temporary_path = parent.join(temporary_name);
+
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Config may contain endpoint overrides and account selectors;
+            // retain the historical private-file default for new files.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary_path)?;
+        file.write_all(encoded)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+
+        replace_config_file(&temporary_path, path)
+    })();
+
+    if result.is_err() {
+        // Once replacement succeeds the temporary path no longer exists.
+        // Best-effort cleanup on every failure prevents stale files from
+        // accumulating and allows a later retry to proceed normally.
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn replace_config_file(temporary_path: &Path, path: &Path) -> io::Result<()> {
+    fs::rename(temporary_path, path)?;
+
+    // A synced file plus an unsynced directory can still disappear after a
+    // power loss.  Directory fsync is available on Unix, but it is a
+    // best-effort durability enhancement: the rename has already succeeded,
+    // so reporting a directory-fsync error as a failed config update would
+    // make callers retry an operation whose new contents are already live.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_config_file(temporary_path: &Path, path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    let temporary_wide: Vec<u16> = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // `MoveFileExW` performs the destination replacement in one filesystem
+    // operation when MOVEFILE_REPLACE_EXISTING is set.  WRITE_THROUGH asks
+    // Windows to flush the move before returning, matching the sync barrier
+    // used by the Unix implementation above.
+    let moved = unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_config_file(temporary_path: &Path, path: &Path) -> io::Result<()> {
+    // Keep a portable fallback for targets without a native replacement API.
+    // Unix and Windows (the supported desktop targets) use the stronger
+    // implementations above.
+    fs::rename(temporary_path, path)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasProvider {
@@ -629,11 +762,7 @@ pub fn cursor_model_account_route_matches(model: &str) -> bool {
 /// Persist only `cursor.modelAccounts`, preserving unrelated configuration
 /// keys.  The same-directory temporary file and rename make TUI edits atomic.
 pub fn persist_cursor_account_routes(policy: &CursorAccountRoutingPolicy) -> io::Result<()> {
-    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| io::Error::other("config write lock poisoned"))?;
+    let _guard = config_write_lock()?;
 
     let path = config_path();
     if let Some(parent) = path.parent() {
@@ -679,27 +808,7 @@ pub fn persist_cursor_account_routes(policy: &CursorAccountRoutingPolicy) -> io:
         .insert("modelAccounts".to_string(), serde_json::Value::Object(map));
 
     let encoded = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-    let write_result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&encoded)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &path)
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write_result
+    write_config_atomically(&path, &encoded)
 }
 
 /// Convenience wrapper for TUI callers editing a route list.
@@ -1162,11 +1271,7 @@ pub fn cursor_model_uses_sand(model: &str) -> bool {
 /// The write uses a same-directory temporary file and rename, so a TUI update
 /// cannot leave a partially written JSON document after a process interruption.
 pub fn persist_cursor_sand_policy(policy: &SandRoutingPolicy) -> io::Result<()> {
-    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| io::Error::other("config write lock poisoned"))?;
+    let _guard = config_write_lock()?;
 
     let path = config_path();
     if let Some(parent) = path.parent() {
@@ -1209,27 +1314,7 @@ pub fn persist_cursor_sand_policy(policy: &SandRoutingPolicy) -> io::Result<()> 
         );
 
     let encoded = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-    let write_result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&encoded)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &path)
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write_result
+    write_config_atomically(&path, &encoded)
 }
 
 /// Convenience wrapper for TUI callers that own the editable pattern list.
@@ -1934,12 +2019,10 @@ pub fn persist_cursor_client_type(client_type: &str) -> io::Result<()> {
     };
 
     // Keep this lock independent from request handling: selecting a transport
-    // in the TUI must never block an in-flight Cursor stream.
-    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| io::Error::other("config write lock poisoned"))?;
+    // in the TUI must never block an in-flight Cursor stream.  It is shared
+    // with Sand/account persistence so concurrent TUI edits cannot clobber
+    // each other's JSON changes.
+    let _guard = config_write_lock()?;
 
     let path = config_path();
     if let Some(parent) = path.parent() {
@@ -1981,27 +2064,7 @@ pub fn persist_cursor_client_type(client_type: &str) -> io::Result<()> {
         );
 
     let encoded = serde_json::to_vec_pretty(&root).map_err(io::Error::other)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-    let write_result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&encoded)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &path)
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write_result
+    write_config_atomically(&path, &encoded)
 }
 
 /// Select the Cursor identity for one request. Sand routing is deliberately
@@ -3074,6 +3137,32 @@ mod tests {
         assert_eq!(value["cursor"]["clientType"], "cli");
         assert_eq!(value["cursor"]["sandModels"][0], "gemini-3.1-pro");
         assert_eq!(value["cursor"]["modelAccounts"]["grok-4.6"], "backup");
+    }
+
+    #[test]
+    fn atomic_config_replace_replaces_existing_file_and_cleans_temp_files() {
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+
+        write_config_atomically(&path, br#"{"version":1}"#).unwrap();
+        write_config_atomically(&path, br#"{"version":2,"keep":true}"#).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["keep"], true);
+
+        let temporary_prefix = ".config.json.tmp-";
+        let leftovers = std::fs::read_dir(config.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(temporary_prefix)
+            });
+        assert!(!leftovers, "successful replacement left a temporary file");
     }
 
     #[test]
