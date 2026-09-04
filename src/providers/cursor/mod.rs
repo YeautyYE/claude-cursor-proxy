@@ -1315,13 +1315,10 @@ fn tap_session_usage(
     let (tx, rx) = mpsc::channel(LIVE_USAGE_TAP_CAP);
     let output_closed = tx.clone();
     tokio::spawn(async move {
-        loop {
-            let Some(item) = (tokio::select! {
-                _ = output_closed.closed() => None,
-                item = events.recv() => item,
-            }) else {
-                break;
-            };
+        while let Some(item) = tokio::select! {
+            _ = output_closed.closed() => None,
+            item = events.recv() => item,
+        } {
             if let Ok(LiveRunEvent::Cursor(CursorStreamEvent::Usage { input_tokens, .. })) = &item
                 && *input_tokens > 0
             {

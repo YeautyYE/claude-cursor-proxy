@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.113 (2026-09-05)
+
+- Keep the downstream-cancellation tap compatible with the latest Clippy
+  rules while preserving prompt receiver release and Sand stream cleanup.
+
 ## v0.1.112 (2026-09-05)
 
 - Stop Sand stream drivers promptly when Claude Code or another downstream
