@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
 use crate::config::{self, SandRoutingPolicy};
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
+        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState, RequestStatus,
         SESSION_TOKEN_BUCKET_SECS, SessionSummary,
     },
     paths,
@@ -2479,7 +2479,7 @@ fn render_header(
         .started_at
         .elapsed()
         .unwrap_or_else(|_| Duration::from_secs(0));
-    let top = Line::from(vec![
+    let mut top_spans = vec![
         Span::styled(
             " claude-cursor-proxy",
             Style::default()
@@ -2513,7 +2513,41 @@ fn render_header(
                 .bg(TEAL)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+    // Sand lifecycle counters are intentionally compact and width-aware. At
+    // normal widths use named counters; on narrow terminals use a short
+    // positional tuple; at emergency widths leave the existing header intact.
+    let sand = sand_phase_counts(state);
+    if area.width >= 120 {
+        top_spans.extend([
+            Span::styled("  sand ", Style::default().fg(BG).bg(TEAL)),
+            Span::styled(
+                format!(
+                    "q:{} o:{} s:{} r:{}",
+                    sand.queued, sand.opening, sand.streaming, sand.retrying
+                ),
+                Style::default()
+                    .fg(BG)
+                    .bg(TEAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    } else if area.width >= 90 {
+        top_spans.extend([
+            Span::styled("  S ", Style::default().fg(BG).bg(TEAL)),
+            Span::styled(
+                format!(
+                    "{}/{}/{}/{}",
+                    sand.queued, sand.opening, sand.streaming, sand.retrying
+                ),
+                Style::default()
+                    .fg(BG)
+                    .bg(TEAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    let top = Line::from(top_spans);
     let usage_line = state.account_usage.header_line();
     let usage = Line::from(Span::styled(
         format!(" {usage_line}"),
@@ -2525,6 +2559,31 @@ fn render_header(
         Paragraph::new(vec![top, usage]).style(Style::default().bg(PANEL_BG)),
         area,
     );
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SandPhaseCounts {
+    queued: usize,
+    opening: usize,
+    streaming: usize,
+    retrying: usize,
+}
+
+fn sand_phase_counts(state: &MonitorState) -> SandPhaseCounts {
+    state
+        .active
+        .iter()
+        .filter(|request| request.client_type.as_deref() == Some("sand"))
+        .fold(SandPhaseCounts::default(), |mut counts, request| {
+            match &request.status {
+                RequestStatus::Queued => counts.queued += 1,
+                RequestStatus::Opening | RequestStatus::Upstream => counts.opening += 1,
+                RequestStatus::Streaming => counts.streaming += 1,
+                RequestStatus::Retrying => counts.retrying += 1,
+                _ => {}
+            }
+            counts
+        })
 }
 
 fn usage_header_color(usage: &crate::monitor::AccountUsageState) -> Color {
@@ -2725,12 +2784,15 @@ fn status_color(value: &str) -> Color {
     match value {
         "completed" => GREEN,
         "streaming" => TEAL,
+        "queued" => BLUE,
+        "opening" | "upstream" => YELLOW,
+        "retrying" => Color::Rgb(205, 160, 100),
+        "waiting_tool" => Color::Rgb(160, 150, 220),
         "failed" => RED,
         // A downstream cancellation is an expected lifecycle edge, not an
         // upstream/API failure. Keep it visible in request details without
         // making the dashboard read like an error storm.
         "abandoned" => DIM,
-        "upstream" => BLUE,
         "selected" | "started" => YELLOW,
         _ => DIM_WHITE,
     }
@@ -5845,6 +5907,96 @@ mod tests {
 
         let active_text = buffer_text(&active);
         assert!(active_text.contains("⠋ upstream"), "{active_text}");
+    }
+
+    #[test]
+    fn header_shows_sand_phase_counts_at_normal_width() {
+        let monitor = MonitorHandle::new(10);
+        for (id, phase) in [
+            ("queued", RequestStatus::Queued),
+            ("opening", RequestStatus::Opening),
+            ("streaming", RequestStatus::Streaming),
+            ("retrying", RequestStatus::Retrying),
+        ] {
+            monitor.request_started(id, None, None, crate::monitor::EndpointKind::Messages);
+            monitor.client_type_resolved(id, "sand");
+            monitor.request_phase(id, phase);
+        }
+        let state = monitor.snapshot();
+        assert_eq!(
+            sand_phase_counts(&state),
+            SandPhaseCounts {
+                queued: 1,
+                opening: 1,
+                streaming: 1,
+                retrying: 1,
+            }
+        );
+        let app = MonitorApp {
+            listen_url: "x".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_sand_settings: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: None,
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::default(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
+        };
+        let buffer = draw(120, 4, |frame| {
+            render_header(frame, frame.area(), &app, &state)
+        });
+        let text = buffer_text(&buffer);
+        assert!(text.contains("sand q:1 o:1 s:1 r:1"), "{text}");
+    }
+
+    #[test]
+    fn sand_header_degrades_to_short_tuple_on_narrow_width() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "narrow-sand",
+            None,
+            None,
+            crate::monitor::EndpointKind::Messages,
+        );
+        monitor.client_type_resolved("narrow-sand", "sand");
+        monitor.request_phase("narrow-sand", RequestStatus::Queued);
+        let state = monitor.snapshot();
+        let app = MonitorApp {
+            listen_url: "x".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_sand_settings: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: None,
+            sand_models: Vec::new(),
+            sand_policy: SandRoutingPolicy::default(),
+            sand_selected: 0,
+            sand_message: None,
+            sand_input: None,
+        };
+        let buffer = draw(90, 4, |frame| {
+            render_header(frame, frame.area(), &app, &state)
+        });
+        let text = buffer_text(&buffer);
+        assert!(!text.contains("sand q:"), "{text}");
+        assert!(text.contains("  S "), "{text}");
     }
 
     #[test]

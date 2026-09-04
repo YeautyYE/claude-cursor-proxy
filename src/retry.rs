@@ -1,9 +1,12 @@
 use std::time::Duration;
 
+use rand::Rng as _;
+
 pub const RETRY_INITIAL_DELAY_MS: u64 = 2000;
 pub const RETRY_MAX_DELAY_MS: u64 = 30_000;
 pub const RETRY_BACKOFF_FACTOR: u64 = 2;
 pub const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+const RETRY_AFTER_JITTER_MAX_MS: u64 = 250;
 
 /// Shared provider-outage classifier used by all Cursor transport paths.
 ///
@@ -153,6 +156,14 @@ pub fn is_policy_rate_limit(message: &str) -> bool {
         return false;
     }
     let lower = message.to_ascii_lowercase();
+    // Cursor's Grok Bot vision meter uses a legacy OpenAI-shaped code and
+    // does not include the usual ERROR_RATE_LIMITED/provider metadata.  The
+    // accompanying "out of usage" message is account-local quota, not a
+    // transient gateway 429; classify it before the generic resource marker
+    // path so Sand does not replay the same exhausted request.
+    if is_grok_bot_vision_quota(&lower) {
+        return true;
+    }
     is_provider_resource_exhausted(message)
         || lower.contains("error_rate_limited_changeable")
         // ERROR_PRO_USER_/ERROR_FREE_USER_/ERROR_USER_RATE_LIMIT_EXCEEDED:
@@ -173,6 +184,44 @@ pub fn is_policy_rate_limit(message: &str) -> bool {
                 // every Claude Code retry to open another empty Run.
                 || lower.contains("out of usage")
                 || lower.contains("switch to auto")))
+}
+
+/// Cursor has reused the `ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT` enum for an
+/// outdated-client diagnostic in older gateway revisions.  Only the variant
+/// carrying the explicit Bot usage/paid-plan language is an account quota;
+/// the update-required form must continue through the client-version mapper.
+pub fn is_grok_bot_vision_quota(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    // Newer Sand gateways include the machine-readable allowance reason in
+    // `additionalInfo` and may omit the legacy GPT-4 vision enum from the
+    // flattened message.  This marker is account-local quota even when the
+    // outer Connect status is a generic 429/resource_exhausted.
+    if (lower.contains("sand_included_limit")
+        || lower.contains("sand-included-limit")
+        || lower.contains("sand included limit"))
+        && !lower.contains("update required")
+        && !lower.contains("version of cursor is no longer supported")
+    {
+        return true;
+    }
+    // Some responses retain only the human-readable title/detail after the
+    // nested ErrorDetails object has been flattened.  Keep this independent
+    // of the legacy enum so those responses do not enter Sand replay.
+    if lower.contains("grok bot usage limit")
+        && (lower.contains("reached")
+            || lower.contains("out of usage")
+            || lower.contains("included"))
+        && !lower.contains("update required")
+        && !lower.contains("version of cursor is no longer supported")
+    {
+        return true;
+    }
+    lower.contains("error_gpt_4_vision_preview_rate_limit")
+        && (lower.contains("out of usage")
+            || lower.contains("grok bot")
+            || lower.contains("paid plan"))
+        && !lower.contains("update required")
+        && !lower.contains("version of cursor is no longer supported")
 }
 
 pub fn should_retry_upstream(status: u16, message: &str) -> bool {
@@ -414,13 +463,39 @@ pub fn responses_error_code(kind: Option<&str>, message: &str) -> &'static str {
 }
 
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
+    compute_backoff_delay_with_sampler(attempt, retry_after, |upper| {
+        if upper == 0 {
+            0
+        } else {
+            rand::thread_rng().gen_range(0..=upper)
+        }
+    })
+}
+
+fn compute_backoff_delay_with_sampler<F>(
+    attempt: u32,
+    retry_after: Option<&str>,
+    mut sample_inclusive: F,
+) -> BackoffOutcome
+where
+    F: FnMut(u64) -> u64,
+{
     if let Some(raw) = retry_after
         && let Ok(raw_secs) = raw.parse::<f64>()
+        && raw_secs.is_finite()
+        && raw_secs >= 0.0
     {
         let target_ms = (raw_secs * 1000.0).ceil() as u64;
+        let jitter_cap = retry_after_jitter_cap_ms(target_ms);
+        let jitter = sample_inclusive(jitter_cap);
+        let proposed = target_ms.saturating_add(jitter);
         return BackoffOutcome {
-            wait_ms: target_ms.min(RETRY_MAX_DELAY_MS),
-            exceeds_budget: target_ms > RETRY_MAX_DELAY_MS,
+            // Do not shorten an explicit server cooldown. Callers that have
+            // a 30s logical retry budget use `exceeds_budget` to stop before
+            // sleeping; callers that honor Retry-After directly still wait
+            // at least the service-provided duration.
+            wait_ms: proposed,
+            exceeds_budget: proposed > RETRY_MAX_DELAY_MS,
         };
     }
 
@@ -429,12 +504,19 @@ pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> Backoff
     if exp > RETRY_MAX_DELAY_MS {
         exp = RETRY_MAX_DELAY_MS;
     }
-    let jitter = exp / 2;
-    let wait_ms = (exp / 2) + (jitter / 2);
+    let lower = exp / 2;
+    let upper = exp.saturating_sub(lower);
+    let wait_ms = lower.saturating_add(sample_inclusive(upper));
     BackoffOutcome {
         wait_ms,
         exceeds_budget: false,
     }
+}
+
+fn retry_after_jitter_cap_ms(target_ms: u64) -> u64 {
+    target_ms
+        .saturating_div(10)
+        .clamp(1, RETRY_AFTER_JITTER_MAX_MS)
 }
 
 pub async fn sleep(ms: u64) {
@@ -517,6 +599,40 @@ mod tests {
         assert!(!is_local_admission_backpressure(
             "Connect error 503: upstream unavailable"
         ));
+    }
+
+    #[test]
+    fn equal_jitter_backoff_stays_within_expected_range() {
+        let min = compute_backoff_delay_with_sampler(0, None, |_| 0);
+        let max = compute_backoff_delay_with_sampler(0, None, |upper| upper);
+        assert_eq!(min.wait_ms, RETRY_INITIAL_DELAY_MS / 2);
+        assert_eq!(max.wait_ms, RETRY_INITIAL_DELAY_MS);
+        assert!(!min.exceeds_budget);
+        assert!(!max.exceeds_budget);
+
+        let capped = compute_backoff_delay_with_sampler(10, None, |upper| upper);
+        assert!(capped.wait_ms >= RETRY_MAX_DELAY_MS / 2);
+        assert!(capped.wait_ms <= RETRY_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn retry_after_waits_at_least_server_value_and_can_add_small_jitter() {
+        let base = compute_backoff_delay_with_sampler(0, Some("2.5"), |_| 0);
+        let jittered = compute_backoff_delay_with_sampler(0, Some("2.5"), |upper| upper);
+        assert_eq!(base.wait_ms, 2500);
+        assert_eq!(jittered.wait_ms, 2750);
+        assert!(!base.exceeds_budget);
+        assert!(!jittered.exceeds_budget);
+
+        let near_budget = compute_backoff_delay_with_sampler(0, Some("29.9"), |upper| upper);
+        assert!(near_budget.wait_ms >= 29_900);
+    }
+
+    #[test]
+    fn retry_after_over_budget_reports_exceeds_budget() {
+        let over = compute_backoff_delay_with_sampler(0, Some("31"), |_| 0);
+        assert_eq!(over.wait_ms, 31_000);
+        assert!(over.exceeds_budget);
     }
 
     #[test]
@@ -618,6 +734,28 @@ mod tests {
             "transient provider exhaustion must stay retryable"
         );
         assert!(should_retry_upstream(429, transient));
+    }
+
+    #[test]
+    fn grok_bot_vision_quota_is_terminal_policy_limit() {
+        let message = "Connect error 429: ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: You are out of usage — Upgrade to a paid plan to use more Grok Bot. [resource_exhausted]";
+        assert!(is_policy_rate_limit(message));
+        assert!(!should_retry_upstream(429, message));
+        for message in [
+            // Current Sand response after the ErrorDetails object is
+            // flattened into a short client diagnostic.
+            "Connect error 429: resource_exhausted rateLimitReason=sand_included_limit isRetryable=false",
+            "Cursor error 429: You've reached your Grok Bot usage limit — included Grok Bot usage limit",
+            // JSON spelling emitted by the dashboard/provider adapter.
+            r#"{"error":{"code":"resource_exhausted","details":[{"debug":{"details":{"additionalInfo":{"rateLimitReason":"sand_included_limit"}}}}]}}"#,
+        ] {
+            assert!(is_grok_bot_vision_quota(message), "{message}");
+            assert!(is_policy_rate_limit(message), "{message}");
+            assert!(!should_retry_upstream(429, message), "{message}");
+        }
+        let outdated = "Connect error 429: ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: Update Required — Your version of Cursor is no longer supported. [resource_exhausted]";
+        assert!(!is_grok_bot_vision_quota(outdated));
+        assert!(!is_policy_rate_limit(outdated));
     }
 
     #[test]

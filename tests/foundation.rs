@@ -222,7 +222,7 @@ fn retry_backoff_decisions() {
     assert!(outcome.wait_ms <= RETRY_MAX_DELAY_MS);
 
     let outcome_num = compute_backoff_delay(0, Some("5"));
-    assert_eq!(outcome_num.wait_ms, 5000);
+    assert!((5000..=5250).contains(&outcome_num.wait_ms));
 
     let too_long = compute_backoff_delay(0, Some("120"));
     assert!(too_long.exceeds_budget);

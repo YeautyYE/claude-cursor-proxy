@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.109 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.110 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -598,10 +598,20 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
 | `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand InferenceService opens (1–512) |
 | `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand opens per account/model lane (1–512) |
+| `CCP_CURSOR_SAND_STREAM_CONCURRENCY` | `512` | Maximum accepted Sand model streams kept alive at once (1–512); excess requests wait locally and do not create duplicate upstream runs |
+| `CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT` | `512` | Initial global cold-open in-flight window (1–512); lower this only when the upstream needs a gentler ramp |
+| `CCP_CURSOR_SAND_OPEN_INITIAL_RATE` | `512` | Initial cold-open launch rate per second (1–512) |
+| `CCP_CURSOR_SAND_OPEN_RATE` | `512` | Cold-open launch-rate ceiling after AIMD recovery (1–512) |
 | `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand admission queue slice (1–120s); saturated requests stay queued and retry the slice without issuing unbounded upstream opens |
 | `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` | `12` | For unbound models, check for a viable alternate saved account after this long behind a saturated account/model lane (1–300s); otherwise keep waiting on the current lane |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | Per-attempt Sand HTTP open timeout (10–180s) |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | Total budget for one Sand open/retry episode (20–900s) |
+| `CCP_CURSOR_SAND_OPEN_RETRIES` | `3` | Maximum retries inside one Sand open episode (0–8; the shared attempt budget still applies) |
+| `CCP_CURSOR_SAND_TOTAL_ATTEMPTS` | `3` | Shared logical-turn transport budget across open retries and pre-output stream replay (1–8); account handoff has its own budget |
+| `CCP_CURSOR_SAND_ACCOUNT_FAILOVER_ATTEMPTS` | `16` | Maximum fresh account handoffs for one logical Sand turn (1–16); independent from transport retries |
+| `CCP_CURSOR_SAND_OPERATION_ENTRIES` | `2048` | Maximum in-process logical Sand operation records; excess requests receive bounded backpressure |
+| `CCP_CURSOR_SAND_OPERATION_SUBSCRIBERS` | `128` | Maximum attached HTTP retries for one logical operation |
+| `CCP_CURSOR_SAND_OPERATION_REPLAY_EVENTS` / `CCP_CURSOR_SAND_OPERATION_REPLAY_BYTES` | `16384` / `16MiB` | Bounded replay history used by duplicate requests; oversized histories stay single-owner |
 | `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | Shared logical budget across the initial Sand open and pre-output stream replays (60–3600s) |
 | `CCP_CURSOR_SAND_BREAKER_THRESHOLD` | `3` | Consecutive transient Sand open failures before the account/model circuit cools down (1–16) |
 | `CCP_CURSOR_SAND_BREAKER_COOLDOWN_SECS` | `15` | Sand account/model circuit cooldown (1–300s) |
@@ -638,20 +648,21 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | unset | Debug |
 
 The two Sand open limits cover only the HTTP/2 handshake and request headers;
-the permit is released as soon as the upstream stream is established. They do
-not cap the number of model streams or client requests. The defaults preserve
-the 512-way Claude Code/Grok fan-out contract: up to 512 handshakes may be in
-flight process-wide and in one account/model lane. A saturated lane is still
-fairly admitted with a pair-wise gate (a waiter never holds an account permit
-while waiting for a global one), and the shared sharded H2 client pool avoids a
-new TCP/TLS client per request. Unbound requests that remain behind a slow
-account lane can rotate through the saved account pool after
-`CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS`; if no unattempted healthy account
-exists (including the single-account case), they continue waiting on the
-current lane. Explicit model-account bindings stay pinned. These controls shape
-upstream pressure and observability, not the client's logical concurrency;
-Cursor may still return a genuine transient 5xx when its own admission service
-is saturated.
+those permits are released as soon as the upstream stream is established. The
+separate `CCP_CURSOR_SAND_STREAM_CONCURRENCY` gate covers the lifetime of
+accepted model streams and returns its permit on End or client cancellation.
+Defaults preserve the 512-way Claude Code/Grok fan-out contract: up to 512
+handshakes and 512 active Sand streams can run process-wide, with the same
+per-account/model open ceiling. A saturated lane is fairly admitted with a
+pair-wise gate (a waiter never holds an account permit while waiting for a
+global one), and the shared sharded H2 client pool avoids a new TCP/TLS client
+per request. Unbound requests that remain behind a slow account lane can rotate
+through the saved account pool after `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS`;
+if no unattempted healthy account exists (including the single-account case),
+they continue waiting on the current lane. Explicit model-account bindings stay
+pinned. These controls shape upstream pressure and observability without
+changing the client's logical concurrency; Cursor may still return a genuine
+transient 5xx when its own admission service is saturated.
 
 ### Claude Code (client) env / settings
 

@@ -64,6 +64,24 @@ const SAND_OPEN_GLOBAL_DEFAULT: usize = 512;
 const SAND_OPEN_GLOBAL_MAX: usize = 512;
 const SAND_OPEN_ACCOUNT_DEFAULT: usize = 512;
 const SAND_OPEN_ACCOUNT_MAX: usize = 512;
+// A logical request may be queued while the upstream is opening, but a
+// response that has been accepted consumes a stream slot until its terminal
+// event (or downstream cancellation).  This is deliberately independent of
+// the cold-open bulkhead: a large Claude/Grok fan-out can queue locally while
+// at most this many model streams are actually alive upstream.
+const SAND_STREAM_GLOBAL_DEFAULT: usize = 512;
+const SAND_STREAM_GLOBAL_MAX: usize = 512;
+// Cold opens are substantially more expensive than an established HTTP/2
+// stream. The default preserves the historical 512-way contract; operators
+// can opt into a gentler ramp with CCP_CURSOR_SAND_OPEN_INITIAL_*.
+// Preserve the historical 512-way Sand fan-out by default. Operators that
+// need a gentler cold-start can opt in with CCP_CURSOR_SAND_OPEN_INITIAL_*;
+// making 16/s the default silently turns a 512-client burst into a minutes-
+// long queue and recreates the timeout wave this gate is meant to prevent.
+const SAND_OPEN_INITIAL_INFLIGHT_DEFAULT: usize = SAND_OPEN_GLOBAL_DEFAULT;
+const SAND_OPEN_INITIAL_INFLIGHT_MAX: usize = 512;
+const SAND_OPEN_INITIAL_RATE_DEFAULT: u64 = SAND_OPEN_RATE_MAX;
+const SAND_OPEN_RATE_MAX: u64 = 512;
 // Keep the local fairness slice short so queued callers re-check capacity
 // promptly. A saturated slice is non-terminal backpressure; callers retry it
 // without issuing an untracked upstream open.
@@ -119,6 +137,38 @@ fn sand_open_account_limit() -> usize {
         "CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY",
         SAND_OPEN_ACCOUNT_DEFAULT,
         SAND_OPEN_ACCOUNT_MAX,
+    )
+}
+
+fn sand_stream_global_limit() -> usize {
+    bounded_env_usize(
+        "CCP_CURSOR_SAND_STREAM_CONCURRENCY",
+        SAND_STREAM_GLOBAL_DEFAULT,
+        SAND_STREAM_GLOBAL_MAX,
+    )
+}
+
+fn sand_open_initial_inflight() -> usize {
+    bounded_env_usize(
+        "CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT",
+        SAND_OPEN_INITIAL_INFLIGHT_DEFAULT,
+        SAND_OPEN_INITIAL_INFLIGHT_MAX,
+    )
+}
+
+fn sand_open_initial_rate() -> u64 {
+    bounded_env_u64(
+        "CCP_CURSOR_SAND_OPEN_INITIAL_RATE",
+        SAND_OPEN_INITIAL_RATE_DEFAULT,
+        SAND_OPEN_RATE_MAX,
+    )
+}
+
+fn sand_open_rate_ceiling() -> u64 {
+    bounded_env_u64(
+        "CCP_CURSOR_SAND_OPEN_RATE",
+        SAND_OPEN_RATE_MAX,
+        SAND_OPEN_RATE_MAX,
     )
 }
 
@@ -258,6 +308,7 @@ impl SandOpenGate {
                             global: Some(global),
                             account: Some(account),
                             wake: Arc::clone(&self.wake),
+                            cold_open: None,
                         });
                     }
                     Err(_) => {
@@ -302,6 +353,7 @@ pub(crate) struct SandOpenPermit {
     global: Option<OwnedSemaphorePermit>,
     account: Option<OwnedSemaphorePermit>,
     wake: Arc<Notify>,
+    cold_open: Option<SandColdOpenPermit>,
 }
 
 impl Drop for SandOpenPermit {
@@ -313,6 +365,234 @@ impl Drop for SandOpenPermit {
         self.account.take();
         self.global.take();
         self.wake.notify_waiters();
+    }
+}
+
+/// An accepted Sand response keeps this permit until its HTTP body is drained
+/// or dropped.  That makes the stream limit cover the actual upstream model
+/// lifetime rather than only the request-header handshake.
+#[derive(Debug)]
+pub(crate) struct SandStreamPermit {
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for SandStreamPermit {
+    fn drop(&mut self) {
+        self.permit.take();
+    }
+}
+
+static SAND_STREAM_GATE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(sand_stream_global_limit())));
+
+/// Wait for capacity for one accepted upstream model stream. Unlike the open
+/// scheduler, this is intentionally a fixed lifetime capacity: every permit
+/// is returned by `SandInferenceStream::drop`, including downstream cancel.
+pub(crate) async fn admit_sand_stream_until(
+    deadline: Instant,
+) -> Result<SandStreamPermit, CursorError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(sand_open_admission_error());
+    }
+    let permit = tokio::time::timeout(remaining, Arc::clone(&SAND_STREAM_GATE).acquire_owned())
+        .await
+        .map_err(|_| sand_open_admission_error())?
+        .map_err(|_| CursorError::new(503, "Sand stream capacity is unavailable", None))?;
+    Ok(SandStreamPermit {
+        permit: Some(permit),
+    })
+}
+
+/// Global cold-open controller. A failed open halves the launch window and
+/// rate; sustained successes add one slot/rate step at a time. It keeps burst
+/// recovery smooth without shrinking the separate 512-stream capacity.
+#[derive(Debug)]
+struct SandColdOpenScheduler {
+    state: Mutex<SandColdOpenState>,
+    wake: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct SandColdOpenState {
+    in_flight: usize,
+    inflight_limit: usize,
+    max_inflight: usize,
+    rate_per_second: f64,
+    max_rate_per_second: f64,
+    tokens: f64,
+    last_refill: Instant,
+    successes_since_increase: usize,
+}
+
+impl SandColdOpenScheduler {
+    fn new(initial_inflight: usize, initial_rate: u64, max_rate: u64) -> Self {
+        let max_inflight = sand_open_global_limit();
+        let inflight_limit = initial_inflight.clamp(1, max_inflight);
+        let max_rate_per_second = max_rate.clamp(1, SAND_OPEN_RATE_MAX) as f64;
+        let rate_per_second = (initial_rate.clamp(1, max_rate) as f64).min(max_rate_per_second);
+        Self {
+            state: Mutex::new(SandColdOpenState {
+                in_flight: 0,
+                inflight_limit,
+                max_inflight,
+                rate_per_second,
+                max_rate_per_second,
+                tokens: rate_per_second,
+                last_refill: Instant::now(),
+                successes_since_increase: 0,
+            }),
+            wake: Arc::new(Notify::new()),
+        }
+    }
+
+    fn refill(state: &mut SandColdOpenState, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(state.last_refill)
+            .as_secs_f64();
+        state.tokens =
+            (state.tokens + elapsed * state.rate_per_second).min(state.rate_per_second.max(1.0));
+        state.last_refill = now;
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<SandColdOpenPermit, CursorError> {
+        loop {
+            let wait = {
+                let now = Instant::now();
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                Self::refill(&mut state, now);
+                if state.in_flight < state.inflight_limit && state.tokens >= 1.0 {
+                    state.in_flight += 1;
+                    state.tokens -= 1.0;
+                    return Ok(SandColdOpenPermit {
+                        scheduler: Arc::clone(self),
+                        completed: false,
+                    });
+                }
+                let rate_wait = if state.tokens < 1.0 {
+                    Duration::from_secs_f64(
+                        ((1.0 - state.tokens) / state.rate_per_second).max(0.001),
+                    )
+                } else {
+                    Duration::from_millis(25)
+                };
+                rate_wait.min(Duration::from_millis(250))
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(sand_open_admission_error());
+            }
+            tokio::select! {
+                _ = self.wake.notified() => {},
+                _ = tokio::time::sleep(wait.min(remaining)) => {},
+            }
+        }
+    }
+
+    fn finish(&self, success: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if success {
+            state.successes_since_increase += 1;
+            // Grow once per completed launch window. The bounded proportional
+            // step reaches a recovered high-capacity route promptly while
+            // still giving the upstream a full window between increases.
+            if state.successes_since_increase >= state.inflight_limit {
+                let window_step = (state.inflight_limit / 4).max(1);
+                state.inflight_limit = (state.inflight_limit + window_step).min(state.max_inflight);
+                let rate_step = (state.rate_per_second / 4.0).max(1.0);
+                state.rate_per_second =
+                    (state.rate_per_second + rate_step).min(state.max_rate_per_second);
+                state.successes_since_increase = 0;
+            }
+        } else {
+            state.inflight_limit = (state.inflight_limit / 2).max(1);
+            state.rate_per_second = (state.rate_per_second / 2.0).max(1.0);
+            state.tokens = state.tokens.min(state.rate_per_second);
+            state.successes_since_increase = 0;
+        }
+        drop(state);
+        self.wake.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (usize, usize, u64) {
+        let state = self.state.lock().unwrap();
+        (
+            state.in_flight,
+            state.inflight_limit,
+            state.rate_per_second as u64,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct SandColdOpenPermit {
+    scheduler: Arc<SandColdOpenScheduler>,
+    completed: bool,
+}
+
+impl SandColdOpenPermit {
+    fn complete(&mut self, success: bool) {
+        if !self.completed {
+            self.completed = true;
+            self.scheduler.finish(success);
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            let mut state = self
+                .scheduler
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.in_flight = state.in_flight.saturating_sub(1);
+            drop(state);
+            self.scheduler.wake.notify_waiters();
+        }
+    }
+}
+
+impl Drop for SandColdOpenPermit {
+    fn drop(&mut self) {
+        self.complete(false);
+    }
+}
+
+static SAND_COLD_OPEN_SCHEDULER: LazyLock<Arc<SandColdOpenScheduler>> = LazyLock::new(|| {
+    Arc::new(SandColdOpenScheduler::new(
+        sand_open_initial_inflight(),
+        sand_open_initial_rate(),
+        sand_open_rate_ceiling(),
+    ))
+});
+
+impl SandOpenPermit {
+    fn attach_cold_open(&mut self, permit: SandColdOpenPermit) {
+        self.cold_open = Some(permit);
+    }
+
+    pub(crate) fn record_open_outcome(&mut self, success: bool) {
+        if let Some(cold_open) = self.cold_open.as_mut() {
+            cold_open.complete(success);
+        }
+    }
+
+    pub(crate) fn record_open_neutral(&mut self) {
+        if let Some(cold_open) = self.cold_open.as_mut() {
+            cold_open.cancel();
+        }
     }
 }
 
@@ -344,9 +624,16 @@ pub(crate) async fn admit_sand_open_until(
         return Err(sand_open_admission_error());
     }
     let queue_wait = remaining.min(Duration::from_secs(sand_open_queue_secs()));
+    let mut cold_open = SAND_COLD_OPEN_SCHEDULER.acquire(deadline).await?;
     match SAND_OPEN_GATE.acquire_soft(&key, queue_wait).await {
-        Some(permit) => Ok(Some(permit)),
+        Some(mut permit) => {
+            // The cold scheduler token is now paired with a real open permit;
+            // it remains attached until the HTTP outcome is known.
+            permit.attach_cold_open(cold_open);
+            Ok(Some(permit))
+        }
         None => {
+            cold_open.cancel();
             // A saturated slice is expected under fan-out. Keep it observable
             // for diagnostics, but let the caller wait for a real permit.
             create_logger("cursor").debug(
@@ -1784,6 +2071,9 @@ pub struct SandInferenceStream {
     terminal_emitted: bool,
     tool_buffers: HashMap<String, SandToolBuffer>,
     completed_tool_ids: HashSet<String>,
+    // Kept last so every early return, clean End, decoder error, and
+    // downstream cancellation returns active-stream capacity uniformly.
+    stream_permit: Option<SandStreamPermit>,
 }
 
 #[derive(Debug, Default)]
@@ -1811,7 +2101,13 @@ impl SandInferenceStream {
             terminal_emitted: false,
             tool_buffers: HashMap::new(),
             completed_tool_ids: HashSet::new(),
+            stream_permit: None,
         }
+    }
+
+    pub(crate) fn with_stream_permit(mut self, permit: SandStreamPermit) -> Self {
+        self.stream_permit = Some(permit);
+        self
     }
 
     /// Queue one and only one terminal event.  Marking the stream ended here
@@ -2428,18 +2724,59 @@ fn json_error_direct(value: &Value) -> Option<CursorError> {
 
 fn sand_provider_error_metadata(value: &Value) -> Option<String> {
     let bytes = serde_json::to_vec(value).ok()?;
-    let parsed = parse_connect_error(&bytes)?;
     let mut fields = Vec::new();
-    if let Some(code) = parsed.provider_error_code {
-        fields.push(format!("providerErrorCode={code}"));
+    if let Some(parsed) = parse_connect_error(&bytes) {
+        if let Some(code) = parsed.provider_error_code {
+            fields.push(format!("providerErrorCode={code}"));
+        }
+        if let Some(status) = parsed.provider_status_code {
+            fields.push(format!("providerStatusCode={status}"));
+        }
+        if let Some(retryable) = parsed.provider_is_retryable {
+            fields.push(format!("isRetryable={retryable}"));
+        }
     }
-    if let Some(status) = parsed.provider_status_code {
-        fields.push(format!("providerStatusCode={status}"));
+    // Sand quota responses put the allowance reason and reset timestamp in
+    // `additionalInfo`, but Connect/SSE may flatten or rename those fields
+    // before this helper sees them. Preserve the small machine-readable
+    // values in CursorError::detail so account failover and its breaker can
+    // use the actual reset window instead of a short generic retry cooldown.
+    if let Some(reason) = find_json_string_field(value, &["rateLimitReason", "rate_limit_reason"]) {
+        if !fields
+            .iter()
+            .any(|field| field.starts_with("rateLimitReason="))
+        {
+            fields.push(format!("rateLimitReason={reason}"));
+        }
     }
-    if let Some(retryable) = parsed.provider_is_retryable {
-        fields.push(format!("isRetryable={retryable}"));
+    if let Some(reset) = find_json_string_field(value, &["nextResetAt", "next_reset_at"]) {
+        fields.push(format!("nextResetAt={reset}"));
     }
     (!fields.is_empty()).then(|| fields.join(" "))
+}
+
+/// Find a scalar string/number/bool under a nested Sand error envelope. Error
+/// details have appeared both as objects and arrays across gateway versions,
+/// so keep this traversal deliberately schema-light and case-insensitive.
+fn find_json_string_field(value: &Value, names: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for (key, candidate) in object {
+                if names.iter().any(|name| key.eq_ignore_ascii_case(name)) {
+                    if let Some(text) = value_as_string(candidate) {
+                        return Some(text);
+                    }
+                }
+            }
+            object
+                .values()
+                .find_map(|candidate| find_json_string_field(candidate, names))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|candidate| find_json_string_field(candidate, names)),
+        _ => None,
+    }
 }
 
 fn value_as_string(value: &Value) -> Option<String> {
@@ -3558,6 +3895,7 @@ mod tests {
             terminal_emitted: false,
             tool_buffers: HashMap::new(),
             completed_tool_ids: HashSet::new(),
+            stream_permit: None,
         }
     }
 
@@ -3816,6 +4154,37 @@ mod tests {
     }
 
     #[test]
+    fn sand_json_error_keeps_quota_reset_metadata_for_breaker() {
+        let value = json!({
+            "error": {
+                "code": "resource_exhausted",
+                "message": "You've reached your Grok Bot usage limit",
+                "details": [{
+                    "debug": {
+                        "details": {
+                            "additionalInfo": {
+                                "rateLimitReason": "sand_included_limit",
+                                "nextResetAt": "2037-10-21T07:28:00.000Z"
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+        let error = json_error(&value).expect("quota error");
+        let detail = error.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("rateLimitReason=sand_included_limit"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("nextResetAt=2037-10-21T07:28:00.000Z"),
+            "{detail}"
+        );
+        assert!(crate::retry::is_policy_rate_limit(&error.client_message()));
+    }
+
+    #[test]
     fn sand_json_error_follows_known_response_envelopes_only() {
         let nested = json!({
             "result": {
@@ -3880,6 +4249,16 @@ mod tests {
 
         let quota = CursorError::new(429, "ERROR_PRO_USER_RATE_LIMIT_EXCEEDED", None);
         assert!(!stream_error_is_retryable(&quota));
+
+        // Current Sand/Bot quota responses use the legacy GPT-4 vision enum
+        // plus a machine-readable allowance reason. They are terminal for
+        // this account and must not enter the stream replay loop.
+        let sand_quota = CursorError::new(
+            429,
+            "ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: You've reached your Grok Bot usage limit",
+            Some("rateLimitReason=sand_included_limit isRetryable=false".into()),
+        );
+        assert!(!stream_error_is_retryable(&sand_quota));
 
         let invalid = CursorError::new(400, "Sand traffic is not supported on this endpoint", None);
         assert!(!stream_error_is_retryable(&invalid));
@@ -4196,6 +4575,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_permit_lives_with_the_stream_and_returns_on_drop() {
+        let gate = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&gate)
+            .acquire_owned()
+            .await
+            .expect("fixture semaphore should be open");
+        let stream = test_stream().with_stream_permit(SandStreamPermit {
+            permit: Some(permit),
+        });
+        assert_eq!(gate.available_permits(), 0);
+        drop(stream);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_open_scheduler_adds_capacity_on_success_and_backs_off_on_failure() {
+        let scheduler = Arc::new(SandColdOpenScheduler::new(2, 64, 64));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut first = scheduler.acquire(deadline).await.expect("first open");
+        let mut second = scheduler.acquire(deadline).await.expect("second open");
+        assert_eq!(scheduler.snapshot().0, 2);
+
+        first.complete(true);
+        second.complete(true);
+        assert_eq!(scheduler.snapshot(), (0, 3, 64));
+
+        let mut third = scheduler.acquire(deadline).await.expect("third open");
+        third.complete(false);
+        assert_eq!(scheduler.snapshot(), (0, 1, 32));
+    }
+
+    #[tokio::test]
     async fn sand_open_gate_never_evicts_an_active_lane() {
         // Use a one-entry map so the eviction path is deterministic. The
         // active permit keeps an Arc reference to its semaphore; a new key
@@ -4246,6 +4657,10 @@ mod tests {
         assert_eq!(SAND_OPEN_ACCOUNT_DEFAULT, 512);
         assert_eq!(SAND_OPEN_GLOBAL_MAX, 512);
         assert_eq!(SAND_OPEN_ACCOUNT_MAX, 512);
+        assert_eq!(SAND_STREAM_GLOBAL_DEFAULT, 512);
+        assert_eq!(SAND_STREAM_GLOBAL_MAX, 512);
+        assert_eq!(SAND_OPEN_INITIAL_INFLIGHT_DEFAULT, 512);
+        assert_eq!(SAND_OPEN_INITIAL_RATE_DEFAULT, 512);
     }
 
     #[tokio::test]

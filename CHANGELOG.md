@@ -3,6 +3,22 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.110 (2026-09-04)
+
+- Separate Sand handshake admission from accepted stream lifetime while keeping
+  the documented 512-way default for both dimensions.
+- Add wakeable pair-wise admission, cold-open AIMD recovery, shared attempt
+  budgets, and operation deduplication so retries cannot multiply into 502/503
+  or `already active` waves.
+- Classify Sand/Bot allowance 429s per account/model, preserve
+  `rateLimitReason`/`nextResetAt`, skip exhausted cached accounts, and avoid
+  reducing healthy global concurrency for quota responses.
+- Keep transport retries, account handoff, and tool-catalog fallback on
+  separate bounded budgets; cap operation keys, replay bytes, active entries,
+  and subscribers so stalled clients cannot retain an unbounded 429/503 wave.
+- Add lifecycle visibility for queued/opening/retrying Sand requests and
+  document the new tuning controls in both READMEs.
+
 ## v0.1.109 (2026-09-04)
 
 - Restore the documented 512-way Sand open fan-out without holding admission

@@ -32,6 +32,14 @@ pub enum RequestStatus {
     Started,
     ProviderSelected,
     Upstream,
+    /// Waiting in the local Sand supervisor before an upstream attempt.
+    Queued,
+    /// Acquiring/opening the upstream inference stream.
+    Opening,
+    /// Recovering a transient upstream stream/open failure.
+    Retrying,
+    /// Paused while a native tool continuation is being fulfilled.
+    WaitingTool,
     Streaming,
     Completed,
     /// The downstream consumer closed the response before the body reached a
@@ -48,6 +56,10 @@ impl RequestStatus {
             Self::Started => "started",
             Self::ProviderSelected => "selected",
             Self::Upstream => "upstream",
+            Self::Queued => "queued",
+            Self::Opening => "opening",
+            Self::Retrying => "retrying",
+            Self::WaitingTool => "waiting_tool",
             Self::Streaming => "streaming",
             Self::Completed => "completed",
             Self::Abandoned => "abandoned",
@@ -55,6 +67,11 @@ impl RequestStatus {
         }
     }
 }
+
+/// Request lifecycle phase used by the Sand supervisor and monitor. Keeping
+/// this separate from transport terminal events lets the TUI show queue/open
+/// pressure without changing completion semantics.
+pub type RequestPhase = RequestStatus;
 
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
@@ -91,6 +108,10 @@ pub enum MonitorEvent {
     },
     UpstreamStarted {
         request_id: String,
+    },
+    RequestPhase {
+        request_id: String,
+        phase: RequestPhase,
     },
     GenerationStarted {
         request_id: String,
@@ -557,6 +578,29 @@ impl MonitorHandle {
         });
     }
 
+    pub fn request_phase(&self, request_id: impl Into<String>, phase: RequestPhase) {
+        self.publish(MonitorEvent::RequestPhase {
+            request_id: request_id.into(),
+            phase,
+        });
+    }
+
+    pub fn queued(&self, request_id: impl Into<String>) {
+        self.request_phase(request_id, RequestStatus::Queued);
+    }
+
+    pub fn opening(&self, request_id: impl Into<String>) {
+        self.request_phase(request_id, RequestStatus::Opening);
+    }
+
+    pub fn retrying(&self, request_id: impl Into<String>) {
+        self.request_phase(request_id, RequestStatus::Retrying);
+    }
+
+    pub fn waiting_tool(&self, request_id: impl Into<String>) {
+        self.request_phase(request_id, RequestStatus::WaitingTool);
+    }
+
     pub fn generation_started(&self, request_id: impl Into<String>) {
         self.publish(MonitorEvent::GenerationStarted {
             request_id: request_id.into(),
@@ -748,6 +792,11 @@ impl MonitorStore {
             MonitorEvent::UpstreamStarted { request_id } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.status = RequestStatus::Upstream;
+                }
+            }
+            MonitorEvent::RequestPhase { request_id, phase } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.status = phase;
                 }
             }
             MonitorEvent::GenerationStarted { request_id: _ } => {
@@ -1378,6 +1427,24 @@ mod tests {
         assert_eq!(state.active[0].request_id, "r1");
         assert_eq!(state.active[0].session_id.as_deref(), Some("s1"));
         assert_eq!(state.active[0].session_seq, Some(3));
+    }
+
+    #[test]
+    fn request_phase_updates_active_lifecycle_without_finishing_request() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("phase-1", None, None, EndpointKind::Messages);
+        monitor.request_phase("phase-1", RequestStatus::Queued);
+        assert_eq!(monitor.snapshot().active[0].status, RequestStatus::Queued);
+        monitor.opening("phase-1");
+        assert_eq!(monitor.snapshot().active[0].status, RequestStatus::Opening);
+        monitor.retrying("phase-1");
+        assert_eq!(monitor.snapshot().active[0].status, RequestStatus::Retrying);
+        monitor.waiting_tool("phase-1");
+        assert_eq!(
+            monitor.snapshot().active[0].status,
+            RequestStatus::WaitingTool
+        );
+        assert_eq!(monitor.snapshot().recent.len(), 0);
     }
 
     #[test]

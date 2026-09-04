@@ -6646,14 +6646,20 @@ fn annotate_connect_end_error(
             serde_json::json!(provider_retryable),
         );
     }
+    if let Some(reason) = error.provider_rate_limit_reason.as_deref() {
+        fields.insert("rateLimitReason".into(), serde_json::json!(reason));
+    }
+    if let Some(reset) = error.provider_next_reset_at.as_deref() {
+        fields.insert("nextResetAt".into(), serde_json::json!(reset));
+    }
     let temporary_provider =
         is_transient_provider_error_message(&format!("{} {}", error.message, error.detail));
     let mut text = error.to_string();
+    let mut marker = Vec::new();
     // Cursor may wrap a deterministic provider rejection in outer
     // `resource_exhausted`/429. Preserve a compact marker so the late retry
     // pump can switch accounts after this ConnectEnd crosses into a string.
     if error.is_non_retryable_provider_error() {
-        let mut marker = Vec::new();
         if let Some(code) = error.provider_error_code.as_deref() {
             marker.push(format!("providerErrorCode={code}"));
         }
@@ -6663,11 +6669,20 @@ fn annotate_connect_end_error(
         if let Some(retryable) = error.provider_is_retryable {
             marker.push(format!("isRetryable={retryable}"));
         }
-        if !marker.is_empty() {
-            text.push_str(" [");
-            text.push_str(&marker.join(","));
-            text.push(']');
-        }
+    }
+    // Sand quota metadata is account-local and must survive the Connect END
+    // string boundary. Without these markers the outer 429 looks generic and
+    // queued callers cannot honor the server reset timestamp.
+    if let Some(reason) = error.provider_rate_limit_reason.as_deref() {
+        marker.push(format!("rateLimitReason={reason}"));
+    }
+    if let Some(reset) = error.provider_next_reset_at.as_deref() {
+        marker.push(format!("nextResetAt={reset}"));
+    }
+    if !marker.is_empty() {
+        text.push_str(" [");
+        text.push_str(&marker.join(","));
+        text.push(']');
     }
     // Some gateway revisions leave the human provider detail only in the
     // serialized `detail` field. Preserve a compact, stable marker in the
@@ -16012,6 +16027,8 @@ mod tests {
                 provider_error_code: None,
                 provider_status_code: None,
                 provider_is_retryable: None,
+                provider_rate_limit_reason: None,
+                provider_next_reset_at: None,
             },
             None,
         );
@@ -17999,6 +18016,8 @@ mod tests {
                 provider_error_code: None,
                 provider_status_code: None,
                 provider_is_retryable: None,
+                provider_rate_limit_reason: None,
+                provider_next_reset_at: None,
             },
             None,
         );
@@ -18046,6 +18065,8 @@ mod tests {
                 provider_error_code: Some("ERROR_PROVIDER_ERROR".into()),
                 provider_status_code: Some(403),
                 provider_is_retryable: Some(false),
+                provider_rate_limit_reason: None,
+                provider_next_reset_at: None,
             },
             None,
         );

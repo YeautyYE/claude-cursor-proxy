@@ -360,6 +360,8 @@ pub fn parse_connect_error(payload: &[u8]) -> Option<ConnectEndError> {
         provider_error_code: provider.error_code,
         provider_status_code: provider.status_code,
         provider_is_retryable: provider.is_retryable,
+        provider_rate_limit_reason: provider.rate_limit_reason,
+        provider_next_reset_at: provider.next_reset_at,
     })
 }
 
@@ -374,6 +376,10 @@ pub struct ProviderErrorMetadata {
     pub error_code: Option<String>,
     pub status_code: Option<u16>,
     pub is_retryable: Option<bool>,
+    /// Sand/Bot account allowance reason, e.g. `sand_included_limit`.
+    pub rate_limit_reason: Option<String>,
+    /// Sand/Bot account allowance reset timestamp, normally RFC3339.
+    pub next_reset_at: Option<String>,
 }
 
 fn extract_provider_error_metadata(parsed: &serde_json::Value) -> ProviderErrorMetadata {
@@ -384,6 +390,7 @@ fn extract_provider_error_metadata(parsed: &serde_json::Value) -> ProviderErrorM
         return ProviderErrorMetadata::default();
     };
 
+    let mut metadata = ProviderErrorMetadata::default();
     for entry in details {
         let Some(debug) = entry.get("debug") else {
             continue;
@@ -410,21 +417,67 @@ fn extract_provider_error_metadata(parsed: &serde_json::Value) -> ProviderErrorM
                 value
                     .get("isRetryable")
                     .or_else(|| value.get("is_retryable"))
+                    .or_else(|| {
+                        value
+                            .get("additionalInfo")
+                            .or_else(|| value.get("additional_info"))
+                            .and_then(|info| {
+                                info.get("isRetryable").or_else(|| info.get("is_retryable"))
+                            })
+                    })
             })
             .and_then(serde_json::Value::as_bool);
+        let rate_limit_reason = details
+            .and_then(|value| find_string_field(value, &["rateLimitReason", "rate_limit_reason"]));
+        let next_reset_at =
+            details.and_then(|value| find_string_field(value, &["nextResetAt", "next_reset_at"]));
 
         // A debug entry without provider metadata may describe another
         // diagnostic (for example a region or auth error). Continue looking
-        // so a later provider entry remains authoritative.
-        if error_code.is_some() || status_code.is_some() || is_retryable.is_some() {
-            return ProviderErrorMetadata {
-                error_code,
-                status_code,
-                is_retryable,
-            };
+        // so a later provider entry remains authoritative. Merge fields
+        // across entries because Sand quota metadata and provider status have
+        // appeared in separate ErrorDetails records across gateway versions.
+        if metadata.error_code.is_none() {
+            metadata.error_code = error_code;
+        }
+        if metadata.status_code.is_none() {
+            metadata.status_code = status_code;
+        }
+        if metadata.is_retryable.is_none() {
+            metadata.is_retryable = is_retryable;
+        }
+        if metadata.rate_limit_reason.is_none() {
+            metadata.rate_limit_reason = rate_limit_reason;
+        }
+        if metadata.next_reset_at.is_none() {
+            metadata.next_reset_at = next_reset_at;
         }
     }
-    ProviderErrorMetadata::default()
+    metadata
+}
+
+/// Find a scalar string field in nested Connect ErrorDetails. The gateway has
+/// emitted both camelCase and snake_case keys and may wrap `additionalInfo`
+/// one or more levels deep, so keep this traversal tolerant of either shape.
+fn find_string_field(value: &serde_json::Value, names: &[&str]) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, candidate) in object {
+                if names.iter().any(|name| key.eq_ignore_ascii_case(name)) {
+                    if let Some(text) = error_value_string(candidate) {
+                        return Some(text);
+                    }
+                }
+            }
+            object
+                .values()
+                .find_map(|candidate| find_string_field(candidate, names))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|candidate| find_string_field(candidate, names)),
+        _ => None,
+    }
 }
 
 fn parse_status_code_value(value: &serde_json::Value) -> Option<u16> {
@@ -477,6 +530,10 @@ pub struct ConnectEndError {
     /// Provider retry hint. `false` means retrying the same provider request
     /// cannot repair the failure.
     pub provider_is_retryable: Option<bool>,
+    /// Sand/Bot allowance reason from nested provider ErrorDetails.
+    pub provider_rate_limit_reason: Option<String>,
+    /// Sand/Bot allowance reset timestamp from nested provider ErrorDetails.
+    pub provider_next_reset_at: Option<String>,
 }
 
 impl ConnectEndError {
@@ -1000,6 +1057,34 @@ mod tests {
         assert_eq!(error.provider_status_code, Some(400));
         assert_eq!(error.provider_is_retryable, Some(false));
         assert!(is_non_retryable_provider_error_message(&error.detail));
+    }
+
+    #[test]
+    fn provider_error_metadata_keeps_sand_quota_reason_and_reset() {
+        let payload = serde_json::json!({
+            "error": {
+                "code": "resource_exhausted",
+                "details": [{
+                    "debug": {
+                        "details": {
+                            "additionalInfo": {
+                                "rateLimitReason": "sand_included_limit",
+                                "nextResetAt": "2037-10-21T07:28:00.000Z"
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+        let error = parse_connect_error(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(
+            error.provider_rate_limit_reason.as_deref(),
+            Some("sand_included_limit")
+        );
+        assert_eq!(
+            error.provider_next_reset_at.as_deref(),
+            Some("2037-10-21T07:28:00.000Z")
+        );
     }
 
     #[test]

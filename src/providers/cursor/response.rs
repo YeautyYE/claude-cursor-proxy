@@ -1,3 +1,8 @@
+// Connect END diagnostics intentionally retain the full structured provider
+// payload so callers can classify Sand quota versus transient transport errors.
+// Keep the existing public error shape instead of boxing the enum variant.
+#![allow(clippy::result_large_err)]
+
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::client::{
     CursorUpstreamResponse, decode_frame_payload, decode_upstream_frames,
