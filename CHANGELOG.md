@@ -3,6 +3,22 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.109 (2026-09-04)
+
+- Restore the documented 512-way Sand open fan-out without holding admission
+  permits for the lifetime of a model stream. Global and account/model gates
+  now cover only the HTTP open/headers phase, so long-lived Claude Code and
+  Grok streams do not starve later turns.
+- Add pair-wise, wakeable admission and sharded HTTP/2 client reuse. Waiting
+  callers reserve neither dimension while the other is busy, and released
+  slots wake queued requests promptly instead of producing synchronized local
+  503s.
+- Rebalance unbound Sand requests across healthy saved accounts, preserve
+  explicit model-account bindings, and apply bounded route cooldowns/failover
+  for saturated or closed account lanes.
+- Bound Cursor session-conflict recovery to one fresh-conversation replay so
+  `live run is already active` responses cannot loop indefinitely.
+
 ## v0.1.108 (2026-09-04)
 
 - Bound Sand `InferenceService/Stream` handshakes to a stable default of 32

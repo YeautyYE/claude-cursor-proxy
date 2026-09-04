@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.108 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.109 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -596,9 +596,10 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_SAND_STRICT_H2` | `0` | Force strict H2 prior-knowledge for Sand; normal TLS ALPN is recommended for HTTPS proxies |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value; the TUI `t` chooser persists the same setting in `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |
-| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Maximum simultaneous Sand InferenceService opens (1–512) |
-| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | Maximum simultaneous Sand opens per account/model lane (1–64) |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand InferenceService opens (1–512) |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | Maximum simultaneous Sand opens per account/model lane (1–512) |
 | `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand admission queue slice (1–120s); saturated requests stay queued and retry the slice without issuing unbounded upstream opens |
+| `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` | `12` | For unbound models, check for a viable alternate saved account after this long behind a saturated account/model lane (1–300s); otherwise keep waiting on the current lane |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | Per-attempt Sand HTTP open timeout (10–180s) |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | Total budget for one Sand open/retry episode (20–900s) |
 | `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | Shared logical budget across the initial Sand open and pre-output stream replays (60–3600s) |
@@ -638,15 +639,19 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 
 The two Sand open limits cover only the HTTP/2 handshake and request headers;
 the permit is released as soon as the upstream stream is established. They do
-not cap the number of model streams or client requests at four. The global
-limit is shared by the whole proxy, while the account limit is keyed by one
-Cursor account and canonical Sand model family. A 512-request fan-out can
-therefore enter the proxy and queue, while one account/model lane opens at
-most four handshakes at a time. The conservative defaults prevent a retry
-burst from flooding Cursor's admission service; raise them only after
-measuring the target account, for example with
-`CCP_CURSOR_SAND_OPEN_CONCURRENCY=64` and
-`CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY=8`.
+not cap the number of model streams or client requests. The defaults preserve
+the 512-way Claude Code/Grok fan-out contract: up to 512 handshakes may be in
+flight process-wide and in one account/model lane. A saturated lane is still
+fairly admitted with a pair-wise gate (a waiter never holds an account permit
+while waiting for a global one), and the shared sharded H2 client pool avoids a
+new TCP/TLS client per request. Unbound requests that remain behind a slow
+account lane can rotate through the saved account pool after
+`CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS`; if no unattempted healthy account
+exists (including the single-account case), they continue waiting on the
+current lane. Explicit model-account bindings stay pinned. These controls shape
+upstream pressure and observability, not the client's logical concurrency;
+Cursor may still return a genuine transient 5xx when its own admission service
+is saturated.
 
 ### Claude Code (client) env / settings
 

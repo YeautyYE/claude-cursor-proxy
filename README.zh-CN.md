@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.108 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.109 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -536,9 +536,10 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_SAND_STRICT_H2` | `0` | 强制 Sand 使用严格 H2 prior-knowledge；经过 HTTPS 代理时建议保持默认 TLS ALPN |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头；TUI 的 `t` 选择器会把选择保存到 `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |
-| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `32` | Sand InferenceService 同时建立的连接上限（1–512） |
-| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `4` | 单账号/模型路由同时建立的 Sand 连接上限（1–64） |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Sand InferenceService 同时建立的连接上限（1–512） |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | 单账号/模型路由同时建立的 Sand 连接上限（1–512） |
 | `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand 准入队列片段（1–120 秒）；饱和请求会继续排队重试，不会无界地向上游建连 |
+| `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` | `12` | 未绑定账号的模型在某个账号/模型通道饱和后，等待该时长检查可用的备用账号（1–300 秒）；没有可用备用账号时继续等待当前通道 |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | 单次 Sand HTTP 建连超时（10–180 秒） |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | 一次 Sand 建连及重试总预算（20–900 秒） |
 | `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | 初始建连和无输出流重放共用的逻辑预算（60–3600 秒） |
@@ -576,13 +577,16 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_NO_PROXY` | 关 | 对 Cursor API 跳过 HTTP(S)_PROXY（`1` / `true`） |
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | 未设置 | 调试日志 |
 
-这两个 Sand open 参数只限制 HTTP/2 握手和响应头阶段；上游流建立后就会
-释放槽位，不会把模型流或客户端请求限制为 4 个。全局参数由整个代理共享，
-账号参数按“一个 Cursor 账号 + 一个规范化 Sand 模型族”分别计数。因此 512
-个请求仍可以进入代理并排队，只是同一账号/模型族默认同时最多进行 4 次握手。
-这个保守默认值用于避免重试突发洪泛 Cursor 准入服务；确认目标账号的容量后，
-可以例如设置 `CCP_CURSOR_SAND_OPEN_CONCURRENCY=64` 和
-`CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY=8` 再重启代理。
+这两个 Sand open 参数只限制 HTTP/2 握手和响应头阶段；上游流建立后就会释放
+槽位，不会把模型流或客户端请求限制成 4 个。默认值保留 Claude Code/Grok 的
+512 路并发约定：进程内及单个账号/模型通道都可同时进行最多 512 次握手。准入
+采用双维度成对获取，等待全局槽位时不会占住账号槽位；共享的分片 H2 客户端池
+也会复用 TLS/H2 连接，不会为每个请求新建 reqwest 客户端。未绑定账号的请求若
+长期卡在某个账号通道，会在 `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` 后
+检查账号池中是否存在未尝试且健康的备用账号；单账号或没有可用备用账号时
+继续等待当前通道。显式模型-账号绑定则保持固定。上述设置控制的是上游握手
+压力和观测，不改变客户端逻辑并发；上游自身准入饱和时仍可能返回真实的瞬时
+5xx。
 
 ### Claude Code 侧（非代理配置）
 

@@ -6922,8 +6922,33 @@ fn is_local_live_overload(err: &CursorError) -> bool {
         || message.contains("cursor live run admission queue timed out")
 }
 
+/// Cursor's gateway may reject an open with a session-conflict response even
+/// though the proxy never received a usable Run handle.  The wording has
+/// appeared in both plain HTTP bodies and Connect error details, so callers
+/// should inspect the assembled client message.  This predicate intentionally
+/// does not decide whether the conflict came from the local registry; that
+/// distinction belongs to the request coordinator, which knows whether an
+/// upstream open was attempted.
+pub(crate) fn live_error_is_upstream_already_active(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("already active for this session")
+        || lower.contains("live run is already active")
+        || lower.contains("already-active run")
+        || lower.contains("already active run"))
+        && (lower.contains("cursor")
+            || lower.contains("live run")
+            || lower.contains("session")
+            || lower.contains("invocation"))
+}
+
 fn live_open_should_retry_http1(err: &CursorError) -> bool {
     if matches!(err.status, 400 | 401 | 403 | 404 | 429) {
+        return false;
+    }
+    if live_error_is_upstream_already_active(&err.client_message()) {
+        // RunSSE cannot clear an AgentService session conflict and often
+        // returns the same 503.  Keep the error on the bounded conversation
+        // recovery path instead of changing transports.
         return false;
     }
     if is_local_live_overload(err) {
@@ -7351,6 +7376,14 @@ pub(crate) fn live_error_is_same_request_retryable(message: &str) -> bool {
     if is_non_retryable_provider_error_message(message) {
         return false;
     }
+    // An upstream session-conflict response means the previous AgentService
+    // open may still be alive. Replaying the same conversation here merely
+    // reproduces the 503; the request coordinator owns the one-shot
+    // fresh-conversation recovery fence. Keep this classifier false even for
+    // wrappers that also contain generic transient/503 wording.
+    if live_error_is_upstream_already_active(message) {
+        return false;
+    }
     // The newer provider adapter can encode a temporary connectivity outage
     // as an inner 400/429 with `isRetryable=false`. It is safe to replay only
     // while no visible output has been committed, so keep this branch ahead
@@ -7447,6 +7480,20 @@ pub(crate) fn cursor_start_error_is_same_request_retryable(err: &CursorError) ->
             .detail
             .as_deref()
             .is_some_and(is_non_retryable_provider_error_message)
+    {
+        return false;
+    }
+    // A session-conflict response is handled by the request coordinator's
+    // one-shot fresh-conversation recovery.  Do not let the generic start
+    // retry path replay the same conversation (especially when a transient
+    // provider hint is nested alongside the 503), or every retry observes the
+    // same `already active` rejection.
+    if live_error_is_upstream_already_active(&text)
+        || live_error_is_upstream_already_active(&err.message)
+        || err
+            .detail
+            .as_deref()
+            .is_some_and(live_error_is_upstream_already_active)
     {
         return false;
     }
@@ -8182,6 +8229,23 @@ async fn try_live_reconnect(
         match opened {
             Err(err) => {
                 let err = annotate_live_cursor_error(&reconnect.session_id, err);
+                // A session-conflict response is semantic, not a transport
+                // negotiation failure.  Switching this reconnect to HTTP/1
+                // (or retrying the same conversation in a loop) only repeats
+                // the 503.  Return it to the late-retry coordinator, which
+                // owns the one-shot fresh-conversation recovery fence.
+                if live_error_is_upstream_already_active(&err.client_message()) {
+                    let message = err.client_message();
+                    let outcome = LiveReconnectOutcome::Failed(message);
+                    log_live_reconnect(
+                        &outcome,
+                        *reconnect_attempts,
+                        max_reconnects,
+                        &reconnect.http,
+                        &reconnect.last_trigger,
+                    );
+                    return outcome;
+                }
                 // Cursor's aggregate KV quota is tied to the conversation id.
                 // A ResumeAction against that id can never make progress, so
                 // do not spend the reconnect budget (or seal an ambiguous
@@ -14973,6 +15037,51 @@ mod tests {
         assert!(
             !is_retryable_live_transport_error(&rate_limit_with_connection),
             "429 mentioning connection must still not retry"
+        );
+    }
+
+    #[test]
+    fn upstream_active_conflict_stays_on_conversation_recovery_not_h1() {
+        let wrapped = CursorError::new(
+            503,
+            "Cursor upstream HTTP 503",
+            Some(
+                "A Cursor live run is already active for this session; retry after it advances"
+                    .into(),
+            ),
+        );
+        assert!(live_error_is_upstream_already_active(
+            &wrapped.client_message()
+        ));
+        assert!(
+            !live_open_should_retry_http1(&wrapped),
+            "RunSSE cannot clear an AgentService session conflict"
+        );
+        // This semantic conflict is intentionally *not* a generic
+        // same-request transport retry. The request coordinator handles the
+        // one-shot fresh-conversation replay before reaching this classifier;
+        // returning true here would let a lower retry layer replay the same
+        // conversation indefinitely.
+        assert!(!live_error_is_same_request_retryable(
+            &wrapped.client_message()
+        ));
+        let connect_wrapped = "Connect error 503: A Cursor live run is already active for this session; retry after it advances";
+        assert!(live_error_is_upstream_already_active(connect_wrapped));
+        assert!(
+            !live_error_is_same_request_retryable(connect_wrapped),
+            "generic Connect-503 wording must not bypass the coordinator's one-shot fence"
+        );
+        let structured = CursorError::new(
+            503,
+            "Cursor upstream HTTP 503",
+            Some(
+                "A Cursor live run is already active for this session; retry after it advances"
+                    .into(),
+            ),
+        );
+        assert!(
+            !cursor_start_error_is_same_request_retryable(&structured),
+            "start retry classifier must defer an upstream conflict to the coordinator"
         );
     }
 

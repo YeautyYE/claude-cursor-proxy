@@ -21,7 +21,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
@@ -54,27 +54,29 @@ pub const MAX_SAND_STREAM_RETRIES: u32 = 5;
 // Sand open admission and transport breaker
 // ---------------------------------------------------------------------------
 //
-// InferenceService opens are materially more expensive than reading an
-// already-established stream (TLS/H2 setup plus provider admission).  A
-// Claude Code/Grok retry wave used to let every request perform three 90s
-// opens at once.  Besides exhausting the upstream connection pool, that made
-// one stalled account look like hundreds of independent 502s.  Keep a small,
-// independent open bulkhead here; the AgentService live gate intentionally
-// does not cover Sand requests.
-// Keep the default below Cursor's per-session admission capacity.  The
-// 0.1.107 512-open default let a single active account flood
-// InferenceService while each open was waiting for headers, producing a wave
-// of 88s timeouts and downstream 503s.  Deployments that have measured a
-// higher upstream limit can still opt in through the environment override.
-const SAND_OPEN_GLOBAL_DEFAULT: usize = 32;
+// Sand accepts large independent Claude Code/Grok fan-outs.  This gate exists
+// to bound a pathological retry wave and to keep account/model lanes
+// observable; it must not silently reduce the normal 512-way client contract.
+// Connection pressure is controlled by the shared sharded H2 client pool,
+// which reuses TLS/H2 transports rather than constructing one reqwest client
+// per request.  The AgentService live gate intentionally does not cover Sand.
+const SAND_OPEN_GLOBAL_DEFAULT: usize = 512;
 const SAND_OPEN_GLOBAL_MAX: usize = 512;
-const SAND_OPEN_ACCOUNT_DEFAULT: usize = 4;
-const SAND_OPEN_ACCOUNT_MAX: usize = 64;
+const SAND_OPEN_ACCOUNT_DEFAULT: usize = 512;
+const SAND_OPEN_ACCOUNT_MAX: usize = 512;
 // Keep the local fairness slice short so queued callers re-check capacity
 // promptly. A saturated slice is non-terminal backpressure; callers retry it
 // without issuing an untracked upstream open.
 const SAND_OPEN_QUEUE_DEFAULT_SECS: u64 = 3;
 const SAND_OPEN_QUEUE_MAX_SECS: u64 = 120;
+// A saturated account/model lane should hand an unbound request to the
+// account-pool failover path before the long open budget expires.  Without a
+// short handoff threshold, hundreds of callers can sit behind four stalled
+// opens for three minutes and then become a synchronized 503 wave.  This is
+// only a *lane* threshold; requests still retain the larger logical retry
+// budget once a different account (or a released slot) is selected.
+const SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_DEFAULT_SECS: u64 = 12;
+const SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_MAX_SECS: u64 = 300;
 const SAND_OPEN_BREAKER_THRESHOLD_DEFAULT: u32 = 3;
 const SAND_OPEN_BREAKER_THRESHOLD_MAX: u32 = 16;
 const SAND_OPEN_BREAKER_COOLDOWN_DEFAULT_SECS: u64 = 15;
@@ -140,6 +142,19 @@ pub(crate) fn sand_open_queue_secs() -> u64 {
     )
 }
 
+/// How long an open caller waits behind a saturated account/model lane before
+/// returning a retryable admission diagnostic to the account-pool selector.
+/// The value is intentionally configurable for deployments with a very slow
+/// but high-capacity upstream; the default keeps Claude Code's retry window
+/// responsive during a burst.
+pub(crate) fn sand_open_account_queue_failover_secs() -> u64 {
+    bounded_env_u64(
+        "CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS",
+        SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_DEFAULT_SECS,
+        SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_MAX_SECS,
+    )
+}
+
 fn sand_open_breaker_threshold() -> u32 {
     bounded_env_u64(
         "CCP_CURSOR_SAND_BREAKER_THRESHOLD",
@@ -162,6 +177,12 @@ struct SandOpenGate {
     account_limit: usize,
     account_max_entries: usize,
     account: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// Wake waiters whenever either dimension of the two-dimensional gate is
+    /// released.  A `Notify` is deliberately separate from the semaphores:
+    /// acquiring one permit and then waiting for the other would reserve
+    /// capacity indefinitely, so callers use non-blocking pair attempts and
+    /// sleep only until this signal (or their deadline).
+    wake: Arc<Notify>,
 }
 
 impl SandOpenGate {
@@ -179,6 +200,7 @@ impl SandOpenGate {
             account_limit: account_limit.clamp(1, SAND_OPEN_ACCOUNT_MAX),
             account_max_entries: account_max_entries.max(1),
             account: Mutex::new(HashMap::new()),
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -187,8 +209,8 @@ impl SandOpenGate {
     /// request create a second lane for the same account/model and silently
     /// bypass the configured per-account concurrency limit. If every bounded
     /// entry is active, reject the new lane rather than growing the map
-    /// without limit; the soft admission caller can bypass the local gate and
-    /// let the upstream transport apply its own capacity policy.
+    /// without limit; the admission caller reports a retryable local
+    /// diagnostic instead of creating an untracked lane.
     fn account_gate(&self, key: &str) -> Option<Arc<Semaphore>> {
         let mut account = self
             .account
@@ -215,34 +237,51 @@ impl SandOpenGate {
 
     async fn acquire(&self, key: &str, wait: Duration) -> Result<SandOpenPermit, CursorError> {
         let deadline = Instant::now() + wait;
-        // Acquire the account/model lane first. If the lane is saturated,
-        // waiting callers must not hold all global permits while queued;
-        // doing so would starve unrelated healthy accounts (head-of-line
-        // blocking was a major source of cross-account 502 waves).
+        // Resolve the lane once. `account_gate` only mutates the map while
+        // creating/evicting an idle entry; the returned Arc remains valid even
+        // if a later caller evicts that map entry.
         let account_gate = self
             .account_gate(key)
             .ok_or_else(sand_open_admission_error)?;
-        let account = match tokio::time::timeout(wait, account_gate.acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => return Err(sand_open_admission_error()),
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            drop(account);
-            return Err(sand_open_admission_error());
-        }
-        let global =
-            match tokio::time::timeout(remaining, Arc::clone(&self.global).acquire_owned()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) | Err(_) => {
-                    drop(account);
-                    return Err(sand_open_admission_error());
+        // Acquire both dimensions with `try_acquire_owned` and never retain
+        // one while awaiting the other.  The previous account-first ordering
+        // let four callers reserve an account lane while blocked on the
+        // process-wide semaphore; that made the lane appear full, starved
+        // account balancing, and amplified a 512-way burst into synchronized
+        // timeout/503 waves.
+        loop {
+            let global = Arc::clone(&self.global).try_acquire_owned().ok();
+            if let Some(global) = global {
+                match Arc::clone(&account_gate).try_acquire_owned() {
+                    Ok(account) => {
+                        return Ok(SandOpenPermit {
+                            global: Some(global),
+                            account: Some(account),
+                            wake: Arc::clone(&self.wake),
+                        });
+                    }
+                    Err(_) => {
+                        // Account lane is saturated; release the global slot
+                        // before waiting so another account can use it.
+                        drop(global);
+                    }
                 }
-            };
-        Ok(SandOpenPermit {
-            _global: global,
-            _account: account,
-        })
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(sand_open_admission_error());
+            }
+            // The notify path reacts immediately to permit drops. Keep a
+            // short timer as a lost-wakeup/cancellation fallback; callers
+            // cannot be stranded if a permit is released between the try
+            // attempt and subscription to `Notify`.
+            let retry_slice = remaining.min(Duration::from_millis(100));
+            tokio::select! {
+                _ = self.wake.notified() => {},
+                _ = tokio::time::sleep(retry_slice) => {},
+            }
+        }
     }
 
     /// Attempt one bounded queue slice and return `None` when the lane is
@@ -260,8 +299,21 @@ impl SandOpenGate {
 /// expensive handshake and guarantees cancellation/timeout release.
 #[derive(Debug)]
 pub(crate) struct SandOpenPermit {
-    _global: OwnedSemaphorePermit,
-    _account: OwnedSemaphorePermit,
+    global: Option<OwnedSemaphorePermit>,
+    account: Option<OwnedSemaphorePermit>,
+    wake: Arc<Notify>,
+}
+
+impl Drop for SandOpenPermit {
+    fn drop(&mut self) {
+        // Release both owned semaphore permits before waking contenders. A
+        // custom Drop body runs before fields are dropped, hence the explicit
+        // `take`; notifying first would wake every task while both dimensions
+        // still appeared full and defer progress to the timer fallback.
+        self.account.take();
+        self.global.take();
+        self.wake.notify_waiters();
+    }
 }
 
 static SAND_OPEN_GATE: LazyLock<SandOpenGate> =
@@ -308,6 +360,30 @@ pub(crate) async fn admit_sand_open_until(
             Ok(None)
         }
     }
+}
+
+/// Return the currently available permits for one account/model lane.
+/// `None` means the lane has not been created yet; in that case callers can
+/// treat it as having the configured account capacity.  This read is used by
+/// the request-scoped account balancer to avoid sending a large fan-out to one
+/// active account while other saved accounts are idle.
+pub(crate) fn sand_open_available_permits(token: &str, model: &str) -> Option<usize> {
+    let key = capability_key(token, model).0;
+    let gate = SAND_OPEN_GATE
+        .account
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    gate.get(&key).map(|lane| lane.available_permits())
+}
+
+/// The configured per-account capacity, exposed for an as-yet-unseen lane.
+pub(crate) fn sand_open_account_capacity() -> usize {
+    // Read the environment once, when the process-global gate is first used,
+    // and then report that same snapshot. Calling `sand_open_account_limit()`
+    // directly here would let a late environment mutation disagree with the
+    // already-created semaphore and make account balancing choose the wrong
+    // lane. Configuration changes take effect on the next proxy process.
+    SAND_OPEN_GATE.account_limit
 }
 
 #[derive(Debug, Clone)]
@@ -1976,6 +2052,111 @@ pub struct SandInferenceClient {
     client: reqwest::Client,
     base_url: String,
     timeout_secs: u64,
+}
+
+/// Process-wide Sand HTTP client pools.
+///
+/// `reqwest::Client` is cheap to clone, but expensive to construct: building
+/// one for every Claude Code turn disables the connection pool and causes a
+/// fresh TCP/TLS/HTTP2 handshake for every request.  Under a 512-way Grok
+/// fan-out that looks exactly like an upstream admission outage (and can
+/// exhaust Cursor's connection budget before a stream is accepted).  Keep a
+/// small set of clients, sharded by conversation, and clone the selected
+/// client for each request.  The client cache is separate from the Agent
+/// client cache because Sand may use `CCP_CURSOR_SAND_BASE_URL` and a
+/// different HTTP2 transport mode.
+struct SharedSandInferenceClients {
+    fingerprint: String,
+    clients: Vec<SandInferenceClient>,
+}
+
+static SHARED_SAND_INFERENCE_CLIENTS: LazyLock<Mutex<Option<SharedSandInferenceClients>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn sand_client_shard_count() -> usize {
+    std::env::var("CCP_CURSOR_H2_SHARDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+        .clamp(1, 64)
+}
+
+fn sand_client_shard_index(key: &str, shard_count: usize) -> usize {
+    // Stable FNV-1a keeps one conversation on one H2 pool while still
+    // distributing independent sessions.  A deterministic hash is important
+    // for retries: a reconnect should stay in the same failure domain rather
+    // than opening another client and multiplying handshakes.
+    let hash = key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    (hash as usize) % shard_count.max(1)
+}
+
+fn sand_client_fingerprint(base_url: &str, timeout_secs: u64, shard_count: usize) -> String {
+    // Include transport-affecting environment values.  This lets a TUI or a
+    // test that changes the proxy/strict-H2 switch obtain a fresh pool without
+    // requiring a process restart, while ordinary requests keep reusing the
+    // already-established H2 connections.
+    let no_proxy = std::env::var("CCP_CURSOR_NO_PROXY").unwrap_or_default();
+    let strict_h2 = std::env::var("CCP_CURSOR_SAND_STRICT_H2").unwrap_or_default();
+    let https_proxy = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .unwrap_or_default();
+    let http_proxy = std::env::var("HTTP_PROXY")
+        .or_else(|_| std::env::var("http_proxy"))
+        .unwrap_or_default();
+    format!(
+        "{base_url}\0{timeout_secs}\0{shard_count}\0{no_proxy}\0{strict_h2}\0{https_proxy}\0{http_proxy}"
+    )
+}
+
+/// Return a pooled Sand client for one conversation (or request id when the
+/// caller has no session).  This is intentionally `pub(crate)` so the Cursor
+/// provider can use it while protocol tests can continue to construct an
+/// isolated client with [`SandInferenceClient::with_base_url_timeout`].
+pub(crate) fn shared_client(conversation_key: Option<&str>) -> SandInferenceClient {
+    let base_url = crate::config::cursor_sand_base_url();
+    let timeout_secs = crate::config::cursor_request_timeout_secs();
+    let shard_count = sand_client_shard_count();
+    let fingerprint = sand_client_fingerprint(&base_url, timeout_secs, shard_count);
+    let mut cache = SHARED_SAND_INFERENCE_CLIENTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let needs_rebuild = cache
+        .as_ref()
+        .is_none_or(|existing| existing.fingerprint != fingerprint);
+    if needs_rebuild {
+        let clients = (0..shard_count)
+            .map(|_| {
+                let source = CursorHttpClient::with_base_url_timeout_and_prefer_http1(
+                    base_url.clone(),
+                    timeout_secs,
+                    false,
+                );
+                // `from_cursor_client` switches the source to Sand's H2 mode
+                // once, at pool construction time.  Cloning the resulting
+                // Sand client below shares reqwest's connection pool.
+                SandInferenceClient::from_cursor_client(&source)
+            })
+            .collect();
+        *cache = Some(SharedSandInferenceClients {
+            fingerprint,
+            clients,
+        });
+    }
+
+    let pool = cache
+        .as_ref()
+        .expect("Sand client pool must be initialized");
+    let index = conversation_key
+        .map(|key| sand_client_shard_index(key, pool.clients.len()))
+        .unwrap_or(0);
+    pool.clients[index].clone()
 }
 
 impl SandInferenceClient {
@@ -3900,6 +4081,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sand_open_gate_does_not_hold_account_permit_while_global_is_busy() {
+        // The account-first implementation used to let a waiter consume the
+        // account permit and then block on the global semaphore.  A second
+        // request for that account consequently timed out even after the
+        // global slot was released.  Pair admission must reserve neither
+        // dimension while waiting for the other.
+        let gate = Arc::new(SandOpenGate::new(1, 1));
+        let first = gate
+            .acquire("account-a\0model", Duration::from_millis(100))
+            .await
+            .expect("first permit");
+        let waiting_global = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                gate.acquire("account-b\0model", Duration::from_millis(500))
+                    .await
+                    .map(|permit| {
+                        // Do not return the permit through JoinHandle: the
+                        // caller awaits both tasks, and a returned permit
+                        // would remain held until that JoinHandle is dropped.
+                        drop(permit);
+                    })
+            })
+        };
+        // Let the account-b task observe the busy global slot. It must not
+        // consume account-b's sole permit while waiting for global capacity.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            gate.account_gate("account-b\0model")
+                .expect("account-b lane")
+                .available_permits(),
+            1,
+            "a global waiter must not reserve the account lane"
+        );
+        let second_same_account = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                gate.acquire("account-b\0model", Duration::from_millis(500))
+                    .await
+                    .map(|permit| {
+                        drop(permit);
+                    })
+            })
+        };
+        drop(first);
+        waiting_global
+            .await
+            .expect("global waiter task")
+            .expect("account-b should acquire after release");
+        // Once the first account-b permit is released, the second one must
+        // also complete, proving that pair admission never leaked/duplicated
+        // lane state.
+        second_same_account
+            .await
+            .expect("same-account waiter task")
+            .expect("released account-b lane should be reusable");
+    }
+
+    #[tokio::test]
+    async fn sand_open_gate_admits_512_same_account_opens_without_local_shedding() {
+        const FANOUT: usize = 512;
+        let gate = Arc::new(SandOpenGate::new(FANOUT, FANOUT));
+        // Every task keeps its permit until all peers have acquired one. This
+        // distinguishes true 512-way admission from rapid sequential permit
+        // reuse and catches an accidental return to the old 32/4 defaults.
+        let all_admitted = Arc::new(tokio::sync::Barrier::new(FANOUT + 1));
+        let mut tasks = Vec::with_capacity(FANOUT);
+        for _ in 0..FANOUT {
+            let gate = Arc::clone(&gate);
+            let all_admitted = Arc::clone(&all_admitted);
+            tasks.push(tokio::spawn(async move {
+                let permit = gate
+                    .acquire("account-a\0grok-4.6", Duration::from_secs(2))
+                    .await
+                    .expect("512-way open should not be locally rejected");
+                all_admitted.wait().await;
+                drop(permit);
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), all_admitted.wait())
+            .await
+            .expect("all 512 callers should hold a permit concurrently");
+        for task in tasks {
+            task.await.expect("fan-out task");
+        }
+        assert_eq!(gate.global.available_permits(), FANOUT);
+        let lane = gate
+            .account_gate("account-a\0grok-4.6")
+            .expect("account lane");
+        assert_eq!(lane.available_permits(), FANOUT);
+    }
+
+    #[tokio::test]
     async fn sand_open_gate_soft_admission_reports_a_saturated_slice() {
         // A queue slice expiring must not become a terminal admission error.
         // The caller can wait and retry without opening an untracked upstream
@@ -3964,14 +4238,14 @@ mod tests {
     }
 
     #[test]
-    fn sand_open_defaults_bound_single_account_bursts() {
-        // Keep the production defaults aligned with the pre-0.1.107 stable
-        // profile.  The explicit environment overrides remain available for
-        // operators that have measured a larger upstream capacity.
-        assert_eq!(SAND_OPEN_GLOBAL_DEFAULT, 32);
-        assert_eq!(SAND_OPEN_ACCOUNT_DEFAULT, 4);
+    fn sand_open_defaults_preserve_512_way_fanout() {
+        // Sand's open gate is a hard safety ceiling, not a low default
+        // throughput throttle. A normal 512-way caller must reach the shared
+        // H2 transport without a proxy-generated admission failure.
+        assert_eq!(SAND_OPEN_GLOBAL_DEFAULT, 512);
+        assert_eq!(SAND_OPEN_ACCOUNT_DEFAULT, 512);
         assert_eq!(SAND_OPEN_GLOBAL_MAX, 512);
-        assert_eq!(SAND_OPEN_ACCOUNT_MAX, 64);
+        assert_eq!(SAND_OPEN_ACCOUNT_MAX, 512);
     }
 
     #[tokio::test]

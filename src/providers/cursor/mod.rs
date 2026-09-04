@@ -31,7 +31,7 @@ use futures_util::{FutureExt, StreamExt};
 use http::StatusCode;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -42,9 +42,10 @@ use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::cursor::auth::{
-    CursorAccountProfile, clear_cursor_auth, cursor_account_digest, expired_auth_message,
-    force_refresh_cursor_auth, list_cursor_accounts, load_cursor_auth, load_cursor_auth_for_model,
-    missing_auth_message, run_cursor_login,
+    CursorAccountProfile, CursorAuthSelection, clear_cursor_auth, cursor_account_digest,
+    expired_auth_message, force_refresh_cursor_auth, list_cursor_accounts, load_cursor_auth,
+    load_cursor_auth_for_model, missing_auth_message, refresh_cursor_account_for_usage,
+    run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::connect::{
@@ -64,10 +65,11 @@ use crate::providers::cursor::live::{
     cursor_start_error_is_same_request_retryable, exhausted_live_start_error,
     finish_replacement_after_cancel, live_error_is_agent_looping_detected,
     live_error_is_empty_turn_retry, live_error_is_kv_blob_overflow_replayable,
-    live_error_is_same_request_retryable, live_error_needs_checkpoint_continue,
-    live_pending_must_supersede, live_probe_error_blocks_new_run, live_request_fingerprint,
-    live_resume_error_is_dead_driver, live_run_key_for, live_sse_response,
-    live_start_error_seals_tombstone, local_overload_retry_after, same_request_retry_wait_ms,
+    live_error_is_same_request_retryable, live_error_is_upstream_already_active,
+    live_error_needs_checkpoint_continue, live_pending_must_supersede,
+    live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
+    live_run_key_for, live_sse_response, live_start_error_seals_tombstone,
+    local_overload_retry_after, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{
     anthropic_wire_model, resolve_cursor_model, resolve_sand_model_id,
@@ -241,6 +243,25 @@ struct PolicyRateLimitState {
 static POLICY_RATE_LIMIT_BREAKER: LazyLock<Mutex<HashMap<String, PolicyRateLimitState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Sand account routes can fail independently of the subscription-wide policy
+// meter. Keep their short-lived cooldowns in a *separate* keyed store: putting
+// an admission/auth route failure in POLICY_RATE_LIMIT_BREAKER would make
+// policy_rate_limit_preflight synthesize a client-visible 429 for a healthy
+// single-account login merely because one lane was briefly saturated. The
+// route map is process-local and expires automatically; no account is removed
+// from the persistent registry as a side effect of a transient response.
+#[derive(Clone, Debug)]
+struct SandRouteCooldownState {
+    until: Instant,
+}
+
+static SAND_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<String, SandRouteCooldownState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const SAND_ROUTE_ADMISSION_COOLDOWN_SECS: u64 = 15;
+const SAND_ROUTE_AUTH_COOLDOWN_SECS: u64 = 15 * 60;
+static SAND_ACCOUNT_FAILOVER_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 /// Cold/half-open account+model keys use bounded single-flight. This closes
 /// the gap where a large retry wave could pass an empty breaker: actual output
 /// releases the wave, while a quiet key ramps by only one probe per window.
@@ -388,12 +409,21 @@ impl PolicyRateLimitAdmission {
 }
 
 fn policy_rate_limit_key(model: &str, client_type: &str, token: &str) -> String {
-    let resolved_model = resolve_cursor_model(model)
-        .map(|resolved| resolved.model_id)
-        .unwrap_or_else(|_| model.trim().to_ascii_lowercase());
     let route = match client_type.trim().to_ascii_lowercase() {
         route if !route.is_empty() => route,
         _ => "cli".to_string(),
+    };
+    // Sand's InferenceService keys account state by the family id while the
+    // Agent catalog/CLI route carries an effort suffix (for example
+    // `cursor-grok-4.6-xhigh-fast`). Keep policy cooldowns on the same key as
+    // the Sand open gate; otherwise a 429/closed-account observation on one
+    // spelling is invisible to the other and the retry wave hammers it again.
+    let resolved_model = if route.eq_ignore_ascii_case("sand") {
+        resolve_sand_model_id(model)
+    } else {
+        resolve_cursor_model(model)
+            .map(|resolved| resolved.model_id)
+            .unwrap_or_else(|_| model.trim().to_ascii_lowercase())
     };
     format!("{route}:{resolved_model}:{}", cursor_account_digest(token))
 }
@@ -613,10 +643,13 @@ fn note_policy_rate_limit(
     }
     let retry_after_secs = policy_rate_limit_cooldown_secs(message, retry_after);
     let key = policy_rate_limit_key(model, client_type, token);
-    // Resolve the profile id only for diagnostics.  The helper falls back to
-    // the stable bearer digest when the request uses an environment/legacy
-    // credential; neither path emits the raw token.
-    let account_id = cursor_account_key_for_token(token);
+    // This helper is called directly from async stream/error paths, often by
+    // hundreds of concurrent retries.  Do not take the account-registry file
+    // lock here: `cursor_account_key_for_token` performs synchronous I/O and
+    // can stall every Tokio worker while a 503 wave is being handled.  The
+    // stable bearer digest is sufficient for correlation and never exposes a
+    // credential; selection logs retain the persisted profile id separately.
+    let account_id = cursor_account_digest(token);
     let now = Instant::now();
     let state = PolicyRateLimitState {
         until: now + Duration::from_secs(retry_after_secs),
@@ -668,6 +701,134 @@ fn note_policy_rate_limit(
     create_logger("cursor").warn("policy_rate_limit_breaker_open", Some(fields));
 }
 
+/// Return whether a Sand account/model route is in its short-lived transport
+/// cooldown. This deliberately does not consult the policy breaker: route
+/// pressure and subscription allowance are independent signals.
+fn sand_account_route_is_cooled(model: &str, token: &str) -> bool {
+    let key = policy_rate_limit_key(model, "sand", token);
+    let now = Instant::now();
+    let mut routes = SAND_ROUTE_COOLDOWNS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    routes.retain(|_, state| state.until > now);
+    routes.get(&key).is_some_and(|state| state.until > now)
+}
+
+/// Mark one Sand account/model route unavailable for a bounded interval.
+///
+/// A subsequent unbound request sees the route as cooled and immediately tries
+/// another saved account instead of waiting behind the same stalled lane. The
+/// route marker is intentionally independent from subscription policy state;
+/// a longer existing route cooldown is never shortened by a shorter admission
+/// observation.
+fn note_sand_account_route_cooldown(model: &str, token: &str, reason: &str, cooldown: Duration) {
+    let key = policy_rate_limit_key(model, "sand", token);
+    let now = Instant::now();
+    let state = SandRouteCooldownState {
+        until: now + cooldown,
+    };
+    {
+        let mut routes = SAND_ROUTE_COOLDOWNS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        routes.retain(|_, previous| previous.until > now);
+        match routes.get_mut(&key) {
+            Some(previous) if previous.until >= state.until => {}
+            Some(previous) => *previous = state,
+            None => {
+                if routes.len() >= POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES {
+                    if let Some(oldest) = routes
+                        .iter()
+                        .min_by_key(|(_, previous)| previous.until)
+                        .map(|(key, _)| key.clone())
+                    {
+                        routes.remove(&oldest);
+                    }
+                }
+                routes.insert(key.clone(), state);
+            }
+        }
+    }
+    // This helper runs on the async Sand stream/error path and can be called
+    // by hundreds of concurrent retries. Do not consult the on-disk account
+    // registry here: `list_cursor_accounts()` may wait on an inter-process
+    // lock and would block a Tokio worker while a 503 wave is being logged.
+    // The bearer digest is stable for the lifetime of this route and is the
+    // same fallback used for environment-backed credentials.
+    let account_id = cursor_account_digest(token);
+    let mut fields = quota_diagnostic_fields(&account_id, token, model, "sand");
+    fields.insert("reason".to_string(), serde_json::json!(reason));
+    fields.insert(
+        "cooldownSecs".to_string(),
+        serde_json::json!(cooldown.as_secs().max(1)),
+    );
+    create_logger("cursor").warn("sand_account_route_cooldown", Some(fields));
+}
+
+/// Return whether a structured Cursor error represents an account-scoped
+/// policy result.  The useful marker can live in any `CursorError` field, so
+/// keep this decision in one helper instead of letting the initial-open and
+/// late-stream failover paths drift apart.
+fn cursor_error_is_account_failover_policy(error: &CursorError) -> bool {
+    is_account_failover_policy_error(&error.client_message())
+        || is_account_failover_policy_error(&error.message)
+        || error
+            .detail
+            .as_deref()
+            .is_some_and(is_account_failover_policy_error)
+}
+
+/// Record only the cooldown implied by the observed Sand error.
+///
+/// Admission/open failures are transport pressure, not quota exhaustion. They
+/// may receive the short route cooldown below, but must never be promoted into
+/// the longer policy-429 breaker merely because they share the account
+/// failover path. Conversely, a genuine policy diagnostic keeps the existing
+/// policy cooldown and `Retry-After` semantics.
+fn note_sand_account_failover_error(model: &str, token: &str, error: &CursorError) {
+    if let Some((cooldown, reason)) = sand_account_route_cooldown(error) {
+        note_sand_account_route_cooldown(model, token, reason, cooldown);
+    }
+    if cursor_error_is_account_failover_policy(error) {
+        let diagnostic = error.client_message();
+        note_policy_rate_limit(
+            model,
+            "sand",
+            token,
+            &diagnostic,
+            error.retry_after.as_deref(),
+        );
+    }
+}
+
+/// Return the route cooldown that should be applied to a Sand open error.
+/// Admission saturation is short-lived; an explicit closed/session-invalid
+/// response is held longer so a retry wave does not keep hammering the same
+/// credential.  Generic provider 5xx errors remain on the transport retry
+/// path and do not poison an account route.
+fn sand_account_route_cooldown(error: &CursorError) -> Option<(Duration, &'static str)> {
+    let message = error.client_message();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("error_account_closed")
+        || lower.contains("error_not_logged_in")
+        || (error.status == 401 && lower.contains("authentication error"))
+    {
+        return Some((
+            Duration::from_secs(SAND_ROUTE_AUTH_COOLDOWN_SECS),
+            "authentication_or_account_closed",
+        ));
+    }
+    if lower.contains("sand inference open admission deadline exhausted")
+        || lower.contains("sand open admission queue timed out")
+    {
+        return Some((
+            Duration::from_secs(SAND_ROUTE_ADMISSION_COOLDOWN_SECS),
+            "admission_saturated",
+        ));
+    }
+    None
+}
+
 fn policy_rate_limit_breaker_state(
     model: &str,
     client_type: &str,
@@ -716,6 +877,10 @@ fn policy_rate_limit_preflight(
 #[cfg(test)]
 fn reset_policy_rate_limit_breaker_for_test() {
     POLICY_RATE_LIMIT_BREAKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+    SAND_ROUTE_COOLDOWNS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .clear();
@@ -1246,7 +1411,32 @@ async fn sand_direct_response(
         None
     };
 
-    let client = SandInferenceClient::new();
+    // Reuse a process-wide Sand H2 client pool. Constructing a fresh reqwest
+    // client for every turn disables connection reuse and turns a 512-way
+    // Claude Code/Grok fan-out into a synchronized TLS/H2 handshake burst,
+    // which Cursor reports as 502/503 admission failures. The shard key keeps
+    // one session on one connection pool while independent sessions spread
+    // across the configured H2 shards.
+    // Shard by the logical request id first. Claude Code's nested agents
+    // intentionally share one session id, so using the session alone would
+    // funnel a 512-way fan-out onto one H2 connection pool and recreate the
+    // upstream's stream/admission pressure. `x-grok-req-id` is stable across
+    // retries of one logical turn, preserving its failure domain while
+    // distributing sibling requests. Older clients may omit that header; in
+    // that case include the agent id and finally the proxy request id so each
+    // independent turn still gets a deterministic shard.
+    let sand_client_key = ctx
+        .client_request_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            ctx.claude_code
+                .agent_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+        })
+        .unwrap_or(ctx.req_id.as_str());
+    let client = sand_inference::shared_client(Some(sand_client_key));
     if let Some(monitor) = ctx.monitor.as_ref() {
         monitor.upstream_started(&ctx.req_id);
     }
@@ -1270,6 +1460,7 @@ async fn sand_direct_response(
             &effective_token,
             &effective_request,
             sand_retry_deadline,
+            &account_failover_state,
         )
         .await
         {
@@ -1277,31 +1468,29 @@ async fn sand_direct_response(
             Err(error)
                 if !is_sand_tool_capability_error(&error, tool_count)
                     && (is_account_failover_open_error(model, &error)
-                        || is_account_failover_policy_error(&error.client_message())
-                        || is_account_failover_policy_error(&error.message)
-                        || error
-                            .detail
-                            .as_deref()
-                            .is_some_and(is_account_failover_policy_error)) =>
+                        || cursor_error_is_account_failover_policy(&error)) =>
             {
                 let diagnostic = error.client_message();
-                if is_account_failover_policy_error(&diagnostic) {
-                    note_policy_rate_limit(
-                        model,
-                        "sand",
-                        &effective_token,
-                        &diagnostic,
-                        error.retry_after.as_deref(),
-                    );
-                }
-                let Some(replacement) = account_failover_replacement_token_async(
+                note_sand_account_failover_error(model, &effective_token, &error);
+                let replacement = account_failover_replacement_token_async(
                     effective_token.clone(),
                     model.to_string(),
                     "sand".to_string(),
                     Arc::clone(&account_failover_state),
                 )
-                .await
-                else {
+                .await;
+                let Some(replacement) = replacement else {
+                    // The candidate snapshot and the final claim are
+                    // intentionally separate (the registry is read under a
+                    // blocking lock). Another request may win the candidate
+                    // between them. Keep waiting on this lane while the
+                    // logical deadline remains instead of surfacing a local
+                    // 504 that causes Claude Code to retry in a storm.
+                    if is_sand_admission_capacity_error(&error)
+                        && wait_for_sand_admission_capacity(sand_retry_deadline).await
+                    {
+                        continue;
+                    }
                     return map_cursor_error_to_response(&error);
                 };
                 effective_token = replacement;
@@ -1314,7 +1503,13 @@ async fn sand_direct_response(
                         (
                             "reason".into(),
                             serde_json::json!(if is_account_failover_open_error(model, &error) {
-                                "open_timeout"
+                                if diagnostic.to_ascii_lowercase().contains("admission") {
+                                    "admission_saturated"
+                                } else if error.status == 401 {
+                                    "account_auth"
+                                } else {
+                                    "open_timeout"
+                                }
                             } else {
                                 "policy"
                             }),
@@ -1497,6 +1692,7 @@ async fn open_sand_with_retries_until(
     token: &str,
     request: &SandInferenceRequest,
     logical_deadline: Instant,
+    account_failover_state: &SharedAccountFailoverState,
 ) -> Result<crate::providers::cursor::sand_inference::SandInferenceStream, CursorError> {
     let max_retries = std::env::var("CCP_CURSOR_SAND_OPEN_RETRIES")
         .ok()
@@ -1514,6 +1710,12 @@ async fn open_sand_with_retries_until(
         .unwrap_or_else(crate::config::cursor_request_timeout_secs)
         .clamp(10, 180);
     let mut attempt = 0;
+    // A lane timeout is only useful as an account-pool handoff when there is
+    // an unattempted, healthy profile to receive the request.  Snapshot that
+    // fact once per open invocation; when the registry contains no viable
+    // replacement (the common single-account case), keep waiting until the
+    // normal local deadline instead of manufacturing a 504 after 12 seconds.
+    let mut admission_failover_checked = false;
     loop {
         let remaining = local_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1533,10 +1735,58 @@ async fn open_sand_with_retries_until(
         // 512-open default.  The sleep is deliberately short so a released
         // permit is observed quickly, while the logical deadline remains the
         // final bound for a genuinely wedged upstream.
-        let _open_permit = loop {
+        let admission_started = Instant::now();
+        let open_permit = loop {
             match admit_sand_open_until(token, &request.model_id, local_deadline).await {
                 Ok(Some(permit)) => break Some(permit),
                 Ok(None) => {
+                    // Do not leave a large fan-out parked behind one
+                    // account/model lane until the full 180s open budget.
+                    // The caller can safely rotate an *unbound* request to a
+                    // saved account because Sand carries complete history and
+                    // fresh UUIDs. Explicit model-account bindings remain on
+                    // their selected lane and will receive the original
+                    // retryable diagnostic if no slot becomes available.
+                    if admission_started.elapsed()
+                        >= Duration::from_secs(
+                            crate::providers::cursor::sand_inference::sand_open_account_queue_failover_secs(),
+                        )
+                        && !admission_failover_checked
+                    {
+                        admission_failover_checked = true;
+                        // Do the registry read off Tokio workers.  The helper
+                        // excludes the current/attempted accounts and routes
+                        // already in policy cooldown; a single-account pool
+                        // therefore keeps its request queued rather than
+                        // turning a brief lane burst into a client-visible
+                        // 504/503.  If another request wins the candidate
+                        // concurrently, the caller still falls back to the
+                        // same-account wait on its next logical attempt.
+                        if sand_admission_failover_candidate_available(
+                            token,
+                            &request.model_id,
+                            account_failover_state,
+                        )
+                        .await
+                        {
+                            create_logger("cursor").warn(
+                                "sand_open_admission_failover",
+                                Some(serde_json::Map::from_iter([
+                                    ("model".into(), serde_json::json!(&request.model_id)),
+                                    (
+                                        "waitMs".into(),
+                                        serde_json::json!(admission_started.elapsed().as_millis()),
+                                    ),
+                                    ("recovery".into(), serde_json::json!("account_pool")),
+                                ])),
+                            );
+                            return Err(CursorError::new(
+                                504,
+                                "Sand inference open admission deadline exhausted",
+                                None,
+                            ));
+                        }
+                    }
                     let remaining = local_deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(CursorError::new(
@@ -1582,7 +1832,17 @@ async fn open_sand_with_retries_until(
         };
         let per_attempt = remaining.min(Duration::from_secs(attempt_secs));
         let attempt_started = Instant::now();
-        let result = tokio::time::timeout(per_attempt, client.open(token, &attempt_request)).await;
+        // The admission permit protects only the expensive HTTP open/headers
+        // phase.  Do not keep it in the returned stream's scope: a previous
+        // version bound `_open_permit` to this whole function, effectively
+        // turning the 512-open gate into a 512-*stream* gate.  Once those
+        // streams stayed alive, every later Claude Code turn waited for the
+        // 180s deadline and surfaced a proxy-generated 503 even though the
+        // upstream connection had already been established.
+        let result = {
+            let _open_permit = open_permit;
+            tokio::time::timeout(per_attempt, client.open(token, &attempt_request)).await
+        };
         let result = match result {
             Ok(result) => result,
             Err(_) => Err(CursorError::new(
@@ -1682,8 +1942,14 @@ async fn drive_sand_stream_with_retries(
                 return;
             }
             let retry_request = request.clone().with_fresh_ids();
-            match open_sand_with_retries_until(&client, &token, &retry_request, retry_deadline)
-                .await
+            match open_sand_with_retries_until(
+                &client,
+                &token,
+                &retry_request,
+                retry_deadline,
+                &account_failover_state,
+            )
+            .await
             {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -1955,26 +2221,15 @@ async fn drive_sand_stream_with_retries(
             return;
         }
         if !committed
-            && (is_account_failover_policy_error(&error.client_message())
-                || is_account_failover_policy_error(&error.message)
-                || error
-                    .detail
-                    .as_deref()
-                    .is_some_and(is_account_failover_policy_error))
+            && (is_account_failover_open_error(&model, &error)
+                || cursor_error_is_account_failover_policy(&error))
         {
             // Sand's InferenceService call is full-history and UUID-scoped, so
             // an account swap can safely replay the request while no visible
             // text/tool has reached Claude Code. Mark the old account's
             // cooldown before selecting a replacement; otherwise concurrent
             // retries could keep rediscovering the same exhausted login.
-            let diagnostic = error.client_message();
-            note_policy_rate_limit(
-                &model,
-                &client_type,
-                &token,
-                &diagnostic,
-                error.retry_after.as_deref(),
-            );
+            note_sand_account_failover_error(&model, &token, &error);
             let Some(replacement) = account_failover_replacement_token_async(
                 token.clone(),
                 model.clone(),
@@ -1983,6 +2238,18 @@ async fn drive_sand_stream_with_retries(
             )
             .await
             else {
+                // The admission candidate check is only a snapshot. A
+                // concurrent request may claim the alternate account before
+                // this late retry reaches the registry, so a missing
+                // replacement is ordinary backpressure rather than a
+                // terminal request error. Stay on the current lane until the
+                // shared logical deadline; this avoids a visible 503 retry
+                // storm while preserving a hard upper bound.
+                if is_sand_admission_capacity_error(&error)
+                    && wait_for_sand_admission_capacity(retry_deadline).await
+                {
+                    continue;
+                }
                 discard_sand_replay_buffer(&mut buffered);
                 send_sand_buffered_error(&tx, &mut buffered, error).await;
                 return;
@@ -2472,6 +2739,14 @@ struct LiveRetryStart {
     /// recovery. It spans the initial open and late stream pump so a malformed
     /// compact request can trigger at most one fresh-conversation replay.
     compaction_recovery_attempted: Arc<AtomicBool>,
+    /// Shared one-shot fence for an upstream Cursor response that says the
+    /// conversation already has an active Run.  This is distinct from the
+    /// local live registry's busy state: the upstream response means our
+    /// previous open likely survived after its HTTP stream was lost, so the
+    /// only useful recovery is one fresh conversation replay.  Keeping the
+    /// fence on the logical request prevents the late retry pump from
+    /// repeatedly rotating UUIDs when the remote Run remains stuck.
+    upstream_active_recovery_attempted: Arc<AtomicBool>,
     custom_system: Option<String>,
     session_id: String,
     agent_id: Option<String>,
@@ -2709,6 +2984,47 @@ impl LiveRetryStart {
         error: &str,
     ) -> Result<mpsc::Receiver<LiveEventResult>, CursorError> {
         let mut account_key = self.account_key();
+        // An upstream "already active" response is different from the local
+        // registry busy diagnostic.  It usually means the prior Cursor open
+        // was accepted but its response channel disappeared before a handle
+        // could be published.  Retrying the same conversation reproduces the
+        // conflict forever; rotate the account-scoped conversation exactly
+        // once and replay the complete Anthropic history instead.  A second
+        // conflict is surfaced as-is so Claude Code gets a bounded terminal
+        // error rather than an unbounded 503 loop.
+        if live_error_is_upstream_already_active(error) && !is_local_live_busy_text(error) {
+            if !claim_upstream_active_recovery(&self.upstream_active_recovery_attempted) {
+                return Err(CursorError::new(503, error, None));
+            }
+            let conversation_key = live_retry_conversation_key_for_account(
+                &self.session_id,
+                self.agent_id.as_deref(),
+                Some(&account_key),
+            );
+            conversation::reset(&conversation_key);
+            *self
+                .expected_conversation_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            // Preserve a UUID wave already refreshed by image recovery.  If
+            // none exists, the original account-scoped image ids remain valid
+            // and can be replayed on the fresh conversation.
+            let images = cached_image_recovery_snapshot(&self.image_recovery_images)
+                .unwrap_or_else(|| self.reset_retry_images.clone());
+            create_logger("cursor").warn(
+                "upstream_live_run_conflict_recovery",
+                Some(serde_json::Map::from_iter([
+                    ("sessionId".into(), serde_json::json!(&self.session_id)),
+                    ("model".into(), serde_json::json!(&self.model)),
+                    ("clientType".into(), serde_json::json!(&self.client_type)),
+                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                    ("attempt".into(), serde_json::json!(1)),
+                ])),
+            );
+            return self
+                .start_with_user_text_and_images(&self.reset_user_text, &images, None)
+                .await;
+        }
         // A policy response can arrive after the initial live-open peek (for
         // example Cursor accepts the Run, then emits a delayed Sand
         // quota/error frame).  The normal late-retry classifier keeps this
@@ -2957,6 +3273,7 @@ impl LiveRetryStart {
             Some(Arc::clone(&self.image_recovery_images)),
             Some(Arc::clone(&self.kv_recovery_attempted)),
             Some(Arc::clone(&self.compaction_recovery_attempted)),
+            Some(Arc::clone(&self.upstream_active_recovery_attempted)),
             Some(Arc::clone(&self.account_failover_state)),
             Some(Arc::clone(&opened_conversation_id)),
             LiveStartRecovery {
@@ -3005,6 +3322,26 @@ fn commit_streaming_live_sse_before_start_live(
 
 const LIVE_RUN_BUSY_MESSAGE: &str =
     "A Cursor live run is already active for this session; retry after it advances";
+
+/// The local registry emits [`LIVE_RUN_BUSY_MESSAGE`] when no upstream open
+/// was attempted.  It must continue to use the normal attach/wait path rather
+/// than resetting a healthy conversation merely because a caller timed out.
+fn is_local_live_busy_text(message: &str) -> bool {
+    let trimmed = message.trim();
+    trimmed.eq_ignore_ascii_case(LIVE_RUN_BUSY_MESSAGE)
+        || trimmed
+            .strip_prefix("Cursor error 503:")
+            .is_some_and(|rest| rest.trim().eq_ignore_ascii_case(LIVE_RUN_BUSY_MESSAGE))
+}
+
+/// Claim the one recovery slot for an upstream session-conflict response.
+/// Keeping this tiny atomic operation in one helper makes the no-loop
+/// guarantee explicit and straightforward to regression-test.
+fn claim_upstream_active_recovery(fence: &AtomicBool) -> bool {
+    fence
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 // A Claude Code retry can arrive while the previous HTTP segment is being
 // detached, replayed, or finishing its last Cursor turn.  Short waits turn
 // that normal handoff into a repeated client-visible 503 storm.  Keep the
@@ -3239,6 +3576,180 @@ fn live_ambiguous_accept_error() -> CursorError {
 /// can try all eleven alternatives without allowing an unbounded retry storm.
 const MAX_ACCOUNT_FAILOVER_SWAPS: u32 = 16;
 
+/// Decide whether an unbound Sand request should inspect the saved-account
+/// pool before entering the open gate. `None` means this account/model lane
+/// has not been created yet, so the active account is still the least
+/// surprising destination. A lane with one or more free permits likewise has
+/// no reason to incur registry I/O or alter the user's selected account; only
+/// a fully saturated lane, or a route already in cooldown, needs a replacement
+/// candidate.
+fn sand_account_rebalance_needed(
+    current_available: Option<usize>,
+    current_route_healthy: bool,
+) -> bool {
+    !current_route_healthy || current_available == Some(0)
+}
+
+/// Rebalance an unbound Sand request when its currently selected account lane
+/// has no open capacity (or is already in a route cooldown).
+///
+/// Normal, low-volume traffic keeps the active account semantics users expect.
+/// Once that lane is full, choosing among idle saved accounts before entering
+/// the admission queue lets a 512-request fan-out use the account pool rather
+/// than parking every request behind four permits on one account. Explicit
+/// `cursor.modelAccounts` routes are never rebalanced.
+async fn maybe_rebalance_sand_account(
+    route_model: &str,
+    sand_model: &str,
+    client_type: &str,
+    selection: CursorAuthSelection,
+) -> CursorAuthSelection {
+    let sand_model = resolve_sand_model_id(sand_model);
+    if !client_type.trim().eq_ignore_ascii_case("sand")
+        || crate::config::cursor_account_for_model(route_model).is_some()
+        || crate::config::cursor_account_for_model(&sand_model).is_some()
+        || selection.account_id.is_none()
+    {
+        return selection;
+    }
+
+    let current_token = selection.auth.access_token.clone();
+    let current_available_opt =
+        crate::providers::cursor::sand_inference::sand_open_available_permits(
+            &current_token,
+            &sand_model,
+        );
+    let current_available = current_available_opt
+        .unwrap_or_else(crate::providers::cursor::sand_inference::sand_open_account_capacity);
+    // A route cooldown is represented by the Sand-only route map used by the
+    // failover selector. Rebalance even if its semaphore happens to be idle.
+    let current_healthy = policy_rate_limit_preflight(&sand_model, "sand", &current_token).is_ok()
+        && !sand_account_route_is_cooled(&sand_model, &current_token);
+    // Preserve the active-account default while its lane still has capacity.
+    // A previous implementation treated *any* occupied lane as a reason to
+    // rebalance.  In a normal 512-way burst that made every request after the
+    // first perform a blocking account-registry read and, more importantly,
+    // changed the user's active-account routing even though that account was
+    // perfectly capable of accepting the request.  Only rotate when all open
+    // slots are consumed, or when the current route is in cooldown.  An
+    // unobserved lane (`None`) is treated as idle and remains on the active
+    // account until the gate itself proves saturation.
+    if !sand_account_rebalance_needed(current_available_opt, current_healthy) {
+        return selection;
+    }
+
+    let profiles = match tokio::task::spawn_blocking(list_cursor_accounts)
+        .await
+        .ok()
+        .and_then(Result::ok)
+    {
+        Some(profiles) => profiles,
+        None => return selection,
+    };
+    let current_digest = cursor_account_digest(&current_token);
+    let current_id = selection.account_id.as_deref();
+    let mut candidates: Vec<(usize, usize)> = profiles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, profile)| {
+            let token = profile.auth.access_token.trim();
+            if token.is_empty()
+                || cursor_account_digest(token) == current_digest
+                || current_id == Some(profile.id.as_str())
+                || policy_rate_limit_preflight(&sand_model, "sand", token).is_err()
+                || sand_account_route_is_cooled(&sand_model, token)
+            {
+                return None;
+            }
+            // A recent dashboard meter is stronger than a semaphore snapshot:
+            // avoid deliberately routing a burst to an account already known
+            // to have exhausted its Sand/Bot allowance. Missing or stale
+            // evidence is ignored; typed provider errors still drive normal
+            // account failover when the request is opened.
+            if let Some(evidence) =
+                crate::providers::cursor::usage::cached_sand_usage_evidence(token)
+                && (evidence.usage_percent >= 100.0 || evidence.has_available_usage == Some(false))
+            {
+                return None;
+            }
+            let available = crate::providers::cursor::sand_inference::sand_open_available_permits(
+                token,
+                &sand_model,
+            )
+            .unwrap_or_else(crate::providers::cursor::sand_inference::sand_open_account_capacity);
+            Some((index, available))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return selection;
+    }
+
+    // Prefer lanes with the most free permits. Rotate ties so concurrent
+    // callers do not all select the first alphabetically sorted profile.
+    let best_available = candidates.iter().map(|(_, available)| *available).max();
+    if let Some(best_available) = best_available {
+        candidates.retain(|(_, available)| *available == best_available);
+    }
+    candidates.sort_by_key(|(index, _)| *index);
+    let offset = SAND_ACCOUNT_FAILOVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let (profile_index, _) = candidates[offset % candidates.len()];
+    let profile = profiles[profile_index].clone();
+    let profile_active = profile.active;
+    let refresh_profile = profile.clone();
+    let refreshed = if profile
+        .auth
+        .expires
+        .is_some_and(|expires| expires <= now_ms() + 60_000)
+    {
+        match tokio::task::spawn_blocking(move || {
+            refresh_cursor_account_for_usage(&refresh_profile)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        {
+            Some(auth) => auth,
+            None => return selection,
+        }
+    } else {
+        profile.auth.clone()
+    };
+    let replacement_id = profile.id.clone();
+    let replacement_available =
+        crate::providers::cursor::sand_inference::sand_open_available_permits(
+            &refreshed.access_token,
+            &sand_model,
+        )
+        .unwrap_or_else(crate::providers::cursor::sand_inference::sand_open_account_capacity);
+    create_logger("cursor").info(
+        "sand_account_rebalanced",
+        Some(serde_json::Map::from_iter([
+            (
+                "fromAccount".into(),
+                serde_json::json!(truncate_account_id(
+                    selection.account_id.as_deref().unwrap_or("unknown")
+                )),
+            ),
+            (
+                "toAccount".into(),
+                serde_json::json!(truncate_account_id(&replacement_id)),
+            ),
+            ("model".into(), serde_json::json!(route_model)),
+            ("sandModel".into(), serde_json::json!(&sand_model)),
+            ("fromAvailable".into(), serde_json::json!(current_available)),
+            (
+                "toAvailable".into(),
+                serde_json::json!(replacement_available),
+            ),
+        ])),
+    );
+    CursorAuthSelection {
+        auth: refreshed,
+        account_id: Some(replacement_id),
+        active: profile_active,
+    }
+}
+
 fn account_failover_swap_limit(profiles: &[CursorAccountProfile]) -> u32 {
     let account_count = profiles
         .iter()
@@ -3271,9 +3782,20 @@ fn is_account_failover_policy_error(message: &str) -> bool {
         return true;
     }
     let lower = message.to_ascii_lowercase();
+    // Authentication/account-terminal responses are account-local for the
+    // Sand pool. Treat them like a policy failure so the next saved profile
+    // can be tried immediately instead of replaying a closed bearer.
+    let account_auth_failure = (lower.contains("cursor error 401")
+        || lower.contains("upstream http 401"))
+        && (lower.contains("error_account_closed")
+            || lower.contains("error_not_logged_in")
+            || lower.contains("authentication error")
+            || lower.contains("unauthenticated"));
     lower.contains("user_rate_limit_exceeded")
         || lower.contains("api_rate_limit_exceeded")
         || lower.contains("error_rate_limited_changeable")
+        || lower.contains("sand account route temporarily unavailable")
+        || account_auth_failure
 }
 
 /// A pre-output Sand open timeout can be account-local when an unbound model
@@ -3289,10 +3811,40 @@ fn is_account_failover_open_error(model: &str, error: &CursorError) -> bool {
     }
     let message = error.client_message();
     let lower = message.to_ascii_lowercase();
-    matches!(error.status, 502 | 504)
+    let admission = lower.contains("sand inference open admission deadline exhausted")
+        || lower.contains("sand open admission queue timed out");
+    let account_auth = matches!(error.status, 401)
+        && (lower.contains("error_account_closed")
+            || lower.contains("error_not_logged_in")
+            || lower.contains("authentication error")
+            || lower.contains("unauthenticated"));
+    (matches!(error.status, 502..=504)
         && (lower.contains("sand inference open timed out")
             || lower.contains("sand inference open retry budget exhausted")
-            || lower.contains("sand inference upstream http 502"))
+            || lower.contains("sand inference upstream http 502")
+            || admission))
+        || account_auth
+}
+
+/// Admission handoff is an optimization for a saturated Sand lane, not proof
+/// that the request itself is invalid. A concurrent caller can consume the
+/// candidate account between the registry probe and the failover claim. When
+/// that race leaves no replacement, keep the logical request queued until its
+/// existing Sand deadline instead of turning the race into a client-visible
+/// 503/504 retry storm.
+fn is_sand_admission_capacity_error(error: &CursorError) -> bool {
+    let text = error.client_message().to_ascii_lowercase();
+    text.contains("sand inference open admission deadline exhausted")
+        || text.contains("sand open admission queue timed out")
+}
+
+async fn wait_for_sand_admission_capacity(deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
+    true
 }
 
 /// Account failover is state for one logical request, not one transport
@@ -3316,6 +3868,110 @@ impl AccountFailoverState {
 }
 
 type SharedAccountFailoverState = Arc<Mutex<AccountFailoverState>>;
+
+/// Preserve the profile that was displaced by opportunistic Sand balancing
+/// in the request-local attempted set. Without this marker a later transport
+/// failure on the replacement account could immediately rotate back to the
+/// account whose lane was already observed as saturated.
+fn mark_pre_rebalance_account_attempted(
+    state: &mut AccountFailoverState,
+    previous_account_id: Option<&str>,
+    previous_account_digest: &str,
+    account_was_rebalanced: bool,
+) {
+    if !account_was_rebalanced {
+        return;
+    }
+    state
+        .attempted_accounts
+        .insert(previous_account_digest.to_string());
+    if let Some(account_id) = previous_account_id {
+        state.attempted_accounts.insert(account_id.to_string());
+    }
+}
+
+/// Return whether a Sand admission handoff has at least one viable saved
+/// account.  This is intentionally a pure registry-snapshot helper so the
+/// async caller can perform filesystem/Keychain work on a blocking worker and
+/// unit tests can exercise the single-account behavior without opening a
+/// network connection.
+fn sand_admission_candidate_from_profiles(
+    profiles: &[CursorAccountProfile],
+    current_token: &str,
+    model: &str,
+    attempted_accounts: &BTreeSet<String>,
+) -> bool {
+    // Explicit model-account routes are fail-closed: a saturated pinned lane
+    // must wait for that account rather than silently consuming another
+    // account's allowance.
+    if crate::config::cursor_account_for_model(model).is_some() {
+        return false;
+    }
+    let current_digest = cursor_account_digest(current_token);
+    profiles.iter().any(|profile| {
+        let token = profile.auth.access_token.trim();
+        if token.is_empty() {
+            return false;
+        }
+        let digest = cursor_account_digest(token);
+        if digest == current_digest
+            || attempted_accounts.contains(&digest)
+            || attempted_accounts.contains(&profile.id)
+        {
+            return false;
+        }
+        // Do not hand off to a route that a recent policy response already
+        // cooled.  A stale/missing usage snapshot is deliberately treated as
+        // unknown; the actual Sand open remains the source of truth.
+        if policy_rate_limit_preflight(model, "sand", token).is_err()
+            || sand_account_route_is_cooled(model, token)
+        {
+            return false;
+        }
+        if let Some(evidence) = crate::providers::cursor::usage::cached_sand_usage_evidence(token)
+            && (evidence.usage_percent >= 100.0 || evidence.has_available_usage == Some(false))
+        {
+            return false;
+        }
+        true
+    })
+}
+
+/// Check for an unattempted Sand account without blocking a Tokio worker on
+/// the account registry lock.  Returning `false` on a transient registry read
+/// failure is deliberate: the open path then waits on the current account's
+/// normal deadline instead of producing a premature client-visible 503.
+async fn sand_admission_failover_candidate_available(
+    current_token: &str,
+    model: &str,
+    state: &SharedAccountFailoverState,
+) -> bool {
+    let attempted = state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .attempted_accounts
+        .clone();
+    let current_token = current_token.to_string();
+    let model = model.to_string();
+    let task = tokio::task::spawn_blocking(move || {
+        let profiles = list_cursor_accounts().ok()?;
+        Some(sand_admission_candidate_from_profiles(
+            &profiles,
+            &current_token,
+            &model,
+            &attempted,
+        ))
+    });
+    // Account-registry mutations use an inter-process file lock.  A crashed
+    // companion process or a network filesystem must not hold the inference
+    // request forever while we merely probe for a handoff candidate.
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .unwrap_or(false)
+}
 
 /// Return deterministic account candidates for a policy/quota failure.
 ///
@@ -3360,7 +4016,10 @@ fn account_failover_candidates_from_profiles(
             {
                 return None;
             }
-            if policy_rate_limit_breaker_state(model, client_type, token).is_some() {
+            if policy_rate_limit_breaker_state(model, client_type, token).is_some()
+                || (client_type.trim().eq_ignore_ascii_case("sand")
+                    && sand_account_route_is_cooled(model, token))
+            {
                 return None;
             }
             Some((profile.id.clone(), token.to_string()))
@@ -3383,60 +4042,81 @@ fn take_account_failover_candidate_from_profiles(
     client_type: &str,
     state: &SharedAccountFailoverState,
 ) -> Option<String> {
-    loop {
-        // Record the registry id for the current bearer as well as its digest.
-        // Opaque Cursor tokens can rotate without a stable JWT subject; the
-        // profile id still prevents that same account from re-entering the
-        // candidate set after a refresh.
-        if let Ok(mut state) = state.lock() {
-            for profile in profiles {
-                if profile.auth.access_token == current_token {
-                    state.attempted_accounts.insert(profile.id.clone());
-                }
+    take_account_failover_candidate_from_profiles_with_offset(
+        profiles,
+        current_token,
+        model,
+        client_type,
+        state,
+        0,
+    )
+}
+
+/// Variant used by Sand's concurrent account pool. `offset` rotates the
+/// candidate walk while retaining the same request-local attempted-account
+/// guarantees as the deterministic helper above.
+fn take_account_failover_candidate_from_profiles_with_offset(
+    profiles: &[CursorAccountProfile],
+    current_token: &str,
+    model: &str,
+    client_type: &str,
+    state: &SharedAccountFailoverState,
+    offset: usize,
+) -> Option<String> {
+    // Record the registry id for the current bearer as well as its digest.
+    // Opaque Cursor tokens can rotate without a stable JWT subject; the
+    // profile id still prevents that same account from re-entering the
+    // candidate set after a refresh.
+    if let Ok(mut state) = state.lock() {
+        for profile in profiles {
+            if profile.auth.access_token == current_token {
+                state.attempted_accounts.insert(profile.id.clone());
             }
         }
-        let (swaps, attempted) = {
-            let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
-            (state.swaps, state.attempted_accounts.clone())
-        };
-        if swaps >= account_failover_swap_limit(profiles) {
-            return None;
-        }
-        let candidates = account_failover_candidates_from_profiles(
-            profiles,
-            current_token,
-            model,
-            client_type,
-            &attempted,
-        );
-        let candidate = candidates.into_iter().next()?;
-        let digest = cursor_account_digest(&candidate);
-        let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
-        if state.swaps >= account_failover_swap_limit(profiles) {
-            return None;
-        }
+    }
+    let (swaps, attempted) = {
+        let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        (state.swaps, state.attempted_accounts.clone())
+    };
+    if swaps >= account_failover_swap_limit(profiles) {
+        return None;
+    }
+    let candidates = account_failover_candidates_from_profiles(
+        profiles,
+        current_token,
+        model,
+        client_type,
+        &attempted,
+    );
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    if state.swaps >= account_failover_swap_limit(profiles) {
+        return None;
+    }
+    let mut selected = None;
+    for step in 0..candidates.len() {
+        let candidate = &candidates[(offset + step) % candidates.len()];
+        let digest = cursor_account_digest(candidate);
         let profile_id = profiles
             .iter()
-            .find(|profile| profile.auth.access_token == candidate)
+            .find(|profile| profile.auth.access_token == *candidate)
             .map(|profile| profile.id.clone());
         if state.attempted_accounts.contains(&digest)
             || profile_id
                 .as_deref()
                 .is_some_and(|id| state.attempted_accounts.contains(id))
         {
-            // The digest may be new after an opaque token rotation, but the
-            // profile id can still reveal that it is an already-attempted
-            // account. Keep the existing markers intact and choose the next
-            // candidate under the same request-local budget.
             continue;
         }
-        state.attempted_accounts.insert(digest);
-        if let Some(profile_id) = profile_id {
-            state.attempted_accounts.insert(profile_id);
-        }
-        state.swaps += 1;
-        return Some(candidate);
+        selected = Some((candidate.clone(), digest, profile_id));
+        break;
     }
+    let (candidate, digest, profile_id) = selected?;
+    state.attempted_accounts.insert(digest);
+    if let Some(profile_id) = profile_id {
+        state.attempted_accounts.insert(profile_id);
+    }
+    state.swaps += 1;
+    Some(candidate)
 }
 
 /// Select an unused, non-cooled account from the persistent pool. A missing
@@ -3449,13 +4129,25 @@ fn account_failover_replacement_token(
     state: &SharedAccountFailoverState,
 ) -> Option<String> {
     let profiles = list_cursor_accounts().ok()?;
-    let replacement = take_account_failover_candidate_from_profiles(
-        &profiles,
-        current_token,
-        model,
-        client_type,
-        state,
-    );
+    let replacement = if client_type.trim().eq_ignore_ascii_case("sand") {
+        let offset = SAND_ACCOUNT_FAILOVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        take_account_failover_candidate_from_profiles_with_offset(
+            &profiles,
+            current_token,
+            model,
+            client_type,
+            state,
+            offset,
+        )
+    } else {
+        take_account_failover_candidate_from_profiles(
+            &profiles,
+            current_token,
+            model,
+            client_type,
+            state,
+        )
+    };
     if let Some(token) = replacement.as_deref() {
         let email = profiles
             .iter()
@@ -3608,6 +4300,7 @@ async fn start_live_events_with_retries(
         None,
         None,
         None,
+        None,
         LiveStartRecovery::default(),
     )
     .await
@@ -3639,6 +4332,7 @@ async fn start_live_events_with_retries_with_client_type(
     image_recovery_images: Option<Arc<Mutex<Option<Vec<CursorSelectedImage>>>>>,
     kv_recovery_attempted: Option<Arc<AtomicBool>>,
     compaction_recovery_attempted: Option<Arc<AtomicBool>>,
+    upstream_active_recovery_attempted: Option<Arc<AtomicBool>>,
     account_failover_state: Option<SharedAccountFailoverState>,
     // Receives the exact Cursor conversation binding used by the generation
     // that successfully opened.  This avoids re-reading the session map after
@@ -3682,6 +4376,8 @@ async fn start_live_events_with_retries_with_client_type(
         kv_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let compaction_recovery_attempted =
         compaction_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let upstream_active_recovery_attempted =
+        upstream_active_recovery_attempted.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let account_failover_state = account_failover_state
         .unwrap_or_else(|| Arc::new(Mutex::new(AccountFailoverState::new(&token))));
     // Keep registry/conversation state account-scoped even when callers use
@@ -4221,6 +4917,37 @@ async fn start_live_events_with_retries_with_client_type(
                         }
                         let _ = start.handle.cancel_and_wait().await;
                         let _ = LiveRunRegistry::probe_run(identity.session_id, identity.agent_id);
+                        if live_error_is_upstream_already_active(&error)
+                            && !is_local_live_busy_text(&error)
+                        {
+                            if !claim_upstream_active_recovery(&upstream_active_recovery_attempted)
+                            {
+                                return Err(CursorError::new(503, error, None));
+                            }
+                            let key = live_retry_conversation_key_for_account(
+                                identity.session_id,
+                                base_agent_id,
+                                account_key.as_deref(),
+                            );
+                            conversation::reset(&key);
+                            expected_conversation_id = None;
+                            retry_user_text = Some(reset_user_text.to_string());
+                            image_retry_images = Some(
+                                cached_image_recovery_snapshot(&image_recovery_images)
+                                    .unwrap_or_else(|| reset_retry_images.to_vec()),
+                            );
+                            create_logger("cursor").warn(
+                                "upstream_live_run_conflict_recovery",
+                                Some(serde_json::Map::from_iter([
+                                    ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                    ("model".into(), serde_json::json!(model)),
+                                    ("clientType".into(), serde_json::json!(client_type)),
+                                    ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                    ("attempt".into(), serde_json::json!(1)),
+                                ])),
+                            );
+                            continue;
+                        }
                         if compaction_mode && live_error_is_agent_looping_detected(&error) {
                             if compaction_recovery_attempted
                                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -4371,6 +5098,40 @@ async fn start_live_events_with_retries_with_client_type(
                 }
             }
             Err(error) => {
+                if live_error_is_upstream_already_active(&error.client_message())
+                    && !is_local_live_busy_text(&error.client_message())
+                {
+                    if claim_upstream_active_recovery(&upstream_active_recovery_attempted) {
+                        drop(probe_admission.take());
+                        reservation.release();
+                        let key = live_retry_conversation_key_for_account(
+                            identity.session_id,
+                            base_agent_id,
+                            account_key.as_deref(),
+                        );
+                        conversation::reset(&key);
+                        expected_conversation_id = None;
+                        image_retry_images = Some(
+                            cached_image_recovery_snapshot(&image_recovery_images)
+                                .unwrap_or_else(|| reset_retry_images.to_vec()),
+                        );
+                        retry_user_text = Some(reset_user_text.to_string());
+                        create_logger("cursor").warn(
+                            "upstream_live_run_conflict_recovery",
+                            Some(serde_json::Map::from_iter([
+                                ("sessionId".into(), serde_json::json!(identity.session_id)),
+                                ("model".into(), serde_json::json!(model)),
+                                ("clientType".into(), serde_json::json!(client_type)),
+                                ("recovery".into(), serde_json::json!("fresh_conversation")),
+                                ("attempt".into(), serde_json::json!(1)),
+                            ])),
+                        );
+                        continue;
+                    }
+                    drop(probe_admission.take());
+                    reservation.release();
+                    return Err(error);
+                }
                 if compaction_mode && live_error_is_agent_looping_detected(&error.client_message())
                 {
                     if compaction_recovery_attempted
@@ -4610,6 +5371,7 @@ fn spawn_streaming_live_sse(
             image_recovery_images: Arc::new(Mutex::new(None)),
             kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
             compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            upstream_active_recovery_attempted: Arc::new(AtomicBool::new(false)),
             account_failover_state,
             custom_system,
             session_id: sid,
@@ -4661,7 +5423,15 @@ async fn peek_live_start_for_stale_reset_with_wait(
         // switch the loop passes them through verbatim instead of retrying.
         Ok(Some(Err(error)))
             if (live_error_is_same_request_retryable(&error)
-                || crate::retry::is_policy_rate_limit(&error))
+                || crate::retry::is_policy_rate_limit(&error)
+                // A Cursor gateway can wrap the session-conflict text in a
+                // 503/Connect envelope that the generic classifier correctly
+                // keeps out of same-request retries. It still needs the
+                // coordinator's one-shot fresh-conversation recovery here;
+                // preserve the local registry busy wording for its attach/
+                // wait path instead of rotating a healthy conversation.
+                || (live_error_is_upstream_already_active(&error)
+                    && !is_local_live_busy_text(&error)))
                 && !live_error_is_empty_turn_retry(&error) =>
         {
             LiveStartPeek::Retryable(error)
@@ -4872,6 +5642,19 @@ fn classify_live_pump_item_with_mode(
         return LivePumpAction::Retry;
     }
     match item {
+        // Keep upstream session conflicts on the dedicated one-shot recovery
+        // path. `live_error_is_same_request_retryable` intentionally returns
+        // false for this semantic error so lower transport layers cannot
+        // replay the same conversation indefinitely. A local registry busy
+        // diagnostic is deliberately excluded and retains its attach/wait
+        // semantics.
+        Err(error)
+            if !committed
+                && live_error_is_upstream_already_active(error)
+                && !is_local_live_busy_text(error) =>
+        {
+            LivePumpAction::Retry
+        }
         Err(error) if !committed && crate::retry::is_policy_rate_limit(error) => {
             LivePumpAction::PolicyLimit
         }
@@ -6866,6 +7649,37 @@ impl Provider for CursorProvider {
                 );
             }
         };
+        // Keep the account that was selected before opportunistic Sand
+        // rebalancing. If the active lane is saturated, the request may be
+        // moved to another saved profile below; that original profile should
+        // remain marked as attempted for this logical request so a later
+        // transport failover does not immediately rotate back into the lane
+        // we just observed as full.
+        let pre_rebalance_account_id = auth_selection.account_id.clone();
+        let pre_rebalance_account_digest = cursor_account_digest(&auth_selection.auth.access_token);
+        // Keep the active-account default for ordinary traffic, but when a
+        // Sand lane is already full choose an idle saved account before the
+        // request enters the admission queue. This is the first line of
+        // defence for large Claude Code/Grok fan-outs; later transport errors
+        // still use the bounded failover path below.
+        let auth_selection = if uses_sand {
+            // Account balancing must inspect the same canonical Sand family
+            // that keys the InferenceService open gate. The routed CLI id may
+            // carry an effort suffix (for example
+            // `cursor-grok-4.6-xhigh-fast`), while the Sand wire uses
+            // `grok-4.6`; passing only the former made every lane look unseen
+            // and concentrated the whole fan-out on the active account.
+            let sand_model_for_balance = resolve_sand_model_id(&resolved.model_id);
+            maybe_rebalance_sand_account(
+                model,
+                &sand_model_for_balance,
+                &client_type,
+                auth_selection,
+            )
+            .await
+        } else {
+            auth_selection
+        };
         let selected_account_is_active = auth_selection.active;
         // Prefer the persisted profile id so labels/email aliases and JWT
         // refreshes remain in the same state partition. Environment-backed
@@ -6932,8 +7746,23 @@ impl Provider for CursorProvider {
         // an unused saved account before opening the InferenceService stream;
         // otherwise every Claude Code retry would fail fast on the same stale
         // account and never reach the healthy pool.
-        let sand_account_failover_state =
-            Arc::new(Mutex::new(AccountFailoverState::new(&auth.access_token)));
+        let account_was_rebalanced = uses_sand
+            && (auth_selection.account_id != pre_rebalance_account_id
+                || cursor_account_digest(&auth.access_token) != pre_rebalance_account_digest);
+        let sand_account_failover_state = Arc::new(Mutex::new({
+            let mut state = AccountFailoverState::new(&auth.access_token);
+            // Preserve both stable registry identity and the prior bearer
+            // digest. A refreshed token can change the latter while the
+            // profile id remains the same; storing both prevents either
+            // spelling from re-entering the candidate walk.
+            mark_pre_rebalance_account_attempted(
+                &mut state,
+                pre_rebalance_account_id.as_deref(),
+                &pre_rebalance_account_digest,
+                account_was_rebalanced,
+            );
+            state
+        }));
         if uses_sand {
             while let Err(error) =
                 policy_rate_limit_preflight(model, &client_type, &auth.access_token)
@@ -7448,6 +8277,7 @@ impl Provider for CursorProvider {
                 image_recovery_images: Arc::new(Mutex::new(None)),
                 kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                upstream_active_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 account_failover_state: Arc::clone(&account_failover_state),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
@@ -7572,6 +8402,7 @@ impl Provider for CursorProvider {
                 image_recovery_images: Arc::new(Mutex::new(None)),
                 kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+                upstream_active_recovery_attempted: Arc::new(AtomicBool::new(false)),
                 account_failover_state: Arc::clone(&account_failover_state),
                 custom_system: custom_system.map(str::to_string),
                 session_id: sid.to_string(),
@@ -9294,6 +10125,78 @@ mod tests {
     }
 
     #[test]
+    fn sand_admission_handoff_requires_an_unattempted_viable_account() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let model = "sand-admission-candidate-unique";
+        let profiles = vec![failover_test_profile("only-account", "token-only")];
+        let mut attempted = BTreeSet::new();
+        attempted.insert(cursor_account_digest("token-only"));
+        assert!(
+            !sand_admission_candidate_from_profiles(&profiles, "token-only", model, &attempted,),
+            "a single-account pool must keep waiting instead of handing off"
+        );
+
+        let profiles = vec![
+            failover_test_profile("current-account", "token-current"),
+            failover_test_profile("alternate-account", "token-alternate"),
+        ];
+        let mut attempted = BTreeSet::new();
+        attempted.insert(cursor_account_digest("token-current"));
+        assert!(sand_admission_candidate_from_profiles(
+            &profiles,
+            "token-current",
+            model,
+            &attempted,
+        ));
+        attempted.insert(cursor_account_digest("token-alternate"));
+        assert!(
+            !sand_admission_candidate_from_profiles(&profiles, "token-current", model, &attempted,),
+            "once the alternate was attempted, admission should stay on the current lane"
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn sand_route_cooldown_does_not_become_a_synthetic_policy_429() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let model = "sand-route-cooldown-isolation";
+        let token = "sand-route-cooldown-token";
+
+        note_sand_account_route_cooldown(
+            model,
+            token,
+            "admission_saturated",
+            Duration::from_secs(15),
+        );
+
+        assert!(
+            sand_account_route_is_cooled(model, token),
+            "the Sand selector should see the short route cooldown"
+        );
+        assert!(
+            policy_rate_limit_preflight(model, "sand", token).is_ok(),
+            "a transport lane cooldown must not synthesize a policy 429"
+        );
+
+        let profiles = vec![
+            failover_test_profile("cooled", token),
+            failover_test_profile("healthy", "sand-route-healthy-token"),
+        ];
+        let mut attempted = BTreeSet::new();
+        attempted.insert(cursor_account_digest(token));
+        assert!(sand_admission_candidate_from_profiles(
+            &profiles, token, model, &attempted,
+        ));
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
     fn account_failover_candidates_skip_current_attempted_and_cooled_accounts() {
         let _guard = POLICY_RATE_LIMIT_TEST_LOCK
             .lock()
@@ -9332,11 +10235,99 @@ mod tests {
             &timeout
         ));
 
+        let admission = CursorError::new(
+            504,
+            "Sand inference open admission deadline exhausted",
+            None,
+        );
+        assert!(is_account_failover_open_error(
+            "cursor-grok-account-failover-test",
+            &admission
+        ));
+
+        let closed = CursorError::new(
+            401,
+            "Sand inference upstream HTTP 401",
+            Some("ERROR_ACCOUNT_CLOSED".into()),
+        );
+        assert!(is_account_failover_open_error(
+            "cursor-grok-account-failover-test",
+            &closed
+        ));
+        assert!(is_account_failover_policy_error(&closed.client_message()));
+
         let generic = CursorError::new(503, "Cursor upstream temporarily unavailable", None);
         assert!(!is_account_failover_open_error(
             "cursor-grok-account-failover-test",
             &generic
         ));
+    }
+
+    #[test]
+    fn sand_admission_capacity_error_is_distinguished_from_generic_upstream_5xx() {
+        assert!(is_sand_admission_capacity_error(&CursorError::new(
+            504,
+            "Sand inference open admission deadline exhausted",
+            None,
+        )));
+        assert!(is_sand_admission_capacity_error(&CursorError::new(
+            504,
+            "Sand open admission queue timed out",
+            None,
+        )));
+        assert!(!is_sand_admission_capacity_error(&CursorError::new(
+            503,
+            "Cursor upstream temporarily unavailable",
+            None,
+        )));
+    }
+
+    #[test]
+    fn sand_account_rebalance_keeps_active_account_for_unseen_lane() {
+        assert!(
+            !sand_account_rebalance_needed(None, true),
+            "an unobserved lane should use the active account first"
+        );
+    }
+
+    #[test]
+    fn sand_account_rebalance_keeps_active_account_while_capacity_remains() {
+        assert!(
+            !sand_account_rebalance_needed(Some(512), true),
+            "a completely idle lane should not rebalance"
+        );
+        assert!(
+            !sand_account_rebalance_needed(Some(511), true),
+            "an occupied but non-saturated lane should not rebalance"
+        );
+    }
+
+    #[test]
+    fn sand_account_rebalance_rotates_only_when_lane_is_saturated_or_unhealthy() {
+        assert!(sand_account_rebalance_needed(Some(0), true));
+        assert!(
+            sand_account_rebalance_needed(None, false),
+            "a route cooldown should trigger failover even before its lane exists"
+        );
+        assert!(sand_account_rebalance_needed(Some(128), false));
+    }
+
+    #[test]
+    fn sand_rebalance_marks_displaced_account_before_late_failover() {
+        let mut state = AccountFailoverState::new("token-b");
+        let previous_digest = cursor_account_digest("token-a");
+        mark_pre_rebalance_account_attempted(&mut state, Some("account-a"), &previous_digest, true);
+        assert!(state.attempted_accounts.contains(&previous_digest));
+        assert!(state.attempted_accounts.contains("account-a"));
+
+        let before = state.attempted_accounts.clone();
+        mark_pre_rebalance_account_attempted(
+            &mut state,
+            Some("unused-account"),
+            "unused-digest",
+            false,
+        );
+        assert_eq!(state.attempted_accounts, before);
     }
 
     #[test]
@@ -9526,6 +10517,55 @@ mod tests {
         assert!(!is_account_failover_policy_error(
             "Connect error 429: ERROR_RESOURCE_EXHAUSTED: High Load — switch models"
         ));
+    }
+
+    #[test]
+    fn upstream_already_active_recovery_is_bounded_and_local_busy_is_preserved() {
+        let upstream = "Cursor error 503: Cursor upstream HTTP 503 (A Cursor live run is already active for this session; retry after it advances)";
+        assert!(live_error_is_upstream_already_active(upstream));
+        assert!(
+            !is_local_live_busy_text(upstream),
+            "an upstream wrapper must enter the one-shot fresh-conversation recovery"
+        );
+
+        let local = format!("Cursor error 503: {LIVE_RUN_BUSY_MESSAGE}");
+        assert!(live_error_is_upstream_already_active(&local));
+        assert!(
+            is_local_live_busy_text(&local),
+            "the local registry diagnostic must keep its attach/wait semantics"
+        );
+
+        let fence = AtomicBool::new(false);
+        assert!(claim_upstream_active_recovery(&fence));
+        assert!(
+            !claim_upstream_active_recovery(&fence),
+            "a logical request gets one fresh-conversation recovery, never a loop"
+        );
+    }
+
+    #[test]
+    fn upstream_already_active_pump_uses_dedicated_retry_but_local_busy_does_not() {
+        let upstream = Err(
+            "Connect error 503: Cursor upstream HTTP 503 (A Cursor live run is already active for this session; retry after it advances)"
+                .to_string(),
+        );
+        assert_eq!(
+            classify_live_pump_item(false, &upstream),
+            LivePumpAction::Retry,
+            "a pre-output upstream conflict must reach LiveRetryStart::start_after_error"
+        );
+        assert_eq!(
+            classify_live_pump_item(true, &upstream),
+            LivePumpAction::Forward,
+            "a conflict after committed output remains fail-closed"
+        );
+
+        let local = Err(format!("Cursor error 503: {LIVE_RUN_BUSY_MESSAGE}"));
+        assert_eq!(
+            classify_live_pump_item(false, &local),
+            LivePumpAction::Forward,
+            "the local registry busy response must retain its attach/wait semantics"
+        );
     }
 
     #[test]
@@ -10318,6 +11358,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_upstream_active_uses_fresh_conversation_lane_but_local_busy_does_not() {
+        let upstream = "Cursor error 503: Cursor upstream HTTP 503 (A Cursor live run is already active for this session; retry after it advances)";
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(upstream.to_string())).await.unwrap();
+        drop(tx);
+        assert!(
+            matches!(
+                peek_live_start_for_stale_reset(rx).await,
+                LiveStartPeek::Retryable(error) if error == upstream
+            ),
+            "the initial error must reach the one-shot fresh-conversation recovery"
+        );
+
+        let local = format!("Cursor error 503: {LIVE_RUN_BUSY_MESSAGE}");
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Err(local.clone())).await.unwrap();
+        drop(tx);
+        let LiveStartPeek::Ready { mut events, .. } = peek_live_start_for_stale_reset(rx).await
+        else {
+            panic!("the local registry busy response must not rotate the conversation");
+        };
+        assert_eq!(events.recv().await.unwrap().unwrap_err(), local);
+    }
+
+    #[tokio::test]
     async fn peek_transient_429_does_not_commit_sse() {
         let (tx, rx) = mpsc::channel(2);
         tx.send(Err(
@@ -10656,6 +11721,7 @@ mod tests {
             image_recovery_images: Arc::new(Mutex::new(None)),
             kv_recovery_attempted: Arc::new(AtomicBool::new(false)),
             compaction_recovery_attempted: Arc::new(AtomicBool::new(false)),
+            upstream_active_recovery_attempted: Arc::new(AtomicBool::new(false)),
             account_failover_state: Arc::new(Mutex::new(AccountFailoverState::default())),
             custom_system: None,
             session_id: session.clone(),
