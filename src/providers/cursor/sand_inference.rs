@@ -2404,6 +2404,34 @@ impl SandInferenceStream {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn pending_stream_with_permit_and_notify_for_test(
+    gate: Arc<Semaphore>,
+    polled: Arc<Notify>,
+) -> SandInferenceStream {
+    let permit = gate
+        .try_acquire_owned()
+        .expect("pending stream fixture should own its capacity permit");
+    let bytes = futures_util::stream::poll_fn(move |_cx| {
+        polled.notify_one();
+        Poll::Pending
+    });
+    SandInferenceStream {
+        bytes: Box::pin(bytes),
+        decoder: ConnectFrameDecoder::new(),
+        pending: VecDeque::new(),
+        timeout_secs: 5,
+        ended: false,
+        saw_end: false,
+        terminal_emitted: false,
+        tool_buffers: HashMap::new(),
+        completed_tool_ids: HashSet::new(),
+        stream_permit: Some(SandStreamPermit {
+            permit: Some(permit),
+        }),
+    }
+}
+
 impl Stream for SandInferenceStream {
     type Item = Result<CursorStreamEvent, CursorError>;
 
@@ -2666,13 +2694,9 @@ impl SandInferenceClient {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
-            let detail = response.text().await.ok().filter(|text| !text.is_empty());
-            return Err(CursorError::new(
-                status,
-                format!("Sand inference upstream HTTP {status}"),
-                detail,
-            )
-            .with_retry_after(retry_after));
+            let body = response.bytes().await.unwrap_or_default();
+            let error = sand_http_error_from_body(status, &body);
+            return Err(error.with_retry_after(retry_after));
         }
         Ok(SandInferenceStream::new(response, self.timeout_secs))
     }
@@ -2692,6 +2716,56 @@ impl Default for SandInferenceClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Decode an HTTP non-2xx Sand response into a structured error.
+///
+/// InferenceService can return policy failures either as a plain JSON body or
+/// as one or more Connect frames even when the HTTP status is already 4xx/5xx.
+/// Reading the body as text loses the framed JSON (and therefore the account
+/// quota markers), which makes a deterministic 429 look transient and causes
+/// the stream retry loop to replay it five times. Preserve the machine-readable
+/// provider details before the retry classifier sees the error.
+fn sand_http_error_from_body(status: u16, body: &[u8]) -> CursorError {
+    let mut decoder = ConnectFrameDecoder::new();
+    if let Ok(frames) = decoder.push_with_limit(body, MAX_SAND_FRAME_PAYLOAD) {
+        for frame in frames {
+            let Ok(payload) = frame_payload(&frame) else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_slice::<Value>(&payload)
+                && let Some(error) = json_error(&value)
+            {
+                return CursorError::new(status, error.message, error.detail);
+            }
+            if let Some(error) = parse_connect_error(&payload) {
+                // Keep the compact quota/reset markers even when the generic
+                // Connect parser wins over the Sand JSON adapter.  The raw
+                // provider envelope is useful for diagnostics, but callers
+                // need a stable `nextResetAt=...` field for account breaker
+                // and failover decisions.
+                let detail = serde_json::from_slice::<Value>(&payload)
+                    .ok()
+                    .and_then(|value| sand_provider_error_metadata(&value))
+                    .map(|metadata| format!("{}; {metadata}", error.detail))
+                    .unwrap_or(error.detail);
+                return CursorError::new(status, error.message, Some(detail));
+            }
+        }
+    }
+
+    if let Ok(value) = serde_json::from_slice::<Value>(body)
+        && let Some(error) = json_error(&value)
+    {
+        return CursorError::new(status, error.message, error.detail);
+    }
+
+    let detail = String::from_utf8_lossy(body).trim().to_string();
+    CursorError::new(
+        status,
+        format!("Sand inference upstream HTTP {status}"),
+        (!detail.is_empty()).then_some(detail),
+    )
 }
 
 fn frame_payload(frame: &ConnectFrame) -> Result<Vec<u8>, CursorError> {
@@ -4187,6 +4261,37 @@ mod tests {
         let payload = br#"{"error":{"code":"resource_exhausted","message":"busy"}}"#;
         let error = parse_connect_error(payload).unwrap();
         assert_eq!(error.status, 429);
+    }
+
+    #[test]
+    fn http_error_from_framed_body_preserves_sand_quota_metadata() {
+        let payload = serde_json::to_vec(&json!({
+            "error": {
+                "code": "resource_exhausted",
+                "message": "You've reached your Grok Bot usage limit",
+                "details": [{
+                    "debug": {
+                        "details": {
+                            "additionalInfo": {
+                                "rateLimitReason": "sand_included_limit",
+                                "nextResetAt": "2037-10-21T07:28:00.000Z"
+                            }
+                        }
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+        let framed = encode_connect_frame(payload, FLAG_END);
+        let error = sand_http_error_from_body(429, &framed);
+        assert_eq!(error.status, 429);
+        let message = error.client_message();
+        assert!(message.contains("sand_included_limit"), "{message}");
+        assert!(
+            message.contains("nextResetAt=2037-10-21T07:28:00.000Z"),
+            "{message}"
+        );
+        assert!(crate::retry::is_policy_rate_limit(&message));
     }
 
     #[test]

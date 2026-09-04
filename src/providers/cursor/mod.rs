@@ -99,7 +99,8 @@ use crate::providers::cursor::sand_inference::{
     tools_from_anthropic,
 };
 use crate::providers::cursor::sand_operation::{
-    SandOperationAdmission, SandOperationKey, SandOperationSubscription, admit_sand_operation,
+    SandOperationAdmission, SandOperationKey, SandOperationOwner, SandOperationSubscription,
+    admit_sand_operation,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, bridge_cursor_events_to_sse,
@@ -806,6 +807,13 @@ fn note_policy_rate_limit(
     message: &str,
     retry_after: Option<&str>,
 ) {
+    // A typed Sand/Bot allowance response is stronger than the periodic
+    // dashboard snapshot. Record it immediately so Sand account selection
+    // skips the exhausted credential during the same retry burst. Keep this
+    // evidence strictly isolated from CLI/API quota meters.
+    if client_type.trim().eq_ignore_ascii_case("sand") {
+        crate::providers::cursor::usage::record_sand_quota_error_evidence(token, message);
+    }
     if !crate::retry::is_policy_rate_limit(message)
         && !is_non_retryable_provider_error_message(message)
     {
@@ -1305,15 +1313,27 @@ fn tap_session_usage(
     mut events: mpsc::Receiver<LiveEventResult>,
 ) -> mpsc::Receiver<LiveEventResult> {
     let (tx, rx) = mpsc::channel(LIVE_USAGE_TAP_CAP);
+    let output_closed = tx.clone();
     tokio::spawn(async move {
-        while let Some(item) = events.recv().await {
+        loop {
+            let Some(item) = (tokio::select! {
+                _ = output_closed.closed() => None,
+                item = events.recv() => item,
+            }) else {
+                break;
+            };
             if let Ok(LiveRunEvent::Cursor(CursorStreamEvent::Usage { input_tokens, .. })) = &item
                 && *input_tokens > 0
             {
                 record_session_input_tokens(&session_id, *input_tokens);
             }
-            if tx.send(item).await.is_err() {
-                break;
+            tokio::select! {
+                _ = output_closed.closed() => break,
+                result = tx.send(item) => {
+                    if result.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1825,6 +1845,14 @@ async fn sand_direct_response(
     // The driver keeps its existing single-consumer channel. The operation
     // forwarder is the only added hop and fans those events to every attached
     // HTTP retry, including the original owner subscription.
+    // Keep a separate cancellation sender for the driver.  For an operation
+    // owner, `source_rx` remains alive inside the forwarder after the HTTP
+    // response is dropped, so `tx.closed()` alone would never wake the driver;
+    // the owner's subscriber sender is tied to the actual downstream body.
+    let downstream_tx = sand_operation_owner
+        .as_ref()
+        .and_then(SandOperationOwner::owner_sender)
+        .unwrap_or_else(|| tx.clone());
     let rx = if let Some(owner) = sand_operation_owner.as_mut() {
         let receiver = owner.take_subscription().into_receiver();
         owner.forward_from(source_rx);
@@ -1888,6 +1916,7 @@ async fn sand_direct_response(
             retry_monitor,
             retry_monitor_request_id,
             Some(retry_policy_admission),
+            downstream_tx,
         )
         .await;
     });
@@ -2500,6 +2529,7 @@ async fn drive_sand_stream_with_retries(
     monitor: Option<crate::monitor::MonitorHandle>,
     monitor_request_id: String,
     mut policy_admission: Option<PolicyRateLimitAdmission>,
+    downstream_tx: mpsc::Sender<LiveEventResult>,
 ) {
     let max_retries = stream_retry_limit();
     let mut retries = 0u32;
@@ -2510,6 +2540,12 @@ async fn drive_sand_stream_with_retries(
     let mut next_open_kind = SandOpenAttemptKind::Transport;
 
     loop {
+        // A dropped HTTP response may leave an operation forwarder alive, so
+        // check the sender tied to the actual downstream subscription before
+        // starting another upstream open or retaining the current stream.
+        if downstream_tx.is_closed() {
+            return;
+        }
         let mut stream = if let Some(stream) = next_stream.take() {
             stream
         } else {
@@ -2517,6 +2553,7 @@ async fn drive_sand_stream_with_retries(
                 discard_sand_replay_buffer(&mut buffered);
                 send_sand_buffered_error(
                     &tx,
+                    &downstream_tx,
                     &mut buffered,
                     CursorError::new(
                         504,
@@ -2531,17 +2568,19 @@ async fn drive_sand_stream_with_retries(
                 monitor.retrying(&monitor_request_id);
             }
             let retry_request = request.clone().with_fresh_ids();
-            match open_sand_with_policy_probe_until(
-                &client,
-                &token,
-                &retry_request,
-                retry_deadline,
-                &account_failover_state,
-                &attempt_budget,
-                next_open_kind,
-            )
-            .await
-            {
+            let open_result = tokio::select! {
+                _ = downstream_tx.closed() => return,
+                result = open_sand_with_policy_probe_until(
+                    &client,
+                    &token,
+                    &retry_request,
+                    retry_deadline,
+                    &account_failover_state,
+                    &attempt_budget,
+                    next_open_kind,
+                ) => result,
+            };
+            match open_result {
                 Ok((stream, admission)) => {
                     policy_admission = Some(admission);
                     // The handoff/fallback budget is consumed by the first
@@ -2553,7 +2592,7 @@ async fn drive_sand_stream_with_retries(
                 Err(error) => {
                     if sand_attempt_budget_exhausted(&error) {
                         discard_sand_replay_buffer(&mut buffered);
-                        send_sand_buffered_error(&tx, &mut buffered, error).await;
+                        send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
                         return;
                     }
                     if !committed && is_sand_tool_capability_error(&error, tool_count) {
@@ -2584,7 +2623,8 @@ async fn drive_sand_stream_with_retries(
                         discard_sand_replay_buffer(&mut buffered);
                         let client_error =
                             sand_tool_capability_client_error(&error, &model, tool_count);
-                        send_sand_buffered_error(&tx, &mut buffered, client_error).await;
+                        send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, client_error)
+                            .await;
                         create_logger("cursor").warn(
                             "sand_tools_unsupported",
                             Some(serde_json::Map::from_iter([
@@ -2623,17 +2663,21 @@ async fn drive_sand_stream_with_retries(
                         let remaining = retry_deadline.saturating_duration_since(Instant::now());
                         if remaining <= Duration::from_millis(delay) {
                             discard_sand_replay_buffer(&mut buffered);
-                            send_sand_buffered_error(&tx, &mut buffered, error).await;
+                            send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error)
+                                .await;
                             return;
                         }
-                        crate::retry::sleep(delay).await;
+                        tokio::select! {
+                            _ = downstream_tx.closed() => return,
+                            _ = crate::retry::sleep(delay) => {}
+                        }
                         retries += 1;
                         continue;
                     }
                     if !committed {
                         discard_sand_replay_buffer(&mut buffered);
                     }
-                    send_sand_buffered_error(&tx, &mut buffered, error).await;
+                    send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
                     return;
                 }
             }
@@ -2664,7 +2708,15 @@ async fn drive_sand_stream_with_retries(
                 }
                 Duration::from_secs(idle_secs).min(remaining)
             };
-            let next = tokio::time::timeout(idle_wait, stream.next()).await;
+            // `stream.next()` can remain pending while Cursor has accepted the
+            // request but emits no frames.  The response receiver may already
+            // have been dropped in that interval; observe it directly so the
+            // stream permit and policy probe lease are released immediately
+            // instead of waiting for the 15s+ idle timeout.
+            let next = tokio::select! {
+                _ = downstream_tx.closed() => return,
+                next = tokio::time::timeout(idle_wait, stream.next()) => next,
+            };
             match next {
                 Ok(Some(Ok(event))) => {
                     let Some(event) = normalize_sand_stream_event(event, allowed.as_ref()) else {
@@ -2702,7 +2754,8 @@ async fn drive_sand_stream_with_retries(
                                     tool_names.clone(),
                                 );
                             }
-                            if !send_sand_buffered_events(&tx, &mut buffered).await {
+                            if !send_sand_buffered_events(&tx, &downstream_tx, &mut buffered).await
+                            {
                                 return;
                             }
                         }
@@ -2716,7 +2769,8 @@ async fn drive_sand_stream_with_retries(
                                 None,
                                 committed || (compaction_mode && compaction_thinking),
                             );
-                            if !send_sand_buffered_events(&tx, &mut buffered).await {
+                            if !send_sand_buffered_events(&tx, &downstream_tx, &mut buffered).await
+                            {
                                 return;
                             }
                             return;
@@ -2754,7 +2808,7 @@ async fn drive_sand_stream_with_retries(
                         // "stream ended without turn_ended".  Flush any
                         // post-commit usage/metadata before the local End.
                         buffered.push(CursorStreamEvent::End);
-                        if !send_sand_buffered_events(&tx, &mut buffered).await {
+                        if !send_sand_buffered_events(&tx, &downstream_tx, &mut buffered).await {
                             return;
                         }
                         return;
@@ -2813,7 +2867,7 @@ async fn drive_sand_stream_with_retries(
         }
         if sand_attempt_budget_exhausted(&error) {
             discard_sand_replay_buffer(&mut buffered);
-            send_sand_buffered_error(&tx, &mut buffered, error).await;
+            send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
             return;
         }
         if capability_error {
@@ -2846,7 +2900,7 @@ async fn drive_sand_stream_with_retries(
             }
             discard_sand_replay_buffer(&mut buffered);
             let client_error = sand_tool_capability_client_error(&error, &model, tool_count);
-            send_sand_buffered_error(&tx, &mut buffered, client_error).await;
+            send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, client_error).await;
             create_logger("cursor").warn(
                 "sand_tools_unsupported",
                 Some(serde_json::Map::from_iter([
@@ -2873,14 +2927,16 @@ async fn drive_sand_stream_with_retries(
             // cooldown before selecting a replacement; otherwise concurrent
             // retries could keep rediscovering the same exhausted login.
             note_sand_account_failover_error(&model, &token, &error);
-            let Some(replacement) = account_failover_replacement_token_async(
-                token.clone(),
-                model.clone(),
-                client_type.clone(),
-                Arc::clone(&account_failover_state),
-            )
-            .await
-            else {
+            let replacement = tokio::select! {
+                _ = downstream_tx.closed() => return,
+                replacement = account_failover_replacement_token_async(
+                    token.clone(),
+                    model.clone(),
+                    client_type.clone(),
+                    Arc::clone(&account_failover_state),
+                ) => replacement,
+            };
+            let Some(replacement) = replacement else {
                 // The admission candidate check is only a snapshot. A
                 // concurrent request may claim the alternate account before
                 // this late retry reaches the registry, so a missing
@@ -2888,14 +2944,20 @@ async fn drive_sand_stream_with_retries(
                 // terminal request error. Stay on the current lane until the
                 // shared logical deadline; this avoids a visible 503 retry
                 // storm while preserving a hard upper bound.
-                if is_sand_admission_capacity_error(&error)
-                    && wait_for_sand_admission_capacity(retry_deadline).await
-                {
+                let capacity_released = if is_sand_admission_capacity_error(&error) {
+                    tokio::select! {
+                        _ = downstream_tx.closed() => return,
+                        released = wait_for_sand_admission_capacity(retry_deadline) => released,
+                    }
+                } else {
+                    false
+                };
+                if capacity_released {
                     next_open_kind = SandOpenAttemptKind::Transport;
                     continue;
                 }
                 discard_sand_replay_buffer(&mut buffered);
-                send_sand_buffered_error(&tx, &mut buffered, error).await;
+                send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
                 return;
             };
             token = replacement;
@@ -2930,10 +2992,13 @@ async fn drive_sand_stream_with_retries(
             );
             let remaining = retry_deadline.saturating_duration_since(Instant::now());
             if remaining <= Duration::from_millis(delay) {
-                send_sand_buffered_error(&tx, &mut buffered, error).await;
+                send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
                 return;
             }
-            crate::retry::sleep(delay).await;
+            tokio::select! {
+                _ = downstream_tx.closed() => return,
+                _ = crate::retry::sleep(delay) => {}
+            }
             retries += 1;
             next_open_kind = SandOpenAttemptKind::Transport;
             continue;
@@ -2945,7 +3010,7 @@ async fn drive_sand_stream_with_retries(
         if !committed {
             discard_sand_replay_buffer(&mut buffered);
         }
-        send_sand_buffered_error(&tx, &mut buffered, error).await;
+        send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
         return;
     }
 }
@@ -3014,11 +3079,18 @@ fn normalize_sand_stream_event(
 
 async fn send_sand_buffered_events(
     tx: &mpsc::Sender<LiveEventResult>,
+    downstream_tx: &mpsc::Sender<LiveEventResult>,
     buffered: &mut Vec<CursorStreamEvent>,
 ) -> bool {
     for event in buffered.drain(..) {
-        if tx.send(Ok(LiveRunEvent::Cursor(event))).await.is_err() {
-            return false;
+        let item = Ok(LiveRunEvent::Cursor(event));
+        tokio::select! {
+            _ = downstream_tx.closed() => return false,
+            result = tx.send(item) => {
+                if result.is_err() {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -3026,11 +3098,17 @@ async fn send_sand_buffered_events(
 
 async fn send_sand_buffered_error(
     tx: &mpsc::Sender<LiveEventResult>,
+    downstream_tx: &mpsc::Sender<LiveEventResult>,
     buffered: &mut Vec<CursorStreamEvent>,
     error: CursorError,
 ) {
-    let _ = send_sand_buffered_events(tx, buffered).await;
-    let _ = tx.send(Err(error.client_message())).await;
+    if !send_sand_buffered_events(tx, downstream_tx, buffered).await {
+        return;
+    }
+    tokio::select! {
+        _ = downstream_tx.closed() => {}
+        _ = tx.send(Err(error.client_message())) => {}
+    }
 }
 
 /// Drop events observed before a Sand replay becomes necessary. Sand retries
@@ -9922,6 +10000,7 @@ mod tests {
             .await
             .expect("initial catalog probe should open");
         let (tx, mut rx) = mpsc::channel::<LiveEventResult>(32);
+        let downstream_tx = tx.clone();
         let account_state = Arc::new(Mutex::new(AccountFailoverState::new(token)));
         drive_sand_stream_with_retries(
             client.clone(),
@@ -9943,6 +10022,7 @@ mod tests {
             None,
             "fixture-request".to_string(),
             None,
+            downstream_tx,
         )
         .await;
 
@@ -10071,6 +10151,96 @@ mod tests {
             reset_policy_rate_limit_breaker_for_test();
         }
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn sand_driver_releases_policy_probe_when_downstream_closes() {
+        // A pending upstream stream models a response that has accepted the
+        // request but has not emitted a frame yet. Dropping the downstream
+        // receiver must terminate the driver immediately; otherwise the Sand
+        // policy lease blocks every same-account/model request until the idle
+        // timeout (15s minimum in production).
+        let token = "sand-driver-cancel-regression-token";
+        let model = "grok-build-cancel-regression";
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let probe_window = Duration::from_secs(30);
+        let admission =
+            policy_rate_limit_admit_fresh_open_with_window(model, "sand", token, probe_window)
+                .await
+                .expect("the cancellation fixture should own the policy probe");
+
+        let request = SandInferenceRequest::new(
+            model,
+            "cancel-conversation",
+            "cancel-invocation",
+            vec![SandInferenceMessage::user("pending")],
+        );
+        let stream_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let stream_polled = Arc::new(tokio::sync::Notify::new());
+        let initial_stream = sand_inference::pending_stream_with_permit_and_notify_for_test(
+            Arc::clone(&stream_gate),
+            Arc::clone(&stream_polled),
+        );
+        assert_eq!(stream_gate.available_permits(), 0);
+        let (tx, rx) = mpsc::channel::<LiveEventResult>(1);
+        let downstream_tx = tx.clone();
+        let account_state = Arc::new(Mutex::new(AccountFailoverState::new(token)));
+
+        let driver = tokio::spawn(drive_sand_stream_with_retries(
+            SandInferenceClient::with_base_url_timeout("http://127.0.0.1:1", 5)
+                .expect("fixture client"),
+            token.to_string(),
+            request,
+            initial_stream,
+            None,
+            false,
+            90,
+            tx,
+            model.to_string(),
+            "sand".to_string(),
+            account_state,
+            0,
+            Vec::new(),
+            None,
+            Instant::now() + Duration::from_secs(60),
+            SandAttemptBudget::new(),
+            None,
+            "cancel-regression-request".to_string(),
+            Some(admission),
+            downstream_tx,
+        ));
+        // Wait until the driver has actually polled the pending upstream body
+        // before simulating a client disconnect. This exercises the
+        // cancellation arm of the stream wait rather than the initial
+        // fast-path check.
+        tokio::time::timeout(Duration::from_secs(1), stream_polled.notified())
+            .await
+            .expect("driver should enter the pending upstream read");
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("downstream cancellation must stop a pending stream promptly")
+            .expect("cancellation driver task should not panic");
+        assert_eq!(
+            stream_gate.available_permits(),
+            1,
+            "cancellation must drop the accepted-stream permit"
+        );
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            policy_rate_limit_admit_fresh_open_with_window(model, "sand", token, probe_window),
+        )
+        .await
+        .expect("the canceled owner must release its policy lease promptly")
+        .expect("the next request should be admitted as a fresh probe");
+        assert!(matches!(next, PolicyRateLimitAdmission::Probe(_)));
+        drop(next);
+        reset_policy_rate_limit_breaker_for_test();
     }
 
     #[test]
@@ -10410,6 +10580,25 @@ mod tests {
         assert!(
             policy_rate_limit_preflight("gemini-3.6-flash-high", "cli", "token-a").is_ok(),
             "a Sand allowance limit must not block the CLI route"
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn cli_quota_does_not_poison_sand_usage_evidence() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+        let token = format!("cli-quota-isolation-{}", uuid::Uuid::new_v4());
+        let message = "Cursor error 429: ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: \
+                       You've reached your Grok Bot usage limit";
+
+        note_policy_rate_limit("grok-4.6", "cli", &token, message, None);
+
+        assert!(
+            crate::providers::cursor::usage::cached_sand_usage_evidence(&token).is_none(),
+            "CLI/API quota must not mark the Sand/Bot meter exhausted"
         );
         reset_policy_rate_limit_breaker_for_test();
     }
@@ -13914,6 +14103,17 @@ mod tests {
         let tokens = count_tokens_for_request(Some("sess-count-last"), &body);
         assert_eq!(tokens, expected);
         assert_ne!(tokens, 53_037);
+    }
+
+    #[tokio::test]
+    async fn session_usage_tap_drops_upstream_receiver_when_output_closes() {
+        let (upstream_tx, upstream_rx) = mpsc::channel::<LiveEventResult>(1);
+        let output_rx = tap_session_usage("tap-cancel".to_string(), upstream_rx);
+        drop(output_rx);
+
+        tokio::time::timeout(Duration::from_secs(1), upstream_tx.closed())
+            .await
+            .expect("closing the tapped output must release the upstream receiver");
     }
 
     #[test]

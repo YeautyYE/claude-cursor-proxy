@@ -36,6 +36,12 @@ const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// evidence, then stop using it for request classification: a stale 100% meter
 /// must not make a newly reset Sand period look exhausted.
 const SAND_USAGE_EVIDENCE_TTL: Duration = Duration::from_secs(180);
+/// A typed Sand/Bot quota response is stronger than a dashboard poll. Keep
+/// that account marked exhausted until the advertised reset (or a bounded
+/// fallback window) so a 429 burst cannot immediately re-enter the same
+/// account while the dashboard cache is between polls.
+const SAND_EXPLICIT_QUOTA_EVIDENCE_FALLBACK_TTL: Duration = Duration::from_secs(15 * 60);
+const SAND_EXPLICIT_QUOTA_EVIDENCE_MAX_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SAND_USAGE_EVIDENCE_MAX_ACCOUNTS: usize = 64;
 const ACCOUNT_USAGE_CACHE_VERSION: u64 = 1;
 const ACCOUNT_USAGE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -593,6 +599,10 @@ pub(crate) struct SandUsageEvidence {
     pub has_available_usage: Option<bool>,
     pub next_reset: Option<String>,
     observed_at: Instant,
+    /// In-memory only. Explicit provider quota errors may carry a reset far
+    /// beyond the short dashboard evidence TTL; keep that stronger signal
+    /// until the reset while never persisting the process-local clock.
+    explicit_until: Option<Instant>,
 }
 
 impl SandUsageEvidence {
@@ -644,20 +654,39 @@ fn sand_usage_account_key(token: &str) -> String {
     super::auth::cursor_account_digest(token)
 }
 
+fn sand_usage_evidence_is_fresh(evidence: &SandUsageEvidence, now: Instant) -> bool {
+    // Explicit provider quota evidence supersedes the short dashboard TTL and
+    // must also expire independently at the advertised reset. Otherwise the
+    // old `observed_at` value would keep a just-reset account marked exhausted
+    // for another three minutes after `explicit_until` elapsed.
+    match evidence.explicit_until {
+        Some(until) => until > now,
+        None => now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL,
+    }
+}
+
 fn store_sand_usage_evidence(auth: &CursorAuth, sand: Option<&Value>) {
     let account_key = sand_usage_account_key(&auth.access_token);
     let mut cache = SAND_USAGE_EVIDENCE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let now = Instant::now();
-    cache.retain(|_, evidence| {
-        now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL
-    });
+    cache.retain(|_, evidence| sand_usage_evidence_is_fresh(evidence, now));
     let Some(sand) = sand else {
         // A transient dashboard failure does not erase a recent successful
         // poll. Its evidence naturally expires after the short TTL above.
         return;
     };
+    // A successful dashboard poll can lag the inference service by several
+    // minutes. Never let a malformed/stale dashboard response erase a
+    // stronger, machine-readable quota rejection while its reset window is
+    // still active.
+    if cache
+        .get(&account_key)
+        .is_some_and(|evidence| evidence.explicit_until.is_some_and(|until| until > now))
+    {
+        return;
+    }
     let Some(usage_percent) = json_f64(sand.get("usagePercent")) else {
         cache.remove(&account_key);
         return;
@@ -671,15 +700,108 @@ fn store_sand_usage_evidence(auth: &CursorAuth, sand: Option<&Value>) {
             cache.remove(&oldest);
         }
     }
+    let dashboard_evidence = SandUsageEvidence {
+        usage_percent,
+        has_available_usage: sand.get("hasAvailableUsage").and_then(Value::as_bool),
+        next_reset: dashboard_timestamp(sand.get("nextResetTimestampUtc")),
+        observed_at: now,
+        explicit_until: None,
+    };
+    cache.insert(account_key, dashboard_evidence);
+}
+
+/// Record a machine-readable Sand/Bot quota rejection against the exact
+/// bearer-derived account key. Cursor sometimes returns the allowance error
+/// before the next dashboard poll, so waiting for the poller leaves a burst
+/// of requests free to select the already exhausted account again.
+pub(crate) fn record_sand_quota_error_evidence(token: &str, message: &str) {
+    let lower = message.to_ascii_lowercase();
+    let explicit_quota = lower.contains("sand_included_limit")
+        || lower.contains("sand-included-limit")
+        || lower.contains("sand included limit")
+        || lower.contains("error_sand_user_rate_limit_exceeded")
+        || lower.contains("grok bot usage limit")
+        || (lower.contains("error_gpt_4_vision_preview_rate_limit")
+            && (lower.contains("out of usage")
+                || lower.contains("grok bot")
+                || lower.contains("included")
+                || lower.contains("usage limit")));
+    if !explicit_quota {
+        return;
+    }
+
+    let now = Instant::now();
+    let next_reset = sand_reset_timestamp_from_message(message);
+    let explicit_until = next_reset
+        .as_deref()
+        .and_then(sand_reset_instant)
+        .or_else(|| now.checked_add(SAND_EXPLICIT_QUOTA_EVIDENCE_FALLBACK_TTL));
+    let account_key = sand_usage_account_key(token);
+    let mut cache = SAND_USAGE_EVIDENCE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.retain(|_, evidence| sand_usage_evidence_is_fresh(evidence, now));
+    if cache.len() >= SAND_USAGE_EVIDENCE_MAX_ACCOUNTS && !cache.contains_key(&account_key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, evidence)| evidence.observed_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
     cache.insert(
         account_key,
         SandUsageEvidence {
-            usage_percent,
-            has_available_usage: sand.get("hasAvailableUsage").and_then(Value::as_bool),
-            next_reset: dashboard_timestamp(sand.get("nextResetTimestampUtc")),
+            usage_percent: 100.0,
+            has_available_usage: Some(false),
+            next_reset,
             observed_at: now,
+            explicit_until,
         },
     );
+}
+
+fn sand_reset_timestamp_from_message(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    for marker in ["nextresetat", "next_reset_at", "dashboard reset"] {
+        let mut offset = 0usize;
+        while let Some(relative) = lower[offset..].find(marker) {
+            let start = offset + relative + marker.len();
+            let tail = message[start..].trim_start_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | ':' | '=' | ',' | ' ' | '\t')
+            });
+            let value = tail
+                .chars()
+                .take_while(|ch| {
+                    !matches!(ch, '"' | '\'' | ',' | '}' | ']' | ';' | ' ' | '\t' | '\n')
+                })
+                .collect::<String>();
+            if !value.is_empty()
+                && time::OffsetDateTime::parse(
+                    &value,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_ok()
+            {
+                return Some(value);
+            }
+            offset = start;
+        }
+    }
+    None
+}
+
+fn sand_reset_instant(reset: &str) -> Option<Instant> {
+    let parsed =
+        time::OffsetDateTime::parse(reset, &time::format_description::well_known::Rfc3339).ok()?;
+    let seconds = (parsed - time::OffsetDateTime::now_utc()).whole_seconds();
+    if seconds <= 0 {
+        return None;
+    }
+    Instant::now().checked_add(Duration::from_secs(
+        (seconds as u64).min(SAND_EXPLICIT_QUOTA_EVIDENCE_MAX_TTL.as_secs()),
+    ))
 }
 
 fn store_api_usage_evidence(auth: &CursorAuth, summary: Option<&Value>) {
@@ -735,9 +857,7 @@ pub(crate) fn cached_sand_usage_evidence(token: &str) -> Option<SandUsageEvidenc
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let now = Instant::now();
-    cache.retain(|_, evidence| {
-        now.saturating_duration_since(evidence.observed_at) < SAND_USAGE_EVIDENCE_TTL
-    });
+    cache.retain(|_, evidence| sand_usage_evidence_is_fresh(evidence, now));
     cache.get(&account_key).cloned()
 }
 
@@ -1384,6 +1504,84 @@ mod tests {
         assert_eq!(evidence.has_available_usage, Some(true));
         assert!(evidence.retry_after_secs().is_some_and(|secs| secs > 0));
         assert!(cached_sand_usage_evidence(&token_b).is_none());
+    }
+
+    #[test]
+    fn explicit_sand_quota_evidence_survives_stale_dashboard_refresh() {
+        let token = format!("usage-evidence-explicit-{}", uuid::Uuid::new_v4());
+        record_sand_quota_error_evidence(
+            &token,
+            "Cursor error 429: You've reached your Grok Bot usage limit \
+             rateLimitReason=sand_included_limit \
+             nextResetAt=2099-09-02T20:12:42Z",
+        );
+
+        // The dashboard can still report a low/available meter briefly after
+        // inference has rejected the account. That weaker snapshot must not
+        // reopen the account during the explicit reset window.
+        store_sand_usage_evidence(
+            &auth("user", &token),
+            Some(&serde_json::json!({
+                "usagePercent": 2.0,
+                "hasAvailableUsage": true,
+                "nextResetTimestampUtc": "2099-09-02T20:12:42Z"
+            })),
+        );
+
+        let evidence = cached_sand_usage_evidence(&token).expect("explicit quota evidence");
+        assert_eq!(evidence.usage_percent, 100.0);
+        assert_eq!(evidence.has_available_usage, Some(false));
+        assert!(evidence.explicit_until.is_some());
+    }
+
+    #[test]
+    fn explicit_sand_quota_evidence_survives_missing_dashboard_meter() {
+        let token = format!("usage-evidence-explicit-missing-{}", uuid::Uuid::new_v4());
+        record_sand_quota_error_evidence(
+            &token,
+            "Cursor error 429: sand_included_limit nextResetAt=2099-09-02T20:12:42Z",
+        );
+        store_sand_usage_evidence(
+            &auth("user", &token),
+            Some(&serde_json::json!({"hasAvailableUsage": true})),
+        );
+
+        let evidence = cached_sand_usage_evidence(&token).expect("explicit quota evidence");
+        assert_eq!(evidence.usage_percent, 100.0);
+        assert_eq!(evidence.has_available_usage, Some(false));
+    }
+
+    #[test]
+    fn explicit_sand_quota_evidence_expires_at_reset_before_dashboard_ttl() {
+        let token = format!("usage-evidence-explicit-expiry-{}", uuid::Uuid::new_v4());
+        record_sand_quota_error_evidence(
+            &token,
+            "Cursor error 429: sand_included_limit nextResetAt=2099-09-02T20:12:42Z",
+        );
+
+        // Simulate the reset passing while the normal dashboard evidence TTL
+        // is still active. The explicit marker must disappear immediately so
+        // the next successful dashboard poll can reopen this account.
+        let key = sand_usage_account_key(&token);
+        {
+            let mut cache = SAND_USAGE_EVIDENCE
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let evidence = cache.get_mut(&key).expect("explicit quota evidence");
+            evidence.explicit_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(cached_sand_usage_evidence(&token).is_none());
+
+        store_sand_usage_evidence(
+            &auth("user", &token),
+            Some(&serde_json::json!({
+                "usagePercent": 2.0,
+                "hasAvailableUsage": true
+            })),
+        );
+        let refreshed = cached_sand_usage_evidence(&token).expect("dashboard refresh evidence");
+        assert_eq!(refreshed.usage_percent, 2.0);
+        assert_eq!(refreshed.has_available_usage, Some(true));
     }
 
     #[test]

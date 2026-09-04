@@ -89,6 +89,21 @@ impl SandOperationOwner {
         std::mem::replace(&mut self.subscription, SandOperationSubscription::closed())
     }
 
+    /// Return a clone of the owner's downstream sender so the upstream driver
+    /// can observe HTTP cancellation even while the operation forwarder keeps
+    /// the source channel alive.  `Sender::closed()` resolves as soon as the
+    /// response body drops its receiver; keeping this clone does not retain
+    /// that receiver or prevent the operation from finishing.
+    pub(crate) fn owner_sender(&self) -> Option<mpsc::Sender<LiveEventResult>> {
+        self.entry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .subscribers
+            .iter()
+            .find(|subscriber| subscriber.owner)
+            .map(|subscriber| subscriber.sender.clone())
+    }
+
     /// Fan out the owner driver's events to the original HTTP request and all
     /// retry subscribers.  This task owns terminal state so every exit path
     /// closes subscribers and makes the bounded replay immediately visible.

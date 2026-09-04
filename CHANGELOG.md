@@ -3,6 +3,19 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.112 (2026-09-05)
+
+- Stop Sand stream drivers promptly when Claude Code or another downstream
+  client disconnects, releasing accepted-stream capacity and policy probes
+  without waiting for an idle timeout.
+- Decode non-2xx Sand responses in Connect-framed, gzip, and JSON forms so
+  account quota reasons and reset timestamps survive Cursor's error wrappers.
+- Record explicit Sand/Bot quota rejections immediately per account, preserve
+  them over stale dashboard polls until reset, and keep CLI/API quota state
+  isolated from the Sand meter.
+- Add regression coverage for downstream cancellation, quota evidence expiry,
+  framed errors, and account-lane isolation.
+
 ## v0.1.111 (2026-09-05)
 
 - Stop replaying deterministic Sand/Bot allowance 429s on the same account;
