@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.110 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.111 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -541,7 +541,7 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_SAND_STREAM_CONCURRENCY` | `512` | 同时存活的 Sand 模型流上限（1–512）；超出后在本地排队，不会重复创建上游 Run |
 | `CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT` | `512` | 冷启动初始全局并发窗口（1–512）；只有上游需要更平缓的启动时才调低 |
 | `CCP_CURSOR_SAND_OPEN_INITIAL_RATE` | `512` | 冷启动初始每秒建连速率（1–512） |
-| `CCP_CURSOR_SAND_OPEN_RATE` | `512` | AIMD 恢复后的建连速率上限（1–512） |
+| `CCP_CURSOR_SAND_OPEN_RATE` | `512` | 建连速率上限；瞬时失败不会降低进程级并发窗口（1–512） |
 | `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand 准入队列片段（1–120 秒）；饱和请求会继续排队重试，不会无界地向上游建连 |
 | `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` | `12` | 未绑定账号的模型在某个账号/模型通道饱和后，等待该时长检查可用的备用账号（1–300 秒）；没有可用备用账号时继续等待当前通道 |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | 单次 Sand HTTP 建连超时（10–180 秒） |

@@ -3,6 +3,21 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.111 (2026-09-05)
+
+- Stop replaying deterministic Sand/Bot allowance 429s on the same account;
+  preserve Cursor reset hints and isolate cooldowns by account, model, and
+  CLI/Sand route.
+- Keep the configured 512-way Sand fan-out stable after synchronized transient
+  failures instead of multiplicatively collapsing the process-wide open window.
+- Reserve accepted-stream capacity before an upstream open, release handshake
+  admission as soon as headers arrive, and keep the stream permit until End or
+  downstream cancellation so full local capacity cannot create unowned Runs.
+- Keep Sand policy probes single-flight until the active owner settles, and do
+  not turn deterministic tool/schema capability errors into account cooldowns.
+- Add regression coverage for quota envelopes, provider 4xx classification,
+  single-flight probes, stream admission lifecycle, and 512-way failure bursts.
+
 ## v0.1.110 (2026-09-04)
 
 - Separate Sand handshake admission from accepted stream lifetime while keeping

@@ -391,22 +391,50 @@ static SAND_STREAM_GATE: LazyLock<Arc<Semaphore>> =
 pub(crate) async fn admit_sand_stream_until(
     deadline: Instant,
 ) -> Result<SandStreamPermit, CursorError> {
+    admit_sand_stream_from_gate(Arc::clone(&SAND_STREAM_GATE), deadline).await
+}
+
+/// Acquire accepted-stream capacity from a specific gate. Keeping the gate as
+/// an argument makes the admission lifecycle testable without
+/// mutating the process-wide 512-stream gate.
+async fn admit_sand_stream_from_gate(
+    gate: Arc<Semaphore>,
+    deadline: Instant,
+) -> Result<SandStreamPermit, CursorError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(sand_open_admission_error());
+        return Err(sand_stream_admission_error());
     }
-    let permit = tokio::time::timeout(remaining, Arc::clone(&SAND_STREAM_GATE).acquire_owned())
+    let permit = tokio::time::timeout(remaining, gate.acquire_owned())
         .await
-        .map_err(|_| sand_open_admission_error())?
+        .map_err(|_| sand_stream_admission_error())?
         .map_err(|_| CursorError::new(503, "Sand stream capacity is unavailable", None))?;
     Ok(SandStreamPermit {
         permit: Some(permit),
     })
 }
 
-/// Global cold-open controller. A failed open halves the launch window and
-/// rate; sustained successes add one slot/rate step at a time. It keeps burst
-/// recovery smooth without shrinking the separate 512-stream capacity.
+fn sand_stream_admission_error() -> CursorError {
+    let mut error = CursorError::new(
+        504,
+        "Sand accepted-stream admission deadline exhausted; retry after active streams drain",
+        None,
+    );
+    error.retry_after = Some("1".to_string());
+    error
+}
+
+/// Global cold-open controller.
+///
+/// The controller paces cold opens, but its capacity is deliberately
+/// monotonic for a running process: a single account/model or provider
+/// failure must not shrink the process-wide 512-request contract.  Earlier
+/// versions used multiplicative decrease here.  When a fan-out failed in one
+/// wave, every completion halved the same shared window (512 -> 256 -> ... ->
+/// 1), which left unrelated accounts queued and surfaced proxy-generated 503s.
+/// Account/model policy and transport breakers already isolate those failures;
+/// this scheduler only tracks in-flight opens and additive recovery for an
+/// explicitly lower operator-configured starting window.
 #[derive(Debug)]
 struct SandColdOpenScheduler {
     state: Mutex<SandColdOpenState>,
@@ -515,9 +543,13 @@ impl SandColdOpenScheduler {
                 state.successes_since_increase = 0;
             }
         } else {
-            state.inflight_limit = (state.inflight_limit / 2).max(1);
-            state.rate_per_second = (state.rate_per_second / 2.0).max(1.0);
-            state.tokens = state.tokens.min(state.rate_per_second);
+            // Do not apply multiplicative decrease here.  This state is
+            // process-global, while failures are account/model scoped and
+            // may arrive in a synchronized burst.  Reducing the shared
+            // window for each failed completion collapses a normal 512-way
+            // fan-out to one slot and turns transient upstream errors into a
+            // local admission/503 storm.  The request-level retry/backoff and
+            // account/model breaker provide the appropriate isolation.
             state.successes_since_increase = 0;
         }
         drop(state);
@@ -1108,9 +1140,9 @@ pub fn sand_tool_capability_statuses() -> Vec<SandToolCapabilityStatus> {
 }
 
 /// Determine whether a stream error is the deterministic tool-catalog
-/// rejection observed from the Fable provider.  Cursor wraps it in an outer
-/// 429/resource-exhausted envelope and may include transient wording, so the
-/// request's non-empty tool count is part of the discriminator.
+/// rejection observed from the Fable provider. Cursor wraps it in an outer
+/// 429/resource-exhausted envelope, so the request's non-empty tool count plus
+/// explicit tool/schema rejection wording are part of the discriminator.
 pub fn is_sand_tool_capability_error(error: &CursorError, tool_count: usize) -> bool {
     if tool_count == 0 {
         return false;
@@ -1121,9 +1153,17 @@ pub fn is_sand_tool_capability_error(error: &CursorError, tool_count: usize) -> 
         error.detail.as_deref().unwrap_or_default()
     );
     let lower = text.to_ascii_lowercase();
+    // Cursor reuses the provider 4xx envelope for temporary connectivity
+    // failures. Those responses must stay on the bounded transport retry
+    // path even when the outer status is 429 and `isRetryable=false`.
+    // Check this before any capability markers because the provider detail is
+    // the authoritative disposition for this otherwise ambiguous envelope.
+    if is_transient_provider_error_message(&text) {
+        return false;
+    }
     // The diagnostic reaches this layer as either flattened key/value text or
-    // pretty-printed JSON. Collapse whitespace before looking for the three
-    // structural markers so `providerStatusCode : 400` is treated exactly
+    // pretty-printed JSON. Collapse whitespace before looking for the
+    // structural markers so `providerStatusCode : 422` is treated exactly
     // like the compact form emitted by `json_error`.
     let compact = lower
         .chars()
@@ -1132,14 +1172,34 @@ pub fn is_sand_tool_capability_error(error: &CursorError, tool_count: usize) -> 
     let provider_error = compact.contains("error_provider_error")
         || compact.contains("providererrorcode=error_provider_error")
         || compact.contains("provider_error_code=error_provider_error");
-    let provider_400 = compact.contains("providerstatuscode=400")
-        || compact.contains("provider_status_code=400")
-        || compact.contains("providerstatuscode:400")
-        || compact.contains("provider_status_code:400")
-        || compact.contains("providerstatuscode\":400")
-        || compact.contains("provider_status_code\":400")
-        || compact.contains("providerstatuscode\\\":400")
-        || compact.contains("provider_status_code\\\":400");
+    // Deterministic tool/schema rejections have appeared as several provider
+    // 4xx values (400 and 422 are both in the wild), not only 400. Read the
+    // numeric value after either key spelling and require a 4xx range.
+    let provider_4xx = ["providerstatuscode", "provider_status_code"]
+        .iter()
+        .any(|key| {
+            let mut offset = 0usize;
+            while let Some(relative) = compact[offset..].find(key) {
+                let start = offset + relative + key.len();
+                let tail = compact[start..].trim_start_matches(|character: char| {
+                    matches!(character, '"' | '\'' | ':' | '=' | ',' | '\\')
+                });
+                let digits = tail
+                    .chars()
+                    .take_while(|character| character.is_ascii_digit())
+                    .collect::<String>();
+                if digits.len() == 3
+                    && digits
+                        .parse::<u16>()
+                        .ok()
+                        .is_some_and(|status| (400..500).contains(&status))
+                {
+                    return true;
+                }
+                offset = start;
+            }
+            false
+        });
     let non_retryable = compact.contains("isretryable=false")
         || compact.contains("is_retryable=false")
         || compact.contains("isretryable:false")
@@ -1148,21 +1208,64 @@ pub fn is_sand_tool_capability_error(error: &CursorError, tool_count: usize) -> 
         || compact.contains("is_retryable\":false")
         || compact.contains("isretryable\\\":false")
         || compact.contains("is_retryable\\\":false");
-    if !(provider_error && provider_400 && non_retryable) {
+    if !(provider_error && provider_4xx && non_retryable) {
         return false;
     }
     // Preserve account/plan/capacity classification. Those errors can carry
     // the same nested provider marker but should still use account failover.
+    // Do not call the broad `is_policy_rate_limit` helper here: its bare
+    // `resource_exhausted` branch intentionally recognizes the outer 429
+    // envelope, which is also present on deterministic tool rejections.
     let terminal_policy = lower.contains("out of usage")
         || lower.contains("usage exhausted")
         || lower.contains("usage limit")
         || lower.contains("rate limit exceeded")
-        || lower.contains("quota");
-    let transient_provider = is_transient_provider_error_message(&text);
-    !terminal_policy
-        && !crate::retry::is_billing_block(&text)
-        && (!crate::retry::is_policy_rate_limit(&text) || transient_provider)
-        && !crate::retry::is_capacity_shed(&text)
+        || lower.contains("quota")
+        || lower.contains("included limit")
+        || lower.contains("allowance")
+        || lower.contains("user_rate_limit_exceeded")
+        || lower.contains("api_rate_limit_exceeded")
+        || lower.contains("error_rate_limited")
+        || lower.contains("gpt_4_vision_preview_rate_limit");
+    if terminal_policy
+        || crate::retry::is_billing_block(&text)
+        || crate::retry::is_capacity_shed(&text)
+    {
+        return false;
+    }
+
+    // Metadata alone is insufficient: provider 4xx diagnostics also cover
+    // malformed model parameters, account connectivity, and other request
+    // failures. Only switch to the text bridge when the diagnostic names a
+    // tool/schema/function/catalog context and explicitly says that context
+    // was rejected or is unsupported/invalid.
+    let tool_context = ["tool", "function", "catalog", "schema"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let rejection = [
+        "unsupported",
+        "not supported",
+        "does not support",
+        "rejected",
+        "reject",
+        "invalid",
+        "unknown",
+        "unrecognized",
+        "not allowed",
+        "not accepted",
+        "does not accept",
+        "doesn't accept",
+        "incompatible",
+        "not compatible",
+        "cannot use",
+        "can't use",
+        "unable to use",
+        "not implemented",
+        "not available",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    tool_context && rejection
 }
 
 /// Convert a deterministic tool rejection to a stable client-facing 400.
@@ -1214,6 +1317,12 @@ pub fn stream_error_is_retryable(error: &CursorError) -> bool {
         || crate::retry::is_billing_block(&message)
         || crate::retry::is_policy_rate_limit(&message)
         || crate::retry::is_capacity_shed(&message)
+        // This is proxy-local backpressure after a successful HTTP open. The
+        // response body is dropped on timeout, so replaying another open while
+        // the accepted-stream gate is full would create duplicate upstream
+        // invocations instead of freeing capacity.
+        || lower.contains("sand accepted-stream admission")
+        || lower.contains("sand stream capacity is unavailable")
         || lower.contains("sand traffic is not supported")
         || lower.contains("bad model name")
         || lower.contains("outdated client")
@@ -4150,7 +4259,10 @@ mod tests {
         assert!(message.contains("providerStatusCode=400"), "{message}");
         assert!(message.contains("isRetryable=false"), "{message}");
         assert!(!is_non_retryable_provider_error_message(&message));
-        assert!(is_sand_tool_capability_error(&error, 1));
+        assert!(
+            !is_sand_tool_capability_error(&error, 1),
+            "provider connectivity diagnostics must stay on transport retry path"
+        );
     }
 
     #[test]
@@ -4262,6 +4374,88 @@ mod tests {
 
         let invalid = CursorError::new(400, "Sand traffic is not supported on this endpoint", None);
         assert!(!stream_error_is_retryable(&invalid));
+
+        let accepted_capacity = CursorError::new(
+            504,
+            "Sand accepted-stream admission deadline exhausted; retry after active streams drain",
+            None,
+        );
+        assert!(
+            !stream_error_is_retryable(&accepted_capacity),
+            "local accepted-stream backpressure must not replay another upstream open"
+        );
+    }
+
+    #[test]
+    fn exact_grok_bot_quota_envelope_is_terminal_before_stream_replay() {
+        let value = json!({
+            "error": {
+                "code": "resource_exhausted",
+                "message": "Error",
+                "details": [{
+                    "debug": {
+                        "details": {
+                            "additionalInfo": {
+                                "availableBankedResetCount": "0",
+                                "nextResetAt": "2026-09-05T15:13:32.831Z",
+                                "rateLimitReason": "sand_included_limit"
+                            },
+                            "detail": "Your included Grok Bot usage limit has been reached. It resets in 23 hours. Enable on-demand spend to continue.",
+                            "isRetryable": false,
+                            "title": "You've reached your Grok Bot usage limit"
+                        },
+                        "error": "ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT"
+                    }
+                }]
+            }
+        });
+        let error = json_error(&value).expect("quota envelope should parse");
+        assert_eq!(error.status, 429);
+        let message = error.client_message();
+        assert!(message.contains("sand_included_limit"), "{message}");
+        assert!(crate::retry::is_policy_rate_limit(&message), "{message}");
+        assert!(!stream_error_is_retryable(&error), "{message}");
+    }
+
+    #[tokio::test]
+    async fn accepted_stream_admission_waits_for_capacity_and_releases_on_drop() {
+        let gate = Arc::new(Semaphore::new(0));
+        let waiting = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                admit_sand_stream_from_gate(gate, Instant::now() + Duration::from_secs(1)).await
+            })
+        };
+
+        // The accepted-stream waiter must remain pending until an existing
+        // stream releases capacity; this path is entered only after HTTP open.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(gate.available_permits(), 0);
+        gate.add_permits(1);
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("accepted-stream admission should wake after release")
+            .expect("admission task should not panic")
+            .expect("released accepted-stream slot should be acquired");
+        assert_eq!(gate.available_permits(), 0);
+        drop(permit);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_stream_admission_timeout_has_local_backpressure_error() {
+        let gate = Arc::new(Semaphore::new(0));
+        let error = admit_sand_stream_from_gate(gate, Instant::now() + Duration::from_millis(20))
+            .await
+            .expect_err("a full accepted-stream gate should time out");
+        assert_eq!(error.status, 504);
+        assert_eq!(error.retry_after.as_deref(), Some("1"));
+        assert!(
+            error
+                .client_message()
+                .contains("accepted-stream admission deadline exhausted")
+        );
+        assert!(!stream_error_is_retryable(&error));
     }
 
     #[test]
@@ -4276,7 +4470,7 @@ mod tests {
     }
 
     #[test]
-    fn sand_tool_capability_error_requires_provider_400_and_nonempty_catalog() {
+    fn sand_tool_capability_error_requires_explicit_tool_rejection() {
         let error = CursorError::new(
             429,
             "ERROR_PROVIDER_ERROR",
@@ -4285,8 +4479,35 @@ mod tests {
                     .into(),
             ),
         );
-        assert!(is_sand_tool_capability_error(&error, 1));
+        assert!(
+            !is_sand_tool_capability_error(&error, 1),
+            "a provider connectivity sentence is not evidence of a tool mismatch"
+        );
         assert!(!is_sand_tool_capability_error(&error, 0));
+
+        let deterministic = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some("providerStatusCode=400 isRetryable=false tool catalog is not supported".into()),
+        );
+        assert!(is_sand_tool_capability_error(&deterministic, 1));
+
+        let schema_rejected = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some(
+                "providerStatusCode=422 isRetryable=false function schema rejected by provider"
+                    .into(),
+            ),
+        );
+        assert!(is_sand_tool_capability_error(&schema_rejected, 1));
+
+        let parameter_invalid = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some("providerStatusCode=422 isRetryable=false invalid tool parameter schema".into()),
+        );
+        assert!(is_sand_tool_capability_error(&parameter_invalid, 1));
 
         let retryable = CursorError::new(
             429,
@@ -4294,6 +4515,18 @@ mod tests {
             Some("providerStatusCode=503 isRetryable=false".into()),
         );
         assert!(!is_sand_tool_capability_error(&retryable, 1));
+
+        let temporary_422 = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some(
+                "providerStatusCode=422 isRetryable=false We're having trouble connecting to the model provider. This might be temporary - please try again in a moment".into(),
+            ),
+        );
+        assert!(
+            !is_sand_tool_capability_error(&temporary_422, 1),
+            "the observed 422 provider-connectivity response must not trigger text bridge"
+        );
 
         let quota = CursorError::new(
             429,
@@ -4310,6 +4543,7 @@ mod tests {
             "ERROR_PROVIDER_ERROR",
             Some(
                 r#"{
+                    "message": "tool catalog is not supported by this provider",
                     "additionalInfo": { "providerStatusCode" : 400 },
                     "isRetryable" : false
                 }"#
@@ -4590,7 +4824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_open_scheduler_adds_capacity_on_success_and_backs_off_on_failure() {
+    async fn cold_open_scheduler_adds_capacity_without_global_backoff_on_failure() {
         let scheduler = Arc::new(SandColdOpenScheduler::new(2, 64, 64));
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut first = scheduler.acquire(deadline).await.expect("first open");
@@ -4603,7 +4837,61 @@ mod tests {
 
         let mut third = scheduler.acquire(deadline).await.expect("third open");
         third.complete(false);
-        assert_eq!(scheduler.snapshot(), (0, 1, 32));
+        assert_eq!(
+            scheduler.snapshot(),
+            (0, 3, 64),
+            "one failed route must not shrink the process-wide launch window"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_open_scheduler_preserves_512_way_capacity_after_failure_burst() {
+        // A synchronized provider outage can complete hundreds of opens as
+        // failures.  The old multiplicative-decrease branch applied once per
+        // completion and collapsed the global window to one.  Keep the
+        // configured 512-way contract intact while request-level retry and
+        // account/model breakers handle the outage.
+        const FANOUT: usize = SAND_OPEN_GLOBAL_DEFAULT;
+        let scheduler = Arc::new(SandColdOpenScheduler::new(
+            FANOUT,
+            SAND_OPEN_RATE_MAX,
+            SAND_OPEN_RATE_MAX,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut permits = Vec::with_capacity(FANOUT);
+        for _ in 0..FANOUT {
+            permits.push(
+                scheduler
+                    .acquire(deadline)
+                    .await
+                    .expect("configured fan-out should admit every open"),
+            );
+        }
+        assert_eq!(scheduler.snapshot().0, FANOUT);
+        for mut permit in permits {
+            permit.complete(false);
+        }
+        assert_eq!(
+            scheduler.snapshot(),
+            (0, FANOUT, SAND_OPEN_RATE_MAX),
+            "failure burst must not globally halve 512 opens to one"
+        );
+
+        // A fresh burst remains admissible immediately after the failed wave;
+        // this catches a hidden token/rate collapse in addition to the window
+        // assertion above.
+        let fresh_deadline = Instant::now() + Duration::from_secs(3);
+        let mut fresh = Vec::with_capacity(FANOUT);
+        for _ in 0..FANOUT {
+            fresh.push(
+                scheduler
+                    .acquire(fresh_deadline)
+                    .await
+                    .expect("capacity must remain available after failures"),
+            );
+        }
+        assert_eq!(scheduler.snapshot().0, FANOUT);
+        drop(fresh);
     }
 
     #[tokio::test]

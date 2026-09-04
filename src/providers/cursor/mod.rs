@@ -584,6 +584,16 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
 ) -> Result<PolicyRateLimitAdmission, CursorError> {
     let key = policy_rate_limit_key(model, client_type, token);
     let gate = policy_rate_limit_probe_gate(&key);
+    // Sand/Bot policy decisions are delivered by the full-history
+    // InferenceService stream and can arrive well after the short live-start
+    // peek.  A second Sand open while the first one is still active is not a
+    // harmless health probe: it consumes another allowance and may produce a
+    // duplicate 429 several minutes later.  The Sand stream owner already
+    // releases this lease on a decisive event, terminal error, or its bounded
+    // logical deadline, so keep the probe single-flight for the whole owner
+    // lifetime.  CLI/Agent keeps the quiet-window ramp because its live probe
+    // path does not retain the lease through the complete stream.
+    let sand_probe = client_type.trim().eq_ignore_ascii_case("sand");
     loop {
         policy_rate_limit_preflight(model, client_type, token)?;
         enum ProbeDecision {
@@ -615,7 +625,7 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                 }
                 PolicyRateLimitProbeState::Probing { started, .. } => {
                     let elapsed = started.elapsed();
-                    if elapsed >= probe_window {
+                    if !sand_probe && elapsed >= probe_window {
                         // The current probe remained quiet for one window. Do
                         // not call the key healthy and release the whole retry
                         // wave: delayed policy decisions have arrived well
@@ -632,7 +642,16 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                             started,
                         }
                     } else {
-                        ProbeDecision::Wait(probe_window - elapsed)
+                        // For Sand, wait for the owner to settle the lease.
+                        // A bounded wake/timer keeps cancellation and stale
+                        // state recoverable without opening another upstream
+                        // request after the probe window has elapsed.
+                        let remaining = if sand_probe {
+                            Duration::from_millis(250)
+                        } else {
+                            probe_window - elapsed
+                        };
+                        ProbeDecision::Wait(remaining)
                     }
                 }
             }
@@ -676,7 +695,12 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                 // queued instead of fanning out.
                 tokio::select! {
                     _ = gate.changed.notified() => {}
-                    _ = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
+                    // The notify path handles normal lease settlement.  Keep
+                    // a coarse timer only as a lost-wakeup/cancellation
+                    // fallback; a 25ms poll across a 512-way retry wave
+                    // creates avoidable mutex/CPU pressure while the owner
+                    // is waiting on a delayed Sand response.
+                    _ = tokio::time::sleep(remaining.min(Duration::from_millis(250))) => {}
                 }
             }
         }
@@ -929,6 +953,14 @@ fn cursor_error_is_account_failover_policy(error: &CursorError) -> bool {
 /// unsupported parameters, and context validation failures are request-local
 /// and must not poison the account or trigger account rotation.
 fn cursor_error_is_policy_limited(error: &CursorError) -> bool {
+    // Tool/schema capability rejection is request-local even when Cursor
+    // wraps it in `resource_exhausted`/429.  Keep this guard here as a final
+    // backstop for every live path that settles a probe; the Sand-specific
+    // callers also short-circuit before settlement so the fallback request
+    // cannot inherit an account cooldown.
+    if is_sand_tool_capability_error(error, 1) {
+        return false;
+    }
     let texts = [
         error.client_message(),
         error.message.clone(),
@@ -2092,10 +2124,11 @@ async fn open_sand_with_retries_until(
     // keeps account-failover and stream-replay opens from monopolizing a
     // single request after the caller has already spent most of its budget.
     let local_deadline = logical_deadline.min(Instant::now() + sand_open_total_budget());
-    // Reserve the accepted-stream capacity before contacting the upstream.
-    // Acquiring it after headers would allow an unbounded number of already
-    // live model streams to wait locally for a permit. The permit survives
-    // retries in this logical open and moves into the accepted stream below.
+    // Reserve accepted-stream capacity before contacting the upstream.  A
+    // successful HTTP open represents a live model Run; waiting for the stream
+    // gate after headers would create unowned upstream Runs while the local
+    // 512-stream budget is full.  This permit is held across transport retries
+    // for this logical open and moves into the returned stream on success.
     let stream_permit = admit_sand_stream_until(local_deadline).await?;
     let attempt_secs = std::env::var("CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS")
         .ok()
@@ -2271,9 +2304,10 @@ async fn open_sand_with_retries_until(
         };
         match result {
             Ok(stream) => {
-                // The HTTP handshake succeeded. Release the cold-open
-                // controller now; the independent stream slot was reserved
-                // before the upstream open and remains attached to the body.
+                // The HTTP handshake succeeded. Release both open gates before
+                // consuming model tokens; the independent stream slot was
+                // reserved before the request and remains attached to the
+                // response body until it drains or is cancelled.
                 open_permit.record_open_outcome(true);
                 drop(open_permit);
                 sand_open_breaker_success(token, &request.model_id);
@@ -2288,22 +2322,13 @@ async fn open_sand_with_retries_until(
                 return Err(error);
             }
             Err(error) => {
-                // Only congestion/transport outcomes feed multiplicative
-                // decrease. Auth/model/schema failures must not throttle
-                // every otherwise healthy Sand lane. Account policy/quota
-                // 429s are deterministic for this bearer and are handled by
-                // the account breaker/failover path; counting them as global
-                // congestion would halve the process-wide 512-open window
-                // for unrelated healthy accounts and create a second wave of
-                // local 503s.
-                // Match the same classifier that controls whether this
-                // invocation will actually be retried below. This keeps the
-                // cold-open AIMD controller aligned with retry semantics:
-                // terminal account quota, capacity-shed, billing, and other
-                // policy 429s fail over (or surface) without shrinking the
-                // process-wide launch window. Only a retryable transport
-                // failure represents evidence that the upstream is
-                // overloaded.
+                // Record transport failures for diagnostics, but do not
+                // multiplicatively reduce the process-wide launch window.
+                // Admission capacity is shared by every account/model route;
+                // a synchronized failure burst on one route must not collapse
+                // unrelated healthy lanes to a single slot. Account/model
+                // breakers and the per-request retry budget provide the
+                // isolation and backoff instead.
                 if sand_open_failure_is_retryable(&error) {
                     open_permit.record_open_outcome(false);
                 } else {
@@ -2369,18 +2394,28 @@ async fn open_sand_with_policy_probe_until(
     {
         Ok(stream) => Ok((stream, admission)),
         Err(error) => {
-            // A policy result can arrive before an HTTP body is accepted. Open
-            // the breaker while the cold probe is still owned so queued Sand
-            // callers observe the typed 429 instead of dispatching another
-            // identical request.
-            settle_sand_policy_probe(
-                Some(admission),
-                &request.model_id,
-                "sand",
-                token,
-                Some(&error),
-                false,
-            );
+            // A deterministic tool/schema rejection is request-local.  The
+            // provider wraps it in the same outer resource_exhausted/429
+            // envelope used for account quota, but opening the policy breaker
+            // here would poison the account before the text bridge fallback
+            // gets a chance to replay the turn.  Release the probe without
+            // publishing policy state for this capability-only failure.
+            if is_sand_tool_capability_error(&error, request.tools.len()) {
+                drop(admission);
+            } else {
+                // A policy result can arrive before an HTTP body is accepted.
+                // Open the breaker while the cold probe is still owned so
+                // queued Sand callers observe the typed 429 instead of
+                // dispatching another identical request.
+                settle_sand_policy_probe(
+                    Some(admission),
+                    &request.model_id,
+                    "sand",
+                    token,
+                    Some(&error),
+                    false,
+                );
+            }
             Err(error)
         }
     }
@@ -2759,20 +2794,29 @@ async fn drive_sand_stream_with_retries(
             // events.  No synthetic error is needed here.
             return;
         };
-        settle_sand_policy_probe(
-            policy_admission.take(),
-            &model,
-            &client_type,
-            &token,
-            Some(&error),
-            committed,
-        );
+        // Capability failures are handled immediately below by the text
+        // bridge.  They share the outer resource_exhausted/429 envelope with
+        // quota responses, so settling the probe first would incorrectly
+        // open an account breaker and make the fallback request fail locally.
+        let capability_error = !committed && is_sand_tool_capability_error(&error, tool_count);
+        if capability_error {
+            drop(policy_admission.take());
+        } else {
+            settle_sand_policy_probe(
+                policy_admission.take(),
+                &model,
+                &client_type,
+                &token,
+                Some(&error),
+                committed,
+            );
+        }
         if sand_attempt_budget_exhausted(&error) {
             discard_sand_replay_buffer(&mut buffered);
             send_sand_buffered_error(&tx, &mut buffered, error).await;
             return;
         }
-        if !committed && is_sand_tool_capability_error(&error, tool_count) {
+        if capability_error {
             mark_sand_tools_unsupported(
                 &token,
                 &model,
@@ -9497,8 +9541,9 @@ fn json_error_from_cursor_message(message: impl Into<String>) -> Response {
 
 /// Whether an open failure is evidence that the upstream launch path is
 /// congested. Keep this predicate identical to the same-request retry gate so
-/// Sand's cold-open AIMD controller never backs off for terminal account
-/// policy/quota responses that are being handed to account failover.
+/// Sand's cold-open scheduler never backs off the process-wide launch window
+/// for terminal account policy/quota responses that are being handed to
+/// account failover.
 fn sand_open_failure_is_retryable(error: &client::CursorError) -> bool {
     let diagnostic = error.client_message();
     // The retry classifier recognizes the normal flattened policy forms, but
@@ -9761,8 +9806,14 @@ mod tests {
         use serde_json::{Value, json};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let token = "sand-fixture-token";
+        let token = "sand-fixture-token-capability-regression";
         reset_sand_tool_capability(token, "claude-fable-5");
+        {
+            let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            reset_policy_rate_limit_breaker_for_test();
+        }
         let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let request_log = Arc::clone(&requests);
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -9789,7 +9840,7 @@ mod tests {
                         1 => json!({
                             "error": {
                                 "code": "resource_exhausted",
-                                "message": "We're having trouble connecting to the model provider",
+                                "message": "tool catalog is not supported by this provider",
                                 "details": [{
                                     "debug": {
                                         "error": "ERROR_PROVIDER_ERROR",
@@ -9990,6 +10041,10 @@ mod tests {
         assert_eq!(observed[0]["tools"].as_array().unwrap().len(), 1);
         assert_eq!(observed[1]["tools"], json!([]));
         assert!(
+            policy_rate_limit_preflight("claude-fable-5", "sand", token).is_ok(),
+            "capability fallback must not publish an account 429 cooldown"
+        );
+        assert!(
             observed[1]["messages"]
                 .as_array()
                 .unwrap()
@@ -10009,6 +10064,12 @@ mod tests {
         );
 
         reset_sand_tool_capability(token, "claude-fable-5");
+        {
+            let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            reset_policy_rate_limit_breaker_for_test();
+        }
         server.abort();
     }
 
@@ -10477,6 +10538,53 @@ mod tests {
             "only the original cold probe may reach Cursor before its delayed 429"
         );
         assert_eq!(blocked, REQUESTS);
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn sand_policy_probe_does_not_rotate_while_owner_is_still_active() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        // Use a tiny injectable window.  Sand must still keep one owner after
+        // that window because the provider can delay its quota decision far
+        // beyond the live-start peek.
+        let probe_window = Duration::from_millis(25);
+        let owner = policy_rate_limit_admit_fresh_open_with_window(
+            "grok-build",
+            "sand",
+            "delayed-sand-policy-token",
+            probe_window,
+        )
+        .await
+        .expect("the first Sand request owns the policy probe");
+        assert!(matches!(owner, PolicyRateLimitAdmission::Probe(_)));
+
+        let waiter = tokio::spawn(async move {
+            policy_rate_limit_admit_fresh_open_with_window(
+                "grok-build",
+                "sand",
+                "delayed-sand-policy-token",
+                probe_window,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a Sand waiter must not rotate into a second upstream probe after the quiet window"
+        );
+
+        drop(owner);
+        let admission = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter should wake when the owner settles")
+            .expect("policy waiter task should not panic")
+            .expect("the next Sand request should become the new probe");
+        assert!(matches!(admission, PolicyRateLimitAdmission::Probe(_)));
         reset_policy_rate_limit_breaker_for_test();
     }
 
@@ -11410,6 +11518,52 @@ mod tests {
         assert!(
             policy_rate_limit_preflight(model, client_type, token).is_err(),
             "the stream driver may have released its probe at first output"
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sand_tool_capability_rejection_does_not_open_policy_breaker() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let model = "claude-fable-5";
+        let client_type = "sand";
+        let token = "capability-breaker-regression-token";
+        let admission = policy_rate_limit_admit_fresh_open_with_window(
+            model,
+            client_type,
+            token,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("the first request owns the cold probe");
+        let error = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some(
+                "{\"error\":{\"code\":\"resource_exhausted\",\"details\":[{\"debug\":{\"error\":\"ERROR_PROVIDER_ERROR\",\"details\":{\"additionalInfo\":{\"providerStatusCode\":400},\"isRetryable\":false,\"detail\":\"tool catalog is not supported by this provider\"}}}]}}"
+                    .into(),
+            ),
+        );
+        assert!(is_sand_tool_capability_error(&error, 1));
+        assert!(
+            !settle_sand_policy_probe(
+                Some(admission),
+                model,
+                client_type,
+                token,
+                Some(&error),
+                false,
+            ),
+            "tool capability rejection is not an account policy result"
+        );
+        assert!(
+            policy_rate_limit_preflight(model, client_type, token).is_ok(),
+            "text bridge fallback must not inherit a local 429 cooldown"
         );
         reset_policy_rate_limit_breaker_for_test();
     }
@@ -13318,9 +13472,8 @@ mod tests {
     #[test]
     fn sand_open_policy_429_does_not_backoff_global_launch_window() {
         // These errors are account/model policy outcomes. The caller's
-        // account-failover path handles them, so feeding them to the cold-open
-        // AIMD controller would unnecessarily halve capacity for healthy
-        // Sand accounts.
+        // account-failover path handles them, and the cold-open scheduler must
+        // leave capacity for healthy Sand accounts unchanged.
         let quota = client::CursorError::new(
             429,
             "Connect error 429: ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: You are out of usage",

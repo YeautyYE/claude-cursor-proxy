@@ -70,7 +70,7 @@ macOS / Linux. Windows: download the `.zip` from [Releases](https://github.com/Y
 
 | Method | Command |
 | --- | --- |
-| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.110 curl -fsSL …/install.sh \| bash` |
+| Pin version | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.111 curl -fsSL …/install.sh \| bash` |
 | Custom dir | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | From source | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / mirror | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -601,7 +601,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_CURSOR_SAND_STREAM_CONCURRENCY` | `512` | Maximum accepted Sand model streams kept alive at once (1–512); excess requests wait locally and do not create duplicate upstream runs |
 | `CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT` | `512` | Initial global cold-open in-flight window (1–512); lower this only when the upstream needs a gentler ramp |
 | `CCP_CURSOR_SAND_OPEN_INITIAL_RATE` | `512` | Initial cold-open launch rate per second (1–512) |
-| `CCP_CURSOR_SAND_OPEN_RATE` | `512` | Cold-open launch-rate ceiling after AIMD recovery (1–512) |
+| `CCP_CURSOR_SAND_OPEN_RATE` | `512` | Cold-open launch-rate ceiling; transient failures do not reduce the process-wide window (1–512) |
 | `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand admission queue slice (1–120s); saturated requests stay queued and retry the slice without issuing unbounded upstream opens |
 | `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` | `12` | For unbound models, check for a viable alternate saved account after this long behind a saturated account/model lane (1–300s); otherwise keep waiting on the current lane |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | Per-attempt Sand HTTP open timeout (10–180s) |

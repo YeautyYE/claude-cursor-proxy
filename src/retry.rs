@@ -230,6 +230,11 @@ pub fn should_retry_upstream(status: u16, message: &str) -> bool {
         && !is_billing_block(message)
         && !is_capacity_shed(message)
         && !is_policy_rate_limit(message)
+        // Cursor may wrap a deterministic provider 4xx in an outer 429
+        // without the usual `resource_exhausted` marker.  Retrying that same
+        // request only repeats the provider rejection and amplifies a 429
+        // wave; the structured diagnostic must fail closed on every route.
+        && !crate::providers::cursor::connect::is_non_retryable_provider_error_message(message)
 }
 
 /// Cursor Connect often records `status: 502` while the message is still
@@ -315,7 +320,9 @@ fn embedded_connect_http_status(message: &str) -> Option<u16> {
 /// instead of backing off.
 pub fn is_local_admission_backpressure(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("sand open admission queue timed out")
+    lower.contains("sand accepted-stream admission")
+        || lower.contains("sand stream capacity is unavailable")
+        || lower.contains("sand open admission queue timed out")
         || lower.contains("sand inference open admission deadline exhausted")
         || lower.contains("cursor live generation admission queue timed out")
         || lower.contains("cursor live run admission queue timed out")
@@ -580,11 +587,24 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_provider_4xx_wrapped_in_429_is_not_retried() {
+        let message =
+            "Connect error 429: ERROR_PROVIDER_ERROR providerStatusCode=400 isRetryable=false";
+        assert!(
+            crate::providers::cursor::connect::is_non_retryable_provider_error_message(message)
+        );
+        assert_eq!(classify_proxy_error_status(429, message), 429);
+        assert!(!should_retry_upstream(429, message));
+    }
+
+    #[test]
     fn local_admission_backpressure_stays_503_even_when_wrapped() {
         // The late-retry engine folds local 503s into event strings; the
         // classifier must map them back to 503 so clients back off instead of
         // reporting "Server error (our side)" from a 502.
         for text in [
+            "Sand accepted-stream admission deadline exhausted; retry after active streams drain",
+            "Sand stream capacity is unavailable",
             "Sand open admission queue timed out; retry after upstream capacity recovers",
             "Sand inference open admission deadline exhausted; retry after upstream capacity recovers",
             "Cursor error 503: Cursor live generation admission queue timed out",
