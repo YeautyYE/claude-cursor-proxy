@@ -54,47 +54,40 @@ pub const MAX_SAND_STREAM_RETRIES: u32 = 5;
 // Sand open admission and transport breaker
 // ---------------------------------------------------------------------------
 //
-// Sand accepts large independent Claude Code/Grok fan-outs.  This gate exists
-// to bound a pathological retry wave and to keep account/model lanes
-// observable; it must not silently reduce the normal 512-way client contract.
-// Connection pressure is controlled by the shared sharded H2 client pool,
-// which reuses TLS/H2 transports rather than constructing one reqwest client
-// per request.  The AgentService live gate intentionally does not cover Sand.
+// Sand accepts large independent Claude Code/Grok fan-outs. The logical
+// request contract and the cold-open capacity are intentionally separate. A
+// request fan-out may remain 512, but opening 512 new InferenceService streams
+// in the same scheduler tick overwhelms the Grok gateway and produces a
+// synchronized 503/504 wave. Start the handshake lane conservatively and let
+// the scheduler grow it after successful opens; the hard ceiling remains 512.
 const SAND_OPEN_GLOBAL_DEFAULT: usize = 512;
 const SAND_OPEN_GLOBAL_MAX: usize = 512;
-const SAND_OPEN_ACCOUNT_DEFAULT: usize = 512;
+// Keep the account/model lane aligned with the process-wide ceiling. Account
+// balancing and policy breakers isolate unhealthy credentials; this semaphore
+// is a hard safety ceiling, not a hidden four/32-way throughput limit.
+const SAND_OPEN_ACCOUNT_DEFAULT: usize = SAND_OPEN_GLOBAL_DEFAULT;
 const SAND_OPEN_ACCOUNT_MAX: usize = 512;
-// A logical request may be queued while the upstream is opening, but a
-// response that has been accepted consumes a stream slot until its terminal
-// event (or downstream cancellation).  This is deliberately independent of
-// the cold-open bulkhead: a large Claude/Grok fan-out can queue locally while
-// at most this many model streams are actually alive upstream.
-const SAND_STREAM_GLOBAL_DEFAULT: usize = 512;
-const SAND_STREAM_GLOBAL_MAX: usize = 512;
-// Cold opens are substantially more expensive than an established HTTP/2
-// stream. The default preserves the historical 512-way contract; operators
-// can opt into a gentler ramp with CCP_CURSOR_SAND_OPEN_INITIAL_*.
-// Preserve the historical 512-way Sand fan-out by default. Operators that
-// need a gentler cold-start can opt in with CCP_CURSOR_SAND_OPEN_INITIAL_*;
-// making 16/s the default silently turns a 512-client burst into a minutes-
-// long queue and recreates the timeout wave this gate is meant to prevent.
-const SAND_OPEN_INITIAL_INFLIGHT_DEFAULT: usize = SAND_OPEN_GLOBAL_DEFAULT;
+// The initial window limits only simultaneous cold handshakes. Established
+// streams release this permit immediately after headers, so a 512-request
+// logical fan-out still proceeds concurrently once the route is warm.
+const SAND_OPEN_INITIAL_INFLIGHT_DEFAULT: usize = 32;
 const SAND_OPEN_INITIAL_INFLIGHT_MAX: usize = 512;
-const SAND_OPEN_INITIAL_RATE_DEFAULT: u64 = SAND_OPEN_RATE_MAX;
+// A token bucket starts with one window of tokens. Matching the initial
+// in-flight limit prevents the first request burst from bypassing the ramp.
+const SAND_OPEN_INITIAL_RATE_DEFAULT: u64 = 32;
+// Each account/model route gets its own adaptive handshake lane. Keeping this
+// separate from the process-wide scheduler prevents a sick Grok route from
+// consuming the entire global launch budget, while still allowing a healthy
+// route to grow toward the configured 512-way ceiling.
 const SAND_OPEN_RATE_MAX: u64 = 512;
+const SAND_OPEN_MIN_INFLIGHT: usize = 8;
+const SAND_OPEN_MIN_RATE: u64 = 8;
+const SAND_COLD_OPEN_SCHEDULER_MAX_ENTRIES: usize = 2048;
 // Keep the local fairness slice short so queued callers re-check capacity
 // promptly. A saturated slice is non-terminal backpressure; callers retry it
 // without issuing an untracked upstream open.
 const SAND_OPEN_QUEUE_DEFAULT_SECS: u64 = 3;
 const SAND_OPEN_QUEUE_MAX_SECS: u64 = 120;
-// A saturated account/model lane should hand an unbound request to the
-// account-pool failover path before the long open budget expires.  Without a
-// short handoff threshold, hundreds of callers can sit behind four stalled
-// opens for three minutes and then become a synchronized 503 wave.  This is
-// only a *lane* threshold; requests still retain the larger logical retry
-// budget once a different account (or a released slot) is selected.
-const SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_DEFAULT_SECS: u64 = 12;
-const SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_MAX_SECS: u64 = 300;
 const SAND_OPEN_BREAKER_THRESHOLD_DEFAULT: u32 = 3;
 const SAND_OPEN_BREAKER_THRESHOLD_MAX: u32 = 16;
 const SAND_OPEN_BREAKER_COOLDOWN_DEFAULT_SECS: u64 = 15;
@@ -103,6 +96,9 @@ const SAND_OPEN_BREAKER_MAX_ENTRIES: usize = 2048;
 /// One logical Claude/Grok turn may contain an initial open plus several
 /// pre-output stream replays. Keep a single wall-clock budget across those
 /// phases so each retry cannot start another unbounded 3x90s episode.
+// Keep a stalled Sand turn bounded while leaving enough room for the normal
+// long-running Grok/Fable first-token window. Callers can raise it explicitly
+// when a provider is known to take longer before its first frame.
 const SAND_LOGICAL_RETRY_DEFAULT_SECS: u64 = 600;
 const SAND_LOGICAL_RETRY_MAX_SECS: u64 = 3_600;
 
@@ -140,14 +136,6 @@ fn sand_open_account_limit() -> usize {
     )
 }
 
-fn sand_stream_global_limit() -> usize {
-    bounded_env_usize(
-        "CCP_CURSOR_SAND_STREAM_CONCURRENCY",
-        SAND_STREAM_GLOBAL_DEFAULT,
-        SAND_STREAM_GLOBAL_MAX,
-    )
-}
-
 fn sand_open_initial_inflight() -> usize {
     bounded_env_usize(
         "CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT",
@@ -160,6 +148,22 @@ fn sand_open_initial_rate() -> u64 {
     bounded_env_u64(
         "CCP_CURSOR_SAND_OPEN_INITIAL_RATE",
         SAND_OPEN_INITIAL_RATE_DEFAULT,
+        SAND_OPEN_RATE_MAX,
+    )
+}
+
+fn sand_open_route_initial_inflight() -> usize {
+    bounded_env_usize(
+        "CCP_CURSOR_SAND_ACCOUNT_OPEN_INITIAL_INFLIGHT",
+        sand_open_initial_inflight(),
+        SAND_OPEN_ACCOUNT_MAX,
+    )
+}
+
+fn sand_open_route_initial_rate() -> u64 {
+    bounded_env_u64(
+        "CCP_CURSOR_SAND_ACCOUNT_OPEN_INITIAL_RATE",
+        sand_open_initial_rate(),
         SAND_OPEN_RATE_MAX,
     )
 }
@@ -189,19 +193,6 @@ pub(crate) fn sand_open_queue_secs() -> u64 {
         "CCP_CURSOR_SAND_OPEN_QUEUE_SECS",
         SAND_OPEN_QUEUE_DEFAULT_SECS,
         SAND_OPEN_QUEUE_MAX_SECS,
-    )
-}
-
-/// How long an open caller waits behind a saturated account/model lane before
-/// returning a retryable admission diagnostic to the account-pool selector.
-/// The value is intentionally configurable for deployments with a very slow
-/// but high-capacity upstream; the default keeps Claude Code's retry window
-/// responsive during a burst.
-pub(crate) fn sand_open_account_queue_failover_secs() -> u64 {
-    bounded_env_u64(
-        "CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS",
-        SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_DEFAULT_SECS,
-        SAND_OPEN_ACCOUNT_QUEUE_FAILOVER_MAX_SECS,
     )
 }
 
@@ -285,6 +276,31 @@ impl SandOpenGate {
         Some(gate)
     }
 
+    /// Try to reserve both the process-wide and account/model dimensions
+    /// without waiting. This is used by the three-way Sand admission loop so
+    /// a caller never holds one bulkhead while waiting for another one (or
+    /// while waiting for the cold-open scheduler).
+    fn try_acquire(&self, key: &str) -> Option<SandOpenPermit> {
+        let account_gate = self.account_gate(key)?;
+        let global = Arc::clone(&self.global).try_acquire_owned().ok()?;
+        match account_gate.try_acquire_owned() {
+            Ok(account) => Some(SandOpenPermit {
+                global: Some(global),
+                account: Some(account),
+                wake: Arc::clone(&self.wake),
+                global_cold_open: None,
+                route_cold_open: None,
+            }),
+            Err(_) => {
+                // `global` is dropped before returning so a busy account lane
+                // never reserves a process-wide slot.
+                drop(global);
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn acquire(&self, key: &str, wait: Duration) -> Result<SandOpenPermit, CursorError> {
         let deadline = Instant::now() + wait;
         // Resolve the lane once. `account_gate` only mutates the map while
@@ -308,7 +324,8 @@ impl SandOpenGate {
                             global: Some(global),
                             account: Some(account),
                             wake: Arc::clone(&self.wake),
-                            cold_open: None,
+                            global_cold_open: None,
+                            route_cold_open: None,
                         });
                     }
                     Err(_) => {
@@ -339,6 +356,7 @@ impl SandOpenGate {
     /// saturated. The caller keeps the logical request queued and retries the
     /// admission slice; it must not issue a permit-less upstream open because
     /// that would defeat the bulkhead during a retry burst.
+    #[cfg(test)]
     async fn acquire_soft(&self, key: &str, wait: Duration) -> Option<SandOpenPermit> {
         self.acquire(key, wait).await.ok()
     }
@@ -353,7 +371,8 @@ pub(crate) struct SandOpenPermit {
     global: Option<OwnedSemaphorePermit>,
     account: Option<OwnedSemaphorePermit>,
     wake: Arc<Notify>,
-    cold_open: Option<SandColdOpenPermit>,
+    global_cold_open: Option<SandColdOpenPermit>,
+    route_cold_open: Option<SandColdOpenPermit>,
 }
 
 impl Drop for SandOpenPermit {
@@ -362,66 +381,18 @@ impl Drop for SandOpenPermit {
         // custom Drop body runs before fields are dropped, hence the explicit
         // `take`; notifying first would wake every task while both dimensions
         // still appeared full and defer progress to the timer fallback.
+        // Cancellation is neutral scheduler feedback; only an actual HTTP
+        // outcome should count as a success or failure sample.
+        if let Some(cold_open) = self.route_cold_open.as_mut() {
+            cold_open.cancel();
+        }
+        if let Some(cold_open) = self.global_cold_open.as_mut() {
+            cold_open.cancel();
+        }
         self.account.take();
         self.global.take();
         self.wake.notify_waiters();
     }
-}
-
-/// An accepted Sand response keeps this permit until its HTTP body is drained
-/// or dropped.  That makes the stream limit cover the actual upstream model
-/// lifetime rather than only the request-header handshake.
-#[derive(Debug)]
-pub(crate) struct SandStreamPermit {
-    permit: Option<OwnedSemaphorePermit>,
-}
-
-impl Drop for SandStreamPermit {
-    fn drop(&mut self) {
-        self.permit.take();
-    }
-}
-
-static SAND_STREAM_GATE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(sand_stream_global_limit())));
-
-/// Wait for capacity for one accepted upstream model stream. Unlike the open
-/// scheduler, this is intentionally a fixed lifetime capacity: every permit
-/// is returned by `SandInferenceStream::drop`, including downstream cancel.
-pub(crate) async fn admit_sand_stream_until(
-    deadline: Instant,
-) -> Result<SandStreamPermit, CursorError> {
-    admit_sand_stream_from_gate(Arc::clone(&SAND_STREAM_GATE), deadline).await
-}
-
-/// Acquire accepted-stream capacity from a specific gate. Keeping the gate as
-/// an argument makes the admission lifecycle testable without
-/// mutating the process-wide 512-stream gate.
-async fn admit_sand_stream_from_gate(
-    gate: Arc<Semaphore>,
-    deadline: Instant,
-) -> Result<SandStreamPermit, CursorError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(sand_stream_admission_error());
-    }
-    let permit = tokio::time::timeout(remaining, gate.acquire_owned())
-        .await
-        .map_err(|_| sand_stream_admission_error())?
-        .map_err(|_| CursorError::new(503, "Sand stream capacity is unavailable", None))?;
-    Ok(SandStreamPermit {
-        permit: Some(permit),
-    })
-}
-
-fn sand_stream_admission_error() -> CursorError {
-    let mut error = CursorError::new(
-        504,
-        "Sand accepted-stream admission deadline exhausted; retry after active streams drain",
-        None,
-    );
-    error.retry_after = Some("1".to_string());
-    error
 }
 
 /// Global cold-open controller.
@@ -439,6 +410,7 @@ fn sand_stream_admission_error() -> CursorError {
 struct SandColdOpenScheduler {
     state: Mutex<SandColdOpenState>,
     wake: Arc<Notify>,
+    adaptive_failure_backoff: bool,
 }
 
 #[derive(Debug)]
@@ -446,31 +418,69 @@ struct SandColdOpenState {
     in_flight: usize,
     inflight_limit: usize,
     max_inflight: usize,
+    min_inflight: usize,
     rate_per_second: f64,
     max_rate_per_second: f64,
+    min_rate_per_second: f64,
     tokens: f64,
     last_refill: Instant,
+    window_attempts: usize,
+    window_failures: usize,
+    window_target: usize,
     successes_since_increase: usize,
 }
 
 impl SandColdOpenScheduler {
     fn new(initial_inflight: usize, initial_rate: u64, max_rate: u64) -> Self {
-        let max_inflight = sand_open_global_limit();
+        Self::with_limits(
+            initial_inflight,
+            initial_rate,
+            max_rate,
+            sand_open_global_limit(),
+            false,
+        )
+    }
+
+    fn new_route(initial_inflight: usize, initial_rate: u64, max_rate: u64) -> Self {
+        Self::with_limits(
+            initial_inflight,
+            initial_rate,
+            max_rate,
+            sand_open_account_limit(),
+            true,
+        )
+    }
+
+    fn with_limits(
+        initial_inflight: usize,
+        initial_rate: u64,
+        max_rate: u64,
+        max_inflight: usize,
+        adaptive_failure_backoff: bool,
+    ) -> Self {
         let inflight_limit = initial_inflight.clamp(1, max_inflight);
+        let min_inflight = SAND_OPEN_MIN_INFLIGHT.min(inflight_limit);
         let max_rate_per_second = max_rate.clamp(1, SAND_OPEN_RATE_MAX) as f64;
         let rate_per_second = (initial_rate.clamp(1, max_rate) as f64).min(max_rate_per_second);
+        let min_rate_per_second = (SAND_OPEN_MIN_RATE as f64).min(rate_per_second);
         Self {
             state: Mutex::new(SandColdOpenState {
                 in_flight: 0,
                 inflight_limit,
                 max_inflight,
+                min_inflight,
                 rate_per_second,
                 max_rate_per_second,
+                min_rate_per_second,
                 tokens: rate_per_second,
                 last_refill: Instant::now(),
+                window_attempts: 0,
+                window_failures: 0,
+                window_target: inflight_limit,
                 successes_since_increase: 0,
             }),
             wake: Arc::new(Notify::new()),
+            adaptive_failure_backoff,
         }
     }
 
@@ -483,11 +493,37 @@ impl SandColdOpenScheduler {
         state.last_refill = now;
     }
 
+    /// Reserve one cold-open slot only when both the in-flight window and the
+    /// token bucket are ready. The caller must drop the returned permit before
+    /// retrying another admission dimension; no scheduler capacity is held
+    /// while the account/global gate is unavailable.
+    fn try_acquire_now(self: &Arc<Self>) -> Option<SandColdOpenPermit> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Self::refill(&mut state, now);
+        if state.in_flight >= state.inflight_limit || state.tokens < 1.0 {
+            return None;
+        }
+        state.in_flight += 1;
+        state.tokens -= 1.0;
+        Some(SandColdOpenPermit {
+            scheduler: Arc::clone(self),
+            completed: false,
+        })
+    }
+
+    #[cfg(test)]
     async fn acquire(
         self: &Arc<Self>,
         deadline: Instant,
     ) -> Result<SandColdOpenPermit, CursorError> {
         loop {
+            if let Some(permit) = self.try_acquire_now() {
+                return Ok(permit);
+            }
             let wait = {
                 let now = Instant::now();
                 let mut state = self
@@ -495,14 +531,6 @@ impl SandColdOpenScheduler {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
                 Self::refill(&mut state, now);
-                if state.in_flight < state.inflight_limit && state.tokens >= 1.0 {
-                    state.in_flight += 1;
-                    state.tokens -= 1.0;
-                    return Ok(SandColdOpenPermit {
-                        scheduler: Arc::clone(self),
-                        completed: false,
-                    });
-                }
                 let rate_wait = if state.tokens < 1.0 {
                     Duration::from_secs_f64(
                         ((1.0 - state.tokens) / state.rate_per_second).max(0.001),
@@ -529,27 +557,36 @@ impl SandColdOpenScheduler {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         state.in_flight = state.in_flight.saturating_sub(1);
-        if success {
-            state.successes_since_increase += 1;
-            // Grow once per completed launch window. The bounded proportional
-            // step reaches a recovered high-capacity route promptly while
-            // still giving the upstream a full window between increases.
-            if state.successes_since_increase >= state.inflight_limit {
+        state.window_attempts = state.window_attempts.saturating_add(1);
+        if !success {
+            state.window_failures = state.window_failures.saturating_add(1);
+        }
+        state.successes_since_increase = state
+            .successes_since_increase
+            .saturating_add(usize::from(success));
+
+        // Evaluate once per launch window. A synchronized outage therefore
+        // performs one controlled decrease instead of halving the lane once
+        // per completion as the old global scheduler did.
+        if state.window_attempts >= state.window_target.max(1) {
+            let failed = state.window_failures;
+            let attempts = state.window_attempts;
+            if self.adaptive_failure_backoff && failed.saturating_mul(2) >= attempts {
+                state.inflight_limit = (state.inflight_limit / 2).max(state.min_inflight);
+                state.rate_per_second =
+                    (state.rate_per_second / 2.0).max(state.min_rate_per_second);
+                state.tokens = state.tokens.min(state.rate_per_second);
+            } else if failed == 0 && state.inflight_limit < state.max_inflight {
                 let window_step = (state.inflight_limit / 4).max(1);
                 state.inflight_limit = (state.inflight_limit + window_step).min(state.max_inflight);
                 let rate_step = (state.rate_per_second / 4.0).max(1.0);
                 state.rate_per_second =
                     (state.rate_per_second + rate_step).min(state.max_rate_per_second);
-                state.successes_since_increase = 0;
+                state.tokens = state.tokens.min(state.rate_per_second);
             }
-        } else {
-            // Do not apply multiplicative decrease here.  This state is
-            // process-global, while failures are account/model scoped and
-            // may arrive in a synchronized burst.  Reducing the shared
-            // window for each failed completion collapses a normal 512-way
-            // fan-out to one slot and turns transient upstream errors into a
-            // local admission/503 storm.  The request-level retry/backoff and
-            // account/model breaker provide the appropriate isolation.
+            state.window_attempts = 0;
+            state.window_failures = 0;
+            state.window_target = state.inflight_limit.max(1);
             state.successes_since_increase = 0;
         }
         drop(state);
@@ -590,6 +627,12 @@ impl SandColdOpenPermit {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             state.in_flight = state.in_flight.saturating_sub(1);
+            // Cancellation means no upstream attempt was made. Return the
+            // launch token as well as the in-flight slot; otherwise a route
+            // scheduler race (global slot acquired, account route unavailable)
+            // can drain the process-wide token bucket and throttle unrelated
+            // healthy routes until the refill timer catches up.
+            state.tokens = (state.tokens + 1.0).min(state.rate_per_second.max(1.0));
             drop(state);
             self.scheduler.wake.notify_waiters();
         }
@@ -602,27 +645,68 @@ impl Drop for SandColdOpenPermit {
     }
 }
 
-static SAND_COLD_OPEN_SCHEDULER: LazyLock<Arc<SandColdOpenScheduler>> = LazyLock::new(|| {
-    Arc::new(SandColdOpenScheduler::new(
-        sand_open_initial_inflight(),
-        sand_open_initial_rate(),
+static SAND_COLD_OPEN_SCHEDULERS: LazyLock<Mutex<HashMap<String, Arc<SandColdOpenScheduler>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Process-wide cold-open ramp. The hard semaphore remains 512, but this
+/// controller keeps a fresh process from launching a full 512-way handshake
+/// wave before it has observed successful headers.
+static SAND_GLOBAL_COLD_OPEN_SCHEDULER: LazyLock<Arc<SandColdOpenScheduler>> =
+    LazyLock::new(|| {
+        Arc::new(SandColdOpenScheduler::new(
+            sand_open_initial_inflight(),
+            sand_open_initial_rate(),
+            sand_open_rate_ceiling(),
+        ))
+    });
+
+/// Keep adaptive failure feedback isolated by account and model. A sick Grok
+/// route must not slow a healthy Gemini/Fable route, while the bounded map
+/// prevents account rotation from retaining unbounded scheduler state.
+fn sand_cold_open_scheduler(key: &str) -> Arc<SandColdOpenScheduler> {
+    let mut schedulers = SAND_COLD_OPEN_SCHEDULERS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(scheduler) = schedulers.get(key) {
+        return Arc::clone(scheduler);
+    }
+    if schedulers.len() >= SAND_COLD_OPEN_SCHEDULER_MAX_ENTRIES
+        && let Some(idle) = schedulers
+            .iter()
+            .find(|(_, scheduler)| Arc::strong_count(scheduler) == 1)
+            .map(|(key, _)| key.clone())
+    {
+        schedulers.remove(&idle);
+    }
+    let scheduler = Arc::new(SandColdOpenScheduler::new_route(
+        sand_open_route_initial_inflight(),
+        sand_open_route_initial_rate(),
         sand_open_rate_ceiling(),
-    ))
-});
+    ));
+    schedulers.insert(key.to_string(), Arc::clone(&scheduler));
+    scheduler
+}
 
 impl SandOpenPermit {
-    fn attach_cold_open(&mut self, permit: SandColdOpenPermit) {
-        self.cold_open = Some(permit);
+    fn attach_cold_opens(&mut self, global: SandColdOpenPermit, route: SandColdOpenPermit) {
+        self.global_cold_open = Some(global);
+        self.route_cold_open = Some(route);
     }
 
     pub(crate) fn record_open_outcome(&mut self, success: bool) {
-        if let Some(cold_open) = self.cold_open.as_mut() {
+        if let Some(cold_open) = self.global_cold_open.as_mut() {
+            cold_open.complete(success);
+        }
+        if let Some(cold_open) = self.route_cold_open.as_mut() {
             cold_open.complete(success);
         }
     }
 
     pub(crate) fn record_open_neutral(&mut self) {
-        if let Some(cold_open) = self.cold_open.as_mut() {
+        if let Some(cold_open) = self.global_cold_open.as_mut() {
+            cold_open.cancel();
+        }
+        if let Some(cold_open) = self.route_cold_open.as_mut() {
             cold_open.cancel();
         }
     }
@@ -651,23 +735,48 @@ pub(crate) async fn admit_sand_open_until(
     deadline: Instant,
 ) -> Result<Option<SandOpenPermit>, CursorError> {
     let key = capability_key(token, model).0;
+    let route_scheduler = sand_cold_open_scheduler(&key);
+    let global_scheduler = Arc::clone(&*SAND_GLOBAL_COLD_OPEN_SCHEDULER);
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(sand_open_admission_error());
     }
     let queue_wait = remaining.min(Duration::from_secs(sand_open_queue_secs()));
-    let mut cold_open = SAND_COLD_OPEN_SCHEDULER.acquire(deadline).await?;
-    match SAND_OPEN_GATE.acquire_soft(&key, queue_wait).await {
-        Some(mut permit) => {
-            // The cold scheduler token is now paired with a real open permit;
-            // it remains attached until the HTTP outcome is known.
-            permit.attach_cold_open(cold_open);
-            Ok(Some(permit))
+    let slice_deadline = Instant::now() + queue_wait;
+
+    // Admission has three independent dimensions:
+    //
+    //   * process-wide/account-model semaphores protect HTTP open/headers;
+    //   * the global cold-open scheduler paces process-wide handshakes;
+    //   * the route scheduler isolates account/model failures.
+    //
+    // Never acquire one dimension and then await another. Pair all three
+    // with non-blocking attempts and release any partial reservation before
+    // sleeping. This preserves the historical 512 logical fan-out while
+    // preventing a cold route or synchronized upstream outage from collapsing
+    // every other route into proxy-generated 503/504 waves.
+    loop {
+        if let Some(mut permit) = SAND_OPEN_GATE.try_acquire(&key) {
+            if let Some(global_cold_open) = global_scheduler.try_acquire_now() {
+                if let Some(route_cold_open) = route_scheduler.try_acquire_now() {
+                    permit.attach_cold_opens(global_cold_open, route_cold_open);
+                    return Ok(Some(permit));
+                }
+                // Do not retain a process-wide scheduler reservation while
+                // waiting for this route's adaptive window.
+                let mut global_cold_open = global_cold_open;
+                global_cold_open.cancel();
+            }
+            // `SandOpenPermit::Drop` releases both semaphore dimensions and
+            // neutralizes any attached scheduler reservation.
+            drop(permit);
         }
-        None => {
-            cold_open.cancel();
-            // A saturated slice is expected under fan-out. Keep it observable
-            // for diagnostics, but let the caller wait for a real permit.
+
+        let left = slice_deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            // A saturated slice is expected under fan-out. Keep it observable,
+            // but let the caller wait and retry instead of issuing an
+            // untracked upstream open.
             create_logger("cursor").debug(
                 "sand_open_admission_wait",
                 Some(serde_json::Map::from_iter([
@@ -676,7 +785,16 @@ pub(crate) async fn admit_sand_open_until(
                     ("queueMs".into(), serde_json::json!(queue_wait.as_millis())),
                 ])),
             );
-            Ok(None)
+            return Ok(None);
+        }
+
+        // All dimensions notify on release. The bounded timer handles the
+        // lost-wakeup race between the non-blocking attempt and subscription.
+        tokio::select! {
+            _ = SAND_OPEN_GATE.wake.notified() => {},
+            _ = global_scheduler.wake.notified() => {},
+            _ = route_scheduler.wake.notified() => {},
+            _ = tokio::time::sleep(left.min(Duration::from_millis(100))) => {},
         }
     }
 }
@@ -1317,10 +1435,10 @@ pub fn stream_error_is_retryable(error: &CursorError) -> bool {
         || crate::retry::is_billing_block(&message)
         || crate::retry::is_policy_rate_limit(&message)
         || crate::retry::is_capacity_shed(&message)
-        // This is proxy-local backpressure after a successful HTTP open. The
-        // response body is dropped on timeout, so replaying another open while
-        // the accepted-stream gate is full would create duplicate upstream
-        // invocations instead of freeing capacity.
+        // Keep compatibility with diagnostics emitted by older proxy
+        // versions. These messages describe local backpressure rather than a
+        // provider result, so replaying another upstream invocation would
+        // only amplify the queue.
         || lower.contains("sand accepted-stream admission")
         || lower.contains("sand stream capacity is unavailable")
         || lower.contains("sand traffic is not supported")
@@ -2180,9 +2298,6 @@ pub struct SandInferenceStream {
     terminal_emitted: bool,
     tool_buffers: HashMap<String, SandToolBuffer>,
     completed_tool_ids: HashSet<String>,
-    // Kept last so every early return, clean End, decoder error, and
-    // downstream cancellation returns active-stream capacity uniformly.
-    stream_permit: Option<SandStreamPermit>,
 }
 
 #[derive(Debug, Default)]
@@ -2210,13 +2325,7 @@ impl SandInferenceStream {
             terminal_emitted: false,
             tool_buffers: HashMap::new(),
             completed_tool_ids: HashSet::new(),
-            stream_permit: None,
         }
-    }
-
-    pub(crate) fn with_stream_permit(mut self, permit: SandStreamPermit) -> Self {
-        self.stream_permit = Some(permit);
-        self
     }
 
     /// Queue one and only one terminal event.  Marking the stream ended here
@@ -2405,13 +2514,7 @@ impl SandInferenceStream {
 }
 
 #[cfg(test)]
-pub(crate) fn pending_stream_with_permit_and_notify_for_test(
-    gate: Arc<Semaphore>,
-    polled: Arc<Notify>,
-) -> SandInferenceStream {
-    let permit = gate
-        .try_acquire_owned()
-        .expect("pending stream fixture should own its capacity permit");
+pub(crate) fn pending_stream_with_notify_for_test(polled: Arc<Notify>) -> SandInferenceStream {
     let bytes = futures_util::stream::poll_fn(move |_cx| {
         polled.notify_one();
         Poll::Pending
@@ -2426,9 +2529,6 @@ pub(crate) fn pending_stream_with_permit_and_notify_for_test(
         terminal_emitted: false,
         tool_buffers: HashMap::new(),
         completed_tool_ids: HashSet::new(),
-        stream_permit: Some(SandStreamPermit {
-            permit: Some(permit),
-        }),
     }
 }
 
@@ -4078,7 +4178,6 @@ mod tests {
             terminal_emitted: false,
             tool_buffers: HashMap::new(),
             completed_tool_ids: HashSet::new(),
-            stream_permit: None,
         }
     }
 
@@ -4522,47 +4621,6 @@ mod tests {
         assert!(!stream_error_is_retryable(&error), "{message}");
     }
 
-    #[tokio::test]
-    async fn accepted_stream_admission_waits_for_capacity_and_releases_on_drop() {
-        let gate = Arc::new(Semaphore::new(0));
-        let waiting = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                admit_sand_stream_from_gate(gate, Instant::now() + Duration::from_secs(1)).await
-            })
-        };
-
-        // The accepted-stream waiter must remain pending until an existing
-        // stream releases capacity; this path is entered only after HTTP open.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(gate.available_permits(), 0);
-        gate.add_permits(1);
-        let permit = tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("accepted-stream admission should wake after release")
-            .expect("admission task should not panic")
-            .expect("released accepted-stream slot should be acquired");
-        assert_eq!(gate.available_permits(), 0);
-        drop(permit);
-        assert_eq!(gate.available_permits(), 1);
-    }
-
-    #[tokio::test]
-    async fn accepted_stream_admission_timeout_has_local_backpressure_error() {
-        let gate = Arc::new(Semaphore::new(0));
-        let error = admit_sand_stream_from_gate(gate, Instant::now() + Duration::from_millis(20))
-            .await
-            .expect_err("a full accepted-stream gate should time out");
-        assert_eq!(error.status, 504);
-        assert_eq!(error.retry_after.as_deref(), Some("1"));
-        assert!(
-            error
-                .client_message()
-                .contains("accepted-stream admission deadline exhausted")
-        );
-        assert!(!stream_error_is_retryable(&error));
-    }
-
     #[test]
     fn sand_stream_retry_default_covers_transient_provider_window() {
         assert_eq!(DEFAULT_SAND_STREAM_RETRIES, 5);
@@ -4913,19 +4971,58 @@ mod tests {
         drop(second);
     }
 
-    #[tokio::test]
-    async fn stream_permit_lives_with_the_stream_and_returns_on_drop() {
-        let gate = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&gate)
-            .acquire_owned()
-            .await
-            .expect("fixture semaphore should be open");
-        let stream = test_stream().with_stream_permit(SandStreamPermit {
-            permit: Some(permit),
-        });
-        assert_eq!(gate.available_permits(), 0);
-        drop(stream);
-        assert_eq!(gate.available_permits(), 1);
+    #[test]
+    fn sand_three_way_try_admission_does_not_hold_partial_capacity() {
+        // The production admission loop pairs this gate with the cold-open
+        // scheduler. If either dimension is unavailable, neither one may be
+        // left reserved while the caller waits for the other.
+        let gate = SandOpenGate::new(1, 1);
+        let scheduler = Arc::new(SandColdOpenScheduler::new(1, 1, 1));
+
+        let held_gate = gate
+            .try_acquire("account-a\0model")
+            .expect("gate should admit the first open");
+        let held_cold = scheduler
+            .try_acquire_now()
+            .expect("scheduler should admit the first open");
+
+        assert!(gate.try_acquire("account-a\0model").is_none());
+        assert!(scheduler.try_acquire_now().is_none());
+        assert_eq!(
+            gate.global.available_permits(),
+            0,
+            "the held gate is the only global reservation"
+        );
+        assert_eq!(
+            scheduler.snapshot().0,
+            1,
+            "the held scheduler permit is the only cold-open reservation"
+        );
+
+        drop(held_gate);
+        drop(held_cold);
+        assert!(gate.try_acquire("account-a\0model").is_some());
+        assert_eq!(
+            scheduler.snapshot().0,
+            0,
+            "dropping the scheduler permit must release its in-flight slot"
+        );
+    }
+
+    #[test]
+    fn canceled_cold_open_reservation_refunds_rate_token() {
+        let scheduler = Arc::new(SandColdOpenScheduler::new(1, 1, 1));
+        let mut first = scheduler
+            .try_acquire_now()
+            .expect("initial token should admit one reservation");
+        first.cancel();
+
+        // A canceled reservation never reached the upstream. The next
+        // admission must not wait for the one-token-per-second refill.
+        let mut second = scheduler
+            .try_acquire_now()
+            .expect("cancellation should refund the token");
+        second.cancel();
     }
 
     #[tokio::test]
@@ -4946,6 +5043,52 @@ mod tests {
             scheduler.snapshot(),
             (0, 3, 64),
             "one failed route must not shrink the process-wide launch window"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_cold_open_scheduler_reduces_only_the_failed_route_window() {
+        // Account/model schedulers use a bounded failure ratio to slow a sick
+        // Sand route without changing the process-wide 512-way gate. The
+        // global scheduler intentionally keeps its launch window unchanged;
+        // only this route should be reduced after a synchronized outage.
+        let scheduler = Arc::new(SandColdOpenScheduler::new_route(16, 64, 64));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut permits = Vec::with_capacity(16);
+        for _ in 0..16 {
+            permits.push(
+                scheduler
+                    .acquire(deadline)
+                    .await
+                    .expect("route should admit its initial window"),
+            );
+        }
+        for mut permit in permits {
+            permit.complete(false);
+        }
+        assert_eq!(
+            scheduler.snapshot(),
+            (0, 8, 32),
+            "a failed route should halve once per window, not per completion"
+        );
+
+        let global = Arc::new(SandColdOpenScheduler::new(16, 64, 64));
+        let mut global_permits = Vec::with_capacity(16);
+        for _ in 0..16 {
+            global_permits.push(
+                global
+                    .acquire(deadline)
+                    .await
+                    .expect("global scheduler should admit its window"),
+            );
+        }
+        for mut permit in global_permits {
+            permit.complete(false);
+        }
+        assert_eq!(
+            global.snapshot(),
+            (0, 16, 64),
+            "a route outage must not back off the global scheduler"
         );
     }
 
@@ -5042,18 +5185,17 @@ mod tests {
     }
 
     #[test]
-    fn sand_open_defaults_preserve_512_way_fanout() {
-        // Sand's open gate is a hard safety ceiling, not a low default
-        // throughput throttle. A normal 512-way caller must reach the shared
-        // H2 transport without a proxy-generated admission failure.
+    fn sand_open_defaults_keep_logical_fanout_and_ramp_cold_opens() {
+        // The semaphore remains capable of admitting the historical 512-way
+        // request fan-out. Only the initial handshake window/rate is smaller;
+        // successful opens grow the scheduler toward that ceiling. This keeps
+        // a cold Grok route from receiving 512 simultaneous handshakes.
         assert_eq!(SAND_OPEN_GLOBAL_DEFAULT, 512);
         assert_eq!(SAND_OPEN_ACCOUNT_DEFAULT, 512);
         assert_eq!(SAND_OPEN_GLOBAL_MAX, 512);
         assert_eq!(SAND_OPEN_ACCOUNT_MAX, 512);
-        assert_eq!(SAND_STREAM_GLOBAL_DEFAULT, 512);
-        assert_eq!(SAND_STREAM_GLOBAL_MAX, 512);
-        assert_eq!(SAND_OPEN_INITIAL_INFLIGHT_DEFAULT, 512);
-        assert_eq!(SAND_OPEN_INITIAL_RATE_DEFAULT, 512);
+        assert_eq!(SAND_OPEN_INITIAL_INFLIGHT_DEFAULT, 32);
+        assert_eq!(SAND_OPEN_INITIAL_RATE_DEFAULT, 32);
     }
 
     #[tokio::test]

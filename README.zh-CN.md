@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/YeautyYE/claude-cursor-proxy/main/i
 
 | 方式 | 命令 |
 | --- | --- |
-| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.113 curl -fsSL …/install.sh \| bash` |
+| 固定版本 | `CLAUDE_CURSOR_PROXY_VERSION=v0.1.114 curl -fsSL …/install.sh \| bash` |
 | 安装到指定目录 | `CLAUDE_CURSOR_PROXY_INSTALL_DIR=/opt/bin bash install.sh` |
 | 从源码安装 | `cargo install --git https://github.com/YeautyYE/claude-cursor-proxy --locked` |
 | Fork / 镜像 | `GITHUB_REPO=owner/repo curl -fsSL https://raw.githubusercontent.com/owner/repo/main/install.sh \| bash` |
@@ -536,23 +536,24 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_SAND_STRICT_H2` | `0` | 强制 Sand 使用严格 H2 prior-knowledge；经过 HTTPS 代理时建议保持默认 TLS ALPN |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头；TUI 的 `t` 选择器会把选择保存到 `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |
-| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Sand InferenceService 同时建立的连接上限（1–512） |
-| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | 单账号/模型路由同时建立的 Sand 连接上限（1–512） |
-| `CCP_CURSOR_SAND_STREAM_CONCURRENCY` | `512` | 同时存活的 Sand 模型流上限（1–512）；超出后在本地排队，不会重复创建上游 Run |
-| `CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT` | `512` | 冷启动初始全局并发窗口（1–512）；只有上游需要更平缓的启动时才调低 |
-| `CCP_CURSOR_SAND_OPEN_INITIAL_RATE` | `512` | 冷启动初始每秒建连速率（1–512） |
+| `CCP_CURSOR_SAND_OPEN_CONCURRENCY` | `512` | Sand InferenceService 冷启动连接的最大并发（1–512）；逻辑请求队列仍为 512 |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_CONCURRENCY` | `512` | 单账号/模型路由的 Sand 冷启动连接上限（1–512）；默认不隐藏降低并发 |
+| `CCP_CURSOR_SAND_OPEN_INITIAL_INFLIGHT` | `32` | 冷启动初始全局并发窗口（1–512）；成功建连后会向 512 硬上限自适应增长 |
+| `CCP_CURSOR_SAND_OPEN_INITIAL_RATE` | `32` | 冷启动初始每秒建连速率（1–512）；这里只限制握手，不限制逻辑请求并发 |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_INITIAL_INFLIGHT` | `32` | 单账号/模型冷启动初始并发窗口（1–512）；每条路由独立自适应 |
+| `CCP_CURSOR_SAND_ACCOUNT_OPEN_INITIAL_RATE` | `32` | 单账号/模型冷启动初始每秒建连速率（1–512） |
 | `CCP_CURSOR_SAND_OPEN_RATE` | `512` | 建连速率上限；瞬时失败不会降低进程级并发窗口（1–512） |
 | `CCP_CURSOR_SAND_OPEN_QUEUE_SECS` | `3` | Sand 准入队列片段（1–120 秒）；饱和请求会继续排队重试，不会无界地向上游建连 |
-| `CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` | `12` | 未绑定账号的模型在某个账号/模型通道饱和后，等待该时长检查可用的备用账号（1–300 秒）；没有可用备用账号时继续等待当前通道 |
 | `CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS` | `90` | 单次 Sand HTTP 建连超时（10–180 秒） |
 | `CCP_CURSOR_SAND_OPEN_TOTAL_SECS` | `180` | 一次 Sand 建连及重试总预算（20–900 秒） |
-| `CCP_CURSOR_SAND_OPEN_RETRIES` | `3` | 一次 Sand 建连内部的最大重试次数（0–8；仍受共享 attempt 预算限制） |
-| `CCP_CURSOR_SAND_TOTAL_ATTEMPTS` | `3` | 一次逻辑请求的传输调用预算，覆盖建连重试和无输出流重放（1–8）；账号切换使用独立预算 |
+| `CCP_CURSOR_SAND_OPEN_RETRIES` | 未设置（`TOTAL_ATTEMPTS - 1`） | 一次 Sand 建连内部的最大重试次数（0–8）；显式设置时可进一步降低本次建连上限 |
+| `CCP_CURSOR_SAND_TOTAL_ATTEMPTS` | `3` | 单个建连 episode 的传输调用上限（1–8）；整个逻辑请求还受 `CCP_CURSOR_SAND_LOGICAL_ATTEMPTS` 限制 |
+| `CCP_CURSOR_SAND_LOGICAL_ATTEMPTS` | `8` | 一次逻辑请求从首次建连到所有无输出重放允许的 Sand 传输总次数（1–32） |
 | `CCP_CURSOR_SAND_ACCOUNT_FAILOVER_ATTEMPTS` | `16` | 一次逻辑 Sand 请求最多切换的备用账号数（1–16），与传输重试独立计数 |
 | `CCP_CURSOR_SAND_OPERATION_ENTRIES` | `2048` | 进程内逻辑 Sand 操作记录上限；超过后返回有界背压 |
-| `CCP_CURSOR_SAND_OPERATION_SUBSCRIBERS` | `128` | 单个逻辑操作允许挂载的 HTTP 重试请求上限 |
+| `CCP_CURSOR_SAND_OPERATION_SUBSCRIBERS` | `512` | 单个逻辑操作允许挂载的 HTTP 重试请求上限，与文档并发扇出一致 |
 | `CCP_CURSOR_SAND_OPERATION_REPLAY_EVENTS` / `CCP_CURSOR_SAND_OPERATION_REPLAY_BYTES` | `16384` / `16MiB` | 重复请求使用的有界回放历史；超限时保持单 owner，不再创建第二个上游 Run |
-| `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | 初始建连和无输出流重放共用的逻辑预算（60–3600 秒） |
+| `CCP_CURSOR_SAND_RETRY_BUDGET_SECS` | `600` | 初始建连和无输出流重放共用的逻辑预算（60–3600 秒）；排队时间计入该预算，但每次获得准入后的建连仍有独立传输预算 |
 | `CCP_CURSOR_SAND_BREAKER_THRESHOLD` | `3` | 连续瞬时建连失败后打开账号/模型熔断（1–16 次） |
 | `CCP_CURSOR_SAND_BREAKER_COOLDOWN_SECS` | `15` | Sand 账号/模型熔断冷却时间（1–300 秒） |
 | `CCP_CURSOR_MODEL_ACCOUNTS` | 未设置 | JSON 对象或 `模型=账号` 列表；把 Cursor 模型规则绑定到账号 ID、唯一标签或邮箱，支持 `*` 和 `?` |
@@ -573,7 +574,8 @@ claude-cursor-proxy cursor auth status
 | `CCP_CURSOR_LIVE_NESTED_WAIT_MS` | `1500` | 响应提交前等待嵌套 agent 交接（500–5000 毫秒） |
 | `CCP_CURSOR_RESOURCE_RETRIES` | `6` | Cursor 瞬时 `ERROR_RESOURCE_EXHAUSTED` 的同请求自动重试次数（1–12）；账单、额度和 High Load 等策略型 429 不会隐藏重试 |
 | `CCP_CURSOR_POLICY_429_COOLDOWN_SECS` | `30` | 账号/模型/Sand-or-CLI 路由策略型 429 后的本地冷却时间；该精确路由的新请求快速返回 HTTP 429 + `Retry-After`（5–600 秒） |
-| `CCP_CURSOR_POLICY_429_PROBE_WINDOW_MS` | `30000` | 冷账号/模型/路由的 single-flight 窗口：有效输出会立即放行；安静超时时每个窗口只增放一个探测，不会将全部重试一次性放行（25–120000 毫秒） |
+| `CCP_CURSOR_POLICY_429_PROBE_WINDOW_MS` | `30000` | CLI/API 冷账号/模型/路由的 single-flight 窗口：有效输出会立即放行；安静超时时每个窗口只增加一个探测（25–120000 毫秒） |
+| `CCP_CURSOR_SAND_POLICY_429_PROBE_WINDOW_MS` | `5000` | Sand/Bot 冷账号/模型 single-flight 窗口；后续额度证据仍会打开账号熔断（25–120000 毫秒） |
 | `CCP_CURSOR_STEP_FAILURE_RETRIES` | `4` | 输出产生前 Cursor `Failed to run step, exceeded max retries` 的同请求自动重试次数（1–8）；输出产生后直接转发错误 |
 | `CCP_CURSOR_LIVE_RESUME_RESERVE` | `64` | 为暂停后需要提交工具结果的 Run 额外保留的容量（0–512） |
 | `CCP_CURSOR_OPERATION_LEDGER` | 关 | 可选的持久化操作账本（跨重启拒绝重放）。在“完成标记以下游送达为准”落地前默认关闭，避免响应丢失后客户端重试被永久拒绝 |
@@ -588,16 +590,18 @@ claude-cursor-proxy cursor auth status
 | `CCP_LOG_STDERR` / `CCP_LOG_VERBOSE` / `CCP_TRAFFIC_LOG` | 未设置 | 调试日志 |
 
 这两个 Sand open 参数只限制 HTTP/2 握手和响应头阶段；上游流建立后就会释放
-槽位。另有独立的 `CCP_CURSOR_SAND_STREAM_CONCURRENCY` 覆盖模型流的完整生命
-周期，在 End 或客户端取消时归还槽位。默认值保留 Claude Code/Grok 的 512 路
-并发约定：进程内最多同时进行 512 次握手并保持 512 条 Sand 模型流，单个账号/
-模型通道也可同时进行最多 512 次握手。准入采用双维度成对获取，等待全局槽位时
-不会占住账号槽位；共享的分片 H2 客户端池也会复用 TLS/H2 连接，不会为每个请求
-新建 reqwest 客户端。未绑定账号的请求若长期卡在某个账号通道，会在
-`CCP_CURSOR_SAND_ACCOUNT_QUEUE_FAILOVER_SECS` 后检查账号池中是否存在未尝试且健康
-的备用账号；单账号或没有可用备用账号时继续等待当前通道。显式模型-账号绑定则
-保持固定。上述设置控制的是上游压力和观测，不改变客户端逻辑并发；上游自身准入
-饱和时仍可能返回真实的瞬时 5xx。
+槽位。逻辑请求队列和硬上限仍为 512 路。默认冷启动窗口从 32 路开始，在成功收到
+响应头后自适应增长，避免新 Grok 路由同时发起 512 次握手；全局和单账号/模型
+窗口与速率都可以按私有网关特性调整。这里刻意没有第二个覆盖完整模型流生命周期的进程级 semaphore：长时间生成
+或工具暂停不能把文档中的 512 路并发变成本地 504 排队。仍保留 Claude
+Code/Grok 的 512 路逻辑并发能力；准入采用双维度成对获取，等待全局槽位时不会占住
+账号槽位；共享的分片 H2 客户端池也会复用 TLS/H2 连接，不会为每个请求新建
+reqwest 客户端。未绑定账号的请求会在当前账号通道完成有界逻辑重试后，按账号池
+策略尝试可用的备用账号；单账号或没有可用备用账号时继续等待当前通道。显式
+模型-账号绑定则
+保持固定。请求驱动器会在 End、传输错误或客户端取消时释放已接受的流。上述设置
+控制的是握手压力和观测，不改变客户端逻辑并发。普通 5xx 会在当前账号内有界重试，
+明确的额度或认证错误才会切换账号。
 
 ### Claude Code 侧（非代理配置）
 

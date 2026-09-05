@@ -26,8 +26,9 @@ pub mod tool_use_xml;
 pub mod usage;
 
 use async_trait::async_trait;
-use axum::Json;
 use axum::response::{IntoResponse, Response};
+use axum::{Json, body::Body};
+use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use http::StatusCode;
 use sha2::{Digest, Sha256};
@@ -55,6 +56,7 @@ use crate::providers::cursor::connect::{
     is_transient_provider_error_message,
 };
 use crate::providers::cursor::exec_results::PendingCursorExec;
+use crate::providers::cursor::hosted_web_search::hosted_web_fetch::is_hosted_web_fetch_request;
 use crate::providers::cursor::hosted_web_search::{
     extract_web_search_query, hosted_web_search_json_response, hosted_web_search_sse_response,
     is_hosted_web_search_request, maybe_handle_hosted_web_fetch, search_web,
@@ -91,16 +93,18 @@ use crate::providers::cursor::response::{
 use crate::providers::cursor::sand_inference::{
     SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
     accepted_unadvertised_tool_names_from_anthropic, admit_sand_open_until,
-    admit_sand_stream_until, is_sand_tool_capability_error, mark_sand_tools_supported,
-    mark_sand_tools_unsupported, messages_from_anthropic, sand_logical_retry_budget,
-    sand_open_breaker_abort, sand_open_breaker_admit, sand_open_breaker_failure,
-    sand_open_breaker_success, sand_open_total_budget, sand_tool_capability_client_error,
-    sand_tool_capability_for_token, stream_error_is_retryable, stream_retry_limit,
-    tools_from_anthropic,
+    is_sand_tool_capability_error, mark_sand_tools_supported, mark_sand_tools_unsupported,
+    messages_from_anthropic, sand_logical_retry_budget, sand_open_breaker_abort,
+    sand_open_breaker_admit, sand_open_breaker_failure, sand_open_breaker_success,
+    sand_open_total_budget, sand_tool_capability_client_error, sand_tool_capability_for_token,
+    stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
 };
 use crate::providers::cursor::sand_operation::{
     SandOperationAdmission, SandOperationKey, SandOperationOwner, SandOperationSubscription,
     admit_sand_operation,
+};
+use crate::providers::cursor::sse::{
+    CursorSseEncoder, EVENT_ERROR, EVENT_MESSAGE_DELTA, EVENT_PING, format_sse_event_bytes,
 };
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, bridge_cursor_events_to_sse,
@@ -132,6 +136,15 @@ const CURSOR_AUTH_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 /// have allowed a healthy account to take over.
 const SAND_TOTAL_ATTEMPTS_DEFAULT: usize = 3;
 const SAND_TOTAL_ATTEMPTS_MAX: usize = 8;
+// `SAND_TOTAL_ATTEMPTS` limits one transport episode (the initial open or a
+// single fresh replay).  A logical turn can contain several such episodes,
+// so keep a separate process-local budget for the whole turn.  Without this
+// second cap, resetting the episode counter on every hollow stream allowed a
+// 5-replay turn to fan out to 18 upstream opens before the client saw one
+// error.  The logical cap is deliberately finite and still leaves room for
+// account/tool handoffs to use their independent budgets.
+const SAND_LOGICAL_TRANSPORT_ATTEMPTS_DEFAULT: usize = 8;
+const SAND_LOGICAL_TRANSPORT_ATTEMPTS_MAX: usize = 32;
 const SAND_ACCOUNT_FAILOVER_ATTEMPTS_DEFAULT: usize = 16;
 const SAND_ACCOUNT_FAILOVER_ATTEMPTS_MAX: usize = 16;
 const SAND_TOOL_FALLBACK_ATTEMPTS_DEFAULT: usize = 1;
@@ -143,6 +156,15 @@ fn sand_total_attempts() -> usize {
         .filter(|value| *value > 0)
         .unwrap_or(SAND_TOTAL_ATTEMPTS_DEFAULT)
         .clamp(1, SAND_TOTAL_ATTEMPTS_MAX)
+}
+
+fn sand_logical_transport_attempts() -> usize {
+    std::env::var("CCP_CURSOR_SAND_LOGICAL_ATTEMPTS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(SAND_LOGICAL_TRANSPORT_ATTEMPTS_DEFAULT)
+        .clamp(1, SAND_LOGICAL_TRANSPORT_ATTEMPTS_MAX)
 }
 
 fn sand_account_failover_attempts() -> usize {
@@ -157,7 +179,9 @@ fn sand_account_failover_attempts() -> usize {
 #[derive(Debug, Clone, Copy)]
 enum SandOpenAttemptKind {
     /// Initial opens and fresh transport replays share one logical-turn
-    /// budget. Their retry count is governed by `CCP_CURSOR_SAND_TOTAL_ATTEMPTS`.
+    /// budget. Their per-episode retry count is governed by
+    /// `CCP_CURSOR_SAND_TOTAL_ATTEMPTS`, while the total number of transport
+    /// calls is bounded by `CCP_CURSOR_SAND_LOGICAL_ATTEMPTS`.
     Transport,
     /// A deterministic account-local error has already been observed. One
     /// fresh open is allowed per saved account, independent of transport
@@ -177,7 +201,7 @@ struct SandAttemptBudget {
 impl SandAttemptBudget {
     fn new() -> Self {
         Self {
-            transport_remaining: Arc::new(AtomicUsize::new(sand_total_attempts())),
+            transport_remaining: Arc::new(AtomicUsize::new(sand_logical_transport_attempts())),
             account_failover_remaining: Arc::new(
                 AtomicUsize::new(sand_account_failover_attempts()),
             ),
@@ -232,6 +256,11 @@ const POLICY_RATE_LIMIT_BREAKER_MAX_ENTRIES: usize = 1024;
 /// event still marks the key healthy immediately, so healthy traffic normally
 /// pays only the first Run's time-to-first-useful-event rather than this cap.
 const POLICY_RATE_LIMIT_PROBE_WINDOW_DEFAULT_MS: u64 = 30_000;
+// Sand/Bot allowance decisions arrive on the full-history stream. A long
+// single-flight probe is useful for CLI's delayed policy frames, but it leaves
+// a large Sand fan-out visibly stuck in `opening`. Keep the Sand cold-start
+// fence short; a later quota frame still opens the account/model breaker.
+const POLICY_RATE_LIMIT_PROBE_WINDOW_SAND_DEFAULT_MS: u64 = 5_000;
 const POLICY_RATE_LIMIT_PROBE_WINDOW_MIN_MS: u64 = 25;
 const POLICY_RATE_LIMIT_PROBE_WINDOW_MAX_MS: u64 = 120_000;
 
@@ -563,6 +592,26 @@ fn policy_rate_limit_probe_window() -> Duration {
     )
 }
 
+fn policy_rate_limit_probe_window_for(client_type: &str) -> Duration {
+    let sand = client_type.trim().eq_ignore_ascii_case("sand");
+    let value = if sand {
+        std::env::var("CCP_CURSOR_SAND_POLICY_429_PROBE_WINDOW_MS")
+            .ok()
+            .or_else(|| std::env::var("CCP_CURSOR_POLICY_429_PROBE_WINDOW_MS").ok())
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(POLICY_RATE_LIMIT_PROBE_WINDOW_SAND_DEFAULT_MS)
+    } else {
+        std::env::var("CCP_CURSOR_POLICY_429_PROBE_WINDOW_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(POLICY_RATE_LIMIT_PROBE_WINDOW_DEFAULT_MS)
+    };
+    Duration::from_millis(value.clamp(
+        POLICY_RATE_LIMIT_PROBE_WINDOW_MIN_MS,
+        POLICY_RATE_LIMIT_PROBE_WINDOW_MAX_MS,
+    ))
+}
+
 async fn policy_rate_limit_admit_fresh_open(
     model: &str,
     client_type: &str,
@@ -572,7 +621,7 @@ async fn policy_rate_limit_admit_fresh_open(
         model,
         client_type,
         token,
-        policy_rate_limit_probe_window(),
+        policy_rate_limit_probe_window_for(client_type),
     )
     .await
 }
@@ -586,14 +635,13 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
     let key = policy_rate_limit_key(model, client_type, token);
     let gate = policy_rate_limit_probe_gate(&key);
     // Sand/Bot policy decisions are delivered by the full-history
-    // InferenceService stream and can arrive well after the short live-start
-    // peek.  A second Sand open while the first one is still active is not a
-    // harmless health probe: it consumes another allowance and may produce a
-    // duplicate 429 several minutes later.  The Sand stream owner already
-    // releases this lease on a decisive event, terminal error, or its bounded
-    // logical deadline, so keep the probe single-flight for the whole owner
-    // lifetime.  CLI/Agent keeps the quiet-window ramp because its live probe
-    // path does not retain the lease through the complete stream.
+    // InferenceService stream and can arrive after the live-start peek. Keep
+    // a short single-flight cold-start window so an unknown account does not
+    // immediately receive a large duplicate wave, then promote the gate to
+    // Healthy and let normal concurrency proceed. The original lease remains
+    // attached to its stream and can still publish a late policy 429, which
+    // resets the breaker for subsequent requests. This bounds opening latency
+    // without losing delayed quota evidence.
     let sand_probe = client_type.trim().eq_ignore_ascii_case("sand");
     loop {
         policy_rate_limit_preflight(model, client_type, token)?;
@@ -626,7 +674,16 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                 }
                 PolicyRateLimitProbeState::Probing { started, .. } => {
                     let elapsed = started.elapsed();
-                    if !sand_probe && elapsed >= probe_window {
+                    if sand_probe && elapsed >= probe_window {
+                        // A quiet Sand stream is not proof of a healthy model,
+                        // but holding every waiter until that stream ends can
+                        // leave Claude Code in `opening` for the full logical
+                        // retry budget. Promote the gate after the bounded
+                        // protection window; any later 429 still opens the
+                        // account breaker through the live stream owner.
+                        state.phase = PolicyRateLimitProbeState::Healthy;
+                        ProbeDecision::Healthy
+                    } else if !sand_probe && elapsed >= probe_window {
                         // The current probe remained quiet for one window. Do
                         // not call the key healthy and release the whole retry
                         // wave: delayed policy decisions have arrived well
@@ -647,11 +704,11 @@ async fn policy_rate_limit_admit_fresh_open_with_window(
                         // A bounded wake/timer keeps cancellation and stale
                         // state recoverable without opening another upstream
                         // request after the probe window has elapsed.
-                        let remaining = if sand_probe {
-                            Duration::from_millis(250)
-                        } else {
-                            probe_window - elapsed
-                        };
+                        // Wake at the actual cold-start boundary.  A fixed
+                        // 250ms sleep made short test/operator windows behave
+                        // like a quarter-second lease and kept a fan-out in
+                        // `opening` after the policy gate was already ready.
+                        let remaining = probe_window.saturating_sub(elapsed);
                         ProbeDecision::Wait(remaining)
                     }
                 }
@@ -814,8 +871,12 @@ fn note_policy_rate_limit(
     if client_type.trim().eq_ignore_ascii_case("sand") {
         crate::providers::cursor::usage::record_sand_quota_error_evidence(token, message);
     }
+    let sand_account_429 = client_type.trim().eq_ignore_ascii_case("sand")
+        && is_sand_account_429_message(message)
+        && !is_sand_tool_capability_error(&CursorError::new(429, message, None), 1);
     if !crate::retry::is_policy_rate_limit(message)
         && !is_non_retryable_provider_error_message(message)
+        && !sand_account_429
     {
         return;
     }
@@ -979,6 +1040,44 @@ fn cursor_error_is_policy_limited(error: &CursorError) -> bool {
     })
 }
 
+/// Return whether a Sand diagnostic carries a non-transient HTTP/Connect 429.
+/// Newer InferenceService revisions sometimes omit Cursor's legacy quota enum
+/// and leave only this outer status. Provider-connectivity, billing, and
+/// deliberate capacity-shed diagnostics remain on their dedicated paths.
+fn is_sand_account_429_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let status_429 = lower.contains("connect error 429")
+        || lower.contains("cursor error 429")
+        || lower.contains("upstream http 429")
+        || lower.contains("error 429")
+        || lower.starts_with("429 ")
+        || lower == "429";
+    if !status_429 {
+        return false;
+    }
+    status_429
+        && !is_transient_provider_error_message(message)
+        && !crate::retry::is_capacity_shed(message)
+        && !crate::retry::is_billing_block(message)
+}
+
+/// Sand/Bot allowance failures are not always labelled with one of Cursor's
+/// legacy `ERROR_*_RATE_LIMIT` strings.  Keep account-local failover separate
+/// from temporary provider capacity and deterministic tool-catalog errors.
+fn is_sand_account_failover_error(error: &CursorError, tool_count: usize) -> bool {
+    let text = format!(
+        "{} {} {}",
+        error.client_message(),
+        error.message,
+        error.detail.as_deref().unwrap_or_default()
+    );
+    is_sand_account_429_message(&text)
+        // A tool rejection can share the outer 429/resource-exhausted envelope;
+        // preserve the text-bridge path even when the caller has no catalog
+        // count handy (for example while recording a late error).
+        && !is_sand_tool_capability_error(error, tool_count.max(1))
+}
+
 /// Record only the cooldown implied by the observed Sand error.
 ///
 /// Admission/open failures are transport pressure, not quota exhaustion. They
@@ -990,7 +1089,11 @@ fn note_sand_account_failover_error(model: &str, token: &str, error: &CursorErro
     if let Some((cooldown, reason)) = sand_account_route_cooldown(error) {
         note_sand_account_route_cooldown(model, token, reason, cooldown);
     }
-    if cursor_error_is_account_failover_policy(error) {
+    // Newer Sand gateways may omit the legacy quota marker and return only a
+    // non-transient 429.  It is still account-local for the Sand/Bot lane;
+    // record it before selecting the next profile so concurrent callers skip
+    // the exhausted bearer as well.
+    if cursor_error_is_account_failover_policy(error) || is_sand_account_failover_error(error, 0) {
         let diagnostic = error.client_message();
         note_policy_rate_limit(
             model,
@@ -1484,6 +1587,330 @@ async fn sand_direct_response(
     compaction_mode: bool,
     account_failover_state: SharedAccountFailoverState,
 ) -> Response {
+    // A Sand open can spend several seconds waiting for the account/model
+    // bulkhead or for upstream HTTP headers.  Streaming callers must receive
+    // their Anthropic envelope before that wait starts; otherwise Claude Code
+    // and grok-build treat a healthy queued request as a dead connection.  The
+    // hosted tool shortcuts do not open Sand and retain their direct path.
+    if body.stream && !is_hosted_web_search_request(body) && !is_hosted_web_fetch_request(body) {
+        return sand_deferred_stream_response(
+            body,
+            ctx,
+            token,
+            message_id,
+            wire_model,
+            model,
+            parameter_model,
+            compaction_mode,
+            account_failover_state,
+        )
+        .await;
+    }
+    sand_direct_response_inner(
+        body,
+        ctx,
+        token,
+        message_id,
+        wire_model,
+        model,
+        parameter_model,
+        compaction_mode,
+        account_failover_state,
+        None,
+    )
+    .await
+}
+
+/// Stream a Sand turn while its upstream open/admission runs in a detached
+/// task.  The first `message_start` is emitted synchronously; the inner
+/// response is forwarded once it becomes available.  Operation ownership is
+/// claimed before spawning so duplicate HTTP retries cannot race and create a
+/// second InferenceService invocation.
+#[allow(clippy::too_many_arguments)]
+async fn sand_deferred_stream_response(
+    body: &MessagesRequest,
+    ctx: &RequestContext,
+    token: &str,
+    message_id: String,
+    wire_model: String,
+    model: &str,
+    parameter_model: &str,
+    compaction_mode: bool,
+    account_failover_state: SharedAccountFailoverState,
+) -> Response {
+    let mut preclaimed_owner = None;
+    if let Some(key) = sand_operation_key(body, ctx, model, compaction_mode) {
+        match admit_sand_operation(key) {
+            SandOperationAdmission::Owner(owner) => preclaimed_owner = Some(owner),
+            SandOperationAdmission::Subscriber(subscription) => {
+                // A duplicate already has an authoritative owner.  It can
+                // subscribe to that replay immediately and must never open a
+                // second Sand invocation.
+                let parts = render_cursor_prompt_parts_with(
+                    body,
+                    CursorPromptOptions {
+                        omit_tools: compaction_mode,
+                        delta_only: false,
+                    },
+                );
+                let tool_count = tools_from_anthropic(body, compaction_mode).len();
+                return sand_operation_subscription_response(
+                    subscription,
+                    body,
+                    ctx,
+                    token,
+                    message_id,
+                    wire_model,
+                    compaction_mode,
+                    tool_count,
+                    estimate_rendered_prompt_tokens(&parts),
+                )
+                .await;
+            }
+            SandOperationAdmission::ReplayUnavailable => {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "Sand operation is still active but its replay window is unavailable; retry shortly",
+                );
+            }
+            SandOperationAdmission::CapacityExceeded => {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "Sand operation registry is at capacity; retry shortly",
+                );
+            }
+            SandOperationAdmission::SubscriberLimit => {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "Sand operation subscriber capacity is full; retry shortly",
+                );
+            }
+        }
+    }
+
+    let mut initial_encoder = if compaction_mode {
+        CursorSseEncoder::new_compaction(message_id.clone(), wire_model.clone())
+    } else {
+        CursorSseEncoder::new(message_id.clone(), wire_model.clone())
+    };
+    let estimated_input = estimate_request_input_tokens(body);
+    initial_encoder.seed_estimated_input_tokens(estimated_input);
+    initial_encoder.begin();
+    let initial = Bytes::from(initial_encoder.take_bytes());
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.stream_progress(
+            &ctx.req_id,
+            initial.len() as u64,
+            count_sse_events(&initial),
+            Some(estimated_input).filter(|value| *value > 0),
+            None,
+        );
+        monitor.usage_updated(
+            &ctx.req_id,
+            Some(estimated_input).filter(|value| *value > 0),
+            None,
+        );
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::convert::Infallible>>(32);
+    // Sending the prefix before spawning the task guarantees that the first
+    // body poll cannot depend on Tokio scheduling or upstream readiness.
+    let _ = tx.try_send(Ok(initial));
+    let body = body.clone();
+    let ctx = ctx.clone();
+    let token = token.to_string();
+    let model = model.to_string();
+    let parameter_model = parameter_model.to_string();
+    let cancel = tx.clone();
+    tokio::spawn(async move {
+        // Keep the already-committed HTTP stream alive while the open gate,
+        // policy probe, or account selector is waiting. Without this second
+        // phase heartbeat, the eager `message_start` is followed by a quiet
+        // gap that Grok/Claude Code classify as a dead connection before the
+        // upstream has had a chance to return headers.
+        let mut response_future = Box::pin(sand_direct_response_inner(
+            &body,
+            &ctx,
+            &token,
+            message_id,
+            wire_model,
+            &model,
+            &parameter_model,
+            compaction_mode,
+            account_failover_state,
+            preclaimed_owner,
+        ));
+        let ping_period = Duration::from_secs(sand_sse_ping_secs());
+        let first_ping = tokio::time::Instant::now() + ping_period;
+        let mut ping = tokio::time::interval_at(first_ping, ping_period);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                // If the HTTP body is dropped while Sand is still waiting for
+                // admission or headers, cancel the inner future so its
+                // permit/owner guards release immediately instead of waiting
+                // for the open timeout.
+                _ = cancel.closed() => return,
+                response = &mut response_future => {
+                    forward_deferred_sand_response(response, tx).await;
+                    return;
+                }
+                _ = ping.tick() => {
+                    if tx
+                        .send(Ok(Bytes::from(sand_bridge_keepalive_bytes())))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    // Move the receiver through `unfold`'s state instead of capturing and
+    // consuming it in every `FnMut` invocation. The returned receiver keeps
+    // the channel alive for the next body poll and closes cleanly when the
+    // producer task finishes.
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let mut response = Body::from_stream(stream).into_response();
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response.headers_mut().insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("keep-alive"),
+    );
+    response.headers_mut().insert(
+        http::HeaderName::from_static("x-accel-buffering"),
+        http::HeaderValue::from_static("no"),
+    );
+    response
+}
+
+/// Forward the eventual inner response into the already committed SSE body.
+/// The inner stream emits its own `message_start`; remove only that first
+/// event so the client sees one well-formed Anthropic envelope. Non-200 inner
+/// responses are translated to an SSE error because the outer status is
+/// necessarily 200 after the prefix has been committed.
+async fn forward_deferred_sand_response(
+    response: Response,
+    tx: mpsc::Sender<Result<Bytes, std::convert::Infallible>>,
+) {
+    let status = response.status();
+    let mut body = response.into_body().into_data_stream();
+    if !status.is_success() {
+        let mut bytes = Vec::new();
+        while let Some(item) = body.next().await {
+            match item {
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(error) => {
+                    bytes.extend_from_slice(error.to_string().as_bytes());
+                    break;
+                }
+            }
+        }
+        let message = deferred_sand_error_message(status, &bytes);
+        let _ = tx
+            .send(Ok(Bytes::from(sand_bridge_error_bytes(&message))))
+            .await;
+        return;
+    }
+
+    let mut prefix = Vec::new();
+    let mut stripped = false;
+    while let Some(item) = body.next().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let _ = tx
+                    .send(Ok(Bytes::from(sand_bridge_error_bytes(&format!(
+                        "Sand response body failed: {error}"
+                    )))))
+                    .await;
+                return;
+            }
+        };
+        if !stripped {
+            prefix.extend_from_slice(&chunk);
+            let Some(end) = prefix.windows(2).position(|window| window == b"\n\n") else {
+                // A malformed upstream chunk must not retain unbounded data
+                // while waiting for an SSE delimiter.
+                if prefix.len() > 64 * 1024 {
+                    stripped = true;
+                    let bytes = Bytes::from(std::mem::take(&mut prefix));
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            };
+            let event_end = end + 2;
+            if prefix.starts_with(b"event: message_start\n") {
+                prefix.drain(..event_end);
+            }
+            stripped = true;
+            if prefix.is_empty() {
+                continue;
+            }
+            if tx
+                .send(Ok(Bytes::from(std::mem::take(&mut prefix))))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        if tx.send(Ok(chunk)).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn deferred_sand_error_message(status: StatusCode, bytes: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+        && let Some(message) = value
+            .pointer("/error/message")
+            .or_else(|| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+    {
+        return message.to_string();
+    }
+    let body = String::from_utf8_lossy(bytes).trim().to_string();
+    if body.is_empty() {
+        format!("Sand request failed with HTTP {status}")
+    } else {
+        format!("Sand request failed with HTTP {status}: {body}")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sand_direct_response_inner(
+    body: &MessagesRequest,
+    ctx: &RequestContext,
+    token: &str,
+    message_id: String,
+    wire_model: String,
+    model: &str,
+    parameter_model: &str,
+    compaction_mode: bool,
+    account_failover_state: SharedAccountFailoverState,
+    preclaimed_operation_owner: Option<SandOperationOwner>,
+) -> Response {
     // Keep the local hosted search/fetch shortcuts available on Sand.  These
     // handlers are provider-agnostic and must run after auth (the caller has
     // already selected/validated the Cursor account).
@@ -1569,46 +1996,50 @@ async fn sand_direct_response(
     // "already active" 503. The key deliberately excludes bearer identity:
     // unbound account selection may rotate between transport retries, but the
     // client operation is still one logical turn.
-    let mut sand_operation_owner = match sand_operation_key(body, ctx, model, compaction_mode) {
-        Some(key) => match admit_sand_operation(key) {
-            SandOperationAdmission::Owner(owner) => Some(owner),
-            SandOperationAdmission::Subscriber(subscription) => {
-                return sand_operation_subscription_response(
-                    subscription,
-                    body,
-                    ctx,
-                    token,
-                    message_id,
-                    wire_model,
-                    compaction_mode,
-                    tool_count,
-                    estimated_input,
-                )
-                .await;
-            }
-            SandOperationAdmission::ReplayUnavailable => {
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "Sand operation is still active but its replay window is unavailable; retry shortly",
-                );
-            }
-            SandOperationAdmission::CapacityExceeded => {
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "Sand operation registry is at capacity; retry shortly",
-                );
-            }
-            SandOperationAdmission::SubscriberLimit => {
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "Sand operation subscriber capacity is full; retry shortly",
-                );
-            }
-        },
-        None => None,
+    let mut sand_operation_owner = if let Some(owner) = preclaimed_operation_owner {
+        Some(owner)
+    } else {
+        match sand_operation_key(body, ctx, model, compaction_mode) {
+            Some(key) => match admit_sand_operation(key) {
+                SandOperationAdmission::Owner(owner) => Some(owner),
+                SandOperationAdmission::Subscriber(subscription) => {
+                    return sand_operation_subscription_response(
+                        subscription,
+                        body,
+                        ctx,
+                        token,
+                        message_id,
+                        wire_model,
+                        compaction_mode,
+                        tool_count,
+                        estimated_input,
+                    )
+                    .await;
+                }
+                SandOperationAdmission::ReplayUnavailable => {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "Sand operation is still active but its replay window is unavailable; retry shortly",
+                    );
+                }
+                SandOperationAdmission::CapacityExceeded => {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "Sand operation registry is at capacity; retry shortly",
+                    );
+                }
+                SandOperationAdmission::SubscriberLimit => {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "Sand operation subscriber capacity is full; retry shortly",
+                    );
+                }
+            },
+            None => None,
+        }
     };
     let capability = sand_tool_capability_for_token(token, model);
     // Fable currently accepts the InferenceService text path but rejects the
@@ -1730,7 +2161,6 @@ async fn sand_direct_response(
             &effective_token,
             &effective_request,
             sand_retry_deadline,
-            &account_failover_state,
             &sand_attempt_budget,
             open_attempt_kind,
         )
@@ -1741,7 +2171,8 @@ async fn sand_direct_response(
                 if !sand_attempt_budget_exhausted(&error)
                     && !is_sand_tool_capability_error(&error, tool_count)
                     && (is_account_failover_open_error(model, &error)
-                        || cursor_error_is_account_failover_policy(&error)) =>
+                        || cursor_error_is_account_failover_policy(&error)
+                        || is_sand_account_failover_error(&error, tool_count)) =>
             {
                 let diagnostic = error.client_message();
                 note_sand_account_failover_error(model, &effective_token, &error);
@@ -2137,25 +2568,28 @@ async fn open_sand_with_retries_until(
     token: &str,
     request: &SandInferenceRequest,
     logical_deadline: Instant,
-    account_failover_state: &SharedAccountFailoverState,
     attempt_budget: &SandAttemptBudget,
     attempt_kind: SandOpenAttemptKind,
 ) -> Result<crate::providers::cursor::sand_inference::SandInferenceStream, CursorError> {
-    let max_retries = std::env::var("CCP_CURSOR_SAND_OPEN_RETRIES")
+    let total_attempts = sand_total_attempts();
+    let configured_retries = std::env::var("CCP_CURSOR_SAND_OPEN_RETRIES")
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .unwrap_or(3)
-        .min(8);
-    // Bound each invocation as well as the shared logical deadline. This
-    // keeps account-failover and stream-replay opens from monopolizing a
-    // single request after the caller has already spent most of its budget.
-    let local_deadline = logical_deadline.min(Instant::now() + sand_open_total_budget());
-    // Reserve accepted-stream capacity before contacting the upstream.  A
-    // successful HTTP open represents a live model Run; waiting for the stream
-    // gate after headers would create unowned upstream Runs while the local
-    // 512-stream budget is full.  This permit is held across transport retries
-    // for this logical open and moves into the returned stream on success.
-    let stream_permit = admit_sand_stream_until(local_deadline).await?;
+        .map(|value| value.min(8));
+    // `CCP_CURSOR_SAND_TOTAL_ATTEMPTS` is the hard per-episode cap.  Keep the
+    // older retry variable as a lower operator-configurable ceiling while
+    // avoiding the historical off-by-one path where a fourth invocation was
+    // attempted after a three-slot budget had already been consumed.
+    let max_retries = configured_retries
+        .unwrap_or_else(|| total_attempts.saturating_sub(1) as u32)
+        .min(total_attempts.saturating_sub(1) as u32);
+    // Keep queue time on the logical request deadline, but start the shorter
+    // per-episode open budget only after a real admission permit is acquired.
+    // Charging a 512-request queue against the first 180s open budget made
+    // perfectly healthy tail requests return a proxy-generated 504 before an
+    // upstream socket had even been attempted.
+    let request_deadline = logical_deadline;
+    let mut episode_deadline: Option<Instant> = None;
     let attempt_secs = std::env::var("CCP_CURSOR_SAND_OPEN_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -2163,18 +2597,13 @@ async fn open_sand_with_retries_until(
         .unwrap_or_else(crate::config::cursor_request_timeout_secs)
         .clamp(10, 180);
     let mut attempt = 0;
+    let mut last_error: Option<CursorError> = None;
     // The first invocation after an account/tool handoff consumes that
     // handoff's dedicated budget. Any retries of the same selected account
     // are ordinary transport attempts and use the transport budget instead.
     let mut current_attempt_kind = attempt_kind;
-    // A lane timeout is only useful as an account-pool handoff when there is
-    // an unattempted, healthy profile to receive the request.  Snapshot that
-    // fact once per open invocation; when the registry contains no viable
-    // replacement (the common single-account case), keep waiting until the
-    // normal local deadline instead of manufacturing a 504 after 12 seconds.
-    let mut admission_failover_checked = false;
     loop {
-        let remaining = local_deadline.saturating_duration_since(Instant::now());
+        let remaining = request_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(CursorError::new(
                 504,
@@ -2203,59 +2632,17 @@ async fn open_sand_with_retries_until(
         // 512-open default.  The sleep is deliberately short so a released
         // permit is observed quickly, while the logical deadline remains the
         // final bound for a genuinely wedged upstream.
-        let admission_started = Instant::now();
         let open_permit = loop {
-            match admit_sand_open_until(token, &request.model_id, local_deadline).await {
+            match admit_sand_open_until(token, &request.model_id, request_deadline).await {
                 Ok(Some(permit)) => break permit,
                 Ok(None) => {
-                    // Do not leave a large fan-out parked behind one
-                    // account/model lane until the full 180s open budget.
-                    // The caller can safely rotate an *unbound* request to a
-                    // saved account because Sand carries complete history and
-                    // fresh UUIDs. Explicit model-account bindings remain on
-                    // their selected lane and will receive the original
-                    // retryable diagnostic if no slot becomes available.
-                    if admission_started.elapsed()
-                        >= Duration::from_secs(
-                            crate::providers::cursor::sand_inference::sand_open_account_queue_failover_secs(),
-                        )
-                        && !admission_failover_checked
-                    {
-                        admission_failover_checked = true;
-                        // Do the registry read off Tokio workers.  The helper
-                        // excludes the current/attempted accounts and routes
-                        // already in policy cooldown; a single-account pool
-                        // therefore keeps its request queued rather than
-                        // turning a brief lane burst into a client-visible
-                        // 504/503.  If another request wins the candidate
-                        // concurrently, the caller still falls back to the
-                        // same-account wait on its next logical attempt.
-                        if sand_admission_failover_candidate_available(
-                            token,
-                            &request.model_id,
-                            account_failover_state,
-                        )
-                        .await
-                        {
-                            create_logger("cursor").warn(
-                                "sand_open_admission_failover",
-                                Some(serde_json::Map::from_iter([
-                                    ("model".into(), serde_json::json!(&request.model_id)),
-                                    (
-                                        "waitMs".into(),
-                                        serde_json::json!(admission_started.elapsed().as_millis()),
-                                    ),
-                                    ("recovery".into(), serde_json::json!("account_pool")),
-                                ])),
-                            );
-                            return Err(CursorError::new(
-                                504,
-                                "Sand inference open admission deadline exhausted",
-                                None,
-                            ));
-                        }
-                    }
-                    let remaining = local_deadline.saturating_duration_since(Instant::now());
+                    // A full local lane is backpressure, not an account
+                    // failure. Keep the logical request queued until a real
+                    // permit is released; rotating accounts here creates a
+                    // second cold-start wave and turns a brief burst into a
+                    // synchronized 503/504 storm. The outer deadline remains
+                    // the final bound for a genuinely wedged route.
+                    let remaining = request_deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(CursorError::new(
                             504,
@@ -2275,10 +2662,12 @@ async fn open_sand_with_retries_until(
                 }
             }
         };
-        // The fairness slice may have consumed most of the logical budget.
-        // Recompute it after admission so queue time cannot extend this HTTP
-        // attempt beyond the caller's deadline.
-        let remaining = local_deadline.saturating_duration_since(Instant::now());
+        // Queue time is intentionally excluded from the per-episode open
+        // budget. Once a permit exists, bound this sequence of transport
+        // attempts independently while still respecting the logical deadline.
+        let episode_deadline = *episode_deadline
+            .get_or_insert_with(|| request_deadline.min(Instant::now() + sand_open_total_budget()));
+        let remaining = episode_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             sand_open_breaker_abort(token, &request.model_id, true);
             return Err(CursorError::new(
@@ -2300,11 +2689,29 @@ async fn open_sand_with_retries_until(
         };
         if !attempt_budget.try_consume(current_attempt_kind) {
             sand_open_breaker_abort(token, &request.model_id, true);
-            return Err(CursorError::new(
-                503,
-                "Sand upstream attempt budget exhausted",
-                None,
-            ));
+            // Preserve the final upstream status and diagnostic. Returning a
+            // proxy-only 503 hid whether the route was transiently saturated,
+            // auth-invalid, or policy-limited. Keep a machine-detectable
+            // budget marker in `detail` so the stream driver stops replaying,
+            // while Claude Code still receives the real 502/503/504 cause.
+            let mut exhausted = last_error.unwrap_or_else(|| {
+                CursorError::new(503, "Sand upstream attempt budget exhausted", None)
+            });
+            let marker = "Sand upstream attempt budget exhausted";
+            if !exhausted
+                .client_message()
+                .to_ascii_lowercase()
+                .contains(&marker.to_ascii_lowercase())
+            {
+                exhausted.detail = Some(match exhausted.detail.take() {
+                    Some(detail) if !detail.trim().is_empty() => {
+                        format!("{detail}; {marker}")
+                    }
+                    _ => marker.to_string(),
+                });
+            }
+            exhausted.retry_after.get_or_insert_with(|| "1".to_string());
+            return Err(exhausted);
         }
         let per_attempt = remaining.min(Duration::from_secs(attempt_secs));
         let attempt_started = Instant::now();
@@ -2331,13 +2738,14 @@ async fn open_sand_with_retries_until(
         match result {
             Ok(stream) => {
                 // The HTTP handshake succeeded. Release both open gates before
-                // consuming model tokens; the independent stream slot was
-                // reserved before the request and remains attached to the
-                // response body until it drains or is cancelled.
+                // consuming model tokens.  Sand streams are intentionally not
+                // placed behind a second process-wide lifetime semaphore: the
+                // historical 512-way contract applies to opens, while model
+                // streams may remain live for tool calls and long generations.
                 open_permit.record_open_outcome(true);
                 drop(open_permit);
                 sand_open_breaker_success(token, &request.model_id);
-                return Ok(stream.with_stream_permit(stream_permit));
+                return Ok(stream);
             }
             Err(error) if is_sand_tool_capability_error(&error, request.tools.len()) => {
                 // A deterministic catalog mismatch says nothing about route
@@ -2348,6 +2756,7 @@ async fn open_sand_with_retries_until(
                 return Err(error);
             }
             Err(error) => {
+                last_error = Some(error.clone());
                 // Record transport failures for diagnostics, but do not
                 // multiplicatively reduce the process-wide launch window.
                 // Admission capacity is shared by every account/model route;
@@ -2363,6 +2772,7 @@ async fn open_sand_with_retries_until(
                 drop(open_permit);
                 sand_open_breaker_failure(token, &request.model_id, &error, attempt_started);
                 if attempt < max_retries
+                    && !is_sand_account_failover_error(&error, request.tools.len())
                     && crate::retry::should_retry_upstream(error.status, &error.client_message())
                 {
                     let delay =
@@ -2374,9 +2784,17 @@ async fn open_sand_with_retries_until(
                             ("attempt".into(), serde_json::json!(attempt + 1)),
                             ("status".into(), serde_json::json!(error.status)),
                             ("delayMs".into(), serde_json::json!(delay)),
+                            (
+                                "accountId".into(),
+                                serde_json::json!(cursor_account_digest(token)),
+                            ),
+                            (
+                                "error".into(),
+                                serde_json::json!(truncate_log_detail(&error.client_message())),
+                            ),
                         ])),
                     );
-                    let remaining = local_deadline.saturating_duration_since(Instant::now());
+                    let remaining = episode_deadline.saturating_duration_since(Instant::now());
                     if remaining <= Duration::from_millis(delay) {
                         return Err(error);
                     }
@@ -2402,7 +2820,6 @@ async fn open_sand_with_policy_probe_until(
     token: &str,
     request: &SandInferenceRequest,
     logical_deadline: Instant,
-    account_failover_state: &SharedAccountFailoverState,
     attempt_budget: &SandAttemptBudget,
     attempt_kind: SandOpenAttemptKind,
 ) -> Result<(SandInferenceStream, PolicyRateLimitAdmission), CursorError> {
@@ -2412,7 +2829,6 @@ async fn open_sand_with_policy_probe_until(
         token,
         request,
         logical_deadline,
-        account_failover_state,
         attempt_budget,
         attempt_kind,
     )
@@ -2440,6 +2856,7 @@ async fn open_sand_with_policy_probe_until(
                     token,
                     Some(&error),
                     false,
+                    request.tools.len(),
                 );
             }
             Err(error)
@@ -2458,6 +2875,7 @@ fn settle_sand_policy_probe(
     token: &str,
     error: Option<&CursorError>,
     committed: bool,
+    tool_count: usize,
 ) -> bool {
     // A stream can commit visible text/tool output and still terminate with
     // an account-local allowance error.  Do not let the `committed` bit turn
@@ -2467,7 +2885,15 @@ fn settle_sand_policy_probe(
     // account and recreates a 429 wave.
     if let Some(error) = error {
         let diagnostic = error.client_message();
-        if cursor_error_is_policy_limited(error) {
+        // A bare Sand 429 is account-local even when the provider omits the
+        // legacy quota marker. Keep capability rejections request-local: the
+        // `max(1)` backstop mirrors `cursor_error_is_policy_limited` and
+        // prevents a tool-schema 429 from poisoning the account breaker.
+        let capability_error = is_sand_tool_capability_error(error, tool_count.max(1));
+        if !capability_error
+            && (cursor_error_is_policy_limited(error)
+                || is_sand_account_failover_error(error, tool_count))
+        {
             if let Some(admission) = admission {
                 admission.mark_policy_limited(
                     model,
@@ -2572,7 +2998,6 @@ async fn drive_sand_stream_with_retries(
                     &token,
                     &retry_request,
                     retry_deadline,
-                    &account_failover_state,
                     &attempt_budget,
                     next_open_kind,
                 ) => result,
@@ -2637,7 +3062,51 @@ async fn drive_sand_stream_with_retries(
                         );
                         return;
                     }
-                    if !committed && retries < max_retries && stream_error_is_retryable(&error) {
+                    if !committed
+                        && !sand_attempt_budget_exhausted(&error)
+                        && is_sand_account_failover_error(&error, tool_count)
+                    {
+                        // A retry open can return a bare Sand 429 after the
+                        // previous stream has already been discarded. Rotate
+                        // the account before considering transport replay;
+                        // otherwise the same exhausted bearer consumes every
+                        // open slot and eventually becomes a synthetic 503.
+                        note_sand_account_failover_error(&model, &token, &error);
+                        let replacement = tokio::select! {
+                            _ = downstream_tx.closed() => return,
+                            replacement = account_failover_replacement_token_async(
+                                token.clone(),
+                                model.clone(),
+                                client_type.clone(),
+                                Arc::clone(&account_failover_state),
+                            ) => replacement,
+                        };
+                        let Some(replacement) = replacement else {
+                            discard_sand_replay_buffer(&mut buffered);
+                            send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error)
+                                .await;
+                            return;
+                        };
+                        token = replacement;
+                        request = request.with_fresh_ids();
+                        next_open_kind = SandOpenAttemptKind::AccountFailover;
+                        retries = 0;
+                        discard_sand_replay_buffer(&mut buffered);
+                        create_logger("cursor").warn(
+                            "sand_stream_account_failover",
+                            Some(serde_json::Map::from_iter([
+                                ("model".into(), serde_json::json!(&model)),
+                                ("clientType".into(), serde_json::json!(&client_type)),
+                                ("recovery".into(), serde_json::json!("fresh_open")),
+                            ])),
+                        );
+                        continue;
+                    }
+                    if !committed
+                        && retries < max_retries
+                        && !is_sand_account_failover_error(&error, tool_count)
+                        && stream_error_is_retryable(&error)
+                    {
                         // The failed attempt may have queued thinking/usage
                         // control events without exposing visible output.
                         // A replay carries the full history and will produce
@@ -2655,6 +3124,14 @@ async fn drive_sand_stream_with_retries(
                                 ("attempt".into(), serde_json::json!(retries + 1)),
                                 ("status".into(), serde_json::json!(error.status)),
                                 ("delayMs".into(), serde_json::json!(delay)),
+                                (
+                                    "accountId".into(),
+                                    serde_json::json!(cursor_account_digest(&token)),
+                                ),
+                                (
+                                    "error".into(),
+                                    serde_json::json!(truncate_log_detail(&error.client_message())),
+                                ),
                             ])),
                         );
                         let remaining = retry_deadline.saturating_duration_since(Instant::now());
@@ -2742,6 +3219,7 @@ async fn drive_sand_stream_with_retries(
                                 &token,
                                 None,
                                 true,
+                                tool_count,
                             );
                             if catalog_active {
                                 mark_sand_tools_supported(
@@ -2765,6 +3243,7 @@ async fn drive_sand_stream_with_retries(
                                 &token,
                                 None,
                                 committed || (compaction_mode && compaction_thinking),
+                                tool_count,
                             );
                             if !send_sand_buffered_events(&tx, &downstream_tx, &mut buffered).await
                             {
@@ -2860,6 +3339,7 @@ async fn drive_sand_stream_with_retries(
                 &token,
                 Some(&error),
                 committed,
+                tool_count,
             );
         }
         if sand_attempt_budget_exhausted(&error) {
@@ -2916,7 +3396,8 @@ async fn drive_sand_stream_with_retries(
         if !committed
             && !sand_attempt_budget_exhausted(&error)
             && (is_account_failover_open_error(&model, &error)
-                || cursor_error_is_account_failover_policy(&error))
+                || cursor_error_is_account_failover_policy(&error)
+                || is_sand_account_failover_error(&error, tool_count))
         {
             // Sand's InferenceService call is full-history and UUID-scoped, so
             // an account swap can safely replay the request while no visible
@@ -2972,7 +3453,11 @@ async fn drive_sand_stream_with_retries(
             );
             continue;
         }
-        if !committed && retries < max_retries && stream_error_is_retryable(&error) {
+        if !committed
+            && retries < max_retries
+            && !is_sand_account_failover_error(&error, tool_count)
+            && stream_error_is_retryable(&error)
+        {
             // Do not carry pre-commit events from the abandoned stream into a
             // full-history replay. In particular, duplicate Usage events can
             // make Claude Code's context meter jump after a transient reset.
@@ -2985,6 +3470,14 @@ async fn drive_sand_stream_with_retries(
                     ("attempt".into(), serde_json::json!(retries + 1)),
                     ("status".into(), serde_json::json!(error.status)),
                     ("delayMs".into(), serde_json::json!(delay)),
+                    (
+                        "accountId".into(),
+                        serde_json::json!(cursor_account_digest(&token)),
+                    ),
+                    (
+                        "error".into(),
+                        serde_json::json!(truncate_log_detail(&error.client_message())),
+                    ),
                 ])),
             );
             let remaining = retry_deadline.saturating_duration_since(Instant::now());
@@ -3180,12 +3673,78 @@ async fn collect_sand_bridge_events(
     Ok(output)
 }
 
-fn sand_response_headers() -> [(http::header::HeaderName, &'static str); 3] {
-    [
-        (http::header::CONTENT_TYPE, "text/event-stream"),
-        (http::header::CACHE_CONTROL, "no-cache, no-transform"),
-        (http::header::CONNECTION, "keep-alive"),
-    ]
+/// Keep Claude Code's response watchdog alive while the buffered XML bridge
+/// waits for a complete Sand segment. The bridge still buffers model events so
+/// it can preserve tool ordering and pause state, but the HTTP response must
+/// be committed before a slow model finishes thinking.
+fn sand_sse_ping_secs() -> u64 {
+    std::env::var("CCP_ANTHROPIC_SSE_PING_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(2, 120)
+}
+
+fn sand_bridge_keepalive_bytes() -> Vec<u8> {
+    let mut bytes = format_sse_event_bytes(
+        EVENT_MESSAGE_DELTA,
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "container": null,
+                "stop_reason": null,
+                "stop_sequence": null
+            },
+            "usage": {
+                "input_tokens": null,
+                "output_tokens": null,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null
+            }
+        }),
+    );
+    bytes.extend(format_sse_event_bytes(
+        EVENT_PING,
+        &serde_json::json!({ "type": "ping" }),
+    ));
+    bytes
+}
+
+fn sand_bridge_error_bytes(error: &str) -> Vec<u8> {
+    format_sse_event_bytes(
+        EVENT_ERROR,
+        &serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": error
+            }
+        }),
+    )
+}
+
+/// The bridge's framer emits its own `message_start`. Sand streaming sends an
+/// eager start before buffering, so drop exactly that first event from the
+/// final bridge segment and retain every content/usage/stop event unchanged.
+fn strip_sand_bridge_message_start(bytes: &[u8]) -> Vec<u8> {
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let Some(relative_end) = bytes[cursor..]
+            .windows(2)
+            .position(|window| window == b"\n\n")
+        else {
+            break;
+        };
+        let end = cursor + relative_end + 2;
+        if bytes[cursor..end].starts_with(b"event: message_start\n") {
+            let mut output = Vec::with_capacity(bytes.len().saturating_sub(end - cursor));
+            output.extend_from_slice(&bytes[..cursor]);
+            output.extend_from_slice(&bytes[end..]);
+            return output;
+        }
+        cursor = end;
+    }
+    bytes.to_vec()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3196,31 +3755,183 @@ async fn sand_tool_bridge_stream_response(
     wire_model: String,
     _body: &MessagesRequest,
     allowed: Option<BTreeSet<String>>,
-    _estimated_input: u64,
+    estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
 ) -> Response {
-    let events = match collect_sand_bridge_events(events).await {
-        Ok(events) => events,
-        Err(error) => return json_error_from_cursor_message(error),
-    };
-    let (sse_bytes, _paused) =
-        bridge_cursor_events_to_sse(&message_id, &wire_model, &session_key, &events, allowed);
-    if let Some((handle, req_id)) = monitor {
-        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+    struct State {
+        events: mpsc::Receiver<LiveEventResult>,
+        buffered: Vec<CursorStreamEvent>,
+        session_key: String,
+        message_id: String,
+        wire_model: String,
+        allowed: Option<BTreeSet<String>>,
+        monitor: Option<(crate::monitor::MonitorHandle, String)>,
+        initial: Option<Bytes>,
+        ping: tokio::time::Interval,
+        ping_period: Duration,
+        next_ping_at: tokio::time::Instant,
+        done: bool,
+    }
+
+    let mut initial_encoder = CursorSseEncoder::new(message_id.clone(), wire_model.clone());
+    initial_encoder.seed_estimated_input_tokens(estimated_input);
+    initial_encoder.begin();
+    let initial = Bytes::from(initial_encoder.take_bytes());
+    if let Some((ref handle, ref req_id)) = monitor {
         handle.stream_progress(
-            &req_id,
-            sse_bytes.len() as u64,
-            count_sse_events(&sse_bytes),
-            input_tokens,
-            output_tokens,
+            req_id,
+            initial.len() as u64,
+            count_sse_events(&initial),
+            Some(estimated_input).filter(|value| *value > 0),
+            None,
         );
         handle.usage_updated(
-            &req_id,
-            input_tokens.filter(|value| *value > 0),
-            output_tokens.filter(|value| *value > 0),
+            req_id,
+            Some(estimated_input).filter(|value| *value > 0),
+            None,
         );
     }
-    (sand_response_headers(), sse_bytes).into_response()
+
+    let ping_secs = sand_sse_ping_secs();
+    let ping_period = Duration::from_secs(ping_secs);
+    let first_ping = tokio::time::Instant::now() + ping_period;
+    let mut ping = tokio::time::interval_at(first_ping, ping_period);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let stream = futures_util::stream::unfold(
+        State {
+            events,
+            buffered: Vec::new(),
+            session_key,
+            message_id,
+            wire_model,
+            allowed,
+            monitor,
+            initial: Some(initial),
+            ping,
+            ping_period,
+            next_ping_at: first_ping,
+            done: false,
+        },
+        |mut state| async move {
+            loop {
+                if state.done {
+                    return None;
+                }
+                if let Some(initial) = state.initial.take() {
+                    return Some((Ok::<Bytes, std::convert::Infallible>(initial), state));
+                }
+                // A burst of metadata can keep recv() ready and starve the
+                // timer branch. Check the deadline after every event too.
+                if tokio::time::Instant::now() >= state.next_ping_at {
+                    let now = tokio::time::Instant::now();
+                    state.ping.reset();
+                    state.next_ping_at = now + state.ping_period;
+                    return Some((
+                        Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                            sand_bridge_keepalive_bytes(),
+                        )),
+                        state,
+                    ));
+                }
+                tokio::select! {
+                    biased;
+                    maybe = state.events.recv() => {
+                        match maybe {
+                            Some(Ok(LiveRunEvent::Cursor(event))) => {
+                                state.buffered.push(event);
+                                continue;
+                            }
+                            Some(Ok(LiveRunEvent::NativeToolBatch(tools))) => {
+                                state.buffered.extend(tools.into_iter().map(|tool| {
+                                    CursorStreamEvent::NativeTool {
+                                        tool_use_id: tool.tool_use_id,
+                                        name: tool.name,
+                                        input: tool.input,
+                                    }
+                                }));
+                                continue;
+                            }
+                            Some(Err(error)) => {
+                                state.done = true;
+                                if let Some((ref handle, ref req_id)) = state.monitor {
+                                    handle.request_failed(req_id, Some(502), &error);
+                                }
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                                        sand_bridge_error_bytes(&error),
+                                    )),
+                                    state,
+                                ));
+                            }
+                            None => {
+                                state.done = true;
+                                let (sse_bytes, _paused) =
+                                    bridge_cursor_events_to_sse(
+                                        &state.message_id,
+                                        &state.wire_model,
+                                        &state.session_key,
+                                        &state.buffered,
+                                        state.allowed.take(),
+                                    );
+                                let sse_bytes = strip_sand_bridge_message_start(&sse_bytes);
+                                if let Some((ref handle, ref req_id)) = state.monitor {
+                                    let (input_tokens, output_tokens) =
+                                        usage_from_anthropic_sse(&sse_bytes);
+                                    handle.stream_progress(
+                                        req_id,
+                                        sse_bytes.len() as u64,
+                                        count_sse_events(&sse_bytes),
+                                        input_tokens,
+                                        output_tokens,
+                                    );
+                                    handle.usage_updated(
+                                        req_id,
+                                        input_tokens.filter(|value| *value > 0),
+                                        output_tokens.filter(|value| *value > 0),
+                                    );
+                                }
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(Bytes::from(sse_bytes)),
+                                    state,
+                                ));
+                            }
+                        }
+                    }
+                    _ = state.ping.tick() => {
+                        let now = tokio::time::Instant::now();
+                        state.next_ping_at = now + state.ping_period;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                                sand_bridge_keepalive_bytes(),
+                            )),
+                            state,
+                        ));
+                    }
+                }
+            }
+        },
+    );
+
+    let mut response = Body::from_stream(stream).into_response();
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response.headers_mut().insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("keep-alive"),
+    );
+    response.headers_mut().insert(
+        http::HeaderName::from_static("x-accel-buffering"),
+        http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4576,19 +5287,25 @@ fn is_account_failover_open_error(model: &str, error: &CursorError) -> bool {
     }
     let message = error.client_message();
     let lower = message.to_ascii_lowercase();
-    let admission = lower.contains("sand inference open admission deadline exhausted")
-        || lower.contains("sand open admission queue timed out");
     let account_auth = matches!(error.status, 401)
         && (lower.contains("error_account_closed")
             || lower.contains("error_not_logged_in")
             || lower.contains("authentication error")
             || lower.contains("unauthenticated"));
-    (matches!(error.status, 502..=504)
-        && (lower.contains("sand inference open timed out")
-            || lower.contains("sand inference open retry budget exhausted")
-            || lower.contains("sand inference upstream http 502")
-            || admission))
-        || account_auth
+    // Plain 502/503/504 responses and open timeouts are provider/transport
+    // failures, not account-local state. Retrying the same bearer with fresh
+    // request ids preserves the upstream's recovery window and avoids the
+    // multi-account 90s x N serial tail seen in the 503/504 storms. A route may
+    // still fail over through the policy/429 classifier below when Cursor
+    // includes an explicit account or quota marker.
+    let explicit_account_failure = lower.contains("error_account_closed")
+        || lower.contains("error_not_logged_in")
+        || lower.contains("account quota")
+        || lower.contains("account exhausted")
+        || lower.contains("bot quota")
+        || lower.contains("quota exhausted")
+        || lower.contains("account disabled");
+    account_auth || explicit_account_failure
 }
 
 /// Admission handoff is an optimization for a saturated Sand lane, not proof
@@ -4660,6 +5377,7 @@ fn mark_pre_rebalance_account_attempted(
 /// async caller can perform filesystem/Keychain work on a blocking worker and
 /// unit tests can exercise the single-account behavior without opening a
 /// network connection.
+#[cfg(test)]
 fn sand_admission_candidate_from_profiles(
     profiles: &[CursorAccountProfile],
     current_token: &str,
@@ -4700,42 +5418,6 @@ fn sand_admission_candidate_from_profiles(
         }
         true
     })
-}
-
-/// Check for an unattempted Sand account without blocking a Tokio worker on
-/// the account registry lock.  Returning `false` on a transient registry read
-/// failure is deliberate: the open path then waits on the current account's
-/// normal deadline instead of producing a premature client-visible 503.
-async fn sand_admission_failover_candidate_available(
-    current_token: &str,
-    model: &str,
-    state: &SharedAccountFailoverState,
-) -> bool {
-    let attempted = state
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .attempted_accounts
-        .clone();
-    let current_token = current_token.to_string();
-    let model = model.to_string();
-    let task = tokio::task::spawn_blocking(move || {
-        let profiles = list_cursor_accounts().ok()?;
-        Some(sand_admission_candidate_from_profiles(
-            &profiles,
-            &current_token,
-            &model,
-            &attempted,
-        ))
-    });
-    // Account-registry mutations use an inter-process file lock.  A crashed
-    // companion process or a network filesystem must not hold the inference
-    // request forever while we merely probe for a handoff candidate.
-    tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
-        .unwrap_or(false)
 }
 
 /// Return deterministic account candidates for a policy/quota failure.
@@ -6239,6 +6921,7 @@ fn hold_policy_probe_until_decisive_event(
     probe_window: Duration,
 ) -> mpsc::Receiver<LiveEventResult> {
     let (tx, rx) = mpsc::channel(512);
+    let sand_probe = client_type.trim().eq_ignore_ascii_case("sand");
     tokio::spawn(async move {
         let mut lease = Some(lease);
         let mut empty_turn_deadline: Option<Instant> = None;
@@ -6251,14 +6934,26 @@ fn hold_policy_probe_until_decisive_event(
             let item = if let Some(deadline) = empty_turn_deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    drop(lease.take());
+                    if sand_probe {
+                        if let Some(lease) = lease.take() {
+                            lease.mark_healthy();
+                        }
+                    } else {
+                        drop(lease.take());
+                    }
                     empty_turn_deadline = None;
                     continue;
                 }
                 tokio::select! {
                     item = events.recv() => item,
                     _ = tokio::time::sleep(remaining) => {
-                        drop(lease.take());
+                        if sand_probe {
+                            if let Some(lease) = lease.take() {
+                                lease.mark_healthy();
+                            }
+                        } else {
+                            drop(lease.take());
+                        }
                         empty_turn_deadline = None;
                         continue;
                     }
@@ -6278,6 +6973,11 @@ fn hold_policy_probe_until_decisive_event(
                     if !remaining.is_zero() {
                         empty_turn_deadline = Some(Instant::now() + remaining);
                         tokio::time::sleep(remaining).await;
+                    }
+                    if sand_probe {
+                        if let Some(lease) = lease.take() {
+                            lease.mark_healthy();
+                        }
                     }
                 }
                 break;
@@ -6301,7 +7001,13 @@ fn hold_policy_probe_until_decisive_event(
                         if let Some(probe_lease) = lease.as_ref() {
                             let remaining = probe_lease.remaining_until(probe_window);
                             if remaining.is_zero() {
-                                drop(lease.take());
+                                if sand_probe {
+                                    if let Some(lease) = lease.take() {
+                                        lease.mark_healthy();
+                                    }
+                                } else {
+                                    drop(lease.take());
+                                }
                             } else {
                                 empty_turn_deadline
                                     .get_or_insert_with(|| Instant::now() + remaining);
@@ -9599,6 +10305,16 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn truncate_log_detail(message: &str) -> String {
+    const MAX_LOG_DETAIL_CHARS: usize = 512;
+    let mut compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > MAX_LOG_DETAIL_CHARS {
+        compact = compact.chars().take(MAX_LOG_DETAIL_CHARS).collect();
+        compact.push_str("...");
+    }
+    compact
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
@@ -10176,13 +10892,9 @@ mod tests {
             "cancel-invocation",
             vec![SandInferenceMessage::user("pending")],
         );
-        let stream_gate = Arc::new(tokio::sync::Semaphore::new(1));
         let stream_polled = Arc::new(tokio::sync::Notify::new());
-        let initial_stream = sand_inference::pending_stream_with_permit_and_notify_for_test(
-            Arc::clone(&stream_gate),
-            Arc::clone(&stream_polled),
-        );
-        assert_eq!(stream_gate.available_permits(), 0);
+        let initial_stream =
+            sand_inference::pending_stream_with_notify_for_test(Arc::clone(&stream_polled));
         let (tx, rx) = mpsc::channel::<LiveEventResult>(1);
         let downstream_tx = tx.clone();
         let account_state = Arc::new(Mutex::new(AccountFailoverState::new(token)));
@@ -10222,12 +10934,6 @@ mod tests {
             .await
             .expect("downstream cancellation must stop a pending stream promptly")
             .expect("cancellation driver task should not panic");
-        assert_eq!(
-            stream_gate.available_permits(),
-            1,
-            "cancellation must drop the accepted-stream permit"
-        );
-
         let next = tokio::time::timeout(
             Duration::from_secs(1),
             policy_rate_limit_admit_fresh_open_with_window(model, "sand", token, probe_window),
@@ -10255,6 +10961,19 @@ mod tests {
         ];
         discard_sand_replay_buffer(&mut buffered);
         assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn sand_transport_budget_is_bounded_across_replays() {
+        let budget = SandAttemptBudget::new();
+        let attempts = sand_logical_transport_attempts();
+        for _ in 0..attempts {
+            assert!(budget.try_consume(SandOpenAttemptKind::Transport));
+        }
+        assert!(
+            !budget.try_consume(SandOpenAttemptKind::Transport),
+            "one logical turn must never exceed its transport budget"
+        );
     }
 
     #[test]
@@ -10729,15 +11448,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
-    async fn sand_policy_probe_does_not_rotate_while_owner_is_still_active() {
+    async fn sand_policy_probe_promotes_after_window_while_owner_is_still_active() {
         let _guard = POLICY_RATE_LIMIT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         reset_policy_rate_limit_breaker_for_test();
 
-        // Use a tiny injectable window.  Sand must still keep one owner after
-        // that window because the provider can delay its quota decision far
-        // beyond the live-start peek.
+        // Use a tiny injectable window. Sand keeps one owner during the cold
+        // start, then promotes the gate so sibling requests do not remain in
+        // `opening` while the provider delays its first frame.
         let probe_window = Duration::from_millis(25);
         let owner = policy_rate_limit_admit_fresh_open_with_window(
             "grok-build",
@@ -10760,17 +11479,17 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(
-            !waiter.is_finished(),
-            "a Sand waiter must not rotate into a second upstream probe after the quiet window"
+            waiter.is_finished(),
+            "a Sand waiter must be released after the bounded cold-start window"
         );
-
-        drop(owner);
         let admission = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
-            .expect("the waiter should wake when the owner settles")
+            .expect("the waiter should wake after the quiet window")
             .expect("policy waiter task should not panic")
-            .expect("the next Sand request should become the new probe");
-        assert!(matches!(admission, PolicyRateLimitAdmission::Probe(_)));
+            .expect("the Sand gate should remain available after promotion");
+        assert!(matches!(admission, PolicyRateLimitAdmission::KnownHealthy));
+        drop(admission);
+        drop(owner);
         reset_policy_rate_limit_breaker_for_test();
     }
 
@@ -10987,7 +11706,7 @@ mod tests {
             .expect("the next probe should be admitted after the window")
             .expect("policy waiter task")
             .expect("probe should not be blocked without a policy 429");
-        assert!(matches!(next, PolicyRateLimitAdmission::Probe(_)));
+        assert!(matches!(next, PolicyRateLimitAdmission::KnownHealthy));
 
         drop(next);
         drop(held);
@@ -11049,7 +11768,7 @@ mod tests {
             .expect("the next probe should be admitted after the window")
             .expect("policy waiter task")
             .expect("probe should not be blocked without a policy 429");
-        assert!(matches!(next, PolicyRateLimitAdmission::Probe(_)));
+        assert!(matches!(next, PolicyRateLimitAdmission::KnownHealthy));
         drop(next);
         drop(held);
         reset_policy_rate_limit_breaker_for_test();
@@ -11196,9 +11915,9 @@ mod tests {
     }
 
     #[test]
-    fn sand_open_timeout_is_eligible_for_unbound_account_failover() {
+    fn sand_open_transport_failures_stay_on_bounded_retry_path() {
         let timeout = CursorError::new(504, "Sand inference open timed out after 90s", None);
-        assert!(is_account_failover_open_error(
+        assert!(!is_account_failover_open_error(
             "cursor-grok-account-failover-test",
             &timeout
         ));
@@ -11208,10 +11927,22 @@ mod tests {
             "Sand inference open admission deadline exhausted",
             None,
         );
-        assert!(is_account_failover_open_error(
+        assert!(!is_account_failover_open_error(
             "cursor-grok-account-failover-test",
             &admission
         ));
+
+        for status in [502, 503, 504] {
+            let upstream = CursorError::new(
+                status,
+                format!("Sand inference upstream HTTP {status}"),
+                None,
+            );
+            assert!(!is_account_failover_open_error(
+                "cursor-grok-account-failover-test",
+                &upstream
+            ));
+        }
 
         let closed = CursorError::new(
             401,
@@ -11229,6 +11960,43 @@ mod tests {
             "cursor-grok-account-failover-test",
             &generic
         ));
+    }
+
+    #[test]
+    fn sand_budget_marker_in_detail_stops_further_replays() {
+        let error = CursorError::new(
+            504,
+            "Sand inference open timed out after 45s",
+            Some("Sand upstream attempt budget exhausted".into()),
+        );
+        assert!(sand_attempt_budget_exhausted(&error));
+        assert_eq!(error.status, 504);
+    }
+
+    #[test]
+    fn bare_sand_429_is_account_local_but_transient_429_is_not() {
+        let bare = CursorError::new(429, "Sand inference upstream HTTP 429", None);
+        assert!(is_sand_account_failover_error(&bare, 0));
+
+        let transient = CursorError::new(
+            429,
+            "Sand inference upstream HTTP 429",
+            Some(
+                "ERROR_PROVIDER_ERROR providerStatusCode=503 isRetryable=false provider temporarily unavailable"
+                    .into(),
+            ),
+        );
+        assert!(!is_sand_account_failover_error(&transient, 0));
+
+        let capability = CursorError::new(
+            429,
+            "ERROR_PROVIDER_ERROR",
+            Some("providerStatusCode=400 isRetryable=false tool catalog is not supported".into()),
+        );
+        assert!(
+            !is_sand_account_failover_error(&capability, 0),
+            "tool-catalog 429s must stay on the text-bridge path even without a count"
+        );
     }
 
     #[test]
@@ -11671,6 +12439,7 @@ mod tests {
             token,
             Some(&error),
             true,
+            0,
         ));
         let blocked = policy_rate_limit_preflight(model, client_type, token)
             .expect_err("a late account quota error must open the local breaker");
@@ -11700,12 +12469,79 @@ mod tests {
             token,
             Some(&error),
             true,
+            0,
         ));
         assert!(
             policy_rate_limit_preflight(model, client_type, token).is_err(),
             "the stream driver may have released its probe at first output"
         );
         reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn late_bare_sand_429_is_recorded_without_legacy_quota_marker() {
+        let _guard = POLICY_RATE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_policy_rate_limit_breaker_for_test();
+
+        let model = "grok-4.6";
+        let client_type = "sand";
+        let token = "released-late-bare-429-token";
+        let error = CursorError::new(429, "Sand inference upstream HTTP 429", None);
+
+        assert!(settle_sand_policy_probe(
+            None,
+            model,
+            client_type,
+            token,
+            Some(&error),
+            true,
+            0,
+        ));
+        assert_eq!(
+            policy_rate_limit_preflight(model, client_type, token)
+                .expect_err("a late bare Sand 429 must cool the account route")
+                .status,
+            429
+        );
+        reset_policy_rate_limit_breaker_for_test();
+    }
+
+    #[test]
+    fn sand_bridge_eager_start_does_not_duplicate_buffered_start() {
+        let mut eager = CursorSseEncoder::new("msg-eager", "grok-4.6");
+        eager.seed_estimated_input_tokens(42);
+        eager.begin();
+        let eager = eager.take_bytes();
+        let events = vec![
+            CursorStreamEvent::TextDelta {
+                text: "ready".into(),
+            },
+            CursorStreamEvent::End,
+        ];
+        let (buffered, _) = bridge_cursor_events_to_sse(
+            "msg-eager",
+            "grok-4.6",
+            "sand-bridge-eager-test",
+            &events,
+            None,
+        );
+        let mut combined = eager;
+        combined.extend(strip_sand_bridge_message_start(&buffered));
+        let text = String::from_utf8(combined).expect("SSE bytes are UTF-8");
+        assert_eq!(text.matches("event: message_start\n").count(), 1);
+        assert!(text.contains("ready"));
+        BridgeRegistry::remove("sand-bridge-eager-test");
+    }
+
+    #[test]
+    fn sand_bridge_keepalive_contains_watchdog_safe_events() {
+        let bytes = sand_bridge_keepalive_bytes();
+        let text = String::from_utf8(bytes).expect("keepalive bytes are UTF-8");
+        assert!(text.contains("event: message_delta\n"));
+        assert!(text.contains("\"stop_reason\":null"));
+        assert!(text.contains("event: ping\n"));
     }
 
     #[tokio::test]
@@ -11744,6 +12580,7 @@ mod tests {
                 token,
                 Some(&error),
                 false,
+                1,
             ),
             "tool capability rejection is not an account policy result"
         );
@@ -14470,5 +15307,48 @@ mod tests {
         let body = hello_body();
         let expected = (render_cursor_prompt(&body).len() / 4).max(1) as u64;
         assert_eq!(count_tokens_for_request(Some("sess-zero"), &body), expected);
+    }
+
+    #[tokio::test]
+    async fn deferred_sand_forward_strips_inner_message_start() {
+        let mut encoder = CursorSseEncoder::new("msg_deferred", "grok-4.6");
+        encoder.begin();
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "queued output".into(),
+        });
+        encoder.push_event(&CursorStreamEvent::End);
+        let response = Body::from(encoder.take_bytes()).into_response();
+        let (tx, mut rx) = mpsc::channel(8);
+        forward_deferred_sand_response(response, tx).await;
+
+        let mut bytes = Vec::new();
+        while let Some(item) = rx.recv().await {
+            bytes.extend_from_slice(&item.expect("deferred forwarding is infallible"));
+        }
+        let text = String::from_utf8(bytes).expect("SSE is UTF-8");
+        assert_eq!(text.matches("event: message_start\n").count(), 0);
+        assert!(text.contains("queued output"), "{text}");
+        assert!(text.contains("event: message_stop\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn deferred_sand_forward_maps_inner_http_error_to_sse() {
+        let response = (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": {"type": "api_error", "message": "upstream unavailable"}
+            })),
+        )
+            .into_response();
+        let (tx, mut rx) = mpsc::channel(8);
+        forward_deferred_sand_response(response, tx).await;
+
+        let mut bytes = Vec::new();
+        while let Some(item) = rx.recv().await {
+            bytes.extend_from_slice(&item.expect("deferred forwarding is infallible"));
+        }
+        let text = String::from_utf8(bytes).expect("SSE is UTF-8");
+        assert!(text.contains("event: error\n"), "{text}");
+        assert!(text.contains("upstream unavailable"), "{text}");
     }
 }

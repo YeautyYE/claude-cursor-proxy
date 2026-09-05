@@ -21,7 +21,11 @@ const DEFAULT_EVENT_REPLAY_CAPACITY: usize = 16_384;
 const DEFAULT_TERMINAL_REPLAY_TTL_SECS: u64 = 30;
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 512;
 const MAX_SUBSCRIBER_REPLAY_QUEUE: usize = 16_384;
-const DEFAULT_SUBSCRIBER_LIMIT: usize = 128;
+// A single Claude Code/Grok turn can have the documented 512-way fan-out.
+// Keep the duplicate-operation registry at least that wide as well: retries
+// carrying one stable request id are subscribers, and rejecting subscribers
+// at 128 turns a healthy upstream operation into proxy-generated 503s.
+const DEFAULT_SUBSCRIBER_LIMIT: usize = 512;
 const MAX_SUBSCRIBER_LIMIT: usize = 1_024;
 const DEFAULT_REPLAY_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 const MAX_REPLAY_BYTE_CAPACITY: usize = 128 * 1024 * 1024;
@@ -816,6 +820,31 @@ mod tests {
         }
         assert!(entry.subscribe(false).is_ok());
         assert_eq!(entry.subscribers.len(), 1);
+    }
+
+    #[test]
+    fn subscriber_capacity_covers_documented_512_way_retry_fanout() {
+        // The owner occupies one slot. Every remaining slot must still be
+        // attachable so a burst of same-operation HTTP retries does not emit
+        // a local 503 while the original upstream stream is healthy.
+        // Keep this deterministic when an operator deliberately overrides
+        // the limit for a process-wide deployment test.
+        if std::env::var_os("CCP_CURSOR_SAND_OPERATION_SUBSCRIBERS").is_some() {
+            return;
+        }
+        assert!(subscriber_limit() >= 512);
+        let mut entry = SandOperationEntry::new();
+        let mut subscriptions = Vec::with_capacity(subscriber_limit());
+        subscriptions.push(entry.subscribe(true).expect("owner slot"));
+        for _ in 1..subscriber_limit() {
+            subscriptions.push(entry.subscribe(false).expect("retry subscriber slot"));
+        }
+        assert_eq!(entry.subscribers.len(), subscriber_limit());
+        assert!(matches!(
+            entry.subscribe(false),
+            Err(SubscribeError::SubscriberLimit)
+        ));
+        drop(subscriptions);
     }
 
     #[tokio::test]
