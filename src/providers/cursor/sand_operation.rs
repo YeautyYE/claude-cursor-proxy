@@ -403,6 +403,9 @@ fn replay_event_bytes(event: &LiveEventResult) -> usize {
             | super::response::CursorStreamEvent::TextDelta { text } => {
                 EVENT_OVERHEAD.saturating_add(text.len())
             }
+            super::response::CursorStreamEvent::ThinkingSignature { signature } => {
+                EVENT_OVERHEAD.saturating_add(signature.len())
+            }
             super::response::CursorStreamEvent::NativeTool {
                 tool_use_id,
                 name,
@@ -417,6 +420,7 @@ fn replay_event_bytes(event: &LiveEventResult) -> usize {
                 ),
             super::response::CursorStreamEvent::Usage { .. }
             | super::response::CursorStreamEvent::OutputTokenDelta { .. }
+            | super::response::CursorStreamEvent::ThinkingCompleted
             | super::response::CursorStreamEvent::End => EVENT_OVERHEAD,
         },
         Ok(LiveRunEvent::NativeToolBatch(tools)) => tools
@@ -546,6 +550,23 @@ mod tests {
         Ok(LiveRunEvent::Cursor(CursorStreamEvent::TextDelta {
             text: text.to_string(),
         }))
+    }
+
+    #[test]
+    fn thinking_signature_replay_budget_counts_signature_bytes() {
+        let signature = "opaque-signature".repeat(10_000);
+        let bytes = replay_event_bytes(&Ok(LiveRunEvent::Cursor(
+            CursorStreamEvent::ThinkingSignature {
+                signature: signature.clone(),
+            },
+        )));
+        assert_eq!(bytes, 64 + signature.len());
+        assert_eq!(
+            replay_event_bytes(&Ok(LiveRunEvent::Cursor(
+                CursorStreamEvent::ThinkingCompleted
+            ))),
+            64
+        );
     }
 
     #[tokio::test]

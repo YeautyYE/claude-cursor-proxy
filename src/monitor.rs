@@ -1,16 +1,22 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
+mod metrics;
 mod mock;
 
+pub use metrics::MetricsSnapshot;
+use metrics::{MetricsStore, RequestMetrics};
 pub use mock::{MockMonitor, mock_state};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
+const SESSION_OUTPUT_HISTORY_SECS: u64 = 60 * 60;
+const SESSION_OUTPUT_MAX_SESSIONS: usize = 4_096;
+const SESSION_OUTPUT_PRUNE_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
@@ -102,6 +108,14 @@ pub enum MonitorEvent {
         request_id: String,
         client_type: String,
     },
+    AccountResolved {
+        request_id: String,
+        account: String,
+    },
+    UpstreamError {
+        request_id: String,
+        http_status: u16,
+    },
     ModelResolved {
         request_id: String,
         model: String,
@@ -176,6 +190,7 @@ pub struct ActiveRequest {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    metrics: RequestMetrics,
 }
 
 impl ActiveRequest {
@@ -441,8 +456,10 @@ struct MonitorStore {
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
+    session_output_last_pruned: Option<u64>,
     recent_limit: usize,
     account_usage: AccountUsageState,
+    metrics: MetricsStore,
 }
 
 #[derive(Debug, Clone)]
@@ -464,8 +481,10 @@ impl MonitorHandle {
                 active: HashMap::new(),
                 recent: VecDeque::new(),
                 session_output_buckets: HashMap::new(),
+                session_output_last_pruned: None,
                 recent_limit,
                 account_usage: AccountUsageState::Unknown,
+                metrics: MetricsStore::default(),
             })),
         }
     }
@@ -502,6 +521,16 @@ impl MonitorHandle {
                 account_usage: AccountUsageState::Unknown,
             },
         }
+    }
+
+    /// Read only bounded metric aggregates and active routing labels. Unlike
+    /// the TUI snapshot, this does not clone request payload metadata, sort
+    /// requests, or rebuild session histories while holding the monitor lock.
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.store
+            .lock()
+            .map(|store| MetricsSnapshot::new(&store))
+            .unwrap_or_default()
     }
 
     pub fn set_account_usage(&self, usage: AccountUsageState) {
@@ -569,6 +598,21 @@ impl MonitorHandle {
         self.publish(MonitorEvent::ModelResolved {
             request_id: request_id.into(),
             model: model.into(),
+        });
+    }
+
+    /// `account` must be an opaque account identifier, never an email or token.
+    pub fn account_resolved(&self, request_id: impl Into<String>, account: impl Into<String>) {
+        self.publish(MonitorEvent::AccountResolved {
+            request_id: request_id.into(),
+            account: account.into(),
+        });
+    }
+
+    pub fn upstream_error(&self, request_id: impl Into<String>, http_status: u16) {
+        self.publish(MonitorEvent::UpstreamError {
+            request_id: request_id.into(),
+            http_status,
         });
     }
 
@@ -707,6 +751,7 @@ impl MonitorStore {
                 session_seq,
                 endpoint,
             } => {
+                self.metrics.request_started(endpoint);
                 self.active.insert(
                     request_id.clone(),
                     ActiveRequest {
@@ -734,6 +779,7 @@ impl MonitorStore {
                         output_tokens: None,
                         error: None,
                         traffic_capture_path: None,
+                        metrics: RequestMetrics::default(),
                     },
                 );
             }
@@ -759,11 +805,14 @@ impl MonitorStore {
                 model,
                 effort,
             } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
+                if let Some(mut active) = self.active.remove(&request_id) {
                     active.provider = Some(provider);
                     active.model = Some(model);
                     active.effort = effort;
+                    self.metrics
+                        .phase_changed(&mut active, &RequestStatus::ProviderSelected);
                     active.status = RequestStatus::ProviderSelected;
+                    self.active.insert(request_id, active);
                 }
             }
             MonitorEvent::ClientTypeResolved {
@@ -780,6 +829,22 @@ impl MonitorStore {
                     completed.client_type = Some(client_type);
                 }
             }
+            MonitorEvent::AccountResolved {
+                request_id,
+                account,
+            } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.metrics.account = Some(account);
+                }
+            }
+            MonitorEvent::UpstreamError {
+                request_id,
+                http_status,
+            } => {
+                if self.active.contains_key(&request_id) {
+                    self.metrics.upstream_error(http_status);
+                }
+            }
             MonitorEvent::ModelResolved { request_id, model } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.model = Some(match active.model.take() {
@@ -790,13 +855,18 @@ impl MonitorStore {
                 }
             }
             MonitorEvent::UpstreamStarted { request_id } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
+                if let Some(mut active) = self.active.remove(&request_id) {
+                    self.metrics
+                        .phase_changed(&mut active, &RequestStatus::Upstream);
                     active.status = RequestStatus::Upstream;
+                    self.active.insert(request_id, active);
                 }
             }
             MonitorEvent::RequestPhase { request_id, phase } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
+                if let Some(mut active) = self.active.remove(&request_id) {
+                    self.metrics.phase_changed(&mut active, &phase);
                     active.status = phase;
+                    self.active.insert(request_id, active);
                 }
             }
             MonitorEvent::GenerationStarted { request_id: _ } => {
@@ -817,7 +887,8 @@ impl MonitorStore {
                 output_tokens,
             } => {
                 let mut history_update = None;
-                if let Some(active) = self.active.get_mut(&request_id) {
+                if let Some(mut active) = self.active.remove(&request_id) {
+                    self.metrics.stream_progress(&mut active, bytes);
                     active.status = RequestStatus::Streaming;
                     active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
                     active.stream_chunks = active.stream_chunks.saturating_add(chunks);
@@ -833,6 +904,7 @@ impl MonitorStore {
                         active.output_tokens,
                         bytes,
                     );
+                    self.active.insert(request_id, active);
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
@@ -1013,6 +1085,7 @@ impl MonitorStore {
             // the response wrapper is dropped or drained late.
             return;
         }
+        let tracked = self.active.contains_key(request_id);
         let mut active = self
             .active
             .remove(request_id)
@@ -1041,10 +1114,14 @@ impl MonitorStore {
                 output_tokens: None,
                 error: None,
                 traffic_capture_path: None,
+                metrics: RequestMetrics::default(),
             });
         if let Some(started) = active.generation_started_instant {
             active.generation_finished_at = Some(SystemTime::now());
             active.generation_duration = Some(started.elapsed());
+        }
+        if tracked {
+            self.metrics.request_finished(&active, &status, http_status);
         }
         let completed = CompletedRequest {
             request_id: active.request_id,
@@ -1095,12 +1172,77 @@ impl MonitorStore {
         timestamp: SystemTime,
         tokens: u64,
     ) {
-        let bucket = session_token_bucket(timestamp);
+        self.record_session_output_at(session_id, timestamp, tokens, SystemTime::now());
+    }
+
+    fn record_session_output_at(
+        &mut self,
+        session_id: Option<String>,
+        timestamp: SystemTime,
+        tokens: u64,
+        now: SystemTime,
+    ) {
+        let now_bucket = session_token_bucket(now);
+        let first_bucket =
+            now_bucket.saturating_sub(SESSION_OUTPUT_HISTORY_SECS / SESSION_TOKEN_BUCKET_SECS - 1);
+        if self.session_output_last_pruned.is_none_or(|last| {
+            now_bucket.saturating_sub(last)
+                >= SESSION_OUTPUT_PRUNE_INTERVAL_SECS / SESSION_TOKEN_BUCKET_SECS
+        }) {
+            self.prune_session_output_before(first_bucket);
+            self.session_output_last_pruned = Some(now_bucket);
+        }
+        // Late usage may update a retained request after completion. Keep its
+        // original bucket, but do not resurrect expired history; clamp future
+        // timestamps so a wall-clock adjustment cannot grow the window.
+        let bucket = session_token_bucket(timestamp).min(now_bucket);
+        if tokens == 0 || bucket < first_bucket {
+            return;
+        }
+        if !self.session_output_buckets.contains_key(&session_id)
+            && self.session_output_buckets.len() >= SESSION_OUTPUT_MAX_SESSIONS
+            && !self.evict_unlisted_session_output(&session_id)
+        {
+            // All retained histories still belong to visible requests. Drop
+            // only this new sparkline sample rather than evict those rows or
+            // let observability memory grow without a bound.
+            return;
+        }
         let buckets = self.session_output_buckets.entry(session_id).or_default();
+        let expired = buckets.partition_point(|(bucket, _)| *bucket < first_bucket);
+        buckets.drain(..expired);
         match buckets.binary_search_by_key(&bucket, |(bucket, _)| *bucket) {
             Ok(index) => buckets[index].1 = buckets[index].1.saturating_add(tokens),
             Err(index) => buckets.insert(index, (bucket, tokens)),
         }
+    }
+
+    fn prune_session_output_before(&mut self, first_bucket: u64) {
+        self.session_output_buckets.retain(|_, buckets| {
+            let expired = buckets.partition_point(|(bucket, _)| *bucket < first_bucket);
+            buckets.drain(..expired);
+            !buckets.is_empty()
+        });
+    }
+
+    fn evict_unlisted_session_output(&mut self, protected_session: &Option<String>) -> bool {
+        let visible = self
+            .active
+            .values()
+            .map(|request| &request.session_id)
+            .chain(self.recent.iter().map(|request| &request.session_id))
+            .chain(std::iter::once(protected_session))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let oldest = self
+            .session_output_buckets
+            .iter()
+            .filter(|(session, _)| !visible.contains(*session))
+            .min_by_key(|(_, buckets)| buckets.last().map(|(bucket, _)| *bucket))
+            .map(|(session, _)| session.clone());
+        oldest
+            .and_then(|session| self.session_output_buckets.remove(&session))
+            .is_some()
     }
 
     fn snapshot(&self) -> MonitorState {
@@ -1941,6 +2083,96 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 .map(|(_, tokens)| *tokens)
                 .sum::<u64>(),
             100
+        );
+    }
+
+    #[test]
+    fn session_output_history_expires_after_one_hour() {
+        let monitor = MonitorHandle::new(10);
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let later = start + Duration::from_secs(SESSION_OUTPUT_HISTORY_SECS + 60);
+        let mut store = monitor.store.lock().unwrap();
+
+        store.record_session_output_at(Some("s1".to_string()), start, 20, start);
+        assert_eq!(store.session_output_buckets.len(), 1);
+        store.record_session_output_at(Some("s1".to_string()), later, 80, later);
+
+        let buckets = store
+            .session_output_buckets
+            .get(&Some("s1".to_string()))
+            .expect("current session history remains");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].1, 80);
+    }
+
+    #[test]
+    fn session_output_history_drops_expired_late_samples_and_clamps_future() {
+        let monitor = MonitorHandle::new(10);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
+        let mut store = monitor.store.lock().unwrap();
+
+        store.record_session_output_at(
+            Some("s1".to_string()),
+            now - Duration::from_secs(SESSION_OUTPUT_HISTORY_SECS + 10),
+            10,
+            now,
+        );
+        store.record_session_output_at(
+            Some("s1".to_string()),
+            now - Duration::from_secs(30),
+            20,
+            now,
+        );
+        store.record_session_output_at(
+            Some("s1".to_string()),
+            now + Duration::from_secs(600),
+            30,
+            now,
+        );
+
+        let buckets = store
+            .session_output_buckets
+            .get(&Some("s1".to_string()))
+            .expect("future sample is retained");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].0, session_token_bucket(now) - 3);
+        assert_eq!(buckets[0].1, 20);
+        assert_eq!(buckets[1].0, session_token_bucket(now));
+        assert_eq!(buckets[1].1, 30);
+        assert_eq!(buckets.iter().map(|(_, tokens)| *tokens).sum::<u64>(), 50);
+    }
+
+    #[test]
+    fn session_output_history_caps_unlisted_sessions_but_protects_visible() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "visible-request",
+            Some("visible-session".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30_000);
+        let mut store = monitor.store.lock().unwrap();
+        for index in 0..SESSION_OUTPUT_MAX_SESSIONS {
+            store.record_session_output_at(Some(format!("unlisted-{index}")), now, 1, now);
+        }
+        assert_eq!(
+            store.session_output_buckets.len(),
+            SESSION_OUTPUT_MAX_SESSIONS
+        );
+
+        store.record_session_output_at(Some("visible-session".to_string()), now, 99, now);
+        assert_eq!(
+            store.session_output_buckets.len(),
+            SESSION_OUTPUT_MAX_SESSIONS,
+            "adding a visible session must evict an unlisted history"
+        );
+        assert_eq!(
+            store
+                .session_output_buckets
+                .get(&Some("visible-session".to_string()))
+                .map(|buckets| buckets[0].1),
+            Some(99)
         );
     }
 

@@ -857,6 +857,10 @@ pub fn start_cursor_tool_bridge(
             CursorStreamEvent::ThinkingDelta { text } => {
                 framer.emit_thinking_delta(text);
             }
+            CursorStreamEvent::ThinkingSignature { signature } => {
+                framer.emit_thinking_signature(signature);
+            }
+            CursorStreamEvent::ThinkingCompleted => framer.complete_thinking(),
             CursorStreamEvent::NativeTool {
                 tool_use_id,
                 name,
@@ -1191,6 +1195,10 @@ pub fn resume_cursor_tool_bridge(
                 CursorStreamEvent::ThinkingDelta { text } => {
                     framer.emit_thinking_delta(text);
                 }
+                CursorStreamEvent::ThinkingSignature { signature } => {
+                    framer.emit_thinking_signature(signature);
+                }
+                CursorStreamEvent::ThinkingCompleted => framer.complete_thinking(),
                 CursorStreamEvent::TextDelta { text } => {
                     let recovered = xml_parser.push(text);
                     for evt in recovered {
@@ -1811,6 +1819,47 @@ mod tests {
         assert!(body.contains("plain Sand answer"));
         assert!(body.contains("\"stop_reason\":\"end_turn\""));
         assert!(BridgeRegistry::get("session-sand-text").is_none());
+    }
+
+    #[test]
+    fn thinking_signature_survives_text_tool_bridge() {
+        let _lock = lock_bridge_registry_for_test();
+        BridgeRegistry::clear();
+        let events = vec![
+            CursorStreamEvent::ThinkingSignature {
+                signature: "upstream-signature".into(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::TextDelta {
+                text: r#"<tool_use name="Read">{"file_path":"/tmp/a"}</tool_use>"#.into(),
+            },
+            CursorStreamEvent::End,
+        ];
+        let (bytes, paused) = bridge_cursor_events_to_sse_stateless(
+            "msg-sand-signature",
+            "claude-fable-5-1-thinking-max",
+            "session-sand-signature",
+            &events,
+            Some(BTreeSet::from(["Read".into()])),
+        );
+        assert!(paused);
+        let parsed =
+            crate::providers::cursor::sse::parse_sse_events(&String::from_utf8(bytes).unwrap());
+        let signature_at = parsed
+            .iter()
+            .position(|(_, data)| data["delta"]["type"] == "signature_delta")
+            .expect("upstream signature must survive the XML tool bridge");
+        assert_eq!(
+            parsed[signature_at].1["delta"]["signature"],
+            "upstream-signature"
+        );
+        assert_eq!(parsed[signature_at + 1].0, "content_block_stop");
+        assert_eq!(parsed[signature_at + 1].1["index"], 0);
+        assert!(
+            parsed
+                .iter()
+                .any(|(_, data)| data["content_block"]["type"] == "tool_use" && data["index"] == 1)
+        );
     }
 
     #[test]

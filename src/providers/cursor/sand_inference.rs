@@ -1512,6 +1512,7 @@ pub struct SandInferenceMessage {
     pub parts: Vec<Value>,
     pub tool_calls: Vec<Value>,
     pub tool_content: Option<Value>,
+    pub reasoning_parts: Vec<Value>,
 }
 
 impl SandInferenceMessage {
@@ -1522,6 +1523,7 @@ impl SandInferenceMessage {
             parts: Vec::new(),
             tool_calls: Vec::new(),
             tool_content: None,
+            reasoning_parts: Vec::new(),
         }
     }
 
@@ -1532,6 +1534,7 @@ impl SandInferenceMessage {
             parts: Vec::new(),
             tool_calls: Vec::new(),
             tool_content: None,
+            reasoning_parts: Vec::new(),
         }
     }
 
@@ -1542,6 +1545,7 @@ impl SandInferenceMessage {
             parts: Vec::new(),
             tool_calls: Vec::new(),
             tool_content: None,
+            reasoning_parts: Vec::new(),
         }
     }
 
@@ -1552,6 +1556,7 @@ impl SandInferenceMessage {
             parts: Vec::new(),
             tool_calls: Vec::new(),
             tool_content: Some(json!({ "parts": parts })),
+            reasoning_parts: Vec::new(),
         }
     }
 
@@ -1578,6 +1583,12 @@ impl SandInferenceMessage {
         }
         if !self.tool_calls.is_empty() {
             object.insert("toolCalls".into(), Value::Array(self.tool_calls.clone()));
+        }
+        if !self.reasoning_parts.is_empty() {
+            object.insert(
+                "reasoningParts".into(),
+                Value::Array(self.reasoning_parts.clone()),
+            );
         }
         Value::Object(object)
     }
@@ -1606,6 +1617,7 @@ pub fn messages_from_anthropic(
         let mut parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
+        let mut reasoning_parts = Vec::new();
 
         for block in blocks {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("text");
@@ -1615,11 +1627,14 @@ pub fn messages_from_anthropic(
                         append_text(&mut text, value);
                     }
                 }
-                // Historical reasoning is represented by a separate response
-                // channel. Replaying signatures/markup as user text causes
-                // Sand models to echo or treat it as an instruction.
-                "thinking" if !compaction_mode => {}
-                "thinking" => {}
+                "thinking" | "redacted_thinking" => {
+                    if role == ROLE_ASSISTANT
+                        && !compaction_mode
+                        && let Some(part) = historical_reasoning_part(&block)
+                    {
+                        reasoning_parts.push(part);
+                    }
+                }
                 "compaction" => {
                     if let Some(value) = block.get("content").and_then(Value::as_str) {
                         append_text(&mut text, value);
@@ -1627,11 +1642,13 @@ pub fn messages_from_anthropic(
                 }
                 "image" | "input_image" | "image_url" => {
                     if let Some(part) = image_part(&block) {
+                        flush_text_part(&mut text, &mut parts);
                         parts.push(part);
                     }
                 }
                 "document" | "file" => {
                     if let Some(part) = file_part(&block) {
+                        flush_text_part(&mut text, &mut parts);
                         parts.push(part);
                     } else if let Some(value) = document_text(&block) {
                         append_text(&mut text, &value);
@@ -1696,17 +1713,67 @@ pub fn messages_from_anthropic(
         // A user message may contain only tool_result blocks. The Inference
         // schema requires those to be a role=TOOL message with toolContent.
         if !tool_results.is_empty() {
+            // Claude normalizes results ahead of user text so the previous
+            // assistant's calls remain adjacent to their results.
+            output.push(SandInferenceMessage::tool(tool_results));
             if !text.trim().is_empty() || !parts.is_empty() {
                 output.push(content_message(role, text, parts, Vec::new()));
             }
-            output.push(SandInferenceMessage::tool(tool_results));
             continue;
         }
-        if !text.trim().is_empty() || !parts.is_empty() || !tool_calls.is_empty() {
-            output.push(content_message(role, text, parts, tool_calls));
+        if !text.trim().is_empty()
+            || !parts.is_empty()
+            || !tool_calls.is_empty()
+            || !reasoning_parts.is_empty()
+        {
+            let mut converted = content_message(role, text, parts, tool_calls);
+            converted.reasoning_parts = reasoning_parts;
+            output.push(converted);
         }
     }
     output
+}
+
+fn historical_reasoning_part(block: &Value) -> Option<Value> {
+    let mut part = Map::new();
+    if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+        let data = block
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|data| !data.is_empty())?;
+        part.insert("isRedacted".into(), json!(true));
+        part.insert("text".into(), json!(""));
+        part.insert("redactedData".into(), json!(data));
+    } else {
+        // Older proxy versions fabricated this placeholder. It is not an
+        // upstream signature and must never be replayed as authenticated history.
+        let signature = block
+            .get("signature")
+            .and_then(Value::as_str)
+            .filter(|signature| !signature.is_empty() && *signature != "cursor-proxy")?;
+        let text = block
+            .get("thinking")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        part.insert("isRedacted".into(), json!(false));
+        part.insert("text".into(), json!(text));
+        part.insert("signature".into(), json!(signature));
+    }
+    if let Some(model) = block
+        .get("model_name")
+        .or_else(|| block.get("modelName"))
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        part.insert("modelName".into(), json!(model));
+    }
+    Some(Value::Object(part))
+}
+
+fn flush_text_part(text: &mut String, parts: &mut Vec<Value>) {
+    if !text.is_empty() {
+        parts.push(json!({"text": {"text": std::mem::take(text)}}));
+    }
 }
 
 /// Map Anthropic's tool catalog to `InferenceAgentTool` protobuf-JSON. Sand
@@ -1904,12 +1971,13 @@ fn content_message(
         parts: Vec::new(),
         tool_calls,
         tool_content: None,
+        reasoning_parts: Vec::new(),
     };
     if !text.trim().is_empty() {
         if parts.is_empty() {
             message.text = Some(text);
         } else {
-            parts.insert(0, json!({ "text": { "text": text } }));
+            parts.push(json!({ "text": { "text": text } }));
         }
     }
     if !parts.is_empty() {
@@ -2298,6 +2366,123 @@ pub struct SandInferenceStream {
     terminal_emitted: bool,
     tool_buffers: HashMap<String, SandToolBuffer>,
     completed_tool_ids: HashSet<String>,
+    diagnostics: SandStreamDiagnostics,
+}
+
+/// Content-free counters for distinguishing an empty upstream from discarded
+/// protocol fields. Never retain frame payloads, tool arguments or signatures.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SandStreamDiagnostics {
+    frames: u64,
+    payload_bytes: u64,
+    control_frames: u64,
+    end_frames: u64,
+    json_frames: u64,
+    unknown_json_frames: u64,
+    text_events: u64,
+    text_bytes: u64,
+    thinking_events: u64,
+    thinking_bytes: u64,
+    tool_events: u64,
+    tool_parts: u64,
+    response_info_frames: u64,
+    response_messages: u64,
+    response_text_bytes: u64,
+    response_tool_calls: u64,
+    response_error: bool,
+    unfinished_tools: usize,
+}
+
+impl SandStreamDiagnostics {
+    fn record_json(&mut self, value: &Value, depth: u8) {
+        let Some(object) = value.as_object() else {
+            self.unknown_json_frames += 1;
+            return;
+        };
+        for key in ["result", "response", "data", "payload"] {
+            if let Some(child) = object.get(key)
+                && depth < 8
+            {
+                self.record_json(child, depth + 1);
+                return;
+            }
+        }
+        if object.contains_key("toolCallPart") || object.contains_key("tool_call_part") {
+            self.tool_parts += 1;
+        }
+        if let Some(info) = object
+            .get("responseInfo")
+            .or_else(|| object.get("response_info"))
+        {
+            self.response_info_frames += 1;
+            self.response_error |= response_info_error_message(info).is_some();
+            if let Some(messages) = info.get("messages").and_then(Value::as_array) {
+                self.response_messages += messages.len() as u64;
+                for message in messages {
+                    self.response_text_bytes += message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map_or(0, |text| text.len() as u64);
+                    self.response_tool_calls += message
+                        .get("toolCalls")
+                        .or_else(|| message.get("tool_calls"))
+                        .and_then(Value::as_array)
+                        .map_or(0, |calls| calls.len() as u64);
+                }
+            }
+        }
+        const KNOWN_FIELDS: &[&str] = &[
+            "textPart",
+            "text_part",
+            "thinkingPart",
+            "thinking_part",
+            "toolCallPart",
+            "tool_call_part",
+            "usage",
+            "extendedUsage",
+            "extended_usage",
+            "responseInfo",
+            "response_info",
+            "providerMetadata",
+            "provider_metadata",
+            "invocationId",
+            "invocation_id",
+            "imageDescriptions",
+            "image_descriptions",
+            "error",
+            "done",
+            "finished",
+            "isFinished",
+            "is_finished",
+            "endOfStream",
+            "end_of_stream",
+            "finishReason",
+            "finish_reason",
+            "metadata",
+        ];
+        if !object.is_empty()
+            && !object
+                .keys()
+                .any(|key| KNOWN_FIELDS.contains(&key.as_str()))
+        {
+            self.unknown_json_frames += 1;
+        }
+    }
+
+    fn record_event(&mut self, event: &CursorStreamEvent) {
+        match event {
+            CursorStreamEvent::TextDelta { text } => {
+                self.text_events += 1;
+                self.text_bytes += text.len() as u64;
+            }
+            CursorStreamEvent::ThinkingDelta { text } => {
+                self.thinking_events += 1;
+                self.thinking_bytes += text.len() as u64;
+            }
+            CursorStreamEvent::NativeTool { .. } => self.tool_events += 1,
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2325,7 +2510,12 @@ impl SandInferenceStream {
             terminal_emitted: false,
             tool_buffers: HashMap::new(),
             completed_tool_ids: HashSet::new(),
+            diagnostics: SandStreamDiagnostics::default(),
         }
+    }
+
+    pub fn diagnostics(&self) -> SandStreamDiagnostics {
+        self.diagnostics.clone()
     }
 
     /// Queue one and only one terminal event.  Marking the stream ended here
@@ -2375,12 +2565,18 @@ impl SandInferenceStream {
         if self.ended || self.terminal_emitted {
             return;
         }
+        self.diagnostics.frames += 1;
+        self.diagnostics.payload_bytes += frame.payload.len() as u64;
+        if frame.flags & FLAG_END != 0 {
+            self.diagnostics.end_frames += 1;
+        }
         // Current Sand builds append a control/trailer frame with bit 7 set.
         // Its payload is often binary or an implementation-specific trailer;
         // attempting JSON decoding here turns an otherwise successful answer
         // into a spurious 502.  Check this before FLAG_END because a gateway
         // may combine the trailer and end bits.
         if frame.flags & FLAG_CONTROL != 0 {
+            self.diagnostics.control_frames += 1;
             if frame.flags & FLAG_END != 0 {
                 // A combined control+END frame carries no model payload, but
                 // it is still the authoritative stream terminator.  Ignoring
@@ -2452,6 +2648,8 @@ impl SandInferenceStream {
         if self.ended || self.terminal_emitted {
             return;
         }
+        self.diagnostics.json_frames += 1;
+        self.diagnostics.record_json(value, 0);
         if let Some(error) = json_error(value) {
             self.queue_terminal_error(error);
             return;
@@ -2460,6 +2658,7 @@ impl SandInferenceStream {
         for event in
             events_from_json_with_state(value, &mut self.tool_buffers, &mut self.completed_tool_ids)
         {
+            self.diagnostics.record_event(&event);
             self.pending.push_back(Ok(event));
         }
         // A few desktop builds omit FLAG_END and mark the final object.  Honor
@@ -2477,9 +2676,11 @@ impl SandInferenceStream {
             // StrReplace/XML fallback loop.  A complete empty argument list is
             // represented by an empty object, matching the desktop client.
             let Some(input) = complete_tool_input(&buffer) else {
+                self.diagnostics.unfinished_tools += 1;
                 continue;
             };
             if !buffer.name.is_empty() && self.completed_tool_ids.insert(id.clone()) {
+                self.diagnostics.tool_events += 1;
                 self.pending.push_back(Ok(CursorStreamEvent::NativeTool {
                     tool_use_id: id,
                     name: buffer.name,
@@ -2529,6 +2730,7 @@ pub(crate) fn pending_stream_with_notify_for_test(polled: Arc<Notify>) -> SandIn
         terminal_emitted: false,
         tool_buffers: HashMap::new(),
         completed_tool_ids: HashSet::new(),
+        diagnostics: SandStreamDiagnostics::default(),
     }
 }
 
@@ -2901,6 +3103,15 @@ fn json_error_with_depth(value: &Value, depth: u8) -> Option<CursorError> {
     if let Some(error) = json_error_direct(value) {
         return Some(error);
     }
+    for key in ["responseInfo", "response_info"] {
+        if let Some(message) = value.get(key).and_then(response_info_error_message) {
+            return Some(CursorError::new(
+                connect_error_status(None, None, message),
+                message.to_owned(),
+                Some("Sand responseInfo.errorMessage".into()),
+            ));
+        }
+    }
     if depth >= MAX_ERROR_ENVELOPE_DEPTH {
         return None;
     }
@@ -2915,6 +3126,14 @@ fn json_error_with_depth(value: &Value, depth: u8) -> Option<CursorError> {
         }
     }
     None
+}
+
+fn response_info_error_message(info: &Value) -> Option<&str> {
+    info.get("errorMessage")
+        .or_else(|| info.get("error_message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
 }
 
 fn json_error_direct(value: &Value) -> Option<CursorError> {
@@ -3127,11 +3346,7 @@ fn events_from_json_with_state(
     // Preserve wire order where possible: InferenceService normally emits one
     // part per frame, so this order is deterministic and avoids combining a
     // reasoning delta with visible output in one event.
-    for part in thinking {
-        if !part.is_empty() {
-            events.push(CursorStreamEvent::ThinkingDelta { text: part });
-        }
-    }
+    events.extend(thinking);
     for part in text {
         if !part.is_empty() {
             events.push(CursorStreamEvent::TextDelta { text: part });
@@ -3432,12 +3647,41 @@ fn complete_tool_input(buffer: &SandToolBuffer) -> Option<Value> {
     serde_json::from_str::<Value>(&buffer.args_text).ok()
 }
 
-fn collect_text_parts(value: &Value, text: &mut Vec<String>, thinking: &mut Vec<String>) {
+fn collect_text_parts(
+    value: &Value,
+    text: &mut Vec<String>,
+    thinking: &mut Vec<CursorStreamEvent>,
+) {
     let Value::Object(object) = value else {
         return;
     };
     for (key, child) in object {
         let normalized = key.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "thinkingpart" | "thinking_part") {
+            if let Some(text) = child.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                thinking.push(CursorStreamEvent::ThinkingDelta {
+                    text: text.to_owned(),
+                });
+            }
+            if let Some(signature) = child.get("signature").and_then(Value::as_str)
+                && !signature.is_empty()
+            {
+                thinking.push(CursorStreamEvent::ThinkingSignature {
+                    signature: signature.to_owned(),
+                });
+            }
+            if child
+                .get("isFinal")
+                .or_else(|| child.get("is_final"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                thinking.push(CursorStreamEvent::ThinkingCompleted);
+            }
+            continue;
+        }
         let is_thinking = normalized.contains("thinking")
             || normalized.contains("reasoning")
             || normalized.contains("thought");
@@ -3451,7 +3695,9 @@ fn collect_text_parts(value: &Value, text: &mut Vec<String>, thinking: &mut Vec<
         if is_thinking || is_text_part {
             if let Some(value) = text_from_value(child) {
                 if is_thinking {
-                    thinking.push(value);
+                    if !value.is_empty() {
+                        thinking.push(CursorStreamEvent::ThinkingDelta { text: value });
+                    }
                 } else {
                     text.push(value);
                 }
@@ -3867,6 +4113,101 @@ mod tests {
     }
 
     #[test]
+    fn multiturn_history_preserves_signed_reasoning_and_tool_result_adjacency() {
+        let model = "claude-fable-5-1-thinking-max";
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "inspect the fixture"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "real-upstream-signature"},
+                    {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/fixture"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "read-1", "is_error": false, "content": [{"type": "text", "text": "result"}]},
+                    {"type": "text", "text": "now summarize"}
+                ]}
+            ]
+        })).unwrap();
+        let messages = messages_from_anthropic(&request, false);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            [ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL, ROLE_USER]
+        );
+        let wire = SandInferenceRequest::new(model, "c", "i", messages).to_json_value();
+        assert_eq!(wire["modelId"], model);
+        assert_eq!(wire["requestedModel"]["modelId"], model);
+        assert_eq!(
+            wire["messages"][1]["reasoningParts"][0],
+            json!({
+                "text": "", "signature": "real-upstream-signature", "isRedacted": false
+            })
+        );
+        assert_eq!(wire["messages"][1]["toolCalls"][0]["toolCallId"], "read-1");
+        assert_eq!(
+            wire["messages"][2]["toolContent"]["parts"][0],
+            json!({
+                "toolCallId": "read-1", "toolName": "Read", "isError": false,
+                "result": [{"type": "text", "text": "result"}]
+            })
+        );
+        assert_eq!(wire["messages"][3]["text"], "now summarize");
+        assert!(
+            messages_from_anthropic(&request, true)
+                .iter()
+                .all(|message| message.reasoning_parts.is_empty())
+        );
+    }
+
+    #[test]
+    fn historical_reasoning_keeps_redaction_but_drops_proxy_placeholders() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "thinking", "thinking": "user", "signature": "untrusted-role"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "legacy", "signature": "cursor-proxy"},
+                    {"type": "thinking", "thinking": "unsigned", "signature": ""},
+                    {"type": "redacted_thinking", "data": "opaque-data"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        })).unwrap();
+        let messages = messages_from_anthropic(&request, false);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].reasoning_parts,
+            vec![json!({
+                "isRedacted": true, "text": "", "redactedData": "opaque-data"
+            })]
+        );
+        assert_eq!(messages[0].text.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn sand_multimodal_history_preserves_interleaved_block_order() {
+        let image = json!({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "aGVsbG8="
+        }});
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                image, {"type": "text", "text": "first image"},
+                image, {"type": "text", "text": "second image"}
+            ]}]
+        }))
+        .unwrap();
+        let messages = messages_from_anthropic(&request, false);
+        let parts = &messages[0].parts;
+        assert_eq!(parts.len(), 4);
+        assert!(parts[0].get("image").is_some());
+        assert_eq!(parts[1]["text"]["text"], "first image");
+        assert!(parts[2].get("image").is_some());
+        assert_eq!(parts[3]["text"]["text"], "second image");
+    }
+
+    #[test]
     fn document_and_openai_file_blocks_use_native_file_part() {
         let request: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-fable-5",
@@ -3943,6 +4284,84 @@ mod tests {
             }
         )));
         assert!(events.iter().any(|event| matches!(event, CursorStreamEvent::NativeTool { tool_use_id, name, .. } if tool_use_id == "call-1" && name == "Bash")));
+    }
+
+    #[test]
+    fn thinking_signature_and_block_end_survive_without_ending_the_turn() {
+        let mut stream = test_stream();
+        stream.queue_json_value(&json!({"thinkingPart": {"text": "thinking"}}));
+        stream.queue_json_value(&json!({"response": {"thinkingPart": {
+            "signature": "opaque-signature", "isFinal": true
+        }}}));
+        assert!(!stream.ended);
+        stream.queue_json_value(&json!({"textPart": {"text": "answer"}}));
+        stream.emit_end_once();
+        let events: Vec<_> = stream
+            .pending
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(matches!(&events[..], [
+            CursorStreamEvent::ThinkingDelta { text },
+            CursorStreamEvent::ThinkingSignature { signature },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::TextDelta { text: answer },
+            CursorStreamEvent::End,
+        ] if text == "thinking" && signature == "opaque-signature" && answer == "answer"));
+    }
+
+    #[test]
+    fn response_info_errors_are_not_silent_hollow_completions() {
+        for value in [
+            json!({"responseInfo": {"errorMessage": "invalid argument: tool results missing"}}),
+            json!({"response": {"response_info": {"error_message": "invalid argument: tool results missing"}}}),
+        ] {
+            let mut stream = test_stream();
+            stream.queue_json_value(&value);
+            let error = stream.pending.pop_front().unwrap().unwrap_err();
+            assert_eq!(error.message, "invalid argument: tool results missing");
+            assert_eq!(
+                error.detail.as_deref(),
+                Some("Sand responseInfo.errorMessage")
+            );
+            assert!(stream.ended);
+            assert!(stream.diagnostics.response_error);
+        }
+        for value in [
+            json!({"responseInfo": {"errorMessage": "  "}}),
+            json!({"toolCallPart": {"args": {"responseInfo": {"errorMessage": "fixture"}}}}),
+            json!({"providerMetadata": {"responseInfo": {"errorMessage": "fixture"}}}),
+        ] {
+            assert!(json_error(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn stream_diagnostics_are_content_free_and_distinguish_snapshot_only_output() {
+        let mut stream = test_stream();
+        let value = json!({"responseInfo": {"messages": [{
+            "role": 2, "content": "private-response", "toolCalls": [{"args": {"token": "secret"}}]
+        }]}});
+        stream.queue_frame(ConnectFrame {
+            flags: 0,
+            payload: Bytes::from(serde_json::to_vec(&value).unwrap()),
+        });
+        stream.queue_json_value(&json!({"thinkingPart": {
+            "text": "private-thinking", "signature": "private-signature"
+        }}));
+        stream.queue_json_value(&json!({"unrecognized": "private-value"}));
+        stream.emit_end_once();
+        let counters = stream.diagnostics();
+        assert_eq!(counters.response_info_frames, 1);
+        assert_eq!(counters.response_messages, 1);
+        assert_eq!(counters.response_text_bytes, 16);
+        assert_eq!(counters.response_tool_calls, 1);
+        assert_eq!(counters.text_events, 0);
+        assert_eq!(counters.thinking_events, 1);
+        assert_eq!(counters.unknown_json_frames, 1);
+        let serialized = serde_json::to_string(&counters).unwrap();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("secret"));
     }
 
     #[test]
@@ -4178,6 +4597,7 @@ mod tests {
             terminal_emitted: false,
             tool_buffers: HashMap::new(),
             completed_tool_ids: HashSet::new(),
+            diagnostics: SandStreamDiagnostics::default(),
         }
     }
 

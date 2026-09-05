@@ -16,6 +16,8 @@ pub mod proto;
 pub mod request;
 pub mod response;
 pub mod sand_inference;
+#[cfg(test)]
+mod sand_load_tests;
 pub(crate) mod sand_operation;
 pub mod sand_status;
 pub mod sse;
@@ -196,6 +198,7 @@ struct SandAttemptBudget {
     transport_remaining: Arc<AtomicUsize>,
     account_failover_remaining: Arc<AtomicUsize>,
     tool_fallback_remaining: Arc<AtomicUsize>,
+    telemetry: Option<(crate::monitor::MonitorHandle, String)>,
 }
 
 impl SandAttemptBudget {
@@ -208,7 +211,16 @@ impl SandAttemptBudget {
             tool_fallback_remaining: Arc::new(AtomicUsize::new(
                 SAND_TOOL_FALLBACK_ATTEMPTS_DEFAULT,
             )),
+            telemetry: None,
         }
+    }
+
+    fn with_telemetry(mut self, ctx: &RequestContext) -> Self {
+        self.telemetry = ctx
+            .monitor
+            .clone()
+            .map(|monitor| (monitor, ctx.req_id.clone()));
+        self
     }
 
     /// Consume one slot immediately before an upstream invocation. Waiting
@@ -2146,15 +2158,12 @@ async fn sand_direct_response_inner(
     let mut effective_token = token.to_string();
     let mut effective_request = request;
     let mut fallback_request = fallback_request;
-    let sand_attempt_budget = SandAttemptBudget::new();
+    let sand_attempt_budget = SandAttemptBudget::new().with_telemetry(ctx);
     let mut open_attempt_kind = SandOpenAttemptKind::Transport;
     // Share one deadline between the first open and all pre-output stream
     // replays. This prevents a retrying client from multiplying the open
     // timeout for every transport attempt.
     let sand_retry_deadline = Instant::now() + sand_logical_retry_budget();
-    if let Some(monitor) = ctx.monitor.as_ref() {
-        monitor.opening(&ctx.req_id);
-    }
     let (stream, policy_admission) = loop {
         match open_sand_with_policy_probe_until(
             &client,
@@ -2603,6 +2612,9 @@ async fn open_sand_with_retries_until(
     // are ordinary transport attempts and use the transport budget instead.
     let mut current_attempt_kind = attempt_kind;
     loop {
+        if let Some((monitor, id)) = attempt_budget.telemetry.as_ref() {
+            monitor.queued(id);
+        }
         let remaining = request_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(CursorError::new(
@@ -2723,6 +2735,9 @@ async fn open_sand_with_retries_until(
         // 180s deadline and surfaced a proxy-generated 503 even though the
         // upstream connection had already been established.
         let mut open_permit = open_permit;
+        if let Some((monitor, id)) = attempt_budget.telemetry.as_ref() {
+            monitor.opening(id);
+        }
         let result = tokio::time::timeout(per_attempt, client.open(token, &attempt_request)).await;
         let result = match result {
             Ok(result) => result,
@@ -2735,6 +2750,12 @@ async fn open_sand_with_retries_until(
                 None,
             )),
         };
+        if let Some((monitor, id)) = attempt_budget.telemetry.as_ref() {
+            monitor.upstream_started(id);
+            if let Err(error) = &result {
+                monitor.upstream_error(id, error.status);
+            }
+        }
         match result {
             Ok(stream) => {
                 // The HTTP handshake succeeded. Release both open gates before
@@ -2798,6 +2819,9 @@ async fn open_sand_with_retries_until(
                     if remaining <= Duration::from_millis(delay) {
                         return Err(error);
                     }
+                    if let Some((monitor, id)) = attempt_budget.telemetry.as_ref() {
+                        monitor.retrying(id);
+                    }
                     crate::retry::sleep(delay).await;
                     attempt += 1;
                     current_attempt_kind = SandOpenAttemptKind::Transport;
@@ -2823,6 +2847,10 @@ async fn open_sand_with_policy_probe_until(
     attempt_budget: &SandAttemptBudget,
     attempt_kind: SandOpenAttemptKind,
 ) -> Result<(SandInferenceStream, PolicyRateLimitAdmission), CursorError> {
+    if let Some((monitor, id)) = attempt_budget.telemetry.as_ref() {
+        monitor.account_resolved(id, cursor_account_digest(token));
+        monitor.queued(id);
+    }
     let admission = policy_rate_limit_admit_fresh_open(&request.model_id, "sand", token).await?;
     match open_sand_with_retries_until(
         client,
@@ -3164,6 +3192,7 @@ async fn drive_sand_stream_with_retries(
         // speculative and must remain replayable until visible text or a
         // native tool has been observed.
         let mut compaction_thinking = false;
+        let mut filtered_tools = 0u64;
         loop {
             // A pre-output idle wait is part of the shared replay budget. Do
             // not allow its final timer to outlive that budget; once output
@@ -3194,6 +3223,7 @@ async fn drive_sand_stream_with_retries(
             match next {
                 Ok(Some(Ok(event))) => {
                     let Some(event) = normalize_sand_stream_event(event, allowed.as_ref()) else {
+                        filtered_tools += 1;
                         continue;
                     };
                     if matches!(
@@ -3252,6 +3282,15 @@ async fn drive_sand_stream_with_retries(
                             return;
                         }
                         SandStreamEventAction::HollowEnd => {
+                            create_logger("cursor").warn(
+                                "sand_hollow_stream",
+                                Some(serde_json::Map::from_iter([
+                                    ("reqId".into(), serde_json::json!(monitor_request_id)),
+                                    ("model".into(), serde_json::json!(model)),
+                                    ("filteredTools".into(), serde_json::json!(filtered_tools)),
+                                    ("stream".into(), serde_json::json!(stream.diagnostics())),
+                                ])),
+                            );
                             // A payload-less END (or an END carrying only
                             // thinking/usage/session metadata) is not a
                             // successful assistant turn. Treat it like a
@@ -3267,6 +3306,9 @@ async fn drive_sand_stream_with_retries(
                     }
                 }
                 Ok(Some(Err(error))) => {
+                    if let Some(monitor) = monitor.as_ref() {
+                        monitor.upstream_error(&monitor_request_id, error.status);
+                    }
                     stream_error = Some(error);
                     break;
                 }
@@ -3641,6 +3683,7 @@ fn prepend_sand_text_tool_bridge_prompt(messages: &mut Vec<SandInferenceMessage>
         system.parts.clear();
         system.tool_calls.clear();
         system.tool_content = None;
+        system.reasoning_parts.clear();
         system.text = Some(if existing.trim().is_empty() {
             prompt.to_string()
         } else {
@@ -3981,6 +4024,7 @@ fn anthropic_json_from_sse(
     let parsed = crate::providers::cursor::sse::parse_sse_events(&String::from_utf8_lossy(bytes));
     let mut acc = AnthropicJsonAcc::new(estimated_input);
     let mut tool_blocks: HashMap<i64, (String, String, String)> = HashMap::new();
+    let mut thinking_blocks = BTreeSet::new();
     let mut ended = false;
     for (_, data) in parsed {
         let kind = data
@@ -4006,6 +4050,9 @@ fn anthropic_json_from_sse(
                 let Some(block) = data.get("content_block") else {
                     continue;
                 };
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("thinking") {
+                    thinking_blocks.insert(index);
+                }
                 if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use") {
                     let id = block
                         .get("id")
@@ -4045,6 +4092,15 @@ fn anthropic_json_from_sse(
                             });
                         }
                     }
+                    Some("signature_delta") if thinking_blocks.contains(&index) => {
+                        if let Some(signature) =
+                            delta.get("signature").and_then(serde_json::Value::as_str)
+                        {
+                            acc.push(&CursorStreamEvent::ThinkingSignature {
+                                signature: signature.to_owned(),
+                            });
+                        }
+                    }
                     Some("input_json_delta") => {
                         if let Some((_, _, input)) = tool_blocks.get_mut(&index) {
                             input.push_str(
@@ -4063,6 +4119,9 @@ fn anthropic_json_from_sse(
                     .get("index")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
+                if thinking_blocks.remove(&index) {
+                    acc.push(&CursorStreamEvent::ThinkingCompleted);
+                }
                 if let Some((id, name, input)) = tool_blocks.remove(&index) {
                     let input =
                         serde_json::from_str(&input).unwrap_or_else(|_| serde_json::json!({}));
@@ -7080,6 +7139,8 @@ fn live_event_commits_client_output(event: &LiveRunEvent) -> bool {
         LiveRunEvent::Cursor(CursorStreamEvent::NativeTool { .. } | CursorStreamEvent::End) => true,
         LiveRunEvent::Cursor(
             CursorStreamEvent::ThinkingDelta { .. }
+            | CursorStreamEvent::ThinkingSignature { .. }
+            | CursorStreamEvent::ThinkingCompleted
             | CursorStreamEvent::Session { .. }
             | CursorStreamEvent::Usage { .. }
             | CursorStreamEvent::OutputTokenDelta { .. },
@@ -9198,6 +9259,9 @@ impl Provider for CursorProvider {
         );
         create_logger("cursor").info("cursor_account_selected", Some(selection_fields));
         let mut auth = auth_selection.auth;
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.account_resolved(&ctx.req_id, account_key.clone());
+        }
 
         // Near expiry: refresh first. A rotated token represents a fresh
         // account credential and must not inherit the old token's breaker. A
@@ -10570,6 +10634,59 @@ mod tests {
     fn auth_selection_timeout_is_bounded() {
         assert!(CURSOR_AUTH_LOAD_TIMEOUT <= Duration::from_secs(10));
         assert!(CURSOR_AUTH_LOAD_TIMEOUT >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sand_thinking_signature_roundtrips_through_claude_tool_continuation() {
+        let model = "claude-fable-5-1-thinking-max";
+        let mut encoder =
+            crate::providers::cursor::sse::CursorSseEncoder::new("msg_roundtrip", model);
+        for event in [
+            CursorStreamEvent::ThinkingDelta {
+                text: "inspect".into(),
+            },
+            CursorStreamEvent::ThinkingSignature {
+                signature: "upstream-opaque".into(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::NativeTool {
+                tool_use_id: "call_roundtrip".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/fixture"}),
+            },
+            CursorStreamEvent::End,
+        ] {
+            encoder.push_event(&event);
+        }
+        let answer =
+            anthropic_json_from_sse(&encoder.take_bytes(), "msg_roundtrip", model, 10).unwrap();
+        assert_eq!(answer["stop_reason"], "tool_use");
+        assert_eq!(
+            answer["content"][0],
+            serde_json::json!({
+                "type": "thinking", "thinking": "inspect", "signature": "upstream-opaque"
+            })
+        );
+        let continuation: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "inspect"},
+                {"role": "assistant", "content": answer["content"]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_roundtrip", "content": "result"},
+                    {"type": "text", "text": "summarize"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let messages = messages_from_anthropic(&continuation, false);
+        assert_eq!(
+            messages[1].reasoning_parts[0]["signature"],
+            "upstream-opaque"
+        );
+        assert_eq!(messages[1].tool_calls[0]["toolCallId"], "call_roundtrip");
+        assert_eq!(messages[2].role, sand_inference::ROLE_TOOL);
+        assert_eq!(messages[3].text.as_deref(), Some("summarize"));
     }
     use crate::providers::cursor::live::{
         live_error_allows_fresh_conversation, live_error_is_kv_blob_overflow,

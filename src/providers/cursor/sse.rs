@@ -168,6 +168,10 @@ fn frame_cursor_stream_with_allowed_mode(
         }
         match event {
             CursorStreamEvent::ThinkingDelta { text } => framer.emit_thinking_delta(text),
+            CursorStreamEvent::ThinkingSignature { signature } => {
+                framer.emit_thinking_signature(signature)
+            }
+            CursorStreamEvent::ThinkingCompleted => framer.complete_thinking(),
             CursorStreamEvent::TextDelta { text } => {
                 framer.emit_text_delta(text);
             }
@@ -535,23 +539,13 @@ impl<'a> CursorSseFramer<'a> {
         true
     }
 
-    /// Thinking blocks require a signature delta immediately before their
-    /// content_block_stop. Cursor does not expose an Anthropic signature, so a
-    /// stable proxy signature keeps the event lifecycle well formed.
+    /// Only upstream signatures may be replayed in a later model request.
+    /// Unsigned CLI reasoning remains unsigned rather than receiving a
+    /// fabricated signature that the next upstream cannot validate.
     fn close_thinking(&mut self) {
         if !self.state.thinking_open {
             return;
         }
-
-        let data = serde_json::json!({
-            "type": "content_block_delta",
-            "index": self.state.thinking_index,
-            "delta": {
-                "type": "signature_delta",
-                "signature": "cursor-proxy"
-            }
-        });
-        write_sse_event(self.output, EVENT_CONTENT_BLOCK_DELTA, &data);
 
         let data = serde_json::json!({
             "type": "content_block_stop",
@@ -600,6 +594,25 @@ impl<'a> CursorSseFramer<'a> {
         );
         // No mid-stream message_delta: Claude Code already maps thinking text →
         // ceil(len/4) while outputTokens is null. Progress resumes on text_delta.
+    }
+
+    pub fn emit_thinking_signature(&mut self, signature: &str) {
+        if self.state.compaction_mode || signature.is_empty() || !self.open_thinking() {
+            return;
+        }
+        write_content_delta(
+            self.output,
+            self.state.thinking_index,
+            "signature_delta",
+            "signature",
+            signature,
+        );
+    }
+
+    pub fn complete_thinking(&mut self) {
+        if !self.state.compaction_mode {
+            self.close_thinking();
+        }
     }
 
     pub fn emit_text_delta(&mut self, text: &str) {
@@ -1092,6 +1105,10 @@ impl CursorSseEncoder {
 
         self.with_framer(|framer| match event {
             CursorStreamEvent::ThinkingDelta { text } => framer.emit_thinking_delta(text),
+            CursorStreamEvent::ThinkingSignature { signature } => {
+                framer.emit_thinking_signature(signature)
+            }
+            CursorStreamEvent::ThinkingCompleted => framer.complete_thinking(),
             CursorStreamEvent::TextDelta { text } => framer.emit_text_delta(text),
             CursorStreamEvent::Usage {
                 input_tokens,
@@ -1125,6 +1142,14 @@ impl CursorSseEncoder {
 
     pub fn emit_thinking_delta(&mut self, text: &str) {
         self.with_framer(|framer| framer.emit_thinking_delta(text));
+    }
+
+    pub fn emit_thinking_signature(&mut self, signature: &str) {
+        self.with_framer(|framer| framer.emit_thinking_signature(signature));
+    }
+
+    pub fn complete_thinking(&mut self) {
+        self.with_framer(|framer| framer.complete_thinking());
     }
 
     pub fn emit_text_delta(&mut self, text: &str) {
@@ -1460,6 +1485,105 @@ mod tests {
                 .and_then(|t| t.as_str())
                 == Some("text")
         }));
+    }
+
+    #[test]
+    fn thinking_signature_preserves_full_upstream_value_and_block_boundaries() {
+        let signature = "upstream-signed-data/+=\"".repeat(4096);
+        let mut encoder = CursorSseEncoder::new("msg_signed", "claude-fable-5-1-thinking-max");
+        let mut bytes = Vec::new();
+        for event in [
+            CursorStreamEvent::ThinkingDelta {
+                text: "first".into(),
+            },
+            CursorStreamEvent::ThinkingSignature {
+                signature: signature.clone(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::ThinkingSignature {
+                signature: "second-signature".into(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::TextDelta {
+                text: "answer".into(),
+            },
+            CursorStreamEvent::End,
+        ] {
+            encoder.push_event(&event);
+            bytes.extend_from_slice(&encoder.take_bytes());
+        }
+        let events = parse_sse_events(&String::from_utf8(bytes).unwrap());
+        let signatures: Vec<_> = events
+            .iter()
+            .filter_map(|(_, data)| {
+                (data["delta"]["type"] == "signature_delta")
+                    .then_some((data["index"].clone(), data["delta"]["signature"].clone()))
+            })
+            .collect();
+        assert_eq!(
+            signatures,
+            vec![
+                (serde_json::json!(0), serde_json::json!(signature)),
+                (serde_json::json!(1), serde_json::json!("second-signature")),
+            ]
+        );
+        let stops: Vec<_> = events
+            .iter()
+            .filter_map(|(name, data)| {
+                (name == EVENT_CONTENT_BLOCK_STOP).then_some(data["index"].clone())
+            })
+            .collect();
+        assert_eq!(
+            stops,
+            vec![
+                serde_json::json!(0),
+                serde_json::json!(1),
+                serde_json::json!(2)
+            ]
+        );
+        for (at, (_, data)) in events.iter().enumerate() {
+            if data["delta"]["type"] == "signature_delta" {
+                assert_eq!(events[at + 1].0, EVENT_CONTENT_BLOCK_STOP);
+                assert_eq!(events[at + 1].1["index"], data["index"]);
+            }
+        }
+        assert_eq!(events.last().unwrap().0, EVENT_MESSAGE_STOP);
+    }
+
+    #[test]
+    fn thinking_signature_is_not_fabricated_for_unsigned_reasoning() {
+        let mut encoder = CursorSseEncoder::new("msg_unsigned", "cursor-test");
+        encoder.emit_thinking_delta("unsigned thought");
+        encoder.complete_thinking();
+        encoder.emit_text_delta("answer");
+        encoder.finalize();
+        let events = parse_sse_events(&String::from_utf8(encoder.take_bytes()).unwrap());
+        assert!(
+            events
+                .iter()
+                .all(|(_, data)| data["delta"]["type"] != "signature_delta")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| name == EVENT_CONTENT_BLOCK_STOP && data["index"] == 0)
+        );
+    }
+
+    #[test]
+    fn thinking_signature_does_not_change_compaction_output() {
+        let mut encoder = CursorSseEncoder::new_compaction("msg_compact_signed", "cursor-test");
+        encoder.emit_thinking_signature("opaque-signature");
+        encoder.complete_thinking();
+        encoder.emit_text_delta("summary");
+        encoder.finalize();
+        let bytes = encoder.take_bytes();
+        assert_eq!(rendered_channels(&bytes), ("summary".into(), String::new()));
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("opaque-signature")
+        );
     }
 
     #[test]
@@ -2036,6 +2160,10 @@ mod tests {
             CursorStreamEvent::ThinkingDelta {
                 text: "late thinking".to_string(),
             },
+            CursorStreamEvent::ThinkingSignature {
+                signature: "late-signature".into(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
             CursorStreamEvent::TextDelta {
                 text: "late text".to_string(),
             },

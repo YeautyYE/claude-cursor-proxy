@@ -23,6 +23,12 @@ pub enum CursorStreamEvent {
     ThinkingDelta {
         text: String,
     },
+    /// Complete upstream signature for the current thinking block, not a delta.
+    ThinkingSignature {
+        signature: String,
+    },
+    /// End of one thinking block, independently of the enclosing model turn.
+    ThinkingCompleted,
     TextDelta {
         text: String,
     },
@@ -391,6 +397,9 @@ fn decode_upstream_response_with_allowed_inner(
 #[derive(Debug)]
 pub struct AnthropicJsonAcc {
     text: String,
+    content: Vec<serde_json::Value>,
+    thinking: Option<(String, Option<String>)>,
+    has_visible_text: bool,
     compaction_mode: bool,
     /// Reasoning is only a compaction fallback. Keep it retractable until we
     /// know whether Cursor emits an authoritative text summary later.
@@ -414,6 +423,9 @@ impl AnthropicJsonAcc {
     pub fn new_mode(estimated_input: u64, compaction_mode: bool) -> Self {
         Self {
             text: String::new(),
+            content: Vec::new(),
+            thinking: None,
+            has_visible_text: false,
             compaction_mode,
             compaction_thinking_fallback: String::new(),
             compaction_seen_text: false,
@@ -429,10 +441,12 @@ impl AnthropicJsonAcc {
     pub fn push(&mut self, event: &CursorStreamEvent) {
         match event {
             CursorStreamEvent::TextDelta { text } => {
+                self.flush_thinking();
                 if self.compaction_mode && !self.compaction_seen_text {
                     self.compaction_seen_text = true;
                     self.compaction_thinking_fallback.clear();
                 }
+                self.has_visible_text |= !text.is_empty();
                 self.text.push_str(text);
             }
             CursorStreamEvent::Usage {
@@ -459,18 +473,51 @@ impl AnthropicJsonAcc {
                     self.compaction_thinking_fallback.push_str(text);
                 }
             }
-            CursorStreamEvent::ThinkingDelta { .. }
-            | CursorStreamEvent::Session { .. }
-            | CursorStreamEvent::End => {}
+            CursorStreamEvent::ThinkingDelta { text } => {
+                self.flush_text();
+                self.thinking
+                    .get_or_insert_with(Default::default)
+                    .0
+                    .push_str(text);
+            }
+            CursorStreamEvent::ThinkingSignature { signature } if !self.compaction_mode => {
+                if !signature.is_empty() {
+                    self.flush_text();
+                    self.thinking.get_or_insert_with(Default::default).1 = Some(signature.clone());
+                }
+            }
+            CursorStreamEvent::ThinkingCompleted | CursorStreamEvent::End => {
+                self.flush_thinking();
+            }
+            CursorStreamEvent::ThinkingSignature { .. } | CursorStreamEvent::Session { .. } => {}
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            self.content.push(serde_json::json!({
+                "type": "text", "text": std::mem::take(&mut self.text),
+            }));
+        }
+    }
+
+    fn flush_thinking(&mut self) {
+        if let Some((thinking, signature)) = self.thinking.take() {
+            let mut block = serde_json::json!({"type": "thinking", "thinking": thinking});
+            if let Some(signature) = signature {
+                block["signature"] = serde_json::json!(signature);
+            }
+            self.content.push(block);
         }
     }
 
     pub fn push_native_tool(&mut self, id: String, name: String, input: serde_json::Value) {
+        self.flush_thinking();
         self.tools.push((id, name, input));
     }
 
     pub fn has_useful(&self) -> bool {
-        !self.text.is_empty()
+        self.has_visible_text
             || (self.compaction_mode && !self.compaction_thinking_fallback.is_empty())
             || !self.tools.is_empty()
     }
@@ -490,13 +537,14 @@ impl AnthropicJsonAcc {
     }
 
     pub fn into_message_json(mut self, message_id: &str, model: &str) -> serde_json::Value {
+        self.flush_thinking();
         let text = if self.compaction_mode && self.text.is_empty() {
             std::mem::take(&mut self.compaction_thinking_fallback)
         } else {
             std::mem::take(&mut self.text)
         };
-        let mut content = Vec::new();
-        if !text.is_empty() || self.tools.is_empty() {
+        let mut content = std::mem::take(&mut self.content);
+        if !text.is_empty() || (self.tools.is_empty() && content.is_empty()) {
             content.push(serde_json::json!({
                 "type": "text",
                 "text": text,
@@ -1260,6 +1308,78 @@ mod tests {
         assert_eq!(json["stop_reason"], "end_turn");
         assert_eq!(json["usage"]["input_tokens"].as_u64(), Some(12));
         assert_eq!(json["usage"]["output_tokens"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn thinking_signature_json_acc_preserves_order_and_empty_signed_blocks() {
+        let mut acc = AnthropicJsonAcc::new(9);
+        for event in [
+            CursorStreamEvent::ThinkingDelta {
+                text: "first".into(),
+            },
+            CursorStreamEvent::ThinkingSignature {
+                signature: "first-signature".into(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::TextDelta {
+                text: "intermediate".into(),
+            },
+            CursorStreamEvent::ThinkingSignature {
+                signature: "opaque-signature".into(),
+            },
+            CursorStreamEvent::ThinkingCompleted,
+            CursorStreamEvent::TextDelta {
+                text: "answer".into(),
+            },
+            CursorStreamEvent::End,
+        ] {
+            acc.push(&event);
+        }
+        assert!(acc.has_useful());
+        let json = acc.into_message_json("msg_signed_json", "cursor-test");
+        assert_eq!(
+            json["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "first", "signature": "first-signature"},
+                {"type": "text", "text": "intermediate"},
+                {"type": "thinking", "thinking": "", "signature": "opaque-signature"},
+                {"type": "text", "text": "answer"},
+            ])
+        );
+    }
+
+    #[test]
+    fn thinking_signature_json_does_not_change_useful_or_compaction_contract() {
+        let mut acc = AnthropicJsonAcc::new(1);
+        acc.push(&CursorStreamEvent::ThinkingSignature {
+            signature: "opaque".into(),
+        });
+        acc.push(&CursorStreamEvent::ThinkingCompleted);
+        assert!(!acc.has_useful());
+        acc.push_native_tool("call-1".into(), "Read".into(), serde_json::json!({}));
+        assert!(acc.has_useful());
+        let json = acc.into_message_json("msg_signed_tool", "cursor-test");
+        assert_eq!(json["content"][0]["signature"], "opaque");
+        assert_eq!(json["content"][1]["type"], "tool_use");
+        assert_eq!(json["stop_reason"], "tool_use");
+
+        let mut compact = AnthropicJsonAcc::new_mode(1, true);
+        compact.push(&CursorStreamEvent::ThinkingSignature {
+            signature: "opaque".into(),
+        });
+        compact.push(&CursorStreamEvent::ThinkingCompleted);
+        assert!(!compact.has_useful());
+        compact.push(&CursorStreamEvent::ThinkingDelta {
+            text: "summary".into(),
+        });
+        compact.push(&CursorStreamEvent::ThinkingSignature {
+            signature: "real".into(),
+        });
+        compact.push(&CursorStreamEvent::ThinkingCompleted);
+        assert_eq!(
+            compact.into_message_json("msg_compact", "cursor-test")["content"],
+            serde_json::json!([{"type": "text", "text": "summary"}])
+        );
     }
 
     #[test]

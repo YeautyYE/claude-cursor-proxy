@@ -666,6 +666,9 @@ fn segment_replay_event_cost(event: &LiveRunEvent) -> usize {
         LiveRunEvent::Cursor(
             CursorStreamEvent::TextDelta { text } | CursorStreamEvent::ThinkingDelta { text },
         ) => EVENT_OVERHEAD + text.len(),
+        LiveRunEvent::Cursor(CursorStreamEvent::ThinkingSignature { signature }) => {
+            EVENT_OVERHEAD.saturating_add(signature.len())
+        }
         LiveRunEvent::NativeToolBatch(tools) => tools
             .iter()
             .map(|tool| {

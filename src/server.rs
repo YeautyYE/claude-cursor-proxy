@@ -158,6 +158,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
     let state = Arc::new(AppState { registry, monitor });
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(handler_models))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
@@ -182,6 +183,30 @@ async fn healthz() -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "started_at": PROCESS_STARTED_AT.as_str(),
     }))
+}
+
+/// Prometheus exposition from a bounded metrics-only snapshot. Formatting
+/// happens after the monitor lock is released and skips TUI session aggregation.
+async fn metrics(
+    State(state): State<Arc<AppState>>,
+) -> ([(http::header::HeaderName, http::HeaderValue); 1], String) {
+    let Some(monitor) = state.monitor.as_ref() else {
+        return (
+            [(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            "# claude_cursor_proxy monitor disabled\n".to_string(),
+        );
+    };
+    let snapshot = monitor.metrics_snapshot();
+    (
+        [(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        snapshot.render_prometheus(),
+    )
 }
 
 /// Anthropic/OpenAI-compatible model list.
@@ -2057,9 +2082,9 @@ fn set_mode(path: &Path, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestMonitorGuard, advertised_surface_model, claude_code_headers_from,
+        AppState, RequestMonitorGuard, advertised_surface_model, claude_code_headers_from,
         configured_cursor_route_models, configured_cursor_sand_models, derive_fallback_session_id,
-        enable_accepted_tcp_nodelay, header_text_all, monitor_response_body,
+        enable_accepted_tcp_nodelay, header_text_all, metrics, monitor_response_body,
         parse_advertised_models, resolve_responses_session_id, resolve_session_id,
         session_id_from_headers, wrap_anthropic_as_responses,
     };
@@ -2068,6 +2093,7 @@ mod tests {
     use crate::monitor::{EndpointKind, MonitorHandle, RequestStatus};
     use crate::registry::Registry;
     use axum::body::Body;
+    use axum::extract::State;
     use axum::http::{Response, StatusCode};
     use bytes::Bytes;
     use serde_json::json;
@@ -2078,6 +2104,135 @@ mod tests {
     use tokio::net::TcpListener;
 
     static ERROR_CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn metrics_reports_monitor_disabled_without_panicking() {
+        let state = Arc::new(AppState {
+            registry: Arc::new(Registry::with_default_alias()),
+            monitor: None,
+        });
+        let (headers, body) = metrics(State(state)).await;
+        assert_eq!(headers[0].1, "text/plain; version=0.0.4");
+        assert_eq!(body, "# claude_cursor_proxy monitor disabled\n");
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_active_phases_provider_and_client() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "queued",
+            Some("session-q".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("queued", "cursor", "cursor-grok4.6", None);
+        monitor.client_type_resolved("queued", "sand");
+        monitor.queued("queued");
+
+        monitor.request_started("opening", None, None, EndpointKind::Messages);
+        monitor.provider_selected("opening", "grok", "grok-build", None);
+        monitor.client_type_resolved("opening", "cli");
+        monitor.opening("opening");
+
+        monitor.request_started("retrying", None, None, EndpointKind::Messages);
+        monitor.provider_selected("retrying", "cursor", "cursor-grok4.6", None);
+        monitor.client_type_resolved("retrying", "sand");
+        monitor.retrying("retrying");
+
+        monitor.request_started("streaming", None, None, EndpointKind::Messages);
+        monitor.provider_selected("streaming", "cursor", "cursor-grok4.6", None);
+        monitor.client_type_resolved("streaming", "sand");
+        monitor.stream_progress("streaming", 12, 1, Some(4), Some(2));
+
+        monitor.request_started("tool", None, None, EndpointKind::Messages);
+        monitor.provider_selected("tool", "cursor", "cursor-grok4.6", None);
+        monitor.client_type_resolved("tool", "sand");
+        monitor.waiting_tool("tool");
+
+        let state = Arc::new(AppState {
+            registry: Arc::new(Registry::with_default_alias()),
+            monitor: Some(monitor),
+        });
+        let (_headers, body) = metrics(State(state)).await;
+        for expected in [
+            "ccp_active_requests 5",
+            "ccp_active_requests_phase{phase=\"queued\"} 1",
+            "ccp_active_requests_phase{phase=\"opening\"} 1",
+            "ccp_active_requests_phase{phase=\"retrying\"} 1",
+            "ccp_active_requests_phase{phase=\"streaming\"} 1",
+            "ccp_active_requests_phase{phase=\"waiting_tool\"} 1",
+            "ccp_active_requests_provider{provider=\"cursor\"} 4",
+            "ccp_active_requests_provider{provider=\"grok\"} 1",
+            "ccp_active_requests_client{client_type=\"sand\"} 4",
+            "ccp_active_requests_client{client_type=\"cli\"} 1",
+        ] {
+            assert!(
+                body.contains(expected),
+                "missing {expected} in metrics body:\n{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_escapes_prometheus_label_values() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("escaped", None, None, EndpointKind::Messages);
+        let provider = "provider\\\"line\nnext";
+        let client_type = "client\\\"line\nnext";
+        monitor.provider_selected("escaped", provider, "model", None);
+        monitor.client_type_resolved("escaped", client_type);
+
+        let state = Arc::new(AppState {
+            registry: Arc::new(Registry::with_default_alias()),
+            monitor: Some(monitor),
+        });
+        let (_headers, body) = metrics(State(state)).await;
+        assert!(
+            body.contains(
+                "ccp_active_requests_provider{provider=\"provider\\\\\\\"line\\nnext\"} 1"
+            ),
+            "provider label was not escaped: {body}"
+        );
+        assert!(
+            body.contains(
+                "ccp_active_requests_client{client_type=\"client\\\\\\\"line\\nnext\"} 1"
+            ),
+            "client label was not escaped: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_route_exposes_cumulative_outcomes_after_recent_eviction() {
+        use tower::ServiceExt;
+        let monitor = MonitorHandle::new(1);
+        for id in ["first", "second"] {
+            monitor.request_started(id, None, None, EndpointKind::Messages);
+            monitor.request_failed(id, Some(503), "fixture failure");
+        }
+        let app = super::app_with_monitor(Arc::new(Registry::with_default_alias()), Some(monitor));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("ccp_recent_requests 1\n"));
+        assert!(body.contains("ccp_requests_finished_total{status=\"failed\"} 2\n"));
+        assert!(body.contains("ccp_terminal_http_status_total{status=\"503\"} 2\n"));
+        assert!(body.contains("ccp_request_duration_seconds_count 2\n"));
+    }
 
     #[tokio::test]
     async fn dropped_response_body_is_abandoned_not_failed() {

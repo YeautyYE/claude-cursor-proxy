@@ -697,6 +697,7 @@ fn active_request(
         output_tokens: None,
         error: None,
         traffic_capture_path: None,
+        metrics: Default::default(),
     }
 }
 
