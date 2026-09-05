@@ -8,7 +8,7 @@
 //! stable client operation one owner and lets retries subscribe to that
 //! owner's event stream instead.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -358,7 +358,11 @@ async fn publish(entry: &Arc<Mutex<SandOperationEntry>>, event: LiveEventResult)
     // caller that owns the upstream invocation. Retry subscribers are
     // explicitly best-effort and use `try_send`, so a duplicate request that
     // stopped reading can never stall the upstream driver.
-    let mut failed_ids = Vec::new();
+    // Failed subscriber ids are looked up once for every retained subscriber.
+    // A set keeps a 512-way fan-out at linear cost per event instead of
+    // repeatedly scanning a vector (which becomes quadratic for large retry
+    // waves).
+    let mut failed_ids = HashSet::new();
     let mut owner_closed = false;
     for (id, sender) in owner_senders {
         let delivered = tokio::time::timeout(OWNER_SEND_TIMEOUT, sender.send(event.clone()))
@@ -366,13 +370,13 @@ async fn publish(entry: &Arc<Mutex<SandOperationEntry>>, event: LiveEventResult)
             .is_ok_and(|result| result.is_ok());
         if !delivered {
             owner_closed = true;
-            failed_ids.push(id);
+            failed_ids.insert(id);
         }
     }
 
     for (id, sender) in retry_senders {
         if sender.try_send(event.clone()).is_err() {
-            failed_ids.push(id);
+            failed_ids.insert(id);
         }
     }
 
