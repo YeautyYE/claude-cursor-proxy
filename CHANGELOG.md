@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.116 (2026-09-05)
+
+- Recover Sand multi-turn requests that return an accepted but empty response after a tool result by retrying once with the complete rendered history through the text bridge.
+- Preserve tool-call/tool-result history during bridge fallback and rotate once to another saved account only for unbound hollow Sand turns.
+
 ## v0.1.113 (2026-09-05)
 
 - Keep the downstream-cancellation tap compatible with the latest Clippy

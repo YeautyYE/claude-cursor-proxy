@@ -2099,10 +2099,41 @@ async fn sand_direct_response_inner(
     // model rejects the catalog after HTTP 200, the stream driver can switch
     // once to this request and continue through the text bridge without
     // asking Claude Code to resend the turn.
-    let fallback_request = if tool_count > 0 && !text_bridge_initial {
-        bridge_prompt.as_deref().map(|prompt| {
-            let mut fallback_messages = messages.clone();
-            prepend_sand_text_tool_bridge_prompt(&mut fallback_messages, prompt);
+    let fallback_request = if tool_count > 0 || request_has_current_tool_result(body) {
+        let fallback_prompt = bridge_prompt.clone().unwrap_or_else(|| {
+            "Continue the task using the supplied tool results. Respond with the final answer as plain text."
+                .to_string()
+        });
+        Some({
+            let prompt = fallback_prompt.as_str();
+            // Fable's text bridge accepts the XML contract, but some
+            // generations reject a full InferenceCore history containing
+            // structured toolCalls/toolContent (they close with an empty
+            // responseInfo envelope). Keep the structured form for the first
+            // attempt; on a hollow terminal retry once with the exact same
+            // rendered Anthropic history as plain text.
+            let bridge_history = render_cursor_prompt_parts_with(
+                body,
+                CursorPromptOptions {
+                    omit_tools: true,
+                    delta_only: false,
+                },
+            )
+            .user_text;
+            let mut fallback_messages = if text_bridge_initial {
+                vec![
+                    SandInferenceMessage::system(prompt),
+                    SandInferenceMessage::user(bridge_history.clone()),
+                ]
+            } else {
+                messages.clone()
+            };
+            if !text_bridge_initial {
+                fallback_messages = vec![
+                    SandInferenceMessage::system(prompt),
+                    SandInferenceMessage::user(bridge_history),
+                ];
+            }
             SandInferenceRequest::new(
                 model.to_string(),
                 uuid::Uuid::new_v4().to_string(),
@@ -2989,6 +3020,12 @@ async fn drive_sand_stream_with_retries(
     let mut committed = false;
     let mut catalog_active = !request.tools.is_empty();
     let mut next_open_kind = SandOpenAttemptKind::Transport;
+    // A clean END with no visible event can be a provider/account-local
+    // generation stall even though the HTTP open succeeded. Give an
+    // unbound Sand route one account rotation before spending all stream
+    // replays on the same bearer. Explicit model-to-account bindings remain
+    // pinned and continue through the ordinary bounded retry path.
+    let mut hollow_account_failover_attempted = false;
 
     loop {
         // A dropped HTTP response may leave an operation forwarder alive, so
@@ -3383,6 +3420,73 @@ async fn drive_sand_stream_with_retries(
                 committed,
                 tool_count,
             );
+        }
+        // A structured tool-history continuation can be accepted by Sand but
+        // close with an empty responseInfo envelope. Retry once through the
+        // rendered text bridge before rotating accounts or spending the
+        // normal hollow-stream replay budget.
+        if !committed
+            && error
+                .client_message()
+                .to_ascii_lowercase()
+                .contains("sand stream ended without useful progress")
+            && let Some(replacement) = fallback_request.take()
+        {
+            request = replacement.with_fresh_ids();
+            catalog_active = false;
+            retries = 0;
+            discard_sand_replay_buffer(&mut buffered);
+            create_logger("cursor").warn(
+                "sand_hollow_text_bridge_fallback",
+                Some(serde_json::Map::from_iter([
+                    ("model".into(), serde_json::json!(&model)),
+                    ("recovery".into(), serde_json::json!("rendered_history")),
+                ])),
+            );
+            continue;
+        }
+        // The upstream accepted the request and returned a terminal response
+        // but produced no model event at all. Repeating fresh UUIDs on one
+        // bearer can keep returning the same empty responseInfo envelope.
+        // For an unbound model, rotate once through the saved-account
+        // selector so a healthy account can satisfy the turn. Explicit
+        // model-to-account routes remain pinned.
+        if !committed
+            && !hollow_account_failover_attempted
+            && crate::config::cursor_account_for_model(&model).is_none()
+            && error
+                .client_message()
+                .to_ascii_lowercase()
+                .contains("sand stream ended without useful progress")
+            && !sand_attempt_budget_exhausted(&error)
+        {
+            hollow_account_failover_attempted = true;
+            note_sand_account_failover_error(&model, &token, &error);
+            let replacement = tokio::select! {
+                _ = downstream_tx.closed() => return,
+                replacement = account_failover_replacement_token_async(
+                    token.clone(),
+                    model.clone(),
+                    client_type.clone(),
+                    Arc::clone(&account_failover_state),
+                ) => replacement,
+            };
+            if let Some(replacement) = replacement {
+                token = replacement;
+                request = request.with_fresh_ids();
+                next_open_kind = SandOpenAttemptKind::AccountFailover;
+                retries = 0;
+                discard_sand_replay_buffer(&mut buffered);
+                create_logger("cursor").warn(
+                    "sand_hollow_account_failover",
+                    Some(serde_json::Map::from_iter([
+                        ("model".into(), serde_json::json!(&model)),
+                        ("clientType".into(), serde_json::json!(&client_type)),
+                        ("recovery".into(), serde_json::json!("fresh_open")),
+                    ])),
+                );
+                continue;
+            }
         }
         if sand_attempt_budget_exhausted(&error) {
             discard_sand_replay_buffer(&mut buffered);
