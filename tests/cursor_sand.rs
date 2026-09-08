@@ -4,7 +4,13 @@
 //! from the AgentService fixtures makes an accidental Run/RunSSE fallback
 //! visible and protects the Fable long-context parameters from regressions.
 
-use axum::{Router, body::Body, extract::Request, http::Version, routing::post};
+use axum::{
+    Router,
+    body::Body,
+    extract::Request,
+    http::{StatusCode, Version},
+    routing::post,
+};
 use bytes::Bytes;
 use claude_cursor_proxy::providers::cursor::connect::{
     ConnectFrameDecoder, FLAG_END, encode_connect_frame,
@@ -191,6 +197,89 @@ async fn sand_fable_stream_uses_h2_connect_json_and_long_context_parameters() {
         1,
         "terminal event must be emitted once"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sand_run_inference_endpoint_rejection_falls_back_to_stream() {
+    let run_attempts = Arc::new(AtomicUsize::new(0));
+    let stream_attempts = Arc::new(AtomicUsize::new(0));
+    let response_body = {
+        let text = encode_connect_frame(
+            serde_json::to_vec(&json!({"textPart": {"text": "stream-fallback-ok"}}))
+                .expect("response JSON"),
+            0,
+        );
+        let end = encode_connect_frame(Vec::new(), FLAG_END);
+        [text.as_ref(), end.as_ref()].concat()
+    };
+
+    let app = Router::new()
+        .route(
+            "/aiserver.v1.InferenceService/RunInference",
+            post({
+                let run_attempts = Arc::clone(&run_attempts);
+                move |request: Request<Body>| {
+                    let run_attempts = Arc::clone(&run_attempts);
+                    async move {
+                        run_attempts.fetch_add(1, Ordering::SeqCst);
+                        let mut input = request.into_body().into_data_stream();
+                        let _ = input.next().await;
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"code":"invalid_argument","message":"Sand traffic is not supported on this endpoint"}}"#,
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/aiserver.v1.InferenceService/Stream",
+            post({
+                let stream_attempts = Arc::clone(&stream_attempts);
+                move |_request: Request<Body>| {
+                    let stream_attempts = Arc::clone(&stream_attempts);
+                    let response_body = response_body.clone();
+                    async move {
+                        stream_attempts.fetch_add(1, Ordering::SeqCst);
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/connect+json")],
+                            response_body,
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fallback fixture");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let request = SandInferenceRequest::new(
+        "claude-fable-5-1",
+        "fallback-conversation",
+        "fallback-invocation",
+        vec![SandInferenceMessage::user("use the text tool bridge")],
+    )
+    .with_run_inference(true);
+    let client = SandInferenceClient::with_base_url_timeout(url, 5).unwrap();
+    let mut stream = client
+        .open("fixture-token", &request)
+        .await
+        .expect("endpoint rejection should use Stream");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("fallback event"));
+    }
+    server.abort();
+
+    assert_eq!(run_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(stream_attempts.load(Ordering::SeqCst), 1);
+    assert!(events.iter().any(
+        |event| matches!(event, CursorStreamEvent::TextDelta { text } if text == "stream-fallback-ok")
+    ));
+    assert!(matches!(events.last(), Some(CursorStreamEvent::End)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

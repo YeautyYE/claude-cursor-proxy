@@ -1997,6 +1997,8 @@ async fn sand_direct_response_inner(
     let accepted_unadvertised_tool_names =
         accepted_unadvertised_tool_names_from_anthropic(body, &sand_tools);
     let tool_count = sand_tools.len();
+    let has_tool_history = request_has_tool_history(body);
+    let use_run_inference = sand_should_use_run_inference(model, tool_count > 0, has_tool_history);
     let tool_names = sand_tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
@@ -2096,7 +2098,7 @@ async fn sand_direct_response_inner(
     .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
     .with_parameter_model_id(parameter_model)
     .with_max_tokens(body.max_tokens.map(u64::from))
-    .with_run_inference(tool_count > 0 || request_has_tool_history(body))
+    .with_run_inference(use_run_inference)
     .with_tools(if text_bridge_initial {
         Vec::new()
     } else {
@@ -2152,7 +2154,7 @@ async fn sand_direct_response_inner(
             .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
             .with_parameter_model_id(parameter_model)
             .with_max_tokens(body.max_tokens.map(u64::from))
-            .with_run_inference(true)
+            .with_run_inference(use_run_inference)
             .with_tools(Vec::new())
             .with_accepted_unadvertised_tool_names(Vec::<String>::new())
         })
@@ -3771,6 +3773,10 @@ fn sand_stream_idle_timeout_secs() -> u64 {
 fn sand_model_prefers_text_tool_bridge(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     model.contains("fable")
+}
+
+fn sand_should_use_run_inference(model: &str, has_tools: bool, has_tool_history: bool) -> bool {
+    (has_tools || has_tool_history) && !sand_model_prefers_text_tool_bridge(model)
 }
 
 /// Add the text-tool contract as a single system message while retaining the
@@ -10760,6 +10766,23 @@ mod tests {
     }
 
     #[test]
+    fn fable_text_tools_stay_on_stream_while_native_tools_use_run_inference() {
+        assert!(!sand_should_use_run_inference(
+            "claude-fable-5-1-thinking-max",
+            true,
+            false,
+        ));
+        assert!(!sand_should_use_run_inference(
+            "claude-fable-5-1-thinking-max",
+            false,
+            true,
+        ));
+        assert!(sand_should_use_run_inference("grok-4.6", true, false));
+        assert!(sand_should_use_run_inference("grok-4.6", false, true));
+        assert!(!sand_should_use_run_inference("grok-4.6", false, false));
+    }
+
+    #[test]
     fn sand_thinking_signature_roundtrips_through_claude_tool_continuation() {
         let model = "claude-fable-5-1-thinking-max";
         let mut encoder =
@@ -13279,7 +13302,7 @@ mod tests {
         );
         assert!(
             request_has_tool_history(&body),
-            "historical tool calls still require the duplex Sand protocol"
+            "historical tool calls must remain visible to Sand routing"
         );
         let missing = collect_live_tool_results(&body, &[pending("old-tool")]).unwrap_err();
         assert_eq!(

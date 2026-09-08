@@ -3,6 +3,11 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.118 (2026-09-08)
+
+- Keep Fable text-tool and tool-history turns on `InferenceService/Stream` so Claude Code does not send Sand traffic to a rejected `RunInference` route.
+- Fall back to `Stream` only for the exact Cursor Sand endpoint-rejection response while preserving genuine invalid-request errors, with protocol and two-turn Claude Code regression coverage.
+
 ## v0.1.117 (2026-09-08)
 
 - Route Sand tool-bearing and tool-history turns through the strict HTTP/2 `RunInference` handshake, with ordered invocation events, reliable cancel/finish cleanup, and replay safety for Claude Code multi-turn sessions.

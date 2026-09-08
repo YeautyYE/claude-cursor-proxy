@@ -271,10 +271,11 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 <https://cursor.com/bot/onboarding?product=grok-bot>。账号获得资格后，只需保持
 `claude-cursor-proxy serve` 运行；刚开通时可执行一次 `cursor auth login` 或
 `cursor auth usage`，让本地会话和额度缓存更新。若看到
-`Sand traffic is not supported on this endpoint`，说明仍有旧客户端/旧路由；
-当前代理的纯文本请求走 `InferenceService/Stream`，带工具或工具历史的请求走
-严格握手的 `InferenceService/RunInference`，可用 `cursor sand-status` 中的
-`direct-stream: ready` 检查基础 Sand 路由。
+`Sand traffic is not supported on this endpoint`，说明所选路由拒绝 Sand 流量。
+当前代理会让纯文本以及 Fable 的文本工具/工具历史桥接直接走
+`InferenceService/Stream`；原生 Sand 工具目录优先使用严格握手的
+`InferenceService/RunInference`，遇到该精确路由错误时自动回退到 `Stream`。
+可用 `cursor sand-status` 中的 `direct-stream: ready` 检查基础 Sand 路由。
 这套规则只作用于最终路由到 Cursor 的请求；原生 Codex、Kimi 和 Grok 默认
 仍走各自的后端。Grok 有一个明确的例外：为 `grok-*` 名称配置
 `cursor.modelAccounts` 后，该名称会进入 Cursor 的账号路由。这样同一个公开

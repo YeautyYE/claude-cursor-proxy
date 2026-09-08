@@ -1,10 +1,11 @@
 //! Cursor Desktop Sand inference transport.
 //!
 //! Sand stopped being accepted by `agent.v1.AgentService/Run` in the current
-//! Cursor service. Plain text uses `aiserver.v1.InferenceService/Stream`;
-//! tool-bearing/history requests use the duplex `RunInference` handshake. This
-//! module keeps both Connect-JSON formats separate from the protobuf Agent
-//! transport used by the CLI/IDE paths.
+//! Cursor service. Plain text and Fable's text-tool bridge use
+//! `aiserver.v1.InferenceService/Stream`; native tool requests prefer the
+//! duplex `RunInference` handshake and fall back when a regional route rejects
+//! Sand traffic. This module keeps both Connect-JSON formats separate from the
+//! protobuf Agent transport used by the CLI/IDE paths.
 //!
 //! The Connect framing is shared with the other Cursor transports:
 //! `flags (u8)`, `payload length (u32, big endian)`, then the payload.  Unlike
@@ -41,6 +42,7 @@ use crate::providers::cursor::response::CursorStreamEvent;
 pub const SAND_INFERENCE_STREAM_PATH: &str = "/aiserver.v1.InferenceService/Stream";
 pub const SAND_RUN_INFERENCE_PATH: &str = "/aiserver.v1.InferenceService/RunInference";
 
+const SAND_ENDPOINT_UNSUPPORTED_MESSAGE: &str = "Sand traffic is not supported on this endpoint";
 const MAX_RUN_INFERENCE_ROUTING_BYTES: usize = 32 * 1024;
 
 /// Maximum JSON payload accepted by the Sand decoder.  A normal token frame is
@@ -3759,6 +3761,21 @@ pub(crate) fn shared_client(conversation_key: Option<&str>) -> SandInferenceClie
     pool.clients[index].clone()
 }
 
+fn run_inference_route_unavailable(error: &CursorError) -> bool {
+    if matches!(error.status, 404 | 405 | 501) {
+        return true;
+    }
+    if error.status != 400 {
+        return false;
+    }
+    std::iter::once(error.message.as_str())
+        .chain(error.detail.as_deref())
+        .any(|text| {
+            text.to_ascii_lowercase()
+                .contains(&SAND_ENDPOINT_UNSUPPORTED_MESSAGE.to_ascii_lowercase())
+        })
+}
+
 impl SandInferenceClient {
     pub fn new() -> Self {
         // Sand has its own endpoint override, but should inherit the same
@@ -3808,8 +3825,8 @@ impl SandInferenceClient {
     }
 
     /// Open one Sand operation using the protocol selected by the normalized
-    /// request. Tool-bearing/history turns use the strict duplex handshake;
-    /// simple text turns keep the lighter server-streaming endpoint.
+    /// request. Native tool turns can use the strict duplex handshake; plain
+    /// text and Fable text-tool turns keep the server-streaming endpoint.
     pub async fn open(
         &self,
         token: &str,
@@ -3818,7 +3835,7 @@ impl SandInferenceClient {
         if request.use_run_inference {
             match self.open_run_inference(token, request).await {
                 Ok(stream) => return Ok(stream),
-                Err(error) if matches!(error.status, 404 | 405 | 501) => {
+                Err(error) if run_inference_route_unavailable(&error) => {
                     create_logger("cursor").warn(
                         "sand_run_inference_unavailable",
                         Some(serde_json::Map::from_iter([
@@ -4950,6 +4967,30 @@ mod tests {
         assert!(value.get("providerDefinedTools").is_none());
         assert!(value.get("acceptedUnadvertisedToolNames").is_none());
         assert_eq!(value["modelConfig"]["maxTokens"], 1234);
+    }
+
+    #[test]
+    fn run_inference_fallback_only_accepts_route_unavailability() {
+        assert!(run_inference_route_unavailable(&CursorError::new(
+            400,
+            SAND_ENDPOINT_UNSUPPORTED_MESSAGE,
+            None,
+        )));
+        assert!(run_inference_route_unavailable(&CursorError::new(
+            400,
+            "Cursor upstream HTTP 400",
+            Some(SAND_ENDPOINT_UNSUPPORTED_MESSAGE.into()),
+        )));
+        assert!(run_inference_route_unavailable(&CursorError::new(
+            404,
+            "not found",
+            None,
+        )));
+        assert!(!run_inference_route_unavailable(&CursorError::new(
+            400,
+            "RunInference rejected an invalid request",
+            None,
+        )));
     }
 
     #[test]

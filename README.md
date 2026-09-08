@@ -293,10 +293,12 @@ first-use account, complete Cursor's one-time Bot onboarding in a browser:
 the entitlement, keep only `claude-cursor-proxy serve` running. If the account
 was just onboarded, run `cursor auth login`/`cursor auth usage` once to refresh
 the stored session and quota snapshot. A response such as `Sand traffic is not
-supported on this endpoint` means an old client/route was used; the current
-proxy uses `InferenceService/Stream` for plain text and the strict
-`InferenceService/RunInference` handshake for tool-bearing/history requests
-(`direct-stream: ready` in `cursor sand-status` confirms the base Sand route).
+supported on this endpoint` means the selected route rejects Sand traffic. The
+current proxy keeps plain text and Fable's text-tool/history bridge on
+`InferenceService/Stream`; native Sand tool catalogs prefer the strict
+`InferenceService/RunInference` handshake and fall back to `Stream` on that
+exact route rejection (`direct-stream: ready` in `cursor sand-status` confirms
+the base Sand route).
 The policy applies only to requests resolved to the Cursor provider; Codex,
 Kimi, and native Grok routes keep their normal providers by default. There is
 one intentional Grok exception: an explicit `cursor.modelAccounts` rule for a
