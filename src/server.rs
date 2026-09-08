@@ -2330,8 +2330,10 @@ mod tests {
         let _guard = ERROR_CAPTURE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let previous_state = std::env::var_os("XDG_STATE_HOME");
+        let previous_local = std::env::var_os("LOCALAPPDATA");
         unsafe {
             std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("LOCALAPPDATA", dir.path());
         }
 
         let response = Response::builder()
@@ -2366,6 +2368,10 @@ mod tests {
                 Some(value) => std::env::set_var("XDG_STATE_HOME", value),
                 None => std::env::remove_var("XDG_STATE_HOME"),
             }
+            match previous_local {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
         }
     }
 
@@ -2374,9 +2380,11 @@ mod tests {
         let _guard = ERROR_CAPTURE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let previous_state = std::env::var_os("XDG_STATE_HOME");
+        let previous_local = std::env::var_os("LOCALAPPDATA");
         let previous_max = std::env::var_os("CCP_ERROR_CAPTURE_MAX_FILES");
         unsafe {
             std::env::set_var("XDG_STATE_HOME", dir.path());
+            std::env::set_var("LOCALAPPDATA", dir.path());
             std::env::set_var("CCP_ERROR_CAPTURE_MAX_FILES", "2");
         }
 
@@ -2392,6 +2400,10 @@ mod tests {
             match previous_state {
                 Some(value) => std::env::set_var("XDG_STATE_HOME", value),
                 None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match previous_local {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
             }
             match previous_max {
                 Some(value) => std::env::set_var("CCP_ERROR_CAPTURE_MAX_FILES", value),

@@ -628,6 +628,13 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
             .and_then(|v| v.to_str().ok()),
         Some("sand-test-version")
     );
+    assert_eq!(
+        sand_observed
+            .headers
+            .get("x-sand-box-namespace")
+            .and_then(|v| v.to_str().ok()),
+        Some("prod")
+    );
     assert!(
         !sand_observed.headers.contains_key("x-cursor-streaming"),
         "Sand H2 AgentService/Run must not advertise the RunSSE marker"

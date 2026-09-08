@@ -4754,6 +4754,8 @@ fn live_probe_copies_identity_header(name: &str) -> bool {
                 | "x-client-key"
                 | "x-session-id"
                 | "x-cursor-checksum"
+                | "x-sand-box-namespace"
+                | "x-cursor-version"
         )
 }
 
@@ -4788,6 +4790,10 @@ impl LiveIdentityHeaders {
             ("x-cursor-client-version".into(), client_version.clone()),
             ("x-ghost-mode".into(), ghost_mode.clone()),
         ];
+        if sand_profile {
+            headers.push(("x-sand-box-namespace".into(), "prod".into()));
+            headers.push(("x-cursor-version".into(), client_version.clone()));
+        }
         if ide_profile || sand_profile {
             headers.push(("x-cursor-client-device-type".into(), "desktop".into()));
             headers.push((

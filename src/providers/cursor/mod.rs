@@ -93,13 +93,14 @@ use crate::providers::cursor::response::{
     estimate_rendered_prompt_tokens, estimate_request_input_tokens,
 };
 use crate::providers::cursor::sand_inference::{
-    SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandInferenceStream,
+    SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandTransportStream,
     accepted_unadvertised_tool_names_from_anthropic, admit_sand_open_until,
     is_sand_tool_capability_error, mark_sand_tools_supported, mark_sand_tools_unsupported,
     messages_from_anthropic, sand_logical_retry_budget, sand_open_breaker_abort,
     sand_open_breaker_admit, sand_open_breaker_failure, sand_open_breaker_success,
     sand_open_total_budget, sand_tool_capability_client_error, sand_tool_capability_for_token,
     stream_error_is_retryable, stream_retry_limit, tools_from_anthropic,
+    validate_anthropic_request,
 };
 use crate::providers::cursor::sand_operation::{
     SandOperationAdmission, SandOperationKey, SandOperationOwner, SandOperationSubscription,
@@ -1923,6 +1924,13 @@ async fn sand_direct_response_inner(
     account_failover_state: SharedAccountFailoverState,
     preclaimed_operation_owner: Option<SandOperationOwner>,
 ) -> Response {
+    if let Err(error) = validate_anthropic_request(body) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("Invalid Sand request: {error}"),
+        );
+    }
     // Keep the local hosted search/fetch shortcuts available on Sand.  These
     // handlers are provider-agnostic and must run after auth (the caller has
     // already selected/validated the Cursor account).
@@ -2088,6 +2096,7 @@ async fn sand_direct_response_inner(
     .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
     .with_parameter_model_id(parameter_model)
     .with_max_tokens(body.max_tokens.map(u64::from))
+    .with_run_inference(tool_count > 0 || request_has_tool_history(body))
     .with_tools(if text_bridge_initial {
         Vec::new()
     } else {
@@ -2143,6 +2152,7 @@ async fn sand_direct_response_inner(
             .with_max_mode(parameter_model.to_ascii_lowercase().contains("max"))
             .with_parameter_model_id(parameter_model)
             .with_max_tokens(body.max_tokens.map(u64::from))
+            .with_run_inference(true)
             .with_tools(Vec::new())
             .with_accepted_unadvertised_tool_names(Vec::<String>::new())
         })
@@ -2610,7 +2620,7 @@ async fn open_sand_with_retries_until(
     logical_deadline: Instant,
     attempt_budget: &SandAttemptBudget,
     attempt_kind: SandOpenAttemptKind,
-) -> Result<crate::providers::cursor::sand_inference::SandInferenceStream, CursorError> {
+) -> Result<crate::providers::cursor::sand_inference::SandTransportStream, CursorError> {
     let total_attempts = sand_total_attempts();
     let configured_retries = std::env::var("CCP_CURSOR_SAND_OPEN_RETRIES")
         .ok()
@@ -2877,7 +2887,7 @@ async fn open_sand_with_policy_probe_until(
     logical_deadline: Instant,
     attempt_budget: &SandAttemptBudget,
     attempt_kind: SandOpenAttemptKind,
-) -> Result<(SandInferenceStream, PolicyRateLimitAdmission), CursorError> {
+) -> Result<(SandTransportStream, PolicyRateLimitAdmission), CursorError> {
     if let Some((monitor, id)) = attempt_budget.telemetry.as_ref() {
         monitor.account_resolved(id, cursor_account_digest(token));
         monitor.queued(id);
@@ -2995,7 +3005,7 @@ async fn drive_sand_stream_with_retries(
     client: SandInferenceClient,
     mut token: String,
     mut request: SandInferenceRequest,
-    initial_stream: SandInferenceStream,
+    initial_stream: SandTransportStream,
     allowed: Option<BTreeSet<String>>,
     compaction_mode: bool,
     idle_secs: u64,
@@ -3350,30 +3360,18 @@ async fn drive_sand_stream_with_retries(
                     break;
                 }
                 Ok(None) => {
-                    // A clean EOF without text/tool/end is treated as a
-                    // retryable hollow response.  Sand gateways occasionally
-                    // close after a control frame without FLAG_END.
-                    if committed {
-                        // SandInferenceStream normally synthesizes End at
-                        // EOF, but keep this guard at the retry boundary as
-                        // well.  A wrapper/proxy can consume the synthetic
-                        // marker or report EOF after a committed frame; in
-                        // that case closing the downstream channel without
-                        // End makes the Anthropic SSE adapter emit
-                        // "stream ended without turn_ended".  Flush any
-                        // post-commit usage/metadata before the local End.
-                        buffered.push(CursorStreamEvent::End);
-                        if !send_sand_buffered_events(&tx, &downstream_tx, &mut buffered).await {
-                            return;
-                        }
-                        return;
-                    } else {
-                        stream_error = Some(CursorError::new(
-                            502,
-                            "Sand stream ended without useful progress",
-                            None,
-                        ));
-                    }
+                    // Both Connect transports have an explicit terminal
+                    // message. A bare channel close is truncated even when
+                    // visible text preceded it; never synthesize end_turn.
+                    stream_error = Some(CursorError::new(
+                        502,
+                        if committed {
+                            "Sand stream ended without a terminal event"
+                        } else {
+                            "Sand stream ended without useful progress"
+                        },
+                        None,
+                    ));
                     break;
                 }
                 Err(_) => {
@@ -3398,6 +3396,7 @@ async fn drive_sand_stream_with_retries(
             }
         }
 
+        let replay_safe = stream.replay_safe();
         let Some(error) = stream_error else {
             // A committed stream that cleanly EOF'd has already flushed its
             // events.  No synthetic error is needed here.
@@ -3426,6 +3425,7 @@ async fn drive_sand_stream_with_retries(
         // rendered text bridge before rotating accounts or spending the
         // normal hollow-stream replay budget.
         if !committed
+            && replay_safe
             && error
                 .client_message()
                 .to_ascii_lowercase()
@@ -3452,6 +3452,7 @@ async fn drive_sand_stream_with_retries(
         // selector so a healthy account can satisfy the turn. Explicit
         // model-to-account routes remain pinned.
         if !committed
+            && replay_safe
             && !hollow_account_failover_attempted
             && crate::config::cursor_account_for_model(&model).is_none()
             && error
@@ -3493,7 +3494,7 @@ async fn drive_sand_stream_with_retries(
             send_sand_buffered_error(&tx, &downstream_tx, &mut buffered, error).await;
             return;
         }
-        if capability_error {
+        if capability_error && replay_safe {
             mark_sand_tools_unsupported(
                 &token,
                 &model,
@@ -3540,6 +3541,7 @@ async fn drive_sand_stream_with_retries(
             return;
         }
         if !committed
+            && replay_safe
             && !sand_attempt_budget_exhausted(&error)
             && (is_account_failover_open_error(&model, &error)
                 || cursor_error_is_account_failover_policy(&error)
@@ -3600,6 +3602,7 @@ async fn drive_sand_stream_with_retries(
             continue;
         }
         if !committed
+            && replay_safe
             && retries < max_retries
             && !is_sand_account_failover_error(&error, tool_count)
             && stream_error_is_retryable(&error)
@@ -9122,6 +9125,22 @@ fn request_has_current_tool_result(body: &MessagesRequest) -> bool {
     })
 }
 
+fn request_has_tool_history(body: &MessagesRequest) -> bool {
+    body.messages.iter().any(|message| match &message.content {
+        serde_json::Value::Array(blocks) => blocks.iter().any(|block| {
+            matches!(
+                block.get("type").and_then(serde_json::Value::as_str),
+                Some("tool_use" | "tool_result")
+            )
+        }),
+        serde_json::Value::Object(block) => matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("tool_use" | "tool_result")
+        ),
+        _ => false,
+    })
+}
+
 /// An open account/model breaker blocks only work that could create a new
 /// Cursor Run. Matching tool-result continuations and identical retries can
 /// still attach to a Run that is already accepted upstream; rejecting those
@@ -11053,7 +11072,7 @@ mod tests {
             "catalog, fallback, and continuation requests"
         );
         assert_eq!(observed[0]["tools"].as_array().unwrap().len(), 1);
-        assert_eq!(observed[1]["tools"], json!([]));
+        assert!(observed[1].get("tools").is_none());
         assert!(
             policy_rate_limit_preflight("claude-fable-5", "sand", token).is_ok(),
             "capability fallback must not publish an account 429 cooldown"
@@ -11066,7 +11085,7 @@ mod tests {
                 .any(|message| message["role"] == sand_inference::ROLE_SYSTEM
                     && message["text"].as_str().unwrap_or("").contains("tool_use"))
         );
-        assert_eq!(observed[2]["tools"], json!([]));
+        assert!(observed[2].get("tools").is_none());
         assert_eq!(
             observed[2]["messages"][2]["role"],
             sand_inference::ROLE_TOOL
@@ -13257,6 +13276,10 @@ mod tests {
         assert!(
             !request_has_current_tool_result(&body),
             "historical results must not turn a new request into a live resume"
+        );
+        assert!(
+            request_has_tool_history(&body),
+            "historical tool calls still require the duplex Sand protocol"
         );
         let missing = collect_live_tool_results(&body, &[pending("old-tool")]).unwrap_err();
         assert_eq!(

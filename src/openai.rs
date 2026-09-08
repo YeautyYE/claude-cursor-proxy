@@ -163,7 +163,7 @@ pub fn responses_to_messages(body: &Value) -> anyhow::Result<MessagesRequest> {
         .or_else(|| body.get("max_tokens"))
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
-    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(true);
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut extra = Map::new();
     if let Some(instructions) = body.get("instructions") {
         extra.insert("system".into(), instructions.clone());
@@ -669,6 +669,7 @@ pub struct AnthropicToResponses {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    cache_creation_tokens: u64,
     tool_index: usize,
     next_output_index: usize,
     text_output_index: Option<usize>,
@@ -1418,13 +1419,14 @@ impl AnthropicToResponses {
     }
 
     fn usage_object(&self) -> Value {
+        let input_tokens = self
+            .input_tokens
+            .saturating_add(self.cached_tokens)
+            .saturating_add(self.cache_creation_tokens);
         json!({
-            "input_tokens": self.input_tokens,
+            "input_tokens": input_tokens,
             "output_tokens": self.output_tokens,
-            "total_tokens": self
-                .input_tokens
-                .saturating_add(self.output_tokens)
-                .saturating_add(self.cached_tokens),
+            "total_tokens": input_tokens.saturating_add(self.output_tokens),
             "input_tokens_details": { "cached_tokens": self.cached_tokens },
             "output_tokens_details": { "reasoning_tokens": 0 }
         })
@@ -1439,6 +1441,12 @@ impl AnthropicToResponses {
         }
         if let Some(cached) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.cached_tokens = cached;
+        }
+        if let Some(created) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cache_creation_tokens = created;
         }
     }
 
@@ -1687,6 +1695,24 @@ mod tests {
                 .iter()
                 .any(|item| item["value"] == "low")
         );
+    }
+
+    #[test]
+    fn responses_defaults_to_non_streaming_like_openai() {
+        let request = responses_to_messages(&json!({
+            "model": "claude-fable-5[1m]",
+            "input": "hello"
+        }))
+        .unwrap();
+        assert!(!request.stream);
+
+        let streaming = responses_to_messages(&json!({
+            "model": "claude-fable-5[1m]",
+            "input": "hello",
+            "stream": true
+        }))
+        .unwrap();
+        assert!(streaming.stream);
     }
 
     #[test]

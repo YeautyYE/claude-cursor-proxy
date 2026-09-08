@@ -29,12 +29,16 @@ impl Default for DirResolverEnv {
     }
 }
 
+fn is_windows_platform(platform: &str) -> bool {
+    platform.eq_ignore_ascii_case("windows") || platform.eq_ignore_ascii_case("win32")
+}
+
 pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
     if let Some(override_dir) = deps.env.get("CCP_CONFIG_DIR") {
         return Path::new(override_dir).to_path_buf();
     }
 
-    if deps.platform == "win32" {
+    if is_windows_platform(&deps.platform) {
         let appdata = deps
             .env
             .get("APPDATA")
@@ -56,7 +60,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
-    if deps.platform == "win32" {
+    if is_windows_platform(&deps.platform) {
         let local = deps
             .env
             .get("LOCALAPPDATA")

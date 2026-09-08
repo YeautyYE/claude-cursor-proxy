@@ -3,6 +3,12 @@
 Project renamed to **claude-cursor-proxy** — public repo [YeautyYE/claude-cursor-proxy](https://github.com/YeautyYE/claude-cursor-proxy).
 Adapted from [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). Earlier entries below retain upstream history (including Homebrew notes that do **not** apply here).
 
+## v0.1.117 (2026-09-08)
+
+- Route Sand tool-bearing and tool-history turns through the strict HTTP/2 `RunInference` handshake, with ordered invocation events, reliable cancel/finish cleanup, and replay safety for Claude Code multi-turn sessions.
+- Align Sand identity and request validation, fail closed on truncated streams, fix Responses defaults/cache usage accounting, and use native Windows config/state paths.
+- Display Cursor account names from the configured First Name + Last Name profile fields while keeping email as a separate identity field and persisting the name in the usage cache.
+
 ## v0.1.116 (2026-09-05)
 
 - Recover Sand multi-turn requests that return an accepted but empty response after a tool result by retrying once with the complete rendered history through the text bridge.

@@ -358,6 +358,7 @@ fn mock_state_for_tick(
         active,
         recent: recent.into_iter().collect(),
         account_usage: AccountUsageState::Ready(AccountUsageSnapshot {
+            name: Some("Dev Example".into()),
             email: Some("dev@example.com".into()),
             membership: Some("ultra".into()),
             auto_percent: Some(12.4),

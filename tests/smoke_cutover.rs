@@ -720,6 +720,7 @@ async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
     let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _local_state_env = EnvGuard::set("LOCALAPPDATA", state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
@@ -768,6 +769,7 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
     let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _local_state_env = EnvGuard::set("LOCALAPPDATA", state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
@@ -813,6 +815,7 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
     let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _local_state_env = EnvGuard::set("LOCALAPPDATA", state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
@@ -1275,6 +1278,7 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
     let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _local_state_env = EnvGuard::set("LOCALAPPDATA", state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");

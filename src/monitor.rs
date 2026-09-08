@@ -304,6 +304,8 @@ pub struct AccountUsageEvent {
 /// Official Cursor dashboard usage (Auto / API / optional Grok Bot).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountUsageSnapshot {
+    /// Cursor profile name assembled from First Name + Last Name.
+    pub name: Option<String>,
     pub email: Option<String>,
     pub membership: Option<String>,
     pub auto_percent: Option<f64>,
@@ -325,6 +327,9 @@ pub struct AccountUsageSnapshot {
 impl AccountUsageSnapshot {
     pub fn header_line(&self) -> String {
         let mut parts = Vec::new();
+        if let Some(name) = self.name.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(truncate_middle(name, 28));
+        }
         if let Some(email) = self.email.as_deref().filter(|s| !s.is_empty()) {
             parts.push(truncate_middle(email, 28));
         }
@@ -1529,6 +1534,7 @@ mod tests {
             AccountUsageState::MissingAuth
         ));
         let snapshot = AccountUsageSnapshot {
+            name: Some("Account User".into()),
             email: Some("a@b.c".into()),
             membership: Some("pro".into()),
             auto_percent: Some(9.2),

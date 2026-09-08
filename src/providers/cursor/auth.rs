@@ -98,8 +98,15 @@ impl CursorAccountProfile {
     pub fn display_name(&self) -> &str {
         self.label
             .as_deref()
-            .filter(|label| !label.trim().is_empty())
-            .or(self.auth.email.as_deref())
+            .map(str::trim)
+            .filter(|label| {
+                !label.is_empty()
+                    && self
+                        .auth
+                        .email
+                        .as_deref()
+                        .is_none_or(|email| !label.eq_ignore_ascii_case(email.trim()))
+            })
             .unwrap_or(&self.id)
     }
 }
@@ -2495,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn account_profile_display_name_prefers_label_then_email_then_id() {
+    fn account_profile_display_name_never_treats_email_as_name() {
         let auth = CursorAuth {
             access_token: "token".into(),
             refresh_token: None,
@@ -2512,9 +2519,9 @@ mod tests {
             active: false,
         };
         assert_eq!(profile.display_name(), "Work");
+        profile.label = Some("mail@example.com".into());
+        assert_eq!(profile.display_name(), "account-id");
         profile.label = None;
-        assert_eq!(profile.display_name(), "mail@example.com");
-        profile.auth.email = None;
         assert_eq!(profile.display_name(), "account-id");
     }
 

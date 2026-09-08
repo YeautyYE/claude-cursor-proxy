@@ -294,8 +294,9 @@ the entitlement, keep only `claude-cursor-proxy serve` running. If the account
 was just onboarded, run `cursor auth login`/`cursor auth usage` once to refresh
 the stored session and quota snapshot. A response such as `Sand traffic is not
 supported on this endpoint` means an old client/route was used; the current
-proxy must use `InferenceService/Stream` (shown as `direct-stream: ready` by
-`cursor sand-status`).
+proxy uses `InferenceService/Stream` for plain text and the strict
+`InferenceService/RunInference` handshake for tool-bearing/history requests
+(`direct-stream: ready` in `cursor sand-status` confirms the base Sand route).
 The policy applies only to requests resolved to the Cursor provider; Codex,
 Kimi, and native Grok routes keep their normal providers by default. There is
 one intentional Grok exception: an explicit `cursor.modelAccounts` rule for a
@@ -592,7 +593,8 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_ADVERTISED_MODELS` | unset | Optional comma-separated allowlist for `GET /v1/models` (useful for managed desktop model pickers) |
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
-| `CCP_CURSOR_SAND_BASE_URL` | value of `CCP_CURSOR_BASE_URL` | Optional base URL for the Sand `InferenceService/Stream` route |
+| `CCP_CURSOR_SAND_BASE_URL` | value of `CCP_CURSOR_BASE_URL` | Optional base URL for Sand `InferenceService/Stream` / `RunInference` |
+| `CCP_CURSOR_SAND_CLIENT_VERSION` | `0.30.0` | Sand/Grok Bot API identity version; override only for a gateway that requires it |
 | `CCP_CURSOR_SAND_STRICT_H2` | `0` | Force strict H2 prior-knowledge for Sand; normal TLS ALPN is recommended for HTTPS proxies |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | Default `x-cursor-client-type` value; the TUI `t` chooser persists the same setting in `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | unset | Comma-separated model selectors routed with `x-cursor-client-type: sand`; supports `*` and `?` |

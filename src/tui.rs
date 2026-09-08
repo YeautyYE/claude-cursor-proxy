@@ -1600,9 +1600,21 @@ fn request_account_delete() {
     // avoids holding an account-row borrow across `cancel_usage_locked` and
     // keeps a concurrent usage cancellation from tripping the borrow checker.
     let target = ui.accounts.get(ui.selected).map(|account| {
+        let profile_name = ui
+            .usage
+            .get(&account.id)
+            .and_then(|state| match state {
+                crate::monitor::AccountUsageState::Ready(snapshot) => snapshot.name.as_deref(),
+                _ => None,
+            })
+            .or_else(|| {
+                ui.account_metadata
+                    .get(&account.id)
+                    .and_then(|entry| entry.name.as_deref())
+            });
         (
             account.id.clone(),
-            account_name_for_display(account, account.email()),
+            account_name_for_display(account, profile_name, account.email()),
             account.active,
         )
     });
@@ -4160,8 +4172,18 @@ fn render_account_route_accounts(
                     .and_then(|entry| entry.email.as_deref())
                     .filter(|value| !value.trim().is_empty())
             });
+        let profile_name = snapshot
+            .and_then(|snapshot| snapshot.name.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                metadata
+                    .get(&account.id)
+                    .and_then(|entry| entry.name.as_deref())
+                    .filter(|value| !value.trim().is_empty())
+            });
         let name = account_name_for_display_with_label(
             account,
+            profile_name,
             email,
             metadata
                 .get(&account.id)
@@ -4365,8 +4387,18 @@ fn render_accounts_detail(frame: &mut ratatui::Frame<'_>, area: Rect) {
                         .and_then(|entry| entry.email.as_deref())
                         .filter(|value| !value.trim().is_empty())
                 });
+            let profile_name = usage_snapshot
+                .and_then(|snapshot| snapshot.name.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    ui.account_metadata
+                        .get(&account.id)
+                        .and_then(|entry| entry.name.as_deref())
+                        .filter(|value| !value.trim().is_empty())
+                });
             let name = account_name_for_display_with_label(
                 account,
+                profile_name,
                 email,
                 ui.account_metadata
                     .get(&account.id)
@@ -4613,37 +4645,36 @@ fn push_account_cell<'a>(row: &mut Vec<Span<'a>>, value: &str, width: usize, sty
 
 fn account_name_for_display(
     account: &crate::providers::cursor::auth::CursorAccountProfile,
+    profile_name: Option<&str>,
     email: Option<&str>,
 ) -> String {
-    account_name_for_display_with_label(account, email, None)
+    account_name_for_display_with_label(account, profile_name, email, None)
 }
 
 fn account_name_for_display_with_label(
     account: &crate::providers::cursor::auth::CursorAccountProfile,
+    profile_name: Option<&str>,
     email: Option<&str>,
     cached_label: Option<&str>,
 ) -> String {
+    if let Some(profile_name) = profile_name
+        .map(str::trim)
+        .filter(|profile_name| !profile_name.is_empty())
+    {
+        return profile_name.to_string();
+    }
     let label = account
         .label
         .as_deref()
         .or(cached_label)
         .map(str::trim)
         .filter(|label| !label.is_empty() && *label != account.id);
-    if let Some(label) = label {
-        // Login historically defaulted the label to the email. Showing the
-        // local part in Name keeps that case useful without hiding the full
-        // address in Email.
-        if email.is_none_or(|address| !label.eq_ignore_ascii_case(address)) {
-            return label.to_string();
-        }
+    if let Some(label) = label
+        && email.is_none_or(|address| !label.eq_ignore_ascii_case(address))
+    {
+        return label.to_string();
     }
-    if let Some(email) = email {
-        let local = email.split_once('@').map_or(email, |(local, _)| local);
-        if !local.trim().is_empty() {
-            return local.to_string();
-        }
-    }
-    account.display_name().to_string()
+    short_account_id(&account.id)
 }
 
 fn account_usage_metrics(
@@ -4703,7 +4734,8 @@ fn render_usage_detail(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Monit
         }
         crate::monitor::AccountUsageState::Ready(snapshot) => {
             let mut lines = vec![
-                detail_line("account", snapshot.email.as_deref().unwrap_or("-"), WHITE),
+                detail_line("name", snapshot.name.as_deref().unwrap_or("-"), WHITE),
+                detail_line("email", snapshot.email.as_deref().unwrap_or("-"), DIM_WHITE),
                 detail_line("plan", snapshot.membership.as_deref().unwrap_or("-"), TEAL),
             ];
             push_usage_percent(&mut lines, "total", snapshot.total_percent);
@@ -6178,10 +6210,16 @@ mod tests {
         let mut ui = account_ui_lock();
         ui.accounts = vec![first, second];
         ui.selected = 1;
-        ui.usage
-            .insert("account-a".to_string(), usage_state_with_sand_percent(25.0));
-        ui.usage
-            .insert("account-b".to_string(), usage_state_with_sand_percent(75.0));
+        let mut primary_usage = usage_state_with_sand_percent(25.0);
+        if let crate::monitor::AccountUsageState::Ready(snapshot) = &mut primary_usage {
+            snapshot.name = Some("Primary User".to_string());
+        }
+        let mut secondary_usage = usage_state_with_sand_percent(75.0);
+        if let crate::monitor::AccountUsageState::Ready(snapshot) = &mut secondary_usage {
+            snapshot.name = Some("Secondary User".to_string());
+        }
+        ui.usage.insert("account-a".to_string(), primary_usage);
+        ui.usage.insert("account-b".to_string(), secondary_usage);
         ui.message = None;
         drop(ui);
 
@@ -6195,8 +6233,8 @@ mod tests {
         assert!(text.contains("API"), "{text}");
         assert!(text.contains("Updated"), "{text}");
         assert!(text.contains("Bot/wk"), "{text}");
-        assert!(text.contains("*   Primary"), "{text}");
-        assert!(text.contains("> secondary"), "{text}");
+        assert!(text.contains("*   Primary User"), "{text}");
+        assert!(text.contains("> Secondary User"), "{text}");
         assert!(text.contains("secondary@example.com"), "{text}");
         assert!(text.contains("25.0%/wk"), "{text}");
         assert!(text.contains("75.0%/wk"), "{text}");
@@ -6233,6 +6271,7 @@ mod tests {
         ui.usage.insert(
             "account-narrow".to_string(),
             crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+                name: Some("Narrow User".to_string()),
                 email: Some("narrow@example.com".to_string()),
                 membership: Some("ultra".to_string()),
                 auto_percent: Some(12.5),
@@ -6262,9 +6301,9 @@ mod tests {
         assert!(text.contains("87.5%"), "{text}");
         assert!(text.contains("6.2%"), "{text}");
         // The email column is intentionally omitted at this width, while the
-        // account name remains identifiable from the email local part.
+        // Cursor profile name remains visible.
         assert!(!text.lines().any(|line| line.contains("Email")), "{text}");
-        assert!(text.contains("narrow"), "{text}");
+        assert!(text.contains("Narrow User"), "{text}");
 
         let mut ui = account_ui_lock();
         *ui = AccountUiState::default();
@@ -6405,6 +6444,7 @@ mod tests {
             ui.usage.insert(
                 "account-primary-long-id".to_string(),
                 crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+                    name: Some("Primary User".to_string()),
                     email: Some("primary@example.com".to_string()),
                     membership: Some("pro".to_string()),
                     auto_percent: Some(10.0),
@@ -6463,6 +6503,7 @@ mod tests {
     fn account_route_quota_hint_uses_the_selected_models_surface() {
         let state =
             crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+                name: None,
                 email: None,
                 membership: None,
                 auto_percent: Some(100.0),
@@ -6730,7 +6771,7 @@ mod tests {
     }
 
     #[test]
-    fn account_name_prefers_custom_label_and_falls_back_to_email_local_part() {
+    fn account_name_uses_cursor_profile_name_instead_of_email() {
         let _test_lock = ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -6748,16 +6789,23 @@ mod tests {
             },
             active: false,
         };
-        assert_eq!(account_name_for_display(&account, account.email()), "Work");
+        assert_eq!(
+            account_name_for_display(&account, Some("Alice Smith"), account.email()),
+            "Alice Smith"
+        );
+        account.label = Some("person@example.com".to_string());
+        assert_eq!(
+            account_name_for_display(&account, Some("Alice Smith"), account.email()),
+            "Alice Smith"
+        );
         account.label = None;
         assert_eq!(
-            account_name_for_display(&account, account.email()),
-            "person"
+            account_name_for_display(&account, Some("Alice Smith"), account.email()),
+            "Alice Smith"
         );
-        account.auth.email = None;
         assert_eq!(
-            account_name_for_display(&account, Some("dashboard@example.net")),
-            "dashboard"
+            account_name_for_display(&account, None, Some("dashboard@example.net")),
+            "account-name"
         );
     }
 
@@ -7773,6 +7821,7 @@ mod tests {
 
     fn usage_state_with_sand_percent(percent: f64) -> crate::monitor::AccountUsageState {
         crate::monitor::AccountUsageState::Ready(crate::monitor::AccountUsageSnapshot {
+            name: None,
             email: None,
             membership: None,
             auto_percent: Some(5.0),

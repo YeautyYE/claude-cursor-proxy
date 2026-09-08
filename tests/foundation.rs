@@ -96,15 +96,24 @@ fn path_resolvers_cover_platform_rules() {
         "/x/claude-cursor-proxy"
     );
 
-    let deps = DirResolverEnv {
-        platform: "win32".to_string(),
-        home: "C:/Users/u".into(),
-        env: HashMap::from([("APPDATA".into(), "C:/Users/u/AppData/Roaming".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "C:/Users/u/AppData/Roaming/claude-cursor-proxy"
-    );
+    for platform in ["windows", "win32"] {
+        let deps = DirResolverEnv {
+            platform: platform.to_string(),
+            home: "C:/Users/u".into(),
+            env: HashMap::from([
+                ("APPDATA".into(), "C:/Users/u/AppData/Roaming".into()),
+                ("LOCALAPPDATA".into(), "C:/Users/u/AppData/Local".into()),
+            ]),
+        };
+        assert_eq!(
+            paths::resolve_config_dir(&deps).to_string_lossy(),
+            "C:/Users/u/AppData/Roaming/claude-cursor-proxy"
+        );
+        assert_eq!(
+            paths::resolve_state_dir(&deps).to_string_lossy(),
+            "C:/Users/u/AppData/Local/claude-cursor-proxy"
+        );
+    }
 }
 
 #[test]

@@ -1,10 +1,10 @@
 //! Cursor Desktop Sand inference transport.
 //!
 //! Sand stopped being accepted by `agent.v1.AgentService/Run` in the current
-//! Cursor service.  The patched desktop runtime sends a Connect-JSON request
-//! to `aiserver.v1.InferenceService/Stream` instead.  This module deliberately
-//! keeps that wire format separate from the protobuf Agent transport used by
-//! the CLI/IDE paths.
+//! Cursor service. Plain text uses `aiserver.v1.InferenceService/Stream`;
+//! tool-bearing/history requests use the duplex `RunInference` handshake. This
+//! module keeps both Connect-JSON formats separate from the protobuf Agent
+//! transport used by the CLI/IDE paths.
 //!
 //! The Connect framing is shared with the other Cursor transports:
 //! `flags (u8)`, `payload length (u32, big endian)`, then the payload.  Unlike
@@ -16,12 +16,13 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
@@ -36,8 +37,11 @@ use crate::providers::cursor::request::{
 };
 use crate::providers::cursor::response::CursorStreamEvent;
 
-/// Current Sand inference endpoint.
+/// Current Sand inference endpoints.
 pub const SAND_INFERENCE_STREAM_PATH: &str = "/aiserver.v1.InferenceService/Stream";
+pub const SAND_RUN_INFERENCE_PATH: &str = "/aiserver.v1.InferenceService/RunInference";
+
+const MAX_RUN_INFERENCE_ROUTING_BYTES: usize = 32 * 1024;
 
 /// Maximum JSON payload accepted by the Sand decoder.  A normal token frame is
 /// tiny; the generous ceiling leaves room for tool arguments while preventing
@@ -1734,6 +1738,165 @@ pub fn messages_from_anthropic(
     output
 }
 
+/// Reject malformed tool/message relationships before they reach Cursor. The
+/// InferenceService reports most of these as a generic provider error, which
+/// makes a client retry a request that can never be accepted.
+pub fn validate_anthropic_request(request: &MessagesRequest) -> Result<(), String> {
+    if request.messages.is_empty() {
+        return Err("messages must contain at least one item".into());
+    }
+    if request.max_tokens == Some(0) {
+        return Err("max_tokens must be greater than zero".into());
+    }
+
+    let mut tool_calls = HashMap::<String, String>::new();
+    let mut tool_results = HashSet::<String>::new();
+    let mut representable_blocks = 0usize;
+    for (message_index, message) in request.messages.iter().enumerate() {
+        let role = message.role.trim().to_ascii_lowercase();
+        // Claude Code 2.1.x can materialize injected system/reminder and tool
+        // history as explicit roles on the beta Messages path.
+        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool") {
+            return Err(format!(
+                "messages[{message_index}].role is not supported: {}",
+                message.role
+            ));
+        }
+        let blocks = message_blocks(message);
+        for (block_index, block) in blocks.iter().enumerate() {
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("text");
+            match block_type {
+                "tool_use" => {
+                    if role != "assistant" {
+                        return Err(format!(
+                            "messages[{message_index}].content[{block_index}] tool_use must have assistant role"
+                        ));
+                    }
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "messages[{message_index}].content[{block_index}] tool_use.id is required"
+                            )
+                        })?;
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "messages[{message_index}].content[{block_index}] tool_use.name is required"
+                            )
+                        })?;
+                    if tool_calls
+                        .insert(id.to_string(), name.to_string())
+                        .is_some()
+                    {
+                        return Err(format!("duplicate tool_use id: {id}"));
+                    }
+                    representable_blocks += 1;
+                }
+                "tool_result" => {
+                    if !matches!(role.as_str(), "user" | "tool") {
+                        return Err(format!(
+                            "messages[{message_index}].content[{block_index}] tool_result must have user/tool role"
+                        ));
+                    }
+                    let id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "messages[{message_index}].content[{block_index}] tool_result.tool_use_id is required"
+                            )
+                        })?;
+                    let Some(expected_name) = tool_calls.get(id) else {
+                        return Err(format!("tool_result references unknown tool_use id: {id}"));
+                    };
+                    if let Some(actual_name) = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        && actual_name != expected_name
+                    {
+                        return Err(format!(
+                            "tool_result name {actual_name} does not match {expected_name} for {id}"
+                        ));
+                    }
+                    if !tool_results.insert(id.to_string()) {
+                        return Err(format!("duplicate tool_result for tool_use id: {id}"));
+                    }
+                    representable_blocks += 1;
+                }
+                "text" => {
+                    if block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        representable_blocks += 1;
+                    }
+                }
+                "thinking"
+                | "redacted_thinking"
+                | "compaction"
+                | "image"
+                | "input_image"
+                | "image_url"
+                | "document"
+                | "file"
+                | "server_tool_use"
+                | "web_search_tool_result" => representable_blocks += 1,
+                _ => {
+                    if block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        representable_blocks += 1;
+                    }
+                }
+            }
+        }
+    }
+    if representable_blocks == 0 {
+        return Err("messages contain no representable content".into());
+    }
+
+    if let Some(tools) = request.extra.get("tools") {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| "tools must be an array".to_string())?;
+        let mut names = HashSet::new();
+        for (index, tool) in tools.iter().enumerate() {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("tools[{index}].name is required"))?;
+            if !names.insert(name) {
+                return Err(format!("duplicate tool name: {name}"));
+            }
+            let schema = tool
+                .get("input_schema")
+                .or_else(|| tool.get("parameters"))
+                .ok_or_else(|| format!("tools[{index}].input_schema is required"))?;
+            if !schema.is_object() {
+                return Err(format!("tools[{index}].input_schema must be an object"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn historical_reasoning_part(block: &Value) -> Option<Value> {
     let mut part = Map::new();
     if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
@@ -2177,6 +2340,9 @@ pub struct SandInferenceRequest {
     pub invocation_id: String,
     pub max_mode: bool,
     pub max_tokens: Option<u64>,
+    /// Tool-bearing and tool-history requests use Cursor's duplex handshake.
+    /// The flag is transport-local and is never serialized into the model body.
+    pub use_run_inference: bool,
     pub tools: Vec<Value>,
     /// Names of executable tools that are intentionally absent from
     /// `tools`. Cursor's InferenceService uses this repeated field for
@@ -2204,6 +2370,7 @@ impl SandInferenceRequest {
             invocation_id: invocation_id.into(),
             max_mode: false,
             max_tokens: None,
+            use_run_inference: false,
             tools: Vec::new(),
             accepted_unadvertised_tool_names: Vec::new(),
             extra: Map::new(),
@@ -2227,6 +2394,11 @@ impl SandInferenceRequest {
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
         self.max_tokens = max_tokens.filter(|value| *value > 0);
+        self
+    }
+
+    pub fn with_run_inference(mut self, enabled: bool) -> Self {
+        self.use_run_inference = enabled;
         self
     }
 
@@ -2306,17 +2478,13 @@ impl SandInferenceRequest {
         // AgentService payload.
         object.insert("modelId".into(), json!(self.model_id));
         object.insert("conversationId".into(), json!(self.conversation_id));
-        // Cursor Desktop defaults the optional group binding to the
-        // conversation id.  Fable's tool-capable provider uses this binding
-        // when it attaches execution state; omitting it can make an otherwise
-        // valid non-empty catalog fail as a generic provider 400.
-        object.insert("conversationGroupId".into(), json!(self.conversation_id));
         object.insert("invocationId".into(), json!(self.invocation_id));
-        // These are repeated fields in InferenceStreamRequest. Proto3 JSON
-        // defaults omitted arrays correctly, but emitting them keeps the wire
-        // contract explicit while staying within the current schema.
-        object.insert("tools".into(), Value::Array(self.tools.clone()));
-        object.insert("providerDefinedTools".into(), Value::Array(Vec::new()));
+        // Keep optional repeated fields absent when empty. Connect's protobuf
+        // JSON decoder supplies their defaults, while older Sand revisions can
+        // reject fields that are not part of their exact request schema.
+        if !self.tools.is_empty() {
+            object.insert("tools".into(), Value::Array(self.tools.clone()));
+        }
         if !self.accepted_unadvertised_tool_names.is_empty() {
             object.insert(
                 "acceptedUnadvertisedToolNames".into(),
@@ -2335,6 +2503,58 @@ impl SandInferenceRequest {
         Value::Object(object)
     }
 
+    pub fn encode_run_inference_frames(&self) -> Result<(Bytes, Bytes), CursorError> {
+        let mut requested_model = Map::new();
+        requested_model.insert("modelId".into(), json!(self.model_id));
+        requested_model.insert("builtInModel".into(), json!(true));
+        if self.max_mode {
+            requested_model.insert("maxMode".into(), json!(true));
+        }
+        let parameter_model_id = self
+            .parameter_model_id
+            .as_deref()
+            .unwrap_or(self.model_id.as_str());
+        let parameters = requested_model_parameters_json(parameter_model_id);
+        if !parameters.is_empty() {
+            requested_model.insert("parameters".into(), Value::Array(parameters));
+        }
+        let run_request = json!({
+            "runRequest": {
+                "conversationId": self.conversation_id,
+                "requestedModel": Value::Object(requested_model),
+                "routingConversation": run_inference_routing_conversation(&self.messages),
+                "agentMode": "agent"
+            }
+        });
+
+        let mut invocation_request = self
+            .to_json_value()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        for field in [
+            "requestedModel",
+            "modelId",
+            "conversationId",
+            "conversationGroupId",
+            "invocationId",
+            "automationId",
+            "inferenceReason",
+        ] {
+            invocation_request.remove(field);
+        }
+        let invoke_model = json!({
+            "invokeModel": {
+                "invocationId": self.invocation_id,
+                "request": Value::Object(invocation_request)
+            }
+        });
+        Ok((
+            encode_json_frame(&run_request)?,
+            encode_json_frame(&invoke_model)?,
+        ))
+    }
+
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, CursorError> {
         serde_json::to_vec(&self.to_json_value())
             .map_err(|error| CursorError::internal(format!("Sand request JSON encode: {error}")))
@@ -2345,6 +2565,59 @@ impl SandInferenceRequest {
     }
 }
 
+fn run_inference_routing_conversation(messages: &[SandInferenceMessage]) -> Vec<Value> {
+    let mut projected = messages
+        .iter()
+        .filter(|message| matches!(message.role, ROLE_USER | ROLE_ASSISTANT))
+        .filter_map(|message| {
+            let text = sand_message_routing_text(message);
+            (!text.is_empty()).then_some((message.role, text))
+        })
+        .collect::<Vec<_>>();
+    let mut remaining = MAX_RUN_INFERENCE_ROUTING_BYTES;
+    let mut newest = Vec::new();
+    while remaining > 0 {
+        let Some((role, text)) = projected.pop() else {
+            break;
+        };
+        let text = utf8_suffix_with_max_bytes(&text, remaining);
+        if text.is_empty() {
+            continue;
+        }
+        remaining = remaining.saturating_sub(text.len());
+        newest.push(json!({"role": role, "text": text}));
+    }
+    newest.reverse();
+    newest
+}
+
+fn sand_message_routing_text(message: &SandInferenceMessage) -> String {
+    if let Some(text) = message.text.as_deref().filter(|text| !text.is_empty()) {
+        return text.to_string();
+    }
+    message
+        .parts
+        .iter()
+        .filter_map(|part| {
+            part.get("text")
+                .and_then(|value| value.get("text").or_else(|| value.get("value")))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn utf8_suffix_with_max_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
 /// Encode a raw JSON value as one Connect-JSON request frame.
 pub fn encode_json_frame(value: &Value) -> Result<Bytes, CursorError> {
     let payload = serde_json::to_vec(value)
@@ -2352,9 +2625,11 @@ pub fn encode_json_frame(value: &Value) -> Result<Bytes, CursorError> {
     Ok(encode_connect_frame(payload, 0))
 }
 
+type SandResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
 /// A decoded response stream from InferenceService/Stream.
 pub struct SandInferenceStream {
-    bytes: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    bytes: SandResponseByteStream,
     decoder: ConnectFrameDecoder,
     pending: VecDeque<Result<CursorStreamEvent, CursorError>>,
     timeout_secs: u64,
@@ -2703,24 +2978,27 @@ impl SandInferenceStream {
                 Some(format!("{} trailing bytes", self.decoder.buffered())),
             )));
         } else if !self.terminal_emitted {
-            // The endpoint normally sends FLAG_END. Treat a clean HTTP close
-            // as terminal for compatibility with proxies that strip the end
-            // marker; no useful frame is silently left hanging. Check the
-            // actual terminal state rather than `saw_end`: a control/trailer
-            // parser can observe the END bit before its terminal event is
-            // queued, and that state must still be closed for downstream SSE.
-            self.emit_end_once();
+            // A successful Connect server stream has an explicit EndStream
+            // frame. Treating a bare HTTP EOF as `end_turn` can truncate a
+            // partially delivered answer and is especially harmful to Claude
+            // Code, which then commits the shortened turn to its history.
+            self.terminal_emitted = true;
+            self.pending.push_back(Err(CursorError::new(
+                502,
+                "Sand inference connection closed without an EndStream frame",
+                None,
+            )));
         }
     }
 }
 
 #[cfg(test)]
-pub(crate) fn pending_stream_with_notify_for_test(polled: Arc<Notify>) -> SandInferenceStream {
+pub(crate) fn pending_stream_with_notify_for_test(polled: Arc<Notify>) -> SandTransportStream {
     let bytes = futures_util::stream::poll_fn(move |_cx| {
         polled.notify_one();
         Poll::Pending
     });
-    SandInferenceStream {
+    SandTransportStream::Direct(SandInferenceStream {
         bytes: Box::pin(bytes),
         decoder: ConnectFrameDecoder::new(),
         pending: VecDeque::new(),
@@ -2731,7 +3009,7 @@ pub(crate) fn pending_stream_with_notify_for_test(polled: Arc<Notify>) -> SandIn
         tool_buffers: HashMap::new(),
         completed_tool_ids: HashSet::new(),
         diagnostics: SandStreamDiagnostics::default(),
-    }
+    })
 }
 
 impl Stream for SandInferenceStream {
@@ -2780,11 +3058,598 @@ impl Stream for SandInferenceStream {
     }
 }
 
+/// Unified event stream for the direct endpoint and Cursor's duplex
+/// RunInference handshake.
+pub enum SandTransportStream {
+    Direct(SandInferenceStream),
+    RunInference(SandRunInferenceStream),
+}
+
+impl SandTransportStream {
+    pub fn diagnostics(&self) -> SandStreamDiagnostics {
+        match self {
+            Self::Direct(stream) => stream.diagnostics(),
+            Self::RunInference(stream) => stream.diagnostics.clone(),
+        }
+    }
+
+    /// Whether opening a fresh UUID is known not to duplicate accepted model
+    /// work. Once `invokeModel` is sent, only an explicit `invocationEnd`
+    /// restores replay safety.
+    pub fn replay_safe(&self) -> bool {
+        match self {
+            Self::Direct(_) => true,
+            Self::RunInference(stream) => run_inference_phase_replay_safe(stream.phase),
+        }
+    }
+}
+
+impl Stream for SandTransportStream {
+    type Item = Result<CursorStreamEvent, CursorError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_next(cx),
+            Self::RunInference(stream) => Pin::new(stream).poll_next(cx),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunInferencePhase {
+    AwaitRunReady,
+    AwaitInvocation,
+    Finishing,
+    InvocationEnded,
+}
+
+fn run_inference_phase_replay_safe(phase: RunInferencePhase) -> bool {
+    phase != RunInferencePhase::AwaitInvocation
+}
+
+struct RunInferenceRequestChunk {
+    bytes: Bytes,
+    consumed: Option<oneshot::Sender<()>>,
+}
+
+type RunInferenceRequestSender = mpsc::Sender<RunInferenceRequestChunk>;
+
+pub struct SandRunInferenceStream {
+    bytes: Option<SandResponseByteStream>,
+    decoder: ConnectFrameDecoder,
+    pending: VecDeque<Result<CursorStreamEvent, CursorError>>,
+    timeout_secs: u64,
+    ended: bool,
+    terminal_emitted: bool,
+    phase: RunInferencePhase,
+    invocation_id: String,
+    invoke_frame: Option<Bytes>,
+    request_tx: Option<RunInferenceRequestSender>,
+    finish_ack: Option<oneshot::Receiver<()>>,
+    tool_buffers: HashMap<String, SandToolBuffer>,
+    completed_tool_ids: HashSet<String>,
+    diagnostics: SandStreamDiagnostics,
+}
+
+impl SandRunInferenceStream {
+    fn new(
+        response: reqwest::Response,
+        timeout_secs: u64,
+        invocation_id: String,
+        invoke_frame: Bytes,
+        request_tx: RunInferenceRequestSender,
+    ) -> Self {
+        Self {
+            bytes: Some(Box::pin(response.bytes_stream())),
+            decoder: ConnectFrameDecoder::new(),
+            pending: VecDeque::new(),
+            timeout_secs,
+            ended: false,
+            terminal_emitted: false,
+            phase: RunInferencePhase::AwaitRunReady,
+            invocation_id,
+            invoke_frame: Some(invoke_frame),
+            request_tx: Some(request_tx),
+            finish_ack: None,
+            tool_buffers: HashMap::new(),
+            completed_tool_ids: HashSet::new(),
+            diagnostics: SandStreamDiagnostics::default(),
+        }
+    }
+
+    fn queue_terminal_error(&mut self, error: CursorError) {
+        if self.terminal_emitted {
+            return;
+        }
+        self.terminal_emitted = true;
+        self.ended = true;
+        self.pending.push_back(Err(error));
+    }
+
+    fn flush_tool_buffers(&mut self) {
+        let buffers = std::mem::take(&mut self.tool_buffers);
+        for (id, buffer) in buffers {
+            let Some(input) = complete_tool_input(&buffer) else {
+                self.diagnostics.unfinished_tools += 1;
+                continue;
+            };
+            if !buffer.name.is_empty() && self.completed_tool_ids.insert(id.clone()) {
+                self.diagnostics.tool_events += 1;
+                self.pending.push_back(Ok(CursorStreamEvent::NativeTool {
+                    tool_use_id: id,
+                    name: buffer.name,
+                    input,
+                }));
+            }
+        }
+    }
+
+    fn emit_end_once(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        self.flush_tool_buffers();
+        self.terminal_emitted = true;
+        self.ended = true;
+        self.pending.push_back(Ok(CursorStreamEvent::End));
+    }
+
+    fn send_invoke_model(&mut self) -> Result<(), CursorError> {
+        let frame = self.invoke_frame.take().ok_or_else(|| {
+            CursorError::new(
+                502,
+                "RunInference invokeModel frame was already consumed",
+                None,
+            )
+        })?;
+        let tx = self.request_tx.as_ref().ok_or_else(|| {
+            CursorError::new(
+                502,
+                "RunInference request stream closed before runReady",
+                None,
+            )
+        })?;
+        tx.try_send(RunInferenceRequestChunk {
+            bytes: frame,
+            consumed: None,
+        })
+        .map_err(|error| {
+            CursorError::new(
+                502,
+                "RunInference could not send invokeModel after runReady",
+                Some(error.to_string()),
+            )
+        })
+    }
+
+    fn begin_finish_request_body(&mut self) -> Result<(), CursorError> {
+        let tx = self.request_tx.as_ref().ok_or_else(|| {
+            CursorError::new(
+                502,
+                "RunInference request stream closed before finishRun",
+                None,
+            )
+        })?;
+        let frame = encode_json_frame(&json!({"finishRun": {}}))?;
+        let (consumed, finish_ack) = oneshot::channel();
+        tx.try_send(RunInferenceRequestChunk {
+            bytes: frame,
+            consumed: Some(consumed),
+        })
+        .map_err(|error| {
+            CursorError::new(
+                502,
+                "RunInference could not queue finishRun",
+                Some(error.to_string()),
+            )
+        })?;
+        self.finish_ack = Some(finish_ack);
+        self.phase = RunInferencePhase::Finishing;
+        Ok(())
+    }
+
+    fn poll_finish_request_body(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), CursorError>> {
+        let Some(ack) = self.finish_ack.as_mut() else {
+            return Poll::Ready(Err(CursorError::new(
+                502,
+                "RunInference finishRun acknowledgement is missing",
+                None,
+            )));
+        };
+        match Pin::new(ack).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                self.finish_ack = None;
+                self.request_tx.take();
+                self.phase = RunInferencePhase::InvocationEnded;
+                self.emit_end_once();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(CursorError::new(
+                502,
+                "RunInference request body closed before finishRun was consumed",
+                None,
+            ))),
+        }
+    }
+
+    fn queue_inference_response(&mut self, value: &Value) {
+        self.diagnostics.json_frames += 1;
+        self.diagnostics.record_json(value, 0);
+        if let Some(error) = json_error(value) {
+            self.queue_terminal_error(error);
+            return;
+        }
+        let value = value.get("result").unwrap_or(value);
+        for event in
+            events_from_json_with_state(value, &mut self.tool_buffers, &mut self.completed_tool_ids)
+        {
+            self.diagnostics.record_event(&event);
+            self.pending.push_back(Ok(event));
+        }
+    }
+
+    fn queue_server_message(&mut self, value: &Value) {
+        let Some(object) = value.as_object() else {
+            self.queue_terminal_error(CursorError::new(
+                502,
+                "RunInference server message is not a JSON object",
+                None,
+            ));
+            return;
+        };
+        let variants = [
+            "heartbeat",
+            "runReady",
+            "invocationResponse",
+            "invocationEnd",
+        ]
+        .iter()
+        .filter(|key| object.get(**key).is_some_and(|value| !value.is_null()))
+        .count();
+        if variants != 1 {
+            self.queue_terminal_error(CursorError::new(
+                502,
+                format!("RunInference server message has {variants} variants"),
+                None,
+            ));
+            return;
+        }
+        if object
+            .get("heartbeat")
+            .is_some_and(|value| !value.is_null())
+        {
+            return;
+        }
+        if let Some(ready) = object.get("runReady") {
+            if self.phase != RunInferencePhase::AwaitRunReady {
+                self.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference received runReady out of order",
+                    None,
+                ));
+                return;
+            }
+            let model_id = ready
+                .pointer("/resolvedModel/modelId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if model_id.is_none() {
+                self.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference runReady omitted resolvedModel.modelId",
+                    None,
+                ));
+                return;
+            }
+            if let Err(error) = self.send_invoke_model() {
+                self.queue_terminal_error(error);
+                return;
+            }
+            self.phase = RunInferencePhase::AwaitInvocation;
+            return;
+        }
+        if let Some(reply) = object.get("invocationResponse") {
+            if self.phase != RunInferencePhase::AwaitInvocation {
+                self.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference received invocationResponse before invokeModel",
+                    None,
+                ));
+                return;
+            }
+            if reply
+                .get("invocationId")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id != self.invocation_id)
+            {
+                return;
+            }
+            let Some(response) = reply.get("response") else {
+                self.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference invocationResponse omitted response",
+                    None,
+                ));
+                return;
+            };
+            self.queue_inference_response(response);
+            return;
+        }
+        if let Some(end) = object.get("invocationEnd") {
+            if self.phase != RunInferencePhase::AwaitInvocation {
+                self.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference received invocationEnd out of order",
+                    None,
+                ));
+                return;
+            }
+            if end
+                .get("invocationId")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id != self.invocation_id)
+            {
+                return;
+            }
+            if let Some(error) = end.get("error").filter(|value| !value.is_null()) {
+                self.phase = RunInferencePhase::InvocationEnded;
+                self.queue_terminal_error(run_inference_invocation_error(error));
+                return;
+            }
+            if let Err(error) = self.begin_finish_request_body() {
+                self.queue_terminal_error(error);
+            }
+        }
+    }
+
+    fn queue_frame(&mut self, frame: ConnectFrame) {
+        if self.ended || self.terminal_emitted {
+            return;
+        }
+        self.diagnostics.frames += 1;
+        self.diagnostics.payload_bytes += frame.payload.len() as u64;
+        if frame.flags & FLAG_CONTROL != 0 {
+            self.diagnostics.control_frames += 1;
+            return;
+        }
+        if frame.flags & FLAG_END != 0 {
+            self.diagnostics.end_frames += 1;
+            if !frame.payload.is_empty()
+                && let Ok(payload) = frame_payload(&frame)
+                && let Some(error) = parse_connect_error(&payload)
+            {
+                self.queue_terminal_error(CursorError::new(
+                    error.status,
+                    error.message,
+                    Some(error.detail),
+                ));
+                return;
+            }
+            if self.phase != RunInferencePhase::InvocationEnded {
+                self.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference transport ended before invocationEnd",
+                    None,
+                ));
+            }
+            return;
+        }
+        let payload = match frame_payload(&frame) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.queue_terminal_error(error);
+                return;
+            }
+        };
+        if payload.is_empty() {
+            return;
+        }
+        match serde_json::from_slice::<Value>(&payload) {
+            Ok(value) => self.queue_server_message(&value),
+            Err(error) => self.queue_terminal_error(CursorError::new(
+                502,
+                "RunInference response frame is not valid JSON",
+                Some(error.to_string()),
+            )),
+        }
+    }
+
+    fn finish_at_eof(&mut self) {
+        if self.ended {
+            return;
+        }
+        if self.decoder.buffered() != 0 {
+            self.queue_terminal_error(CursorError::new(
+                502,
+                "RunInference ended with an incomplete Connect frame",
+                Some(format!("{} trailing bytes", self.decoder.buffered())),
+            ));
+        } else {
+            self.queue_terminal_error(CursorError::new(
+                502,
+                "RunInference connection closed before invocationEnd",
+                None,
+            ));
+        }
+    }
+}
+
+async fn send_run_inference_cleanup_frame(tx: &RunInferenceRequestSender, frame: Bytes) {
+    let (consumed, ack) = oneshot::channel();
+    if tx
+        .send(RunInferenceRequestChunk {
+            bytes: frame,
+            consumed: Some(consumed),
+        })
+        .await
+        .is_ok()
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(1), ack).await;
+    }
+}
+
+async fn finish_run_inference_after_drop(
+    tx: Option<RunInferenceRequestSender>,
+    mut bytes: Option<SandResponseByteStream>,
+    invocation_id: String,
+    phase: RunInferencePhase,
+    finish_ack: Option<oneshot::Receiver<()>>,
+) {
+    if let Some(tx) = tx {
+        match phase {
+            RunInferencePhase::AwaitInvocation => {
+                if let Ok(frame) = encode_json_frame(&json!({
+                    "cancelInvocation": {"invocationId": invocation_id}
+                })) {
+                    send_run_inference_cleanup_frame(&tx, frame).await;
+                }
+                if let Ok(frame) = encode_json_frame(&json!({"finishRun": {}})) {
+                    send_run_inference_cleanup_frame(&tx, frame).await;
+                }
+            }
+            RunInferencePhase::Finishing => {
+                if let Some(ack) = finish_ack {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), ack).await;
+                }
+            }
+            RunInferencePhase::InvocationEnded => {
+                if let Ok(frame) = encode_json_frame(&json!({"finishRun": {}})) {
+                    send_run_inference_cleanup_frame(&tx, frame).await;
+                }
+            }
+            RunInferencePhase::AwaitRunReady => {}
+        }
+        drop(tx);
+    }
+    if let Some(stream) = bytes.as_mut() {
+        let drain = async { while stream.next().await.is_some() {} };
+        let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    }
+}
+
+impl Drop for SandRunInferenceStream {
+    fn drop(&mut self) {
+        let tx = self.request_tx.take();
+        let bytes = self.bytes.take();
+        let invocation_id = self.invocation_id.clone();
+        let phase = self.phase;
+        let finish_ack = self.finish_ack.take();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(finish_run_inference_after_drop(
+                tx,
+                bytes,
+                invocation_id,
+                phase,
+                finish_ack,
+            ));
+        }
+    }
+}
+
+impl Stream for SandRunInferenceStream {
+    type Item = Result<CursorStreamEvent, CursorError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(item) = this.pending.pop_front() {
+                return Poll::Ready(Some(item));
+            }
+            if this.phase == RunInferencePhase::Finishing {
+                match this.poll_finish_request_body(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(error)) => {
+                        this.queue_terminal_error(error);
+                        continue;
+                    }
+                }
+            }
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            let Some(bytes) = this.bytes.as_mut() else {
+                this.queue_terminal_error(CursorError::new(
+                    502,
+                    "RunInference response stream was already consumed",
+                    None,
+                ));
+                continue;
+            };
+            match bytes.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    let frames = match this.decoder.push_with_limit(&chunk, MAX_SAND_FRAME_PAYLOAD)
+                    {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            this.queue_terminal_error(CursorError::new(
+                                502,
+                                "RunInference Connect frame decode failed",
+                                Some(error.to_string()),
+                            ));
+                            continue;
+                        }
+                    };
+                    for frame in frames {
+                        this.queue_frame(frame);
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.queue_terminal_error(CursorError::from_reqwest(error, this.timeout_secs));
+                }
+                Poll::Ready(None) => this.finish_at_eof(),
+            }
+        }
+    }
+}
+
+fn run_inference_invocation_error(value: &Value) -> CursorError {
+    let code = value
+        .get("code")
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+        })
+        .unwrap_or(2);
+    let (status, message) = match code {
+        1 => (499, "RunInference request canceled"),
+        3 => (400, "RunInference rejected an invalid request"),
+        4 => (504, "RunInference upstream deadline exceeded"),
+        5 => (404, "RunInference model or resource was not found"),
+        7 => (403, "RunInference permission denied"),
+        8 => (429, "RunInference resource exhausted"),
+        9 => (400, "RunInference failed a request precondition"),
+        12 => (501, "RunInference is not implemented for this route"),
+        14 => (503, "RunInference upstream unavailable"),
+        16 => (401, "RunInference authentication required"),
+        _ => (502, "RunInference upstream invocation failed"),
+    };
+    let detail_types = value
+        .get("details")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|detail| detail.get("@type").and_then(Value::as_str))
+        .filter_map(|name| name.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    CursorError::new(
+        status,
+        message,
+        (!detail_types.is_empty()).then(|| format!("details={}", detail_types.join(","))),
+    )
+}
+
 /// Thin HTTP client for the Sand endpoint.  It can be built from the shared
 /// Cursor client so proxy/base-url/timeout settings remain identical.
 #[derive(Clone)]
 pub struct SandInferenceClient {
     client: reqwest::Client,
+    duplex_client: reqwest::Client,
     base_url: String,
     timeout_secs: u64,
 }
@@ -2912,8 +3777,10 @@ impl SandInferenceClient {
         // Sand must never inherit a process-wide HTTP/1 pin.  The shared
         // constructor selects strict H2 (or prior-knowledge H2 for fixtures).
         let sand = source.with_sand_transport_mode();
+        let duplex = source.with_strict_sand_transport_mode();
         Self {
             client: sand.client.clone(),
+            duplex_client: duplex.client.clone(),
             base_url: sand.base_url.clone(),
             timeout_secs: sand.timeout_secs,
         }
@@ -2940,9 +3807,35 @@ impl SandInferenceClient {
         )
     }
 
-    /// Open one Sand stream.  No replay occurs after a response is accepted;
-    /// callers can safely retry only a returned connect/open error.
+    /// Open one Sand operation using the protocol selected by the normalized
+    /// request. Tool-bearing/history turns use the strict duplex handshake;
+    /// simple text turns keep the lighter server-streaming endpoint.
     pub async fn open(
+        &self,
+        token: &str,
+        request: &SandInferenceRequest,
+    ) -> Result<SandTransportStream, CursorError> {
+        if request.use_run_inference {
+            match self.open_run_inference(token, request).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) if matches!(error.status, 404 | 405 | 501) => {
+                    create_logger("cursor").warn(
+                        "sand_run_inference_unavailable",
+                        Some(serde_json::Map::from_iter([
+                            ("status".into(), json!(error.status)),
+                            ("fallback".into(), json!("InferenceService/Stream")),
+                        ])),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.open_direct(token, request)
+            .await
+            .map(SandTransportStream::Direct)
+    }
+
+    async fn open_direct(
         &self,
         token: &str,
         request: &SandInferenceRequest,
@@ -3003,13 +3896,100 @@ impl SandInferenceClient {
         Ok(SandInferenceStream::new(response, self.timeout_secs))
     }
 
+    async fn open_run_inference(
+        &self,
+        token: &str,
+        request: &SandInferenceRequest,
+    ) -> Result<SandTransportStream, CursorError> {
+        let (run_frame, invoke_frame) = request.encode_run_inference_frames()?;
+        let (request_tx, request_rx) = mpsc::channel::<RunInferenceRequestChunk>(8);
+        request_tx
+            .send(RunInferenceRequestChunk {
+                bytes: run_frame,
+                consumed: None,
+            })
+            .await
+            .map_err(|_| CursorError::internal("RunInference request stream closed at startup"))?;
+        let body_stream = futures_util::stream::unfold(request_rx, |mut receiver| async move {
+            receiver.recv().await.map(|mut chunk| {
+                if let Some(consumed) = chunk.consumed.take() {
+                    let _ = consumed.send(());
+                }
+                (Ok::<Bytes, std::io::Error>(chunk.bytes), receiver)
+            })
+        });
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let endpoint = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            SAND_RUN_INFERENCE_PATH
+        );
+        let mut builder = self
+            .duplex_client
+            .post(endpoint)
+            .bearer_auth(token)
+            .header("content-type", "application/connect+json")
+            .header("connect-protocol-version", "1")
+            .header("connect-accept-encoding", "gzip")
+            .header("user-agent", "connect-es/1.6.1")
+            .header("x-request-id", &request_id);
+        builder = crate::providers::cursor::client::apply_cursor_identity_headers_for_client_type(
+            builder,
+            token,
+            Some("sand"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs.max(1)),
+            builder.body(reqwest::Body::wrap_stream(body_stream)).send(),
+        )
+        .await
+        .map_err(|_| {
+            CursorError::new(
+                504,
+                format!("RunInference open timed out after {}s", self.timeout_secs),
+                None,
+            )
+        })?
+        .map_err(|error| CursorError::from_reqwest(error, self.timeout_secs))?;
+        if response.version() != http::Version::HTTP_2 {
+            drop(request_tx);
+            return Err(CursorError::new(
+                502,
+                "RunInference requires an end-to-end HTTP/2 connection",
+                Some(format!("negotiated {:?}", response.version())),
+            ));
+        }
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            drop(request_tx);
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let body = response.bytes().await.unwrap_or_default();
+            return Err(sand_http_error_from_body(status, &body).with_retry_after(retry_after));
+        }
+        Ok(SandTransportStream::RunInference(
+            SandRunInferenceStream::new(
+                response,
+                self.timeout_secs,
+                request.invocation_id.clone(),
+                invoke_frame,
+                request_tx,
+            ),
+        ))
+    }
+
     /// Convenience wrapper for callers that need a stream of events and do
     /// not need to retain the HTTP response object.
     pub async fn stream_events(
         &self,
         token: &str,
         request: &SandInferenceRequest,
-    ) -> Result<SandInferenceStream, CursorError> {
+    ) -> Result<SandTransportStream, CursorError> {
         self.open(token, request).await
     }
 }
@@ -3965,10 +4945,221 @@ mod tests {
         );
         assert_eq!(value["conversationId"], "conv-1");
         assert_eq!(value["invocationId"], "invoke-1");
-        assert_eq!(value["tools"], json!([]));
-        assert_eq!(value["providerDefinedTools"], json!([]));
+        assert!(value.get("conversationGroupId").is_none());
+        assert!(value.get("tools").is_none());
+        assert!(value.get("providerDefinedTools").is_none());
         assert!(value.get("acceptedUnadvertisedToolNames").is_none());
         assert_eq!(value["modelConfig"]["maxTokens"], 1234);
+    }
+
+    #[test]
+    fn sand_request_validation_rejects_malformed_tool_history_locally() {
+        let missing_id: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5-1-thinking-max",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "tool_use", "name": "Read", "input": {}}]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            validate_anthropic_request(&missing_id)
+                .unwrap_err()
+                .contains("tool_use.id")
+        );
+
+        let orphan: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5-1-thinking-max",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "missing", "content": "x"}]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            validate_anthropic_request(&orphan)
+                .unwrap_err()
+                .contains("unknown tool_use id")
+        );
+
+        let invalid_tools: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5-1-thinking-max",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "Read", "input_schema": true}]
+        }))
+        .unwrap();
+        assert!(
+            validate_anthropic_request(&invalid_tools)
+                .unwrap_err()
+                .contains("input_schema")
+        );
+    }
+
+    #[test]
+    fn sand_request_validation_accepts_claude_code_multiturn_tool_history() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-fable-5-1-thinking-max",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "check", "signature": "opaque"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"},
+                    {"type": "text", "text": "continue"}
+                ]}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        }))
+        .unwrap();
+        validate_anthropic_request(&request).unwrap();
+    }
+
+    #[test]
+    fn run_inference_frames_split_routing_from_invocation_payload() {
+        let request = SandInferenceRequest::new(
+            "claude-fable-5-1",
+            "conv-run",
+            "invoke-run",
+            vec![
+                SandInferenceMessage::system("system"),
+                SandInferenceMessage::user("first"),
+                SandInferenceMessage::assistant("answer"),
+                SandInferenceMessage::tool(vec![json!({
+                    "toolCallId": "tool-1",
+                    "toolName": "Read",
+                    "result": "ok"
+                })]),
+                SandInferenceMessage::user("continue"),
+            ],
+        )
+        .with_parameter_model_id("claude-fable-5-1-thinking-max")
+        .with_max_mode(true)
+        .with_run_inference(true);
+        let (run_frame, invoke_frame) = request.encode_run_inference_frames().unwrap();
+        let decode = |frame: Bytes| {
+            let mut decoder = ConnectFrameDecoder::new();
+            let frames = decoder.push(&frame).unwrap();
+            assert_eq!(frames.len(), 1);
+            serde_json::from_slice::<Value>(&frames[0].payload).unwrap()
+        };
+        let run = decode(run_frame);
+        assert_eq!(run["runRequest"]["conversationId"], "conv-run");
+        assert_eq!(
+            run["runRequest"]["requestedModel"]["modelId"],
+            "claude-fable-5-1"
+        );
+        assert_eq!(run["runRequest"]["requestedModel"]["maxMode"], true);
+        assert_eq!(
+            run["runRequest"]["routingConversation"],
+            json!([
+                {"role": ROLE_USER, "text": "first"},
+                {"role": ROLE_ASSISTANT, "text": "answer"},
+                {"role": ROLE_USER, "text": "continue"}
+            ])
+        );
+        let invoke = decode(invoke_frame);
+        assert_eq!(invoke["invokeModel"]["invocationId"], "invoke-run");
+        let payload = invoke["invokeModel"]["request"].as_object().unwrap();
+        for field in [
+            "requestedModel",
+            "modelId",
+            "conversationId",
+            "conversationGroupId",
+            "invocationId",
+            "automationId",
+            "inferenceReason",
+        ] {
+            assert!(!payload.contains_key(field), "invoke retained {field}");
+        }
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn run_inference_routing_keeps_newest_utf8_suffix_within_limit() {
+        let old = "old".repeat(20_000);
+        let newest = format!("{}END", "你".repeat(20_000));
+        let routing = run_inference_routing_conversation(&[
+            SandInferenceMessage::user(old),
+            SandInferenceMessage::assistant(newest),
+        ]);
+        let bytes = routing
+            .iter()
+            .map(|turn| turn["text"].as_str().unwrap().len())
+            .sum::<usize>();
+        assert!(bytes <= MAX_RUN_INFERENCE_ROUTING_BYTES);
+        assert!(routing.len() <= 2);
+        assert!(
+            routing.last().unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("END")
+        );
+    }
+
+    #[test]
+    fn run_inference_replay_is_blocked_only_while_invocation_is_ambiguous() {
+        assert!(run_inference_phase_replay_safe(
+            RunInferencePhase::AwaitRunReady
+        ));
+        assert!(!run_inference_phase_replay_safe(
+            RunInferencePhase::AwaitInvocation
+        ));
+        assert!(run_inference_phase_replay_safe(
+            RunInferencePhase::Finishing
+        ));
+        assert!(run_inference_phase_replay_safe(
+            RunInferencePhase::InvocationEnded
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_run_inference_sends_cancel_then_finish() {
+        let (tx, mut rx) = mpsc::channel::<RunInferenceRequestChunk>(4);
+        let cleanup = tokio::spawn(finish_run_inference_after_drop(
+            Some(tx),
+            None,
+            "invoke-drop".into(),
+            RunInferencePhase::AwaitInvocation,
+            None,
+        ));
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            let mut chunk = rx.recv().await.expect("cleanup frame");
+            let mut decoder = ConnectFrameDecoder::new();
+            let frames = decoder.push(&chunk.bytes).unwrap();
+            messages.push(serde_json::from_slice::<Value>(&frames[0].payload).unwrap());
+            if let Some(consumed) = chunk.consumed.take() {
+                let _ = consumed.send(());
+            }
+        }
+        cleanup.await.unwrap();
+        assert_eq!(
+            messages[0]["cancelInvocation"]["invocationId"],
+            "invoke-drop"
+        );
+        assert!(messages[1].get("finishRun").is_some());
+    }
+
+    #[test]
+    fn run_inference_invocation_error_is_typed_and_redacted() {
+        let error = run_inference_invocation_error(&json!({
+            "code": 8,
+            "message": "Bearer secret prompt text",
+            "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "secret": "x"}]
+        }));
+        assert_eq!(error.status, 429);
+        let message = error.client_message();
+        assert!(message.contains("resource exhausted"));
+        assert!(message.contains("QuotaFailure"));
+        assert!(!message.contains("Bearer"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("prompt text"));
     }
 
     #[test]
@@ -4532,58 +5723,48 @@ mod tests {
     }
 
     #[test]
-    fn clean_eof_after_text_emits_one_terminal_event() {
+    fn clean_eof_after_text_is_not_misreported_as_end_turn() {
         let mut stream = test_stream();
         stream.queue_json_value(&json!({
             "textPart": {"text": "answer before EOF"}
         }));
 
-        // A reverse proxy may strip the Connect END frame.  The stream must
-        // still provide the terminal marker required by the Anthropic SSE
-        // encoder after the final text delta has been queued.
         stream.finish_at_eof();
-        let events: Vec<_> = stream.pending.drain(..).filter_map(Result::ok).collect();
-        assert!(events.iter().any(|event| matches!(
+        assert!(stream.pending.iter().any(|event| matches!(
             event,
-            CursorStreamEvent::TextDelta { text } if text == "answer before EOF"
+            Ok(CursorStreamEvent::TextDelta { text }) if text == "answer before EOF"
         )));
-        assert_eq!(
-            events
+        assert!(
+            stream
+                .pending
                 .iter()
-                .filter(|event| matches!(event, CursorStreamEvent::End))
-                .count(),
-            1
+                .all(|event| !matches!(event, Ok(CursorStreamEvent::End)))
         );
+        assert!(stream.pending.iter().any(|event| matches!(
+            event,
+            Err(error) if error.message.contains("without an EndStream frame")
+        )));
 
-        // `finish_at_eof` can only be reached once from the HTTP body, but
-        // keeping the call idempotent protects against wrapper streams that
-        // report EOF more than once.
+        stream.pending.clear();
         stream.finish_at_eof();
         assert!(stream.pending.is_empty());
     }
 
     #[test]
-    fn clean_eof_repairs_end_bit_seen_without_queued_terminal() {
+    fn observed_end_bit_without_a_queued_terminal_fails_closed() {
         let mut stream = test_stream();
         stream.queue_json_value(&json!({
             "textPart": {"text": "answer"}
         }));
-
-        // Model the narrow parser state in which a trailer has set `saw_end`
-        // but no terminal event made it into the queue yet.  Checking
-        // `terminal_emitted` in `finish_at_eof` closes this gap; checking only
-        // `saw_end` would make the downstream encoder report a missing
-        // `turn_ended` event.
         stream.saw_end = true;
         stream.finish_at_eof();
-        assert_eq!(
+        assert!(
             stream
                 .pending
                 .iter()
-                .filter(|event| matches!(event, Ok(CursorStreamEvent::End)))
-                .count(),
-            1
+                .all(|event| !matches!(event, Ok(CursorStreamEvent::End)))
         );
+        assert!(stream.pending.iter().any(Result::is_err));
     }
 
     fn test_stream() -> SandInferenceStream {

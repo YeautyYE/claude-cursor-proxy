@@ -1293,7 +1293,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir
             .path()
-            .join(".claude/plugins/cache/lobster-lab/lobster-channel/1.23.0");
+            .join(".claude")
+            .join("plugins")
+            .join("cache")
+            .join("lobster-lab")
+            .join("lobster-channel")
+            .join("1.23.0");
         fs::create_dir_all(root.join(".claude-plugin")).unwrap();
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::write(

@@ -437,6 +437,8 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
         }
         AuthCommand::List => {
             let accounts = cursor_auth::list_cursor_accounts()?;
+            let metadata =
+                claude_cursor_proxy::providers::cursor::usage::load_account_usage_cache_metadata();
             if accounts.is_empty() {
                 println!("No Cursor accounts saved.");
                 println!(
@@ -447,9 +449,18 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
             println!("Cursor accounts ({}):", accounts.len());
             for account in accounts {
                 let marker = if account.active { '*' } else { ' ' };
-                let label = account.display_name();
                 let email = account.auth.email.as_deref().unwrap_or("-");
-                println!("{marker} {id}  {label}  ({email})", id = account.id);
+                let custom_label = account.label.as_deref().map(str::trim).filter(|label| {
+                    !label.is_empty() && *label != account.id && !label.eq_ignore_ascii_case(email)
+                });
+                let name = metadata
+                    .get(&account.id)
+                    .and_then(|entry| entry.name.as_deref())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .or(custom_label)
+                    .unwrap_or(&account.id);
+                println!("{marker} {id}  {name}  ({email})", id = account.id);
             }
             Ok(())
         }
@@ -663,6 +674,7 @@ fn usage_snapshot_json(
     snapshot: &claude_cursor_proxy::monitor::AccountUsageSnapshot,
 ) -> serde_json::Value {
     serde_json::json!({
+        "name": snapshot.name,
         "email": snapshot.email,
         "membership": snapshot.membership,
         "autoPercent": snapshot.auto_percent,

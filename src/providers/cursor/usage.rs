@@ -24,6 +24,7 @@ use crate::providers::cursor::auth::{
 
 const DASHBOARD_ORIGIN: &str = "https://cursor.com";
 const USAGE_SUMMARY_PATH: &str = "/api/usage-summary";
+const DASHBOARD_ME_PATH: &str = "/api/dashboard/get-me";
 const AUTH_ME_PATH: &str = "/api/auth/me";
 const AGGREGATED_USAGE_PATH: &str = "/api/dashboard/get-aggregated-usage-events";
 const FILTERED_USAGE_PATH: &str = "/api/dashboard/get-filtered-usage-events";
@@ -72,6 +73,8 @@ struct CachedAccountUsageSnapshot {
     account_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     account_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     email: Option<String>,
     membership: Option<String>,
     auto_percent: Option<f64>,
@@ -104,6 +107,7 @@ impl CachedAccountUsageSnapshot {
         Self {
             account_label: bounded_cache_string(account_label),
             account_active,
+            name: bounded_cache_string(snapshot.name.as_deref()),
             email: bounded_cache_string(snapshot.email.as_deref()),
             membership: bounded_cache_string(snapshot.membership.as_deref()),
             auto_percent: finite(snapshot.auto_percent),
@@ -143,6 +147,7 @@ impl CachedAccountUsageSnapshot {
     fn into_snapshot(self) -> Option<AccountUsageSnapshot> {
         let fetched_at = UNIX_EPOCH.checked_add(Duration::from_millis(self.fetched_at_ms?))?;
         Some(AccountUsageSnapshot {
+            name: self.name,
             email: self.email,
             membership: self.membership,
             auto_percent: finite(self.auto_percent),
@@ -177,6 +182,7 @@ impl CachedAccountUsageSnapshot {
         let fetched_at = UNIX_EPOCH.checked_add(Duration::from_millis(fetched_at_ms))?;
         Some(AccountUsageCacheMetadata {
             label: self.account_label.clone(),
+            name: self.name.clone(),
             email: self.email.clone(),
             active: self.account_active,
             fetched_at,
@@ -190,6 +196,7 @@ impl CachedAccountUsageSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountUsageCacheMetadata {
     pub label: Option<String>,
+    pub name: Option<String>,
     pub email: Option<String>,
     pub active: Option<bool>,
     pub fetched_at: SystemTime,
@@ -405,6 +412,7 @@ fn persist_account_usage_to_with_metadata(
             (
                 previous.account_label.clone(),
                 previous.account_active,
+                previous.name.clone(),
                 previous.email.clone(),
             )
         });
@@ -414,12 +422,17 @@ fn persist_account_usage_to_with_metadata(
             account_active,
         );
         let mut next = next;
-        if let Some((previous_label, previous_active, previous_email)) = previous_metadata {
+        if let Some((previous_label, previous_active, previous_name, previous_email)) =
+            previous_metadata
+        {
             if next.account_label.is_none() {
                 next.account_label = previous_label;
             }
             if next.account_active.is_none() {
                 next.account_active = previous_active;
+            }
+            if next.name.is_none() {
+                next.name = previous_name;
             }
             if next.email.is_none() {
                 next.email = previous_email;
@@ -1053,7 +1066,19 @@ fn fetch_account_usage_with(
     if let Ok(summary) = summary_result.as_ref() {
         store_api_usage_evidence(auth, Some(summary));
     }
-    let me = dashboard_get(client, origin, AUTH_ME_PATH, cookie, FETCH_TIMEOUT).ok();
+    // Dashboard get-me carries the profile First Name / Last Name configured
+    // by the user. The lighter auth/me endpoint is retained only as a fallback
+    // for deployments that do not expose the dashboard route.
+    let me = dashboard_post(
+        client,
+        origin,
+        DASHBOARD_ME_PATH,
+        cookie,
+        "{}",
+        FETCH_TIMEOUT,
+    )
+    .or_else(|_| dashboard_get(client, origin, AUTH_ME_PATH, cookie, FETCH_TIMEOUT))
+    .ok();
     let aggregated = dashboard_post(
         client,
         origin,
@@ -1216,6 +1241,7 @@ fn parse_account_usage_with_events(
     let on_demand = summary.pointer("/individualUsage/onDemand");
     let (on_demand_used_usd, on_demand_limit_usd) = usd_pair(on_demand).unwrap_or((None, None));
 
+    let name = cursor_profile_name(me);
     let email = string_field(me.and_then(|v| v.get("email"))).or_else(|| auth.email.clone());
     let membership = string_field(summary.get("membershipType"))
         .or_else(|| string_field(summary.pointer("/individualUsage/membershipType")))
@@ -1232,6 +1258,7 @@ fn parse_account_usage_with_events(
     );
 
     AccountUsageSnapshot {
+        name,
         email,
         membership,
         auto_percent,
@@ -1385,6 +1412,52 @@ fn dashboard_timestamp_number(number: f64) -> Option<String> {
         .or_else(|| Some(format!("{number:.0}")))
 }
 
+fn cursor_profile_name(me: Option<&Value>) -> Option<String> {
+    let first = cursor_profile_field(
+        me,
+        &[
+            "firstName",
+            "first_name",
+            "userFirstName",
+            "givenName",
+            "given_name",
+        ],
+    );
+    let last = cursor_profile_field(
+        me,
+        &[
+            "lastName",
+            "last_name",
+            "userLastName",
+            "familyName",
+            "family_name",
+        ],
+    );
+    let joined = [first, last]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !joined.is_empty() {
+        return Some(joined);
+    }
+    cursor_profile_field(me, &["name", "displayName", "display_name", "userName"])
+        .filter(|name| !name.contains('@'))
+}
+
+fn cursor_profile_field(me: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let me = me?;
+    std::iter::once(me)
+        .chain(
+            ["user", "profile", "data"]
+                .into_iter()
+                .filter_map(|key| me.get(key)),
+        )
+        .find_map(|object| keys.iter().find_map(|key| string_field(object.get(*key))))
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty())
+}
+
 fn string_field(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
@@ -1448,8 +1521,14 @@ mod tests {
             "currentPeriodStart": "2026-08-01T00:00:00.000Z",
             "nextResetTimestampUtc": "2026-08-31T00:00:00.000Z"
         });
-        let parsed = parse_account_usage(&auth("user_1", "tok"), &summary, None, Some(&sand));
-        assert_eq!(parsed.email.as_deref(), Some("dev@example.com"));
+        let me = serde_json::json!({
+            "firstName": " Ada ",
+            "lastName": " Lovelace ",
+            "email": "ada@example.com"
+        });
+        let parsed = parse_account_usage(&auth("user_1", "tok"), &summary, Some(&me), Some(&sand));
+        assert_eq!(parsed.name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(parsed.email.as_deref(), Some("ada@example.com"));
         assert_eq!(parsed.membership.as_deref(), Some("ultra"));
         assert_eq!(parsed.auto_percent, Some(12.4));
         assert_eq!(parsed.api_percent, Some(48.0));
@@ -1471,6 +1550,32 @@ mod tests {
         assert!(line.contains("auto"), "{line}");
         assert!(line.contains("api"), "{line}");
         assert!(line.contains("bot"), "{line}");
+    }
+
+    #[test]
+    fn cursor_profile_name_combines_first_and_last_name_aliases() {
+        assert_eq!(
+            cursor_profile_name(Some(&serde_json::json!({
+                "userFirstName": "Grace",
+                "userLastName": "Hopper"
+            })))
+            .as_deref(),
+            Some("Grace Hopper")
+        );
+        assert_eq!(
+            cursor_profile_name(Some(&serde_json::json!({
+                "profile": {"first_name": "Lin", "last_name": "Chen"}
+            })))
+            .as_deref(),
+            Some("Lin Chen")
+        );
+        assert_eq!(
+            cursor_profile_name(Some(&serde_json::json!({"name": "Profile User"}))).as_deref(),
+            Some("Profile User")
+        );
+        assert!(
+            cursor_profile_name(Some(&serde_json::json!({"name": "mail@example.com"}))).is_none()
+        );
     }
 
     #[test]
@@ -1787,6 +1892,7 @@ mod tests {
 
     fn cache_snapshot(seed: u64) -> AccountUsageSnapshot {
         AccountUsageSnapshot {
+            name: Some(format!("Account {seed}")),
             email: Some(format!("account-{seed}@example.com")),
             membership: Some("ultra".into()),
             auto_percent: Some(seed as f64),
@@ -1848,6 +1954,7 @@ mod tests {
             .and_then(CachedAccountUsageSnapshot::metadata)
             .expect("identity metadata");
         assert_eq!(metadata.label.as_deref(), Some("Work account"));
+        assert_eq!(metadata.name.as_deref(), snapshot.name.as_deref());
         assert_eq!(metadata.email.as_deref(), snapshot.email.as_deref());
         assert_eq!(metadata.active, Some(true));
         assert_eq!(metadata.fetched_at, snapshot.fetched_at);
@@ -1872,6 +1979,7 @@ mod tests {
         // newer snapshot without profile metadata must not erase the label,
         // active marker, or dashboard email needed during an offline render.
         let mut newer = cache_snapshot(20);
+        newer.name = None;
         newer.email = None;
         persist_account_usage_to(&cache, &lock, "account-meta", &newer).unwrap();
 
@@ -1879,6 +1987,7 @@ mod tests {
         let cached = entries.get("account-meta").expect("cached account");
         assert_eq!(cached.account_label.as_deref(), Some("Work account"));
         assert_eq!(cached.account_active, Some(true));
+        assert_eq!(cached.name.as_deref(), Some("Account 10"));
         assert_eq!(cached.email.as_deref(), Some("account-10@example.com"));
     }
 

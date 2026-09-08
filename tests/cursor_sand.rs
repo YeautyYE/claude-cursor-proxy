@@ -127,6 +127,13 @@ async fn sand_fable_stream_uses_h2_connect_json_and_long_context_parameters() {
     assert_eq!(
         observed
             .headers
+            .get("x-sand-box-namespace")
+            .and_then(|value| value.to_str().ok()),
+        Some("prod")
+    );
+    assert_eq!(
+        observed
+            .headers
             .get("connect-protocol-version")
             .and_then(|value| value.to_str().ok()),
         Some("1")
@@ -184,6 +191,196 @@ async fn sand_fable_stream_uses_h2_connect_json_and_long_context_parameters() {
         1,
         "terminal event must be emitted once"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sand_run_inference_uses_strict_duplex_handshake_for_multiturn_tools() {
+    let observed_frames = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed_headers = Arc::new(Mutex::new(None::<axum::http::HeaderMap>));
+    let app = Router::new().route(
+        "/aiserver.v1.InferenceService/RunInference",
+        post({
+            let observed_frames = Arc::clone(&observed_frames);
+            let observed_headers = Arc::clone(&observed_headers);
+            move |request: Request<Body>| {
+                let observed_frames = Arc::clone(&observed_frames);
+                let observed_headers = Arc::clone(&observed_headers);
+                async move {
+                    *observed_headers.lock().unwrap() = Some(request.headers().clone());
+                    let input = request.into_body().into_data_stream();
+                    let output = futures_util::stream::unfold(
+                        (input, ConnectFrameDecoder::new(), 0u8, observed_frames),
+                        |(mut input, mut decoder, mut phase, observed)| async move {
+                            loop {
+                                if phase >= 3 {
+                                    return None;
+                                }
+                                let chunk = input.next().await?;
+                                let chunk = chunk.ok()?;
+                                let frames = decoder.push(&chunk).ok()?;
+                                for frame in frames {
+                                    let value: Value =
+                                        serde_json::from_slice(&frame.payload).ok()?;
+                                    observed.lock().unwrap().push(value.clone());
+                                    if phase == 0 && value.get("runRequest").is_some() {
+                                        phase = 1;
+                                        let ready = encode_connect_frame(
+                                            serde_json::to_vec(&json!({
+                                                "runReady": {
+                                                    "resolvedModel": {
+                                                        "modelId": "claude-fable-5-1"
+                                                    }
+                                                }
+                                            }))
+                                            .ok()?,
+                                            0,
+                                        );
+                                        return Some((
+                                            Ok::<Bytes, Infallible>(ready),
+                                            (input, decoder, phase, observed),
+                                        ));
+                                    }
+                                    if phase == 2 && value.get("finishRun").is_some() {
+                                        phase = 3;
+                                        return Some((
+                                            Ok::<Bytes, Infallible>(encode_connect_frame(
+                                                Vec::new(),
+                                                FLAG_END,
+                                            )),
+                                            (input, decoder, phase, observed),
+                                        ));
+                                    }
+                                    if phase == 1 {
+                                        let invocation_id = value
+                                            .pointer("/invokeModel/invocationId")
+                                            .and_then(Value::as_str)?;
+                                        let response = encode_connect_frame(
+                                            serde_json::to_vec(&json!({
+                                                "invocationResponse": {
+                                                    "invocationId": invocation_id,
+                                                    "response": {
+                                                        "textPart": {"text": "duplex-ok"},
+                                                        "usage": {
+                                                            "promptTokens": 9,
+                                                            "completionTokens": 2
+                                                        }
+                                                    }
+                                                }
+                                            }))
+                                            .ok()?,
+                                            0,
+                                        );
+                                        let end = encode_connect_frame(
+                                            serde_json::to_vec(&json!({
+                                                "invocationEnd": {
+                                                    "invocationId": invocation_id
+                                                }
+                                            }))
+                                            .ok()?,
+                                            0,
+                                        );
+                                        phase = 2;
+                                        return Some((
+                                            Ok::<Bytes, Infallible>(Bytes::from(
+                                                [response.as_ref(), end.as_ref()].concat(),
+                                            )),
+                                            (input, decoder, phase, observed),
+                                        ));
+                                    }
+                                }
+                            }
+                        },
+                    );
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/connect+json")],
+                        Body::from_stream(output),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let request = SandInferenceRequest::new(
+        "claude-fable-5-1",
+        "duplex-conversation",
+        "duplex-invocation",
+        vec![
+            SandInferenceMessage::user("first"),
+            SandInferenceMessage::assistant("answer"),
+            SandInferenceMessage::user("continue"),
+        ],
+    )
+    .with_parameter_model_id("claude-fable-5-1-thinking-max")
+    .with_max_mode(true)
+    .with_run_inference(true);
+    let client = SandInferenceClient::with_base_url_timeout(url, 5).unwrap();
+    let mut stream = client.open("fixture-token", &request).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if observed_frames.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finishRun must reach the request stream");
+    server.abort();
+
+    assert!(events.iter().any(
+        |event| matches!(event, CursorStreamEvent::TextDelta { text } if text == "duplex-ok")
+    ));
+    assert!(matches!(events.last(), Some(CursorStreamEvent::End)));
+    let headers = observed_headers.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        headers
+            .get("x-sand-box-namespace")
+            .and_then(|value| value.to_str().ok()),
+        Some("prod")
+    );
+    assert_eq!(
+        headers
+            .get("x-cursor-client-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("0.30.0")
+    );
+    let frames = observed_frames.lock().unwrap();
+    assert_eq!(
+        frames.len(),
+        3,
+        "runRequest, invokeModel, then finishRun expected"
+    );
+    assert!(frames[2].get("finishRun").is_some());
+    assert_eq!(
+        frames[0]["runRequest"]["requestedModel"]["modelId"],
+        "claude-fable-5-1"
+    );
+    assert_eq!(
+        frames[0]["runRequest"]["routingConversation"],
+        json!([
+            {"role": 1, "text": "first"},
+            {"role": 2, "text": "answer"},
+            {"role": 1, "text": "continue"}
+        ])
+    );
+    let invocation = frames[1]["invokeModel"]["request"].as_object().unwrap();
+    for field in [
+        "requestedModel",
+        "modelId",
+        "conversationId",
+        "conversationGroupId",
+        "invocationId",
+    ] {
+        assert!(!invocation.contains_key(field), "invoke retained {field}");
+    }
 }
 
 /// Exercise the Sand transport fan-out against a local HTTP/2 fixture.

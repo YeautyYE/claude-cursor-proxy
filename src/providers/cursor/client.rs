@@ -284,6 +284,19 @@ impl CursorHttpClient {
         Self::with_base_url_timeout_and_mode(self.base_url.clone(), self.timeout_secs, mode)
     }
 
+    /// RunInference keeps the request body open while waiting for `runReady`,
+    /// so HTTP/1 fallback would deadlock behind buffering proxies. Use an
+    /// H2-only client for this duplex method even when ordinary Sand streams
+    /// use negotiable ALPN.
+    pub(crate) fn with_strict_sand_transport_mode(&self) -> Self {
+        let mode = if self.base_url.starts_with("http://") {
+            CursorReqwestMode::CleartextH2PriorKnowledge
+        } else {
+            CursorReqwestMode::Http2Only
+        };
+        Self::with_base_url_timeout_and_mode(self.base_url.clone(), self.timeout_secs, mode)
+    }
+
     pub(crate) fn prefers_http1(&self) -> bool {
         self.http1_only
     }
@@ -945,6 +958,9 @@ impl CursorHttpClient {
             .header("x-ghost-mode", ghost_mode)
             .header("x-request-id", &request_id)
             .header("x-original-request-id", &request_id);
+        if sand_profile {
+            req = req.header("x-sand-box-namespace", "prod");
+        }
 
         // `x-cursor-streaming` is a RunSSE/HTTP/1 method marker. The native
         // CLI AgentService/Run request is already a Connect H2 stream and
@@ -1783,6 +1799,11 @@ pub(crate) fn apply_cursor_identity_headers_for_client_type(
         .header("x-cursor-client-type", &client_type)
         .header("x-cursor-client-version", &client_version)
         .header("x-ghost-mode", ghost_mode);
+    if sand_profile {
+        req = req
+            .header("x-sand-box-namespace", "prod")
+            .header("x-cursor-version", &client_version);
+    }
 
     // Sand's managed-local route uses the desktop common-header interceptor
     // even when the proxy's process profile remains `cli`.  Preserve the old
@@ -3451,7 +3472,11 @@ mod tests {
 
     #[test]
     fn with_prefer_http1_builds_an_http1_only_client() {
-        let http1 = CursorHttpClient::with_prefer_http1(true);
+        let http1 = CursorHttpClient::with_base_url_timeout_and_prefer_http1(
+            "https://api2.cursor.sh".into(),
+            5,
+            true,
+        );
         assert!(
             http1.prefers_http1(),
             "RunSSE fallback must use http1_only(), not an H2 client posting to RunSSE"
@@ -3460,7 +3485,11 @@ mod tests {
             cursor_reqwest_mode(true, false),
             CursorReqwestMode::Http1Only
         );
-        let http2 = CursorHttpClient::with_prefer_http1(false);
+        let http2 = CursorHttpClient::with_base_url_timeout_and_prefer_http1(
+            "https://api2.cursor.sh".into(),
+            5,
+            false,
+        );
         assert!(!http2.prefers_http1());
         assert_eq!(
             cursor_reqwest_mode(false, false),

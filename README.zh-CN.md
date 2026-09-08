@@ -272,8 +272,9 @@ Sand 是 Cursor 的独立请求面，按**模型**逐个选择。命中 Sand 规
 `claude-cursor-proxy serve` 运行；刚开通时可执行一次 `cursor auth login` 或
 `cursor auth usage`，让本地会话和额度缓存更新。若看到
 `Sand traffic is not supported on this endpoint`，说明仍有旧客户端/旧路由；
-当前代理应走 `InferenceService/Stream`，可用 `cursor sand-status` 中的
-`direct-stream: ready` 检查。
+当前代理的纯文本请求走 `InferenceService/Stream`，带工具或工具历史的请求走
+严格握手的 `InferenceService/RunInference`，可用 `cursor sand-status` 中的
+`direct-stream: ready` 检查基础 Sand 路由。
 这套规则只作用于最终路由到 Cursor 的请求；原生 Codex、Kimi 和 Grok 默认
 仍走各自的后端。Grok 有一个明确的例外：为 `grok-*` 名称配置
 `cursor.modelAccounts` 后，该名称会进入 Cursor 的账号路由。这样同一个公开
@@ -532,7 +533,8 @@ claude-cursor-proxy cursor auth status
 | `CCP_ADVERTISED_MODELS` | 未设置 | `GET /v1/models` 的可选逗号白名单，适合托管桌面端模型选择器 |
 | `CCP_CURSOR_AUTH_TOKEN` | 未设置 | 手动覆盖 Cursor 登录令牌 |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API 地址 |
-| `CCP_CURSOR_SAND_BASE_URL` | 跟随 `CCP_CURSOR_BASE_URL` | 可选的 Sand `InferenceService/Stream` 专用地址 |
+| `CCP_CURSOR_SAND_BASE_URL` | 跟随 `CCP_CURSOR_BASE_URL` | 可选的 Sand `InferenceService/Stream` / `RunInference` 专用地址 |
+| `CCP_CURSOR_SAND_CLIENT_VERSION` | `0.30.0` | Sand/Grok Bot API 身份版本；仅在私有网关明确要求时覆盖 |
 | `CCP_CURSOR_SAND_STRICT_H2` | `0` | 强制 Sand 使用严格 H2 prior-knowledge；经过 HTTPS 代理时建议保持默认 TLS ALPN |
 | `CCP_CURSOR_CLIENT_TYPE` | `cli` | 默认的 `x-cursor-client-type` 请求头；TUI 的 `t` 选择器会把选择保存到 `cursor.clientType` |
 | `CCP_CURSOR_SAND_MODELS` | 未设置 | 逗号分隔的 Sand 模型匹配规则，支持 `*` 和 `?` |

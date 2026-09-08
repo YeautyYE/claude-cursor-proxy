@@ -208,9 +208,9 @@ struct CodexConfig {
 struct CursorConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
-    /// Base URL for the Desktop Sand `InferenceService/Stream` route.  Keep
-    /// this separate from the ordinary AgentService URL because deployments
-    /// may front the two services with different gateways.
+    /// Base URL for the Sand `InferenceService/Stream` and `RunInference`
+    /// routes. Keep this separate from the ordinary AgentService URL because
+    /// deployments may front the services with different gateways.
     #[serde(rename = "sandBaseUrl")]
     pub sand_base_url: Option<String>,
     #[serde(rename = "clientVersion")]
@@ -1781,10 +1781,10 @@ pub fn cursor_base_url() -> String {
     "https://api2.cursor.sh".to_string()
 }
 
-/// URL used by the current Sand inference transport.  Sand moved from the
-/// AgentService endpoint to `aiserver.v1.InferenceService/Stream`; an explicit
-/// override is useful for regional gateways and local protocol fixtures while
-/// leaving normal CLI/IDE traffic on `cursor_base_url()`.
+/// URL used by the current Sand inference transports. Sand moved from the
+/// AgentService endpoint to `aiserver.v1.InferenceService/Stream` and
+/// `RunInference`; an explicit override is useful for regional gateways and
+/// local fixtures while leaving normal CLI/IDE traffic on `cursor_base_url()`.
 pub fn cursor_sand_base_url() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CURSOR_SAND_BASE_URL") {
@@ -1837,14 +1837,9 @@ pub fn cursor_client_version() -> String {
 
 /// Return the client-version value used by a request identity.
 ///
-/// Cursor's desktop Sand path uses the product version (for example
-/// `3.18.9`), while the standalone Agent CLI uses `cli-<version>`.  Sending
-/// the CLI-prefixed value together with `x-cursor-client-type: sand` can make
-/// the server classify the request as a legacy CLI stream and skip the local
-/// runtime route.  Keep the Sand override request-scoped and deterministic:
-/// `CCP_CURSOR_SAND_CLIENT_VERSION` wins, then `cursor.sandClientVersion`, then
-/// a locally installed Cursor product version, and finally the normal client
-/// version as an offline fallback.
+/// The standalone Grok Bot/Sand API has its own semantic client version; it is
+/// not the Cursor Desktop product version and must not inherit the `cli-*`
+/// Agent identity. Explicit environment/file overrides remain authoritative.
 pub fn cursor_client_version_for_type(client_type: &str) -> String {
     if !client_type.trim().eq_ignore_ascii_case("sand") {
         return cursor_client_version();
@@ -1868,14 +1863,14 @@ pub fn cursor_client_version_for_type(client_type: &str) -> String {
         }
     }
 
-    detect_installed_cursor_desktop_version().unwrap_or_else(cursor_client_version)
+    "0.30.0".to_string()
 }
 
 /// Best-effort detection of the installed Cursor desktop product version.
 ///
 /// The helper intentionally reads only small JSON metadata files and never
-/// starts or mutates Cursor.  It is useful for Sand identity headers on macOS
-/// and Linux; callers can override it with `CCP_CURSOR_SAND_CLIENT_VERSION`.
+/// starts or mutates Cursor. It remains available to diagnostics and explicit
+/// desktop-profile integrations; Sand uses its own API identity version.
 pub fn detect_installed_cursor_desktop_version() -> Option<String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(raw) = std::env::var_os("CCP_CURSOR_APP") {

@@ -767,7 +767,7 @@ data: {"type":"message_stop"}
 }
 
 #[test]
-fn anthropic_to_responses_maps_cache_read_tokens() {
+fn anthropic_to_responses_maps_all_cache_input_tokens() {
     let mut translator =
         AnthropicToResponses::new("resp_cache".into(), "claude-fable-5[1m]".into());
     let bytes = translator.push(
@@ -791,15 +791,15 @@ data: {"type":"message_stop"}
         .find(|event| event["type"] == "response.completed")
         .expect("completed");
     let usage = &completed["response"]["usage"];
-    assert_eq!(usage["input_tokens"], 20);
+    assert_eq!(usage["input_tokens"], 103);
     assert_eq!(usage["output_tokens"], 4);
     assert_eq!(
         usage["input_tokens_details"]["cached_tokens"], 80,
         "cache_read_input_tokens must map to cached_tokens: {usage}"
     );
     assert_eq!(
-        usage["total_tokens"], 104,
-        "total_tokens must include cache reads for grok-build context: {usage}"
+        usage["total_tokens"], 107,
+        "total_tokens must include cache reads and writes for grok-build context: {usage}"
     );
 }
 
