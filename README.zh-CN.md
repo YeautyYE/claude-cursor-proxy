@@ -649,6 +649,22 @@ export CCP_CURSOR_MODEL_ACCOUNTS='{"claude-fable-5":"work","gemini-*":"ACCOUNT_I
 
 ## MCP 故障排查
 
+### 客户端工具交接与历史
+
+已完整接收的、在客户端工具目录中声明的结构化 MCP 调用与
+`AskUserQuestion` 使用有上限的 100 毫秒收集窗口，不再要求 Cursor
+先发送 `turn_ended` 或 Connect END 才让客户端执行。交接前会检查已经
+接收的帧和错误；Connect 数据不完整，或仍有缓冲/混合 XML 工具调用时，
+仍等待正常边界。这是尽力而为的交接，不保证捕获交接后才到达的错误，
+也不会改变原生文件/shell 工具的执行方式或客户端权限检查。
+
+ToolSearch 的 `tool_reference` 会把发现的精确工具名作为带引号的历史
+数据保留，不会因此向已声明目录新增可执行工具。WebFetch 返回的内容
+和错误也会保留在完整及增量历史中。超时诊断只记录有数量上限的待处理
+工具标识和类型，不记录参数、命令或文件内容。
+
+### Lobster 会话断开
+
 如果 Claude Code 反复显示
 `MCP server 'plugin:lobster-channel:lobster-channel' not connected`，这条
 消息来自 Claude Code 本地的 hook dispatcher：Lobster MCP client 没有连接
