@@ -77,6 +77,12 @@ impl CursorToolUseXmlParser {
         self.recovered_tool_use
     }
 
+    /// Whether a streamed control marker or tool body is still incomplete.
+    /// A client-tool handoff must not discard this retained text.
+    pub(crate) fn has_buffered_content(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     /// Push a new text delta chunk and drain any complete events.
     pub fn push(&mut self, text: &str) -> Vec<RecoveredCursorEvent> {
         self.buffer.push_str(text);
@@ -668,6 +674,7 @@ mod tests {
         assert!(matches!(&events[1], RecoveredCursorEvent::ToolUse(tool) if tool.name == "Read"));
         assert_eq!(events[2], RecoveredCursorEvent::Text(" after".into()));
         assert!(parser.saw_tool_use());
+        assert!(!parser.has_buffered_content());
         assert!(parser.flush().is_empty());
     }
 
@@ -677,13 +684,22 @@ mod tests {
             Some(["Read".to_string()].into_iter().collect()),
             test_id_factory(),
         );
+        assert!(!parser.has_buffered_content());
         assert_eq!(
             parser.push("before <tool_"),
             vec![RecoveredCursorEvent::Text("before ".into())]
         );
-        let events = parser.push(r#"use id="x" name="Read">{"file_path":"a"}</tool_use> after"#);
+        assert!(parser.has_buffered_content());
+        assert!(
+            parser
+                .push(r#"use id="x" name="Read">{"file_path":"a"}"#)
+                .is_empty()
+        );
+        assert!(parser.has_buffered_content());
+        let events = parser.push("</tool_use> after");
         assert!(matches!(&events[0], RecoveredCursorEvent::ToolUse(tool) if tool.name == "Read"));
         assert_eq!(events[1], RecoveredCursorEvent::Text(" after".into()));
+        assert!(!parser.has_buffered_content());
         assert!(parser.flush().is_empty());
     }
 
@@ -901,9 +917,11 @@ mod tests {
         // But the parser holds back the partial prefix, so "some text " emits.
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], RecoveredCursorEvent::Text("some text ".into()));
+        assert!(parser.has_buffered_content());
 
         // Flush must drop incomplete control markup instead of leaking it.
         let events = parser.flush();
+        assert!(!parser.has_buffered_content());
         assert!(
             !leaked_raw_xml(&events),
             "incomplete <tool_use> on flush must not leak: {events:?}"
@@ -1092,11 +1110,13 @@ mod tests {
             )),
             "incomplete </assistant must not leak or be stripped early: {first:?}"
         );
+        assert!(parser.has_buffered_content());
         let rest = parser.push(">");
         assert!(
             rest.is_empty(),
             "completing </assistant> must not emit leftover text: {rest:?}"
         );
+        assert!(!parser.has_buffered_content());
         assert!(parser.flush().is_empty());
     }
 

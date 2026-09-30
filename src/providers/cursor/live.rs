@@ -1148,6 +1148,8 @@ fn encode_tool_result_batch(
     Ok(frames)
 }
 
+const CLIENT_ONLY_HANDOFF_QUIET: Duration = Duration::from_millis(100);
+
 /// Pending native execs are split into an exposed batch (Claude Code has seen
 /// these tool ids and is executing them) and a collecting batch (new execs that
 /// arrived before, or unusually just after, the downstream segment closed).
@@ -1175,6 +1177,11 @@ impl PendingExecState {
     }
 
     fn queue(&mut self, mut exec: PendingCursorExec, quiet: Duration) -> bool {
+        let quiet = if Self::is_client_only_handoff(&exec) {
+            quiet.max(CLIENT_ONLY_HANDOFF_QUIET)
+        } else {
+            quiet
+        };
         let discriminator = exec
             .exec_id
             .as_deref()
@@ -1243,18 +1250,53 @@ impl PendingExecState {
         .flatten()
     }
 
-    fn collecting_has_lifecycle(&self) -> bool {
-        // MCP sibling `spawn_subagent` may flush on a quiet window.
-        // XML-recovered lifecycle uses `client_only_*` exec ids and must wait
-        // for `turn_ended` — tearing after the first streamed chunk dumps the
-        // rest as visible `<tool_use>` XML.
-        self.collecting.iter().any(|exec| {
-            is_grok_build_subagent_lifecycle_tool(&exec.claude_name)
-                && exec
-                    .exec_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with("mcp_"))
-        })
+    fn is_client_only_handoff(exec: &PendingCursorExec) -> bool {
+        matches!(exec.kind, CursorExecKind::ClientOnly)
+            && exec
+                .exec_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("mcp_") || id.starts_with("ask_"))
+    }
+
+    fn collecting_can_handoff(&self) -> bool {
+        // Advertised client-local calls are queued only once the structured
+        // tool_call_started has arrived (partial_tool_call only accumulates
+        // arguments). Cursor can wait for their result without sending END,
+        // so publish after a bounded quiet window and received-frame error
+        // scan. Every member must be structured: mixed/recovered XML uses
+        // client_only_* ids and must still wait for turn_ended/END/EOF.
+        !self.collecting.is_empty() && self.collecting.iter().all(Self::is_client_only_handoff)
+    }
+
+    fn collecting_diagnostics(&self) -> serde_json::Value {
+        // Never format CursorExecKind with Debug here: its payload can carry
+        // file contents, commands, paths, and replacement text.
+        serde_json::Value::Array(
+            self.collecting
+                .iter()
+                .take(16)
+                .map(|exec| {
+                    let kind = match &exec.kind {
+                        CursorExecKind::Read { .. } => "Read",
+                        CursorExecKind::Write { .. } => "Write",
+                        CursorExecKind::PiWrite { .. } => "PiWrite",
+                        CursorExecKind::PiEdit { .. } => "PiEdit",
+                        CursorExecKind::PiEditContinuation { .. } => "PiEditContinuation",
+                        CursorExecKind::Delete { .. } => "Delete",
+                        CursorExecKind::Grep { .. } => "Grep",
+                        CursorExecKind::Ls { .. } => "Ls",
+                        CursorExecKind::Shell { .. } => "Shell",
+                        CursorExecKind::ClientOnly => "ClientOnly",
+                    };
+                    serde_json::json!({
+                        "id": exec.id,
+                        "execId": exec.exec_id,
+                        "name": exec.claude_name,
+                        "kind": kind,
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn expose(&mut self) -> Vec<PendingCursorExec> {
@@ -9204,11 +9246,6 @@ async fn drive_live_run(
                     break;
                 }
             }
-            if keep_running && pending.can_expose() && pending.collecting_has_lifecycle() {
-                if !expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay).await {
-                    keep_running = false;
-                }
-            }
             keep_running
         }};
     }
@@ -9391,6 +9428,16 @@ async fn drive_live_run(
                     (
                         "pendingCollecting".into(),
                         serde_json::json!(pending.collecting.len()),
+                    ),
+                    (
+                        "pendingCollectingTools".into(),
+                        pending.collecting_diagnostics(),
+                    ),
+                    (
+                        "pendingCollectingAgeMs".into(),
+                        serde_json::json!(pending.collecting_since.map(|since| {
+                            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        })),
                     ),
                     (
                         "acceptedResumeUnconfirmed".into(),
@@ -9674,10 +9721,12 @@ async fn drive_live_run(
             break 'driver;
         }
         let batch_deadline = pending.native_collect_deadline().or_else(|| {
-            pending
-                .collecting_has_lifecycle()
-                .then(|| pending.client_only_collect_deadline())
-                .flatten()
+            (held_turn_end_frames.is_empty()
+                && decoder.buffered() == 0
+                && !xml_parser.has_buffered_content()
+                && pending.collecting_can_handoff())
+            .then(|| pending.client_only_collect_deadline())
+            .flatten()
         });
         let coalesce_deadline = coalescer.deadline();
         tokio::select! {
@@ -10366,13 +10415,20 @@ async fn drive_live_run(
                             {
                                 break 'driver;
                             }
-                        } else if pending.collecting_has_lifecycle()
+                        } else if pending.collecting_can_handoff()
+                            && decoder.buffered() == 0
+                            && !xml_parser.has_buffered_content()
+                            && upstream.is_empty()
+                            && prefetched_upstream.is_empty()
                             && pending
                                 .client_only_collect_deadline()
                                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                         {
                             if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                                 break 'driver;
+                            }
+                            if !upstream.is_empty() || !prefetched_upstream.is_empty() {
+                                continue 'driver;
                             }
                             if !expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay)
                                 .await
@@ -10747,7 +10803,13 @@ async fn drive_live_run(
                 if !flush_coalescer(&mut sink, &mut deferred, &mut segment_replay, &mut coalescer).await {
                     break 'driver;
                 }
-                let exposed = if pending.collecting_has_lifecycle()
+                // Sending coalesced text may have yielded while a trailing
+                // END arrived. Let the biased upstream arm validate every
+                // already-queued chunk before committing the tool handoff.
+                if !upstream.is_empty() || !prefetched_upstream.is_empty() {
+                    continue 'driver;
+                }
+                let exposed = if pending.collecting_can_handoff()
                     && pending.native_collect_deadline().is_none()
                 {
                     expose_collected_tools(&mut pending, &pending_shared, &mut sink, &mut segment_replay).await
@@ -11284,17 +11346,18 @@ async fn process_live_frame_impl(
             if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                 return false;
             }
-            pending.queue(
-                ask_user_question_pending_exec(query.id, ask, emit_name),
-                Duration::ZERO,
-            );
+            let exec = ask_user_question_pending_exec(query.id, ask, emit_name);
+            if !pending_has_client_only(pending, &exec) {
+                pending.queue(exec, Duration::ZERO);
+            }
             *last_progress = Instant::now();
             *useful = true;
             // Do not auto-reject: expose ClientOnly AskUserQuestion and tear
             // down like Workflow. Cursor AskQuestionResult has no answer tags
             // in proto.rs, so the Claude tool_result path is ClientOnly.
-            // The live driver must first drain the authoritative END frame:
-            // it can carry a trailing error that invalidates this tool call.
+            // This complete query can block Cursor waiting for an answer.
+            // The live driver gives trailing END errors a bounded quiet
+            // window, then publishes without requiring END to arrive.
             if turn_ctx.is_some() {
                 return true;
             }
@@ -11948,7 +12011,9 @@ async fn process_interaction_update(
                 // option descriptions instead of rebuilding it through the
                 // legacy Cursor title/prompt representation.
                 exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
-                pending.queue(exec, Duration::ZERO);
+                if !pending_has_client_only(pending, &exec) {
+                    pending.queue(exec, Duration::ZERO);
+                }
                 *useful = true;
                 *last_progress = Instant::now();
                 if !defer_client_only_exposure {
@@ -13453,13 +13518,19 @@ fn query_client_only_pending_exec(
 }
 
 fn pending_has_client_only(pending: &PendingExecState, exec: &PendingCursorExec) -> bool {
+    let run_tool_use_id = pending
+        .run_generation
+        .as_ref()
+        .map(|generation| format!("{}__cursor_run_{generation}", exec.tool_use_id));
     pending.all().any(|queued| {
-        queued.claude_name == exec.claude_name
-            || queued.tool_use_id == exec.tool_use_id
-            || queued
-                .tool_use_id
-                .starts_with(&format!("{}__cursor_run_", exec.tool_use_id))
-            || queued.exec_id == exec.exec_id
+        matches!(queued.kind, CursorExecKind::ClientOnly)
+            && (queued.tool_use_id == exec.tool_use_id
+                || run_tool_use_id.as_ref() == Some(&queued.tool_use_id)
+                || exec
+                    .exec_id
+                    .as_ref()
+                    .filter(|id| !id.is_empty())
+                    .is_some_and(|id| queued.exec_id.as_ref() == Some(id)))
     })
 }
 
@@ -19557,6 +19628,55 @@ mod tests {
     }
 
     #[test]
+    fn client_only_deduplication_does_not_match_empty_exec_ids() {
+        let mut state = PendingExecState::for_run("identity-test");
+        let first = PendingCursorExec {
+            id: 1,
+            exec_id: Some(String::new()),
+            tool_use_id: "first".into(),
+            claude_name: "AskUserQuestion".into(),
+            claude_input: serde_json::json!({}),
+            kind: CursorExecKind::ClientOnly,
+        };
+        state.queue(first.clone(), Duration::ZERO);
+        let second = PendingCursorExec {
+            id: 2,
+            tool_use_id: "second".into(),
+            ..first.clone()
+        };
+        assert!(!pending_has_client_only(&state, &second));
+        assert!(pending_has_client_only(&state, &first));
+    }
+
+    #[test]
+    fn pending_collecting_diagnostics_omit_arguments_and_bound_output() {
+        let mut state = PendingExecState::default();
+        for id in 1..=20 {
+            state.queue(
+                PendingCursorExec {
+                    id,
+                    exec_id: Some(format!("exec-{id}")),
+                    tool_use_id: format!("tool-{id}"),
+                    claude_name: "Bash".into(),
+                    claude_input: serde_json::json!({"command": "private-tool-argument"}),
+                    kind: CursorExecKind::Shell {
+                        command: "private-shell-command".into(),
+                        working_directory: "private-working-directory".into(),
+                        streaming: false,
+                    },
+                },
+                Duration::ZERO,
+            );
+        }
+        let diagnostics = state.collecting_diagnostics();
+        assert_eq!(diagnostics.as_array().unwrap().len(), 16);
+        assert_eq!(diagnostics[0]["name"], "Bash");
+        assert_eq!(diagnostics[0]["kind"], "Shell");
+        assert_eq!(diagnostics[0]["execId"], "exec-1");
+        assert!(!diagnostics.to_string().contains("private-"));
+    }
+
+    #[test]
     fn pending_tool_ttl_starts_when_the_batch_is_exposed_downstream() {
         let mut state = PendingExecState::default();
         assert!(state.queue(pending_exec(1, "tool-1"), Duration::ZERO));
@@ -19679,7 +19799,7 @@ mod tests {
             Duration::ZERO,
         );
         assert!(
-            !xml_state.collecting_has_lifecycle(),
+            !xml_state.collecting_can_handoff(),
             "XML spawn_subagent must wait for turn_ended, not the MCP sibling quiet window"
         );
 
@@ -19696,7 +19816,7 @@ mod tests {
             Duration::ZERO,
         );
         assert!(
-            mcp_state.collecting_has_lifecycle(),
+            mcp_state.collecting_can_handoff(),
             "MCP sibling spawn must still flush on the quiet window"
         );
     }
@@ -25848,7 +25968,7 @@ mod tests {
                 "XML {call_id} must stay on the BiDi until turn_ended so later chunks can join"
             );
             assert!(
-                !pending.collecting_has_lifecycle(),
+                !pending.collecting_can_handoff(),
                 "XML lifecycle must not arm the MCP sibling flush after {call_id}"
             );
         }
@@ -30355,6 +30475,308 @@ mod tests {
         assert!(
             !harness.completed.load(Ordering::Acquire),
             "the run must stay resumable for tool results after an attach"
+        );
+    }
+
+    fn ask_question_driver_wire(call_id: &str, started: bool) -> Bytes {
+        let args = proto::AskQuestionArgs {
+            title: "Choose".into(),
+            questions: vec![proto::AskQuestionItem {
+                id: "choice".into(),
+                prompt: "Which approach?".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let message = if started {
+            proto::AgentServerMessage {
+                interaction_update: Some(InteractionUpdate {
+                    tool_call_started: Some(proto::ToolCallStarted {
+                        call_id: call_id.into(),
+                        model_call_id: "ask-model".into(),
+                        tool_call: Some(proto::ToolCall {
+                            ask_question_tool_call: Some(proto::AskQuestionToolCall {
+                                args: Some(args),
+                            }),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        } else {
+            proto::AgentServerMessage {
+                interaction_query: Some(InteractionQuery {
+                    id: 7,
+                    ask_question_interaction_query: Some(proto::AskQuestionInteractionQuery {
+                        args: Some(args),
+                        tool_call_id: call_id.into(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+        encode_connect_frame(message.encode_to_vec(), 0)
+    }
+
+    async fn receive_driver_ask_question_batch(wire: Bytes) -> Vec<LiveNativeTool> {
+        let session = format!("ask-question-handoff-{}", uuid::Uuid::new_v4());
+        let mut harness = spawn_attach_replay_driver_with_tools(
+            &session,
+            BTreeSet::from(["AskUserQuestion".into()]),
+        );
+        harness.upstream_tx.send(Ok(Some(wire))).await.unwrap();
+        // Keep upstream open: an InteractionQuery can wait for the user and
+        // need not send turn_ended/END until its answer has arrived.
+        let event = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("AskQuestion must be exposed without waiting for upstream END")
+            .expect("driver must publish the question before closing")
+            .expect("AskQuestion handoff must not fail");
+        let LiveRunEvent::NativeToolBatch(tools) = event else {
+            panic!("expected AskQuestion tool batch, got {event:?}");
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+                .await
+                .expect("client-only handoff must close the downstream segment")
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !harness.completed.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client-only handoff must finish the driver");
+        assert!(
+            harness
+                .terminal_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            "a client-only handoff must not be marked ambiguous"
+        );
+        tools
+    }
+
+    fn advertised_mcp_driver_wire() -> Bytes {
+        let name = "mcp__compat_test__echo";
+        let message = proto::AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(proto::ToolCallStarted {
+                    call_id: "mcp-echo-call".into(),
+                    model_call_id: "mcp-echo-model".into(),
+                    tool_call: Some(proto::ToolCall {
+                        mcp_tool_call: Some(proto::McpToolCall {
+                            args: Some(proto::McpArgs {
+                                name: name.into(),
+                                tool_name: name.into(),
+                                tool_call_id: "mcp-echo-call".into(),
+                                provider_identifier: "compat_test".into(),
+                                args: HashMap::from([("text".into(), br#""hello""#.to_vec())]),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        encode_connect_frame(message.encode_to_vec(), 0)
+    }
+
+    #[tokio::test]
+    async fn driver_advertised_mcp_started_handoff_does_not_wait_for_end() {
+        let session = format!("mcp-handoff-{}", uuid::Uuid::new_v4());
+        let name = "mcp__compat_test__echo";
+        let mut harness =
+            spawn_attach_replay_driver_with_tools(&session, BTreeSet::from([name.into()]));
+        harness
+            .upstream_tx
+            .send(Ok(Some(advertised_mcp_driver_wire())))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("complete advertised MCP call must not wait for END or idle timeout")
+            .expect("MCP tool batch")
+            .expect("MCP handoff must not fail");
+        assert!(matches!(
+            event,
+            LiveRunEvent::NativeToolBatch(tools)
+                if tools.len() == 1
+                    && tools[0].name == name
+                    && tools[0].input == serde_json::json!({"text": "hello"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn driver_mcp_handoff_preserves_complete_and_partial_xml_until_end() {
+        for partial in [false, true] {
+            let session = format!("mcp-xml-handoff-{}", uuid::Uuid::new_v4());
+            let mut harness = spawn_attach_replay_driver_with_tools(
+                &session,
+                BTreeSet::from(["mcp__compat_test__echo".into(), "Workflow".into()]),
+            );
+            let prefix = r#"<tool_use id="xml-workflow" name="Workflow">{"name":"deep-research"}"#;
+            let text = if partial {
+                prefix.to_string()
+            } else {
+                format!("{prefix}</tool_use>")
+            };
+            let xml = xml_tool_use_frame(&text);
+            let mut wire = encode_connect_frame(xml.payload, xml.flags).to_vec();
+            wire.extend_from_slice(&advertised_mcp_driver_wire());
+            harness
+                .upstream_tx
+                .send(Ok(Some(Bytes::from(wire))))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(CLIENT_ONLY_HANDOFF_QUIET * 2, harness.event_rx.recv(),)
+                    .await
+                    .is_err(),
+                "MCP quiet handoff must not expose/drop XML before END (partial={partial})"
+            );
+            let mut ending = Vec::new();
+            if partial {
+                let xml = xml_tool_use_frame("</tool_use>");
+                ending.extend_from_slice(&encode_connect_frame(xml.payload, xml.flags));
+            }
+            ending.extend_from_slice(&encode_connect_frame(Vec::new(), FLAG_END));
+            harness
+                .upstream_tx
+                .send(Ok(Some(Bytes::from(ending))))
+                .await
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+                .await
+                .expect("END must release the complete mixed batch")
+                .expect("mixed tool batch")
+                .expect("mixed handoff must not fail");
+            let LiveRunEvent::NativeToolBatch(tools) = event else {
+                panic!("expected mixed tool batch, got {event:?}");
+            };
+            assert_eq!(tools.len(), 2, "both XML and MCP calls must survive");
+            assert!(tools.iter().any(|tool| tool.name == "Workflow"));
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool.name == "mcp__compat_test__echo")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_ask_question_query_handoff_does_not_wait_for_end() {
+        let tools =
+            receive_driver_ask_question_batch(ask_question_driver_wire("ask-live", false)).await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "AskUserQuestion");
+        assert_eq!(
+            tools[0].input["questions"][0]["question"],
+            "Which approach?"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_ask_question_started_and_query_publish_once() {
+        let mut wire = ask_question_driver_wire("ask-shared", true).to_vec();
+        wire.extend_from_slice(&ask_question_driver_wire("ask-shared", false));
+        wire.extend_from_slice(&encode_connect_frame(Vec::new(), FLAG_END));
+        let tools = receive_driver_ask_question_batch(Bytes::from(wire)).await;
+        assert_eq!(tools.len(), 1, "started and query represent the same call");
+        assert!(tools[0].tool_use_id.starts_with("ask-shared__cursor_run_"));
+    }
+
+    #[tokio::test]
+    async fn driver_ask_question_query_and_started_publish_once() {
+        let mut wire = ask_question_driver_wire("ask-shared", false).to_vec();
+        wire.extend_from_slice(&ask_question_driver_wire("ask-shared", true));
+        wire.extend_from_slice(&encode_connect_frame(Vec::new(), FLAG_END));
+        let tools = receive_driver_ask_question_batch(Bytes::from(wire)).await;
+        assert_eq!(tools.len(), 1, "query and started represent the same call");
+        assert!(tools[0].tool_use_id.starts_with("ask-shared__cursor_run_"));
+    }
+
+    #[tokio::test]
+    async fn driver_ask_question_different_calls_are_not_name_deduplicated() {
+        let mut wire = ask_question_driver_wire("ask-first", true).to_vec();
+        wire.extend_from_slice(&ask_question_driver_wire("ask-second", false));
+        wire.extend_from_slice(&encode_connect_frame(Vec::new(), FLAG_END));
+        let tools = receive_driver_ask_question_batch(Bytes::from(wire)).await;
+        assert_eq!(tools.len(), 2, "same tool name does not mean the same call");
+        assert!(tools[0].tool_use_id.starts_with("ask-first__cursor_run_"));
+        assert!(tools[1].tool_use_id.starts_with("ask-second__cursor_run_"));
+    }
+
+    #[tokio::test]
+    async fn driver_ask_question_incomplete_end_frame_blocks_handoff() {
+        let session = format!("ask-question-partial-end-{}", uuid::Uuid::new_v4());
+        let mut harness = spawn_attach_replay_driver_with_tools(
+            &session,
+            BTreeSet::from(["AskUserQuestion".into()]),
+        );
+        let end = encode_connect_frame(
+            br#"{"error":{"code":"internal","message":"fragmented question error"}}"#,
+            FLAG_END,
+        );
+        let mut wire = ask_question_driver_wire("ask-partial-end", false).to_vec();
+        wire.extend_from_slice(&end[..3]);
+        harness
+            .upstream_tx
+            .send(Ok(Some(Bytes::from(wire))))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(CLIENT_ONLY_HANDOFF_QUIET * 2, harness.event_rx.recv())
+                .await
+                .is_err(),
+            "handoff must wait until received partial Connect data can be validated"
+        );
+        harness
+            .upstream_tx
+            .send(Ok(Some(end.slice(3..))))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("driver must decode the fragmented END error")
+            .expect("expected END error event");
+        assert!(
+            matches!(event, Err(ref error) if error.contains("fragmented question error")),
+            "fragmented END error must win over the pending tool: {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_ask_question_received_end_error_wins_over_handoff() {
+        let session = format!("ask-question-end-error-{}", uuid::Uuid::new_v4());
+        let mut harness = spawn_attach_replay_driver_with_tools(
+            &session,
+            BTreeSet::from(["AskUserQuestion".into()]),
+        );
+        let mut wire = ask_question_driver_wire("ask-invalidated", false).to_vec();
+        wire.extend_from_slice(&encode_connect_frame(
+            br#"{"error":{"code":"internal","message":"question invalidated"}}"#,
+            FLAG_END,
+        ));
+        harness
+            .upstream_tx
+            .send(Ok(Some(Bytes::from(wire))))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), harness.event_rx.recv())
+            .await
+            .expect("driver must report the received END error")
+            .expect("expected END error event");
+        assert!(
+            matches!(event, Err(ref error) if error.contains("question invalidated")),
+            "END error must win before any tool is published: {event:?}"
         );
     }
 

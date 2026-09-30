@@ -718,6 +718,24 @@ and usage guide.
 
 ## MCP troubleshooting
 
+### Client-owned tools and history
+
+Complete structured calls to advertised client-owned MCP tools and
+`AskUserQuestion` use a bounded 100 ms collection window rather than requiring
+Cursor to send `turn_ended` or Connect END before the client can execute them.
+Already-received frames and errors are checked before handoff; partial Connect
+data and buffered or mixed XML tool calls still wait for their normal boundary.
+This is best-effort handoff, not a guarantee against errors arriving afterward,
+and it does not change native file/shell execution or client permission checks.
+
+ToolSearch `tool_reference` results preserve the exact discovered name as
+quoted history data; they do not add executable tools to the advertised catalog.
+WebFetch result content and errors are also retained in full and delta history.
+Timeout diagnostics include a bounded list of pending tool identities and kinds,
+without logging their arguments, commands, or file contents.
+
+### Disconnected Lobster sessions
+
 If Claude Code repeatedly prints
 `MCP server 'plugin:lobster-channel:lobster-channel' not connected`, the
 message is produced by Claude Code's local hook dispatcher when its Lobster
