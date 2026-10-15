@@ -96,16 +96,20 @@ claude-cursor-proxy serve --port 11435    # 换端口
 - 已有会话的下一轮会在新账号下重开 Cursor 对话（客户端自动重发完整历史，上下文不丢）。
 
 `cursor auth status` 可查看当前生效的账号。注意：如果 `serve` 进程的环境里设了
-`CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN`，env token 会遮蔽存储的登录态，
+`CCP_CURSOR_API_KEY`/`CURSOR_API_KEY` 或 `CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN`，环境变量会遮蔽存储的登录态，
 热切换不会生效，需先取消该环境变量。
+
+> [!NOTE]
+> Cursor 用户 API 密钥（`CURSOR_API_KEY` / `--api-key`）通过官方 `AgentService`（CLI 协议）认证。Cursor 桌面端的 Sand 协议（`InferenceService/Stream`）仅接受浏览器/桌面端 Session Token。当使用 API 密钥时，代理会自动回退到 CLI 协议以确保请求正常完成，并在日志中输出提示。
 
 #### 多账号管理
 
-需要让新登录账号立即生效时使用 `login`；只想把账号加入账号池、保持当前账号继续
+需要让新登录账号立即生效时使用 `login`（或 `login --api-key <key>`）；只想把账号加入账号池、保持当前账号继续
 工作时使用 `add`：
 
 ```bash
 claude-cursor-proxy cursor auth add --label work
+claude-cursor-proxy cursor auth add --api-key sk-... --label api-account
 claude-cursor-proxy cursor auth list
 claude-cursor-proxy cursor auth use ACCOUNT_ID
 claude-cursor-proxy cursor auth usage                 # 拉取全部账号
@@ -533,6 +537,7 @@ claude-cursor-proxy cursor auth status
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | 监听地址（默认只本机） |
 | `CCP_ADVERTISED_MODELS` | 未设置 | `GET /v1/models` 的可选逗号白名单，适合托管桌面端模型选择器 |
 | `CCP_CURSOR_AUTH_TOKEN` | 未设置 | 手动覆盖 Cursor 登录令牌 |
+| `CCP_CURSOR_API_KEY` | 未设置 | Cursor 用户 API 密钥（`sk-...`），自动换取会话令牌 |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API 地址 |
 | `CCP_CURSOR_SAND_BASE_URL` | 跟随 `CCP_CURSOR_BASE_URL` | 可选的 Sand `InferenceService/Stream` / `RunInference` 专用地址 |
 | `CCP_CURSOR_SAND_CLIENT_VERSION` | `0.30.0` | Sand/Grok Bot API 身份版本；仅在私有网关明确要求时覆盖 |

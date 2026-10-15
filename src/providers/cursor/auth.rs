@@ -179,9 +179,9 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
     }
 
     fn refresh_if_needed(&self, auth: CursorAuth) -> anyhow::Result<Option<CursorAuth>> {
-        let Some(refresh_token) = auth.refresh_token.clone() else {
+        if auth.refresh_token.is_none() && auth.api_key.is_none() {
             return Ok(Some(auth));
-        };
+        }
         let Some(expires) = auth.expires else {
             return Ok(Some(auth));
         };
@@ -212,7 +212,7 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
             None => return Ok(None),
         }
 
-        match refresh_cursor_auth(&refresh_token) {
+        match refresh_or_exchange(auth.refresh_token.as_deref(), auth.api_key.as_deref()) {
             Ok(Some(refreshed)) => {
                 // Account CAS and the write must share the cross-process
                 // registry lock.  Otherwise a concurrent `auth use` can
@@ -226,14 +226,14 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
                 {
                     return Ok(Some(enrich(current, self.auth_path())));
                 }
-                let new_refresh = if refreshed.refresh_token.is_empty() {
-                    auth.refresh_token.clone()
-                } else {
-                    Some(refreshed.refresh_token)
-                };
+                let refresh_token = resolve_next_refresh_token(
+                    &refreshed,
+                    auth.refresh_token.as_deref(),
+                    auth.api_key.is_some(),
+                );
                 let next = StoredCursorAuth {
                     access_token: refreshed.access_token,
-                    refresh_token: new_refresh,
+                    refresh_token,
                     api_key: auth.api_key.clone(),
                 };
                 let saved = self.save_auth(next.clone())?;
@@ -287,13 +287,14 @@ impl<S: AuthStorage<StoredCursorAuth>> CursorTokenStore<S> {
             return Ok(Some(enrich(stored, self.auth_path())));
         }
         let auth = enrich(stored.clone(), self.auth_path());
-        let Some(refresh_token) = auth.refresh_token.as_deref() else {
+        if auth.refresh_token.is_none() && auth.api_key.is_none() {
             anyhow::bail!(
                 "No Cursor refresh token available (env tokens cannot auto-renew). Run `claude-cursor-proxy cursor auth login`."
             );
-        };
-        let refreshed = refresh_cursor_auth(refresh_token)?
-            .ok_or_else(|| anyhow::anyhow!("Cursor /auth/refresh returned non-success"))?;
+        }
+        let refreshed =
+            refresh_or_exchange(auth.refresh_token.as_deref(), auth.api_key.as_deref())?
+                .ok_or_else(|| anyhow::anyhow!("Cursor /auth/refresh returned non-success"))?;
         // Account CAS and the write share the cross-process registry lock
         // acquired above. Cursor refresh tokens are often one-shot, so the
         // lock also serializes refreshes across separate proxy processes.
@@ -342,9 +343,9 @@ pub struct CursorLogin {
 #[derive(Debug, Deserialize)]
 pub struct RefreshResponse {
     #[serde(rename = "accessToken")]
-    access_token: String,
+    pub access_token: String,
     #[serde(rename = "refreshToken")]
-    refresh_token: String,
+    pub refresh_token: String,
 }
 
 pub fn file_store() -> CursorTokenStore<DefaultCursorAuthStore> {
@@ -727,8 +728,17 @@ fn stored_auth_identity_matches(a: &StoredCursorAuth, b: &StoredCursorAuth) -> b
     // Opaque access tokens do not carry a subject. A stable refresh token is
     // still enough to recognize the same account during a migration or an
     // explicit re-login, without treating an unrelated bearer as a rotation.
-    matches!(
+    if matches!(
         (a.refresh_token.as_deref(), b.refresh_token.as_deref()),
+        (Some(left), Some(right))
+            if !left.trim().is_empty()
+                && !right.trim().is_empty()
+                && left.trim() == right.trim()
+    ) {
+        return true;
+    }
+    matches!(
+        (a.api_key.as_deref(), b.api_key.as_deref()),
         (Some(left), Some(right))
             if !left.trim().is_empty()
                 && !right.trim().is_empty()
@@ -813,19 +823,7 @@ fn cursor_token_has_stable_identity(token: &str) -> bool {
 /// install, the active `auth.json` is exposed as an ephemeral profile and is
 /// migrated to `accounts.json` on the next login/add/switch write.
 pub fn list_cursor_accounts() -> anyhow::Result<Vec<CursorAccountProfile>> {
-    let env_auth = env_cursor_token().map(|token| {
-        synthetic_account_profile(
-            enrich(
-                StoredCursorAuth {
-                    access_token: token,
-                    refresh_token: None,
-                    api_key: None,
-                },
-                "environment".to_string(),
-            ),
-            true,
-        )
-    });
+    let env_auth = load_env_cursor_auth()?.map(|auth| synthetic_account_profile(auth, true));
     // Hold the registry lock for the complete persistent read/sync operation.
     // Read only the current raw mirror while locked: using a pre-lock auth
     // snapshot here could resurrect an account after a concurrent logout.
@@ -910,15 +908,7 @@ pub fn current_cursor_account() -> anyhow::Result<Option<CursorAccountProfile>> 
 pub fn load_cursor_auth_for_model(model: &str) -> anyhow::Result<Option<CursorAuthSelection>> {
     // Environment credentials intentionally shadow the persistent account
     // pool.  There is no account to switch or refresh in this mode.
-    if let Some(token) = env_cursor_token() {
-        let auth = enrich(
-            StoredCursorAuth {
-                access_token: token,
-                refresh_token: None,
-                api_key: None,
-            },
-            "environment".to_string(),
-        );
+    if let Some(auth) = load_env_cursor_auth()? {
         return Ok(Some(CursorAuthSelection {
             auth,
             account_id: None,
@@ -1145,9 +1135,9 @@ pub fn add_cursor_auth(
     if auth.access_token.trim().is_empty() {
         anyhow::bail!("Cursor auth accessToken is required");
     }
-    if env_cursor_token().is_some() {
+    if env_cursor_token_present() {
         anyhow::bail!(
-            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN before adding accounts"
+            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY before adding accounts"
         );
     }
     // An expired active token is still a valid registry entry to migrate; its
@@ -1265,9 +1255,9 @@ pub fn switch_cursor_account(id: &str) -> anyhow::Result<CursorAccountProfile> {
     if id.is_empty() {
         anyhow::bail!("Cursor account id is required");
     }
-    if env_cursor_token().is_some() {
+    if env_cursor_token_present() {
         anyhow::bail!(
-            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN before switching accounts"
+            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY before switching accounts"
         );
     }
     let _registry_lock = lock_account_registry()?;
@@ -1318,9 +1308,9 @@ pub fn remove_cursor_account(id: &str) -> anyhow::Result<Option<CursorAccountPro
     if id.is_empty() {
         anyhow::bail!("Cursor account id is required");
     }
-    if env_cursor_token().is_some() {
+    if env_cursor_token_present() {
         anyhow::bail!(
-            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN before removing accounts"
+            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY before removing accounts"
         );
     }
     let _registry_lock = lock_account_registry()?;
@@ -1414,15 +1404,8 @@ pub fn remove_cursor_account(id: &str) -> anyhow::Result<Option<CursorAccountPro
 
 pub fn load_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
     let result = (|| {
-        if let Some(token) = env_cursor_token() {
-            return Ok(Some(enrich(
-                StoredCursorAuth {
-                    access_token: token,
-                    refresh_token: None,
-                    api_key: None,
-                },
-                "environment".to_string(),
-            )));
+        if let Some(auth) = load_env_cursor_auth()? {
+            return Ok(Some(auth));
         }
         if let Some(auth) = file_store().load_auth()? {
             return Ok(Some(auth));
@@ -1630,8 +1613,20 @@ fn load_official_cli_keychain_auth() -> anyhow::Result<Option<CursorAuth>> {
         let Some(token) = raw.filter(|t| !t.trim().is_empty()) else {
             return Ok(None);
         };
+        let keychain_api_key = SystemKeychain
+            .read("cursor-api-key", "cursor-user")
+            .ok()
+            .flatten()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
+        let keychain_refresh = SystemKeychain
+            .read("cursor-refresh-token", "cursor-user")
+            .ok()
+            .flatten()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         // CLI sometimes stores a bare JWT, sometimes JSON with accessToken.
-        let stored = if token.trim_start().starts_with('{') {
+        let mut stored = if token.trim_start().starts_with('{') {
             match serde_json::from_str::<StoredCursorAuth>(&token) {
                 Ok(s) if !s.access_token.trim().is_empty() => s,
                 _ => {
@@ -1656,7 +1651,11 @@ fn load_official_cli_keychain_auth() -> anyhow::Result<Option<CursorAuth>> {
                             .or_else(|| parsed.get("refresh_token"))
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
-                        api_key: None,
+                        api_key: parsed
+                            .get("apiKey")
+                            .or_else(|| parsed.get("api_key"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                     }
                 }
             }
@@ -1667,6 +1666,12 @@ fn load_official_cli_keychain_auth() -> anyhow::Result<Option<CursorAuth>> {
                 api_key: None,
             }
         };
+        if stored.api_key.is_none() {
+            stored.api_key = keychain_api_key;
+        }
+        if stored.refresh_token.is_none() {
+            stored.refresh_token = keychain_refresh;
+        }
         Ok(Some(enrich(
             stored,
             "macos-keychain:cursor-access-token".to_string(),
@@ -1751,6 +1756,13 @@ pub fn force_refresh_cursor_auth(
             "CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set; those tokens cannot be refreshed. Unset env and use `claude-cursor-proxy cursor auth login`, or supply a fresh token."
         );
     }
+    if let Some(api_key) = env_cursor_api_key() {
+        let auth = get_or_exchange_env_api_key(&api_key, failed_access_token)?;
+        if let Some(ref a) = auth {
+            crate::providers::cursor::model::observe_live_usable_models_account(&a.access_token);
+        }
+        return Ok(auth);
+    }
     // A model-specific route may be using an inactive account.  Refresh that
     // registry entry in place instead of rotating whichever account happens
     // to be mirrored by auth.json.  Matching the failed bearer also protects
@@ -1800,9 +1812,9 @@ pub fn force_refresh_cursor_account(
     account_id: &str,
     failed_access_token: Option<&str>,
 ) -> anyhow::Result<Option<CursorAuth>> {
-    if env_cursor_token().is_some() {
+    if env_cursor_token_present() {
         anyhow::bail!(
-            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN before refreshing an account"
+            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY before refreshing an account"
         );
     }
     let account_id = account_id.trim();
@@ -1831,13 +1843,14 @@ pub fn force_refresh_cursor_account(
             accounts_path().to_string_lossy().into_owned(),
         )));
     }
-    let Some(refresh_token) = old.refresh_token.as_deref() else {
+    if old.refresh_token.is_none() && old.api_key.is_none() {
         return Ok(Some(enrich(
             old,
             accounts_path().to_string_lossy().into_owned(),
         )));
-    };
-    let refreshed = match refresh_cursor_auth(refresh_token) {
+    }
+    let refreshed = match refresh_or_exchange(old.refresh_token.as_deref(), old.api_key.as_deref())
+    {
         Ok(Some(value)) => value,
         Ok(None) => {
             return Ok(Some(enrich(
@@ -1847,13 +1860,14 @@ pub fn force_refresh_cursor_account(
         }
         Err(error) => return Err(error).context("Cursor account refresh failed"),
     };
+    let refresh_token = resolve_next_refresh_token(
+        &refreshed,
+        old.refresh_token.as_deref(),
+        old.api_key.is_some(),
+    );
     let next = StoredCursorAuth {
         access_token: refreshed.access_token,
-        refresh_token: if refreshed.refresh_token.is_empty() {
-            old.refresh_token.clone()
-        } else {
-            Some(refreshed.refresh_token)
-        },
+        refresh_token,
         api_key: old.api_key.clone(),
     };
     if (cursor_token_has_stable_identity(&old.access_token)
@@ -1944,16 +1958,17 @@ pub fn refresh_cursor_account_for_usage(
             anyhow::bail!("Cursor account no longer exists: {}", profile.id);
         }
     };
-    let Some(refresh_token) = old.refresh_token.as_deref() else {
+    if old.refresh_token.is_none() && old.api_key.is_none() {
         return Ok(old);
-    };
+    }
     if let Some(expires) = old.expires
         && expires > now_ms() + REFRESH_EXPIRY_SKEW_MS
     {
         return Ok(old);
     }
 
-    let refreshed = match refresh_cursor_auth(refresh_token) {
+    let refreshed = match refresh_or_exchange(old.refresh_token.as_deref(), old.api_key.as_deref())
+    {
         Ok(Some(refreshed)) => refreshed,
         Ok(None) if old.expires.is_some_and(|expires| expires <= now_ms()) => {
             anyhow::bail!(
@@ -1970,13 +1985,14 @@ pub fn refresh_cursor_account_for_usage(
         }
         Err(_) => return Ok(old),
     };
+    let refresh_token = resolve_next_refresh_token(
+        &refreshed,
+        old.refresh_token.as_deref(),
+        old.api_key.is_some(),
+    );
     let next = StoredCursorAuth {
         access_token: refreshed.access_token,
-        refresh_token: if refreshed.refresh_token.is_empty() {
-            old.refresh_token.clone()
-        } else {
-            Some(refreshed.refresh_token)
-        },
+        refresh_token,
         api_key: old.api_key.clone(),
     };
     // A refresh response must not silently move an account's identity to a
@@ -2082,7 +2098,7 @@ pub fn cursor_auth_location() -> String {
 pub fn missing_auth_message() -> String {
     [
         "Cursor authentication was not found.",
-        "Run `claude-cursor-proxy cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
+        "Run `claude-cursor-proxy cursor auth login`, or set CURSOR_API_KEY / CURSOR_AUTH_TOKEN.",
         "On macOS the proxy also falls back to Cursor Agent Keychain (cursor-access-token) when CCP_CURSOR_CLI_KEYCHAIN_FALLBACK is on (default).",
         "The TUI usage view can also read Cursor Desktop state.vscdb on macOS when the proxy and Agent stores are empty.",
         "On Linux/Windows it also reads ~/.config/cursor/auth.json when that fallback is enabled.",
@@ -2096,7 +2112,7 @@ pub fn expired_auth_message(auth: &CursorAuth) -> String {
         .map(format_unix_ms)
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "Cursor access token from {} is expired or near expiry ({}). Run `claude-cursor-proxy cursor auth login` again or set CCP_CURSOR_AUTH_TOKEN.",
+        "Cursor access token from {} is expired or near expiry ({}). Run `claude-cursor-proxy cursor auth login` again, supply a fresh CCP_CURSOR_AUTH_TOKEN, or unset it and set CURSOR_API_KEY.",
         auth.source, expires
     )
 }
@@ -2116,13 +2132,13 @@ pub fn create_cursor_login() -> CursorLogin {
 }
 
 pub fn run_cursor_login() -> anyhow::Result<Option<CursorAuth>> {
-    run_cursor_login_with_mode(false, None)
+    run_cursor_login_flow(None, false, None)
 }
 
 /// Browser login used by `cursor auth add`.  The login flow is identical to
 /// normal login, but the resulting credentials are appended to the registry.
 pub fn run_cursor_login_add() -> anyhow::Result<Option<CursorAuth>> {
-    run_cursor_login_with_mode(true, None)
+    run_cursor_login_flow(None, true, None)
 }
 
 /// Browser login used by `cursor auth add --label`.  Keeping the label in the
@@ -2132,39 +2148,63 @@ pub fn run_cursor_login_add() -> anyhow::Result<Option<CursorAuth>> {
 pub fn run_cursor_login_add_with_label(
     label: Option<String>,
 ) -> anyhow::Result<Option<CursorAuth>> {
-    run_cursor_login_with_mode(true, label)
+    run_cursor_login_flow(None, true, label)
 }
 
-fn run_cursor_login_with_mode(
+/// Login or add an account using a Cursor user API key (`sk-...`).
+pub fn run_cursor_login_with_api_key(
+    api_key: &str,
     append: bool,
     label: Option<String>,
 ) -> anyhow::Result<Option<CursorAuth>> {
-    if append && env_cursor_token().is_some() {
+    run_cursor_login_flow(Some(api_key), append, label)
+}
+
+pub fn run_cursor_login_flow(
+    api_key: Option<&str>,
+    append: bool,
+    label: Option<String>,
+) -> anyhow::Result<Option<CursorAuth>> {
+    if append && env_cursor_token_present() {
         anyhow::bail!(
-            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN before adding accounts"
+            "An environment Cursor token is active; unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY before adding accounts"
         );
     }
-    let login = create_cursor_login();
-    println!("Open this URL to authenticate with Cursor:");
-    println!("{}", login.login_url);
-    println!();
-    if let Err(err) = open_cursor_login_url(&login.login_url) {
-        println!("Could not open browser automatically: {err}");
-    }
-    println!("Waiting for Cursor login...");
-    let result = wait_for_cursor_login(&login, 150, |attempt| {
-        if attempt > 0 && attempt % 10 == 0 {
-            print!(".");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let (result, key_stored) = if let Some(raw_key) = api_key {
+        let key = raw_key.trim();
+        if key.is_empty() {
+            anyhow::bail!("Cursor API key cannot be empty");
         }
-    })?;
-    let Some(result) = result else {
-        return Ok(None);
+        let exchanged = exchange_user_api_key(key)?.ok_or_else(|| {
+            anyhow::anyhow!("Cursor API key exchange rejected. Verify that the key is valid.")
+        })?;
+        (exchanged, Some(key.to_string()))
+    } else {
+        let login = create_cursor_login();
+        println!("Open this URL to authenticate with Cursor:");
+        println!("{}", login.login_url);
+        println!();
+        if let Err(err) = open_cursor_login_url(&login.login_url) {
+            println!("Could not open browser automatically: {err}");
+        }
+        println!("Waiting for Cursor login...");
+        let result = wait_for_cursor_login(&login, 150, |attempt| {
+            if attempt > 0 && attempt % 10 == 0 {
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        })?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        (result, None)
     };
+
     let stored = StoredCursorAuth {
-        access_token: result.access_token,
-        refresh_token: Some(result.refresh_token),
-        api_key: None,
+        access_token: result.access_token.clone(),
+        refresh_token: resolve_next_refresh_token(&result, None, key_stored.is_some()),
+        api_key: key_stored,
     };
     let saved = if append {
         add_cursor_auth(stored, label)?
@@ -2216,25 +2256,92 @@ pub fn wait_for_cursor_login(
     Ok(None)
 }
 
-fn refresh_cursor_auth(refresh_token: &str) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+fn auth_http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build auth HTTP client")
+    })
+}
+
+fn post_auth_endpoint(
+    path: &str,
+    bearer: &str,
+    op_name: &str,
+) -> anyhow::Result<Option<RefreshResponse>> {
     let url = format!(
-        "{}/auth/refresh",
-        config::cursor_base_url().trim_end_matches('/')
+        "{}/{}",
+        config::cursor_base_url().trim_end_matches('/'),
+        path.trim_start_matches('/')
     );
-    let resp = client
+    let resp = auth_http_client()
         .post(url)
         .header("content-type", "application/json")
-        .bearer_auth(refresh_token)
+        .bearer_auth(bearer)
         .body("{}")
         .send()?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
+        let parsed: serde_json::Value = resp.json()?;
+        return Ok(parse_cursor_auth_tokens(&parsed));
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        if let Ok(body) = resp.json::<serde_json::Value>()
+            && body.get("error").and_then(|e| e.as_str()) == Some("sign_in_policy_violation")
+        {
+            anyhow::bail!(
+                "Sign-in on this device is restricted by your organization's device policy (sign_in_policy_violation)"
+            );
+        }
         return Ok(None);
     }
-    let parsed: serde_json::Value = resp.json()?;
-    Ok(parse_cursor_auth_tokens(&parsed))
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    anyhow::bail!("{op_name} failed with HTTP {status}");
+}
+
+fn refresh_cursor_auth(refresh_token: &str) -> anyhow::Result<Option<RefreshResponse>> {
+    post_auth_endpoint("auth/refresh", refresh_token, "Cursor auth refresh")
+}
+
+pub fn exchange_user_api_key(api_key: &str) -> anyhow::Result<Option<RefreshResponse>> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Ok(None);
+    }
+    post_auth_endpoint(
+        "auth/exchange_user_api_key",
+        api_key,
+        "Cursor API key exchange",
+    )
+}
+
+fn refresh_or_exchange(
+    refresh_token: Option<&str>,
+    api_key: Option<&str>,
+) -> anyhow::Result<Option<RefreshResponse>> {
+    let refresh_token = refresh_token.map(str::trim).filter(|t| !t.is_empty());
+    let api_key = api_key.map(str::trim).filter(|k| !k.is_empty());
+
+    if let Some(token) = refresh_token {
+        match refresh_cursor_auth(token) {
+            Ok(Some(res)) => return Ok(Some(res)),
+            // Only fall back to API key exchange when the refresh token was
+            // explicitly rejected (401/403 -> Ok(None)). Transient network,
+            // 429, or 5xx errors must propagate immediately rather than
+            // hammering the exchange endpoint on a degraded upstream.
+            Ok(None) if api_key.is_none() => return Ok(None),
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if let Some(key) = api_key {
+        return exchange_user_api_key(key);
+    }
+    Ok(None)
 }
 
 fn parse_cursor_auth_tokens(parsed: &serde_json::Value) -> Option<RefreshResponse> {
@@ -2260,20 +2367,114 @@ fn parse_cursor_auth_tokens(parsed: &serde_json::Value) -> Option<RefreshRespons
     })
 }
 
+fn resolve_next_refresh_token(
+    refreshed: &RefreshResponse,
+    existing_refresh: Option<&str>,
+    has_api_key: bool,
+) -> Option<String> {
+    if has_api_key && refreshed.refresh_token == refreshed.access_token {
+        return None;
+    }
+    if !refreshed.refresh_token.is_empty() {
+        return Some(refreshed.refresh_token.clone());
+    }
+    if has_api_key {
+        None
+    } else {
+        existing_refresh.map(str::to_string)
+    }
+}
+
 fn env_cursor_token() -> Option<String> {
     env_cursor_token_from(|key| std::env::var(key).ok())
 }
 
-/// True when an env token shadows the persistent store. A `cursor auth login`
+pub fn env_cursor_api_key() -> Option<String> {
+    std::env::var("CCP_CURSOR_API_KEY")
+        .or_else(|_| std::env::var("CURSOR_API_KEY"))
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+/// True when an env token or API key shadows the persistent store. A `cursor auth login`
 /// hot-swap will not take effect for a running `serve` in that case.
 pub fn env_cursor_token_present() -> bool {
-    env_cursor_token().is_some()
+    env_cursor_token().is_some() || env_cursor_api_key().is_some()
 }
 
 fn env_cursor_token_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     get("CCP_CURSOR_AUTH_TOKEN")
         .filter(|token| !token.trim().is_empty())
         .or_else(|| get("CURSOR_AUTH_TOKEN").filter(|token| !token.trim().is_empty()))
+}
+
+static ENV_API_KEY_AUTH: std::sync::Mutex<Option<StoredCursorAuth>> = std::sync::Mutex::new(None);
+
+pub fn load_env_cursor_auth() -> anyhow::Result<Option<CursorAuth>> {
+    if let Some(token) = env_cursor_token() {
+        return Ok(Some(enrich(
+            StoredCursorAuth {
+                access_token: token,
+                refresh_token: None,
+                api_key: None,
+            },
+            "environment".to_string(),
+        )));
+    }
+    load_env_cursor_api_key_auth()
+}
+
+pub fn load_env_cursor_api_key_auth() -> anyhow::Result<Option<CursorAuth>> {
+    let Some(api_key) = env_cursor_api_key() else {
+        return Ok(None);
+    };
+    get_or_exchange_env_api_key(&api_key, None)
+}
+
+fn get_or_exchange_env_api_key(
+    api_key: &str,
+    failed_access_token: Option<&str>,
+) -> anyhow::Result<Option<CursorAuth>> {
+    let api_key = api_key.trim();
+    let failed = failed_access_token.map(str::trim).filter(|f| !f.is_empty());
+
+    let existing_refresh = {
+        let guard = ENV_API_KEY_AUTH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cached) = *guard
+            && cached.api_key.as_deref() == Some(api_key)
+        {
+            if let Some(failed_tok) = failed {
+                if cached.access_token != failed_tok {
+                    return Ok(Some(enrich(cached.clone(), "environment".to_string())));
+                }
+            } else if token_expiry_ms(&cached.access_token)
+                .is_none_or(|exp| exp > now_ms() + REFRESH_EXPIRY_SKEW_MS)
+            {
+                return Ok(Some(enrich(cached.clone(), "environment".to_string())));
+            }
+            cached.refresh_token.clone()
+        } else {
+            None
+        }
+    };
+
+    // Perform blocking HTTP I/O outside the global mutex so concurrent
+    // requests do not stall waiting on the lock.
+    let exchanged = refresh_or_exchange(existing_refresh.as_deref(), Some(api_key))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cursor API key exchange rejected. Verify that CCP_CURSOR_API_KEY/CURSOR_API_KEY is valid."
+            )
+        })?;
+
+    let next = StoredCursorAuth {
+        access_token: exchanged.access_token.clone(),
+        refresh_token: resolve_next_refresh_token(&exchanged, existing_refresh.as_deref(), true),
+        api_key: Some(api_key.to_string()),
+    };
+    *ENV_API_KEY_AUTH.lock().unwrap_or_else(|e| e.into_inner()) = Some(next.clone());
+    Ok(Some(enrich(next, "environment".to_string())))
 }
 
 fn enrich(stored: StoredCursorAuth, source: String) -> CursorAuth {
@@ -2370,6 +2571,12 @@ pub fn cursor_access_token_is_session(token: &str) -> bool {
     cursor_access_token_type(token)
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("session"))
+}
+
+/// Returns true if the credential is a browser/IDE session JWT suitable for Sand transport.
+/// API key credentials and opaque CLI tokens authenticate via AgentService and do not support Sand.
+pub fn cursor_auth_supports_sand(auth: &CursorAuth) -> bool {
+    auth.api_key.is_none() && cursor_access_token_is_session(&auth.access_token)
 }
 
 fn parse_jwt_claims(token: &str) -> Option<serde_json::Value> {
@@ -2757,5 +2964,184 @@ mod tests {
         fn path(&self) -> String {
             "test-auth".to_string()
         }
+    }
+
+    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, val);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(ref val) = self.prev {
+                    std::env::set_var(self.key, val);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn spawn_mock_server(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<()>) {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (status, body) in responses {
+                let (mut socket, _) = server.accept().unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn token_json(jwt: &str, refresh: &str) -> String {
+        format!(r#"{{"accessToken":"{jwt}","refreshToken":"{refresh}"}}"#)
+    }
+
+    #[test]
+    fn exchange_user_api_key_status_handling() {
+        let _test_lock = TEST_ENV_MUTEX.lock().unwrap();
+        let access_jwt = test_jwt(4_102_444_800, Some("user_sk"), Some("user@sk.com"));
+        let (base_url, handle) = spawn_mock_server(vec![
+            (200, token_json(&access_jwt, "ref-from-exchange")),
+            (401, String::new()),
+            (403, String::new()),
+            (
+                403,
+                r#"{"error":"sign_in_policy_violation","message":"Sign-in policy violation"}"#
+                    .into(),
+            ),
+            (429, "too many requests".into()),
+            (500, "internal error".into()),
+        ]);
+        let _guard = ScopedEnvVar::set("CCP_CURSOR_BASE_URL", &base_url);
+
+        // 200 -> Ok(Some)
+        let res = exchange_user_api_key("sk-key-200").unwrap().unwrap();
+        assert_eq!(res.access_token, access_jwt);
+        assert_eq!(res.refresh_token, "ref-from-exchange");
+
+        // 401 & generic 403 -> Ok(None)
+        assert!(exchange_user_api_key("sk-key-401").unwrap().is_none());
+        assert!(exchange_user_api_key("sk-key-403").unwrap().is_none());
+
+        // 403 sign_in_policy_violation -> surfaces MDM policy violation
+        let err = exchange_user_api_key("sk-key-policy").unwrap_err();
+        assert!(err.to_string().contains("sign_in_policy_violation"));
+
+        // 429 & 500 -> Err
+        assert!(exchange_user_api_key("sk-key-429").is_err());
+        assert!(exchange_user_api_key("sk-key-500").is_err());
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn refresh_or_exchange_semantics() {
+        let _test_lock = TEST_ENV_MUTEX.lock().unwrap();
+        assert!(refresh_or_exchange(None, None).unwrap().is_none());
+
+        let access_jwt = test_jwt(
+            4_102_444_800,
+            Some("user_healed"),
+            Some("healed@example.com"),
+        );
+
+        // Both 401 (expired refresh) and 404 (purged session) must self-heal via API key fallback.
+        // None refresh_token directly exchanges the API key.
+        for (refresh, status) in [
+            (Some("stale-401"), Some(401)),
+            (Some("stale-404"), Some(404)),
+            (None, None),
+        ] {
+            let mut responses = Vec::new();
+            if let Some(s) = status {
+                responses.push((s, String::new()));
+            }
+            responses.push((200, token_json(&access_jwt, "ref-healed")));
+            let (base_url, handle) = spawn_mock_server(responses);
+            let _guard = ScopedEnvVar::set("CCP_CURSOR_BASE_URL", &base_url);
+
+            let healed = refresh_or_exchange(refresh, Some("sk-healing-key"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(healed.access_token, access_jwt);
+            assert_eq!(healed.refresh_token, "ref-healed");
+            handle.join().unwrap();
+        }
+
+        // Transient errors (429/500) must propagate immediately without falling back
+        for status in [429, 500] {
+            let (base_url, handle) = spawn_mock_server(vec![(status, format!("status {status}"))]);
+            let _guard = ScopedEnvVar::set("CCP_CURSOR_BASE_URL", &base_url);
+
+            let err = refresh_or_exchange(Some("valid-refresh"), Some("sk-fallback-key"))
+                .expect_err("transient error must propagate immediately");
+            assert!(err.to_string().contains(&status.to_string()));
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn env_api_key_lifecycle_caching_and_isolation() {
+        let _test_lock = TEST_ENV_MUTEX.lock().unwrap();
+        *ENV_API_KEY_AUTH.lock().unwrap() = None;
+        let jwt_first = test_jwt(4_102_444_800, Some("user_env"), Some("env@example.com"));
+        let jwt_second = test_jwt(4_102_445_800, Some("user_env"), Some("env@example.com"));
+        let jwt_other = test_jwt(4_102_446_800, Some("user_other"), Some("other@example.com"));
+
+        let (base_url, handle) = spawn_mock_server(vec![
+            (200, token_json(&jwt_first, "ref-env")),
+            (401, String::new()),
+            (200, token_json(&jwt_second, "ref-env-2")),
+            (200, token_json(&jwt_other, "ref-env-3")),
+        ]);
+
+        let _guard_url = ScopedEnvVar::set("CCP_CURSOR_BASE_URL", &base_url);
+        let _guard_key = ScopedEnvVar::set("CCP_CURSOR_API_KEY", "sk-env-test-key");
+
+        // 1. Initial load exchanges key and caches it
+        let auth1 = load_env_cursor_api_key_auth().unwrap().unwrap();
+        assert_eq!(auth1.access_token, jwt_first);
+        assert_eq!(auth1.email.as_deref(), Some("env@example.com"));
+
+        // 2. Second load hits memory cache
+        let auth2 = load_env_cursor_api_key_auth().unwrap().unwrap();
+        assert_eq!(auth2.access_token, jwt_first);
+
+        // 3. Force refresh invalidates the failed access token and gets second token
+        let auth3 = get_or_exchange_env_api_key("sk-env-test-key", Some(&jwt_first))
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth3.access_token, jwt_second);
+
+        // 4. Switching key isolates cache and fetches new identity
+        let auth4 = get_or_exchange_env_api_key("sk-env-other-key", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth4.access_token, jwt_other);
+        assert_eq!(auth4.refresh_token.as_deref(), Some("ref-env-3"));
+
+        handle.join().unwrap();
     }
 }

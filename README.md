@@ -88,7 +88,7 @@ claude-cursor-proxy serve --port 11435    # custom port
 
 #### Hot account switch (no restart)
 
-Run `claude-cursor-proxy cursor auth login` in another terminal while `serve`
+Run `claude-cursor-proxy cursor auth login` (or `--api-key <key>`) in another terminal while `serve`
 is running. Credentials are re-read from the store on every request, so:
 
 - new requests use the new account immediately;
@@ -98,9 +98,12 @@ is running. Credentials are re-read from the store on every request, so:
   (the client resends its history automatically).
 
 `cursor auth status` shows the active account. Note: if
-`CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN` is set in the `serve` process's
-environment, the env token shadows the store and a login hot swap will not
+`CCP_CURSOR_API_KEY`/`CURSOR_API_KEY` or `CCP_CURSOR_AUTH_TOKEN`/`CURSOR_AUTH_TOKEN` is set in the `serve` process's
+environment, the env credentials shadow the store and a login hot swap will not
 take effect until you unset it.
+
+> [!NOTE]
+> Cursor user API keys (`CURSOR_API_KEY` / `--api-key`) authenticate against Cursor's official `AgentService` (CLI transport). Cursor's desktop Sand transport (`InferenceService/Stream`) strictly requires browser/desktop session tokens; when an API key is active, the proxy automatically routes via CLI transport with a log notice.
 
 #### Multiple Cursor accounts
 
@@ -110,6 +113,7 @@ login to the local account pool:
 
 ```bash
 claude-cursor-proxy cursor auth add --label work
+claude-cursor-proxy cursor auth add --api-key sk-... --label api-account
 claude-cursor-proxy cursor auth list
 claude-cursor-proxy cursor auth use ACCOUNT_ID
 claude-cursor-proxy cursor auth usage                 # every saved account
@@ -594,6 +598,7 @@ Override with `CCP_CONFIG_DIR`. Env prefix stays **`CCP_*`** (unchanged from ear
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Bind address |
 | `CCP_ADVERTISED_MODELS` | unset | Optional comma-separated allowlist for `GET /v1/models` (useful for managed desktop model pickers) |
 | `CCP_CURSOR_AUTH_TOKEN` | unset | Cursor bearer override |
+| `CCP_CURSOR_API_KEY` | unset | Cursor user API key (`sk-...`); automatically exchanged for session tokens |
 | `CCP_CURSOR_BASE_URL` | `https://api2.cursor.sh` | Cursor API base |
 | `CCP_CURSOR_SAND_BASE_URL` | value of `CCP_CURSOR_BASE_URL` | Optional base URL for Sand `InferenceService/Stream` / `RunInference` |
 | `CCP_CURSOR_SAND_CLIENT_VERSION` | `0.30.0` | Sand/Grok Bot API identity version; override only for a gateway that requires it |

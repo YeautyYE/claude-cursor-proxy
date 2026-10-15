@@ -298,8 +298,8 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     let handlers = provider.cli();
     match command {
         ProviderGroup::Auth { command } => match command {
-            claude_cursor_proxy::provider::AuthCommand::Login => {
-                if let Err(err) = handlers.login() {
+            claude_cursor_proxy::provider::AuthCommand::Login { api_key } => {
+                if let Err(err) = handlers.login_with_api_key(api_key.as_deref()) {
                     eprintln!("{err}");
                     std::process::exit(2);
                 }
@@ -391,7 +391,7 @@ fn auth_command_name(command: &claude_cursor_proxy::provider::AuthCommand) -> &'
         AuthCommand::Use { .. } => "use",
         AuthCommand::Remove { .. } => "remove",
         AuthCommand::Usage { .. } => "usage",
-        AuthCommand::Login => "login",
+        AuthCommand::Login { .. } => "login",
         AuthCommand::Device => "device",
         AuthCommand::Status => "status",
         AuthCommand::Logout => "logout",
@@ -403,8 +403,8 @@ fn run_cursor_account_cli(command: claude_cursor_proxy::provider::AuthCommand) -
     use claude_cursor_proxy::providers::cursor::auth as cursor_auth;
 
     match command {
-        AuthCommand::Add { label } => {
-            let auth = cursor_auth::run_cursor_login_add_with_label(label.clone())?
+        AuthCommand::Add { label, api_key } => {
+            let auth = cursor_auth::run_cursor_login_flow(api_key.as_deref(), true, label.clone())?
                 .ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
             // Resolve the persisted profile once so the output names the
             // account just added (which can be inactive) rather than merely
