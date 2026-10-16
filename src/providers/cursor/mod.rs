@@ -50,7 +50,6 @@ use crate::providers::cursor::auth::{
     CursorAccountProfile, CursorAuthSelection, clear_cursor_auth, cursor_account_digest,
     expired_auth_message, force_refresh_cursor_auth, list_cursor_accounts, load_cursor_auth,
     load_cursor_auth_for_model, missing_auth_message, refresh_cursor_account_for_usage,
-    run_cursor_login,
 };
 use crate::providers::cursor::client::{CursorError, CursorHttpClient, CursorRunOptions};
 use crate::providers::cursor::connect::{
@@ -9316,6 +9315,28 @@ impl Provider for CursorProvider {
                 );
             }
         };
+
+        let (client_type, uses_sand) = if uses_sand
+            && !crate::providers::cursor::auth::cursor_auth_supports_sand(&auth_selection.auth)
+        {
+            create_logger("cursor").warn(
+                "sand_transport_unsupported_for_non_session_token",
+                Some(serde_json::Map::from_iter([
+                    ("model".into(), serde_json::json!(model)),
+                    (
+                        "account".into(),
+                        serde_json::json!(cursor_account_digest(&auth_selection.auth.access_token)),
+                    ),
+                ])),
+            );
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.client_type_resolved(&ctx.req_id, "cli");
+            }
+            ("cli".to_string(), false)
+        } else {
+            (client_type, uses_sand)
+        };
+
         // Keep the account that was selected before opportunistic Sand
         // rebalancing. If the active lane is saturated, the request may be
         // moved to another saved profile below; that original profile should
@@ -10669,12 +10690,16 @@ pub(crate) struct CursorCli;
 
 impl CliHandlers for CursorCli {
     fn login(&self) -> Result<(), anyhow::Error> {
-        // Capture the account being replaced so a hot swap is explicit.
+        self.login_with_api_key(None)
+    }
+
+    fn login_with_api_key(&self, api_key: Option<&str>) -> Result<(), anyhow::Error> {
         let previous_email = load_cursor_auth()
             .ok()
             .flatten()
             .and_then(|auth| auth.email);
-        let auth = run_cursor_login()?.ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
+        let auth = crate::providers::cursor::auth::run_cursor_login_flow(api_key, false, None)?
+            .ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
         println!("Cursor auth saved in {}", auth.source);
         if let Some(ref user_id) = auth.user_id {
             println!("User: {user_id}");
@@ -10704,8 +10729,8 @@ impl CliHandlers for CursorCli {
         if crate::providers::cursor::auth::env_cursor_token_present() {
             println!();
             println!(
-                "WARNING: CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN is set in this shell. Any \
-                 process started with that env (including `serve`) keeps using the env token \
+                "WARNING: CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY is set in this shell. Any \
+                 process started with that env (including `serve`) keeps using the env credentials \
                  and will NOT see this login. Unset the env var to use the stored account."
             );
         }
@@ -10743,7 +10768,7 @@ impl CliHandlers for CursorCli {
     fn logout(&self) -> Result<(), anyhow::Error> {
         clear_cursor_auth()?;
         println!(
-            "Cursor persistent auth cleared. Unset CCP_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN if using env auth."
+            "Cursor persistent auth cleared. Unset CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN or CCP_CURSOR_API_KEY/CURSOR_API_KEY if using env auth."
         );
         println!(
             "A running `serve` keeps finishing in-flight runs with the old credentials; new \

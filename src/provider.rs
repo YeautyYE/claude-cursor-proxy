@@ -9,8 +9,12 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
-    /// Sign in using browser-based authentication
-    Login,
+    /// Sign in using browser-based authentication or user API key
+    Login {
+        /// Optional Cursor user API key (e.g. sk-...)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
     /// Sign in using a device code
     Device,
     /// Show the current authentication status
@@ -25,6 +29,9 @@ pub enum AuthCommand {
         /// Optional display label. Cursor falls back to the account email.
         #[arg(long)]
         label: Option<String>,
+        /// Optional Cursor user API key (e.g. sk-...)
+        #[arg(long)]
+        api_key: Option<String>,
     },
     /// List persisted Cursor accounts.
     List,
@@ -50,6 +57,7 @@ pub enum AuthCommand {
     },
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
@@ -61,6 +69,12 @@ pub trait Provider: Send + Sync {
 
 pub trait CliHandlers: Send + Sync {
     fn login(&self) -> Result<()>;
+    fn login_with_api_key(&self, api_key: Option<&str>) -> Result<()> {
+        if api_key.is_some() {
+            anyhow::bail!("--api-key login is not supported for this provider");
+        }
+        self.login()
+    }
     fn device(&self) -> Result<()>;
     fn status(&self) -> Result<()>;
     fn logout(&self) -> Result<()>;
