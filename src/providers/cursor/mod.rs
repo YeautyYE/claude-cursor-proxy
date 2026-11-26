@@ -74,8 +74,8 @@ use crate::providers::cursor::live::{
     live_error_is_same_request_retryable, live_error_is_upstream_already_active,
     live_error_needs_checkpoint_continue, live_pending_must_supersede,
     live_probe_error_blocks_new_run, live_request_fingerprint, live_resume_error_is_dead_driver,
-    live_run_key_for, live_sse_response, live_start_error_seals_tombstone,
-    local_overload_retry_after, same_request_retry_wait_ms,
+    live_run_key_for, live_sse_response, live_sse_response_with_cumulative_usage,
+    live_start_error_seals_tombstone, local_overload_retry_after, same_request_retry_wait_ms,
 };
 use crate::providers::cursor::model::{
     anthropic_wire_model, resolve_cursor_model, resolve_sand_model_id,
@@ -90,7 +90,7 @@ use crate::providers::cursor::request::{
 use crate::providers::cursor::response::{
     AnthropicJsonAcc, CursorDecodeError, CursorStreamEvent, decode_cursor_upstream_compaction,
     decode_cursor_upstream_with_allowed, decode_upstream_response_with_allowed,
-    estimate_rendered_prompt_tokens, estimate_request_input_tokens,
+    estimate_prompt_text_tokens, estimate_rendered_prompt_tokens, estimate_request_input_tokens,
 };
 use crate::providers::cursor::sand_inference::{
     SandInferenceClient, SandInferenceMessage, SandInferenceRequest, SandTransportStream,
@@ -1562,6 +1562,7 @@ fn live_path_skip_reason(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_sse_recording_usage(
     session_id: &str,
     events: mpsc::Receiver<LiveEventResult>,
@@ -1570,14 +1571,16 @@ fn live_sse_recording_usage(
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
     compaction_mode: bool,
+    cumulative_turn_usage: bool,
 ) -> Response {
-    live_sse_response(
+    live_sse_response_with_cumulative_usage(
         tap_session_usage(session_id.to_string(), events),
         message_id,
         wire_model,
         estimated_input,
         monitor,
         compaction_mode,
+        cumulative_turn_usage,
     )
 }
 
@@ -7027,6 +7030,7 @@ fn spawn_streaming_live_sse(
         estimated_input,
         monitor,
         compaction_mode,
+        false,
     )
 }
 
@@ -7890,6 +7894,7 @@ async fn live_downstream_response(
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
     compaction_mode: bool,
+    cumulative_turn_usage: bool,
 ) -> Response {
     if want_stream {
         live_sse_recording_usage(
@@ -7900,6 +7905,7 @@ async fn live_downstream_response(
             estimated_input,
             monitor,
             compaction_mode,
+            cumulative_turn_usage,
         )
     } else {
         live_json_recording_usage(
@@ -7910,19 +7916,40 @@ async fn live_downstream_response(
             estimated_input,
             monitor,
             compaction_mode,
+            cumulative_turn_usage,
         )
         .await
     }
 }
 
 async fn collect_live_events_to_json(
-    mut events: mpsc::Receiver<LiveEventResult>,
+    events: mpsc::Receiver<LiveEventResult>,
     message_id: &str,
     model: &str,
     estimated_input: u64,
     compaction_mode: bool,
 ) -> Result<serde_json::Value, String> {
-    let mut acc = AnthropicJsonAcc::new_mode(estimated_input, compaction_mode);
+    collect_live_events_to_json_with_cumulative_usage(
+        events,
+        message_id,
+        model,
+        estimated_input,
+        compaction_mode,
+        false,
+    )
+    .await
+}
+
+async fn collect_live_events_to_json_with_cumulative_usage(
+    mut events: mpsc::Receiver<LiveEventResult>,
+    message_id: &str,
+    model: &str,
+    estimated_input: u64,
+    compaction_mode: bool,
+    cumulative_turn_usage: bool,
+) -> Result<serde_json::Value, String> {
+    let mut acc = AnthropicJsonAcc::new_mode(estimated_input, compaction_mode)
+        .with_cumulative_turn_usage(cumulative_turn_usage);
     let mut saw_end = false;
     let mut tool_handoff = false;
     // Keep this bit separate from `acc.has_useful()`: a compaction
@@ -8009,6 +8036,7 @@ fn clean_json_eof_can_synthesize_terminal(saw_text: bool) -> bool {
     saw_text
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_json_recording_usage(
     session_id: &str,
     events: mpsc::Receiver<LiveEventResult>,
@@ -8017,13 +8045,15 @@ async fn live_json_recording_usage(
     estimated_input: u64,
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
     compaction_mode: bool,
+    cumulative_turn_usage: bool,
 ) -> Response {
-    match collect_live_events_to_json(
+    match collect_live_events_to_json_with_cumulative_usage(
         tap_session_usage(session_id.to_string(), events),
         &message_id,
         &wire_model,
         estimated_input,
         compaction_mode,
+        cumulative_turn_usage,
     )
     .await
     {
@@ -9927,7 +9957,7 @@ impl Provider for CursorProvider {
         if let Some(events) = resumed_live_events.take() {
             let sid = session_id.expect("a resumed live run requires a session id");
             let identity = live_run_identity_with_account(sid, &ctx, Some(&account_key));
-            let estimated_input = estimate_rendered_prompt_tokens(&parts);
+            let estimated_input = estimate_prompt_text_tokens(custom_system, &reset_user_text);
             let monitor = ctx
                 .monitor
                 .clone()
@@ -9977,6 +10007,7 @@ impl Provider for CursorProvider {
                 estimated_input,
                 monitor,
                 xai_compact,
+                has_tool_results,
             )
             .await;
         }
@@ -10008,7 +10039,7 @@ impl Provider for CursorProvider {
             log_live_start_claude_headers(&ctx, sid, model, &client_type, xai_compact);
             let allowed = request_allowed_tools.clone();
             let mcp_tools = request_mcp_tools.clone();
-            let estimated_input = estimate_rendered_prompt_tokens(&parts);
+            let estimated_input = estimate_prompt_text_tokens(custom_system, &reset_user_text);
             let monitor = ctx
                 .monitor
                 .clone()
@@ -10102,6 +10133,7 @@ impl Provider for CursorProvider {
                         estimated_input,
                         monitor,
                         xai_compact,
+                        false,
                     )
                     .await;
                 }

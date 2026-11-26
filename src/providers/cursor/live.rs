@@ -14357,6 +14357,26 @@ pub fn live_sse_response(
     monitor: Option<(crate::monitor::MonitorHandle, String)>,
     compaction_mode: bool,
 ) -> Response {
+    live_sse_response_with_cumulative_usage(
+        events,
+        message_id,
+        model,
+        estimated_input_tokens,
+        monitor,
+        compaction_mode,
+        false,
+    )
+}
+
+pub fn live_sse_response_with_cumulative_usage(
+    events: mpsc::Receiver<LiveEventResult>,
+    message_id: String,
+    model: String,
+    estimated_input_tokens: u64,
+    monitor: Option<(crate::monitor::MonitorHandle, String)>,
+    compaction_mode: bool,
+    cumulative_turn_usage: bool,
+) -> Response {
     struct State {
         events: mpsc::Receiver<LiveEventResult>,
         encoder: CursorSseEncoder,
@@ -14379,6 +14399,7 @@ pub fn live_sse_response(
         CursorSseEncoder::new(message_id, model)
     };
     encoder.seed_estimated_input_tokens(estimated_input_tokens);
+    encoder.set_cumulative_turn_usage(cumulative_turn_usage);
     if let Some((ref handle, ref req_id)) = monitor {
         let (input_tokens, output_tokens) = encoder.current_usage();
         handle.usage_updated(

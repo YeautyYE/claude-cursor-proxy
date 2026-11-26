@@ -336,6 +336,82 @@ pub(crate) fn normalize_cursor_usage_for_anthropic(
     }
 }
 
+/// Minimum single-request prompt estimate before the non-cumulative safety
+/// guard triggers. Keeps tiny prompts (where Cursor's system prompt or tool
+/// catalog dominates) and synthetic unit-test seeds untouched.
+const CUMULATIVE_USAGE_GUARD_MIN_ESTIMATE: u64 = 10_000;
+/// Overhead allowance added on top of 3x `estimated_input_tokens` for the
+/// single-step cumulative safety guard (accommodates CJK tokenization and
+/// Cursor system/tool framing).
+const CUMULATIVE_USAGE_GUARD_OVERHEAD: u64 = 30_000;
+
+/// Scale `(input, cache_read, cache_write)` proportionally down so their sum
+/// equals `cap`, preserving the relative cache hit ratio without overflow.
+fn scale_context_usage_to_cap(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    cap: u64,
+) -> (u64, u64, u64) {
+    let total = input_tokens
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_write_tokens);
+    if total <= cap || total == 0 {
+        return (input_tokens, cache_read_tokens, cache_write_tokens);
+    }
+    let scaled_read = ((cache_read_tokens as u128 * cap as u128) / total as u128) as u64;
+    let scaled_write = ((cache_write_tokens as u128 * cap as u128) / total as u128) as u64;
+    let scaled_input = cap.saturating_sub(scaled_read.saturating_add(scaled_write));
+    (scaled_input, scaled_read, scaled_write)
+}
+
+/// Normalize Cursor `TurnEnded` usage for a single Anthropic Messages response,
+/// bounding multi-step cumulative BiDi totals against the single-request
+/// prompt estimate.
+///
+/// In a multi-step Cursor AgentService BiDi `Run` (e.g., 30 tool-use loops
+/// paused and resumed with `tool_result`), `TurnEnded` reports the **aggregate**
+/// `input_tokens` / `cache_read_tokens` summed across every internal step of the
+/// run (easily >1M tokens even when the single-request context is ~90k).
+/// Anthropic clients like Claude Code sum `input + cache_read + cache_creation`
+/// of the final message to compute context window usage and trigger auto-compact,
+/// so passing raw cumulative totals causes false 100% context alerts.
+pub(crate) fn normalize_cursor_usage_for_anthropic_with_estimate(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    estimated_input_tokens: u64,
+    cumulative_turn_usage: bool,
+) -> (u64, u64, u64, u64) {
+    let (norm_in, norm_out, norm_read, norm_write) = normalize_cursor_usage_for_anthropic(
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    );
+    if estimated_input_tokens == 0 {
+        return (norm_in, norm_out, norm_read, norm_write);
+    }
+    let reported_ctx = norm_in.saturating_add(norm_read).saturating_add(norm_write);
+    let should_bound = if cumulative_turn_usage {
+        reported_ctx > estimated_input_tokens
+    } else {
+        estimated_input_tokens >= CUMULATIVE_USAGE_GUARD_MIN_ESTIMATE
+            && reported_ctx
+                > estimated_input_tokens
+                    .saturating_mul(3)
+                    .saturating_add(CUMULATIVE_USAGE_GUARD_OVERHEAD)
+    };
+    if should_bound {
+        let (bounded_in, bounded_read, bounded_write) =
+            scale_context_usage_to_cap(norm_in, norm_read, norm_write, estimated_input_tokens);
+        (bounded_in, norm_out, bounded_read, bounded_write)
+    } else {
+        (norm_in, norm_out, norm_read, norm_write)
+    }
+}
+
 /// SSE framer that tracks state to produce well-formed Anthropic SSE events.
 pub struct CursorSseFramer<'a> {
     output: &'a mut Vec<u8>,
@@ -361,6 +437,11 @@ struct CursorSseState {
     usage_output_estimate: u64,
     usage_cache_read_tokens: u64,
     usage_cache_write_tokens: u64,
+    /// Single-request prompt token estimate seeded before upstream usage arrives.
+    estimated_input_tokens: u64,
+    /// True when this response closes a resumed multi-step BiDi run whose
+    /// `TurnEnded` usage aggregates all steps in the run.
+    cumulative_turn_usage: bool,
     /// Last `message_delta` usage progress snapshot (Claude Code Out meter).
     last_progress_input: u64,
     last_progress_output: u64,
@@ -397,6 +478,8 @@ impl Default for CursorSseState {
             usage_output_estimate: 0,
             usage_cache_read_tokens: 0,
             usage_cache_write_tokens: 0,
+            estimated_input_tokens: 0,
+            cumulative_turn_usage: false,
             last_progress_input: 0,
             last_progress_output: 0,
             last_progress_cache_read: 0,
@@ -876,11 +959,13 @@ impl<'a> CursorSseFramer<'a> {
             return;
         }
         let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
-            normalize_cursor_usage_for_anthropic(
+            normalize_cursor_usage_for_anthropic_with_estimate(
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
+                self.state.estimated_input_tokens,
+                self.state.cumulative_turn_usage,
             );
         self.state.usage_input_tokens = input_tokens;
         self.state.usage_output_tokens = output_tokens;
@@ -906,12 +991,19 @@ impl<'a> CursorSseFramer<'a> {
         if self.state.finalized || tokens == 0 {
             return;
         }
+        self.state.estimated_input_tokens = tokens;
         if self.state.usage_input_tokens == 0
             && self.state.usage_cache_read_tokens == 0
             && self.state.usage_cache_write_tokens == 0
         {
             self.state.usage_input_tokens = tokens;
         }
+    }
+
+    /// Mark whether `TurnEnded` usage on this stream is expected to aggregate
+    /// multiple BiDi tool-continuation steps rather than a single inference call.
+    pub fn set_cumulative_turn_usage(&mut self, cumulative: bool) {
+        self.state.cumulative_turn_usage = cumulative;
     }
 
     pub fn next_content_block_index(&mut self) -> i32 {
@@ -1181,6 +1273,10 @@ impl CursorSseEncoder {
         self.with_framer(|framer| framer.seed_estimated_input_tokens(tokens));
     }
 
+    pub fn set_cumulative_turn_usage(&mut self, cumulative: bool) {
+        self.with_framer(|framer| framer.set_cumulative_turn_usage(cumulative));
+    }
+
     /// Snapshot of the best-known Anthropic usage for TUI/monitor updates.
     pub fn current_usage(&self) -> (u64, u64) {
         (
@@ -1318,6 +1414,67 @@ mod tests {
         assert_eq!(
             normalize_cursor_usage_for_anthropic(100, 10, 0, 0),
             (100, 10, 0, 0)
+        );
+    }
+
+    #[test]
+    fn normalize_bounds_cumulative_bidi_turn_ended_usage_to_single_turn_estimate() {
+        // Observed 32-step BiDi run: actual single-request context ~88k, but
+        // Cursor TurnEnded summed all 32 steps into 122k input + 1.17M cache_read.
+        let mut encoder = CursorSseEncoder::new("msg_cum", "gemini-4-neon-high");
+        encoder.seed_estimated_input_tokens(88_000);
+        encoder.set_cumulative_turn_usage(true);
+        encoder.push_event(&CursorStreamEvent::TextDelta {
+            text: "done".to_string(),
+        });
+        encoder.push_event(&CursorStreamEvent::Usage {
+            input_tokens: 122_466,
+            output_tokens: 15_465,
+            cache_read_tokens: 1_170_232,
+            cache_write_tokens: 0,
+        });
+        encoder.push_event(&CursorStreamEvent::End);
+
+        let events = parse_sse_events(&String::from_utf8_lossy(&encoder.take_bytes()));
+        let delta = events
+            .iter()
+            .rev()
+            .find(|(name, _)| *name == "message_delta")
+            .map(|(_, data)| data)
+            .expect("message_delta");
+        let input = delta["usage"]["input_tokens"].as_u64().unwrap();
+        let cache_read = delta["usage"]["cache_read_input_tokens"].as_u64().unwrap();
+        let cache_write = delta["usage"]["cache_creation_input_tokens"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(input + cache_read + cache_write, 88_000);
+        assert!(cache_read > input, "cache ratio should be preserved");
+        assert_eq!(delta["usage"]["output_tokens"].as_u64(), Some(15_465));
+    }
+
+    #[test]
+    fn normalize_guard_catches_extreme_multi_step_accumulation_even_without_flag() {
+        let (input, output, cache_read, cache_write) =
+            normalize_cursor_usage_for_anthropic_with_estimate(
+                122_466, 15_465, 1_170_232, 0, 88_000, false,
+            );
+        assert_eq!(input + cache_read + cache_write, 88_000);
+        assert_eq!(output, 15_465);
+
+        // Single-step CJK/high-density prompt (2x estimate) stays untouched.
+        assert_eq!(
+            normalize_cursor_usage_for_anthropic_with_estimate(
+                10_000, 500, 90_000, 0, 50_000, false,
+            ),
+            (10_000, 500, 90_000, 0)
+        );
+
+        // Compacted multi-step run already below estimate stays untouched.
+        assert_eq!(
+            normalize_cursor_usage_for_anthropic_with_estimate(
+                20_000, 500, 40_000, 0, 88_000, true,
+            ),
+            (20_000, 500, 40_000, 0)
         );
     }
 

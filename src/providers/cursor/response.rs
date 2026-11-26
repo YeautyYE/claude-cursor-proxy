@@ -411,6 +411,7 @@ pub struct AnthropicJsonAcc {
     cache_read: u64,
     cache_write: u64,
     estimated_input: u64,
+    cumulative_turn_usage: bool,
 }
 
 impl AnthropicJsonAcc {
@@ -435,7 +436,13 @@ impl AnthropicJsonAcc {
             cache_read: 0,
             cache_write: 0,
             estimated_input,
+            cumulative_turn_usage: false,
         }
+    }
+
+    pub fn with_cumulative_turn_usage(mut self, cumulative: bool) -> Self {
+        self.cumulative_turn_usage = cumulative;
+        self
     }
 
     pub fn push(&mut self, event: &CursorStreamEvent) {
@@ -528,11 +535,16 @@ impl AnthropicJsonAcc {
     }
 
     fn normalized_usage(&self) -> (u64, u64, u64, u64) {
-        crate::providers::cursor::sse::normalize_cursor_usage_for_anthropic(
-            self.input_tokens.max(self.estimated_input.max(1)),
+        if self.input_tokens == 0 && self.cache_read == 0 && self.cache_write == 0 {
+            return (self.estimated_input.max(1), self.output_tokens, 0, 0);
+        }
+        crate::providers::cursor::sse::normalize_cursor_usage_for_anthropic_with_estimate(
+            self.input_tokens,
             self.output_tokens,
             self.cache_read,
             self.cache_write,
+            self.estimated_input,
+            self.cumulative_turn_usage,
         )
     }
 
@@ -998,9 +1010,18 @@ pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
 /// `CursorPromptParts` when it has applied checkpoint/delta options, avoiding a
 /// second full history render on the hot path.
 pub fn estimate_rendered_prompt_tokens(parts: &super::request::CursorPromptParts) -> u64 {
-    let system_chars = parts.custom_system_prompt.as_ref().map_or(0, String::len);
+    estimate_prompt_text_tokens(parts.custom_system_prompt.as_deref(), &parts.user_text)
+}
+
+/// Estimate tokens from an explicit system prompt + full user prompt text.
+///
+/// Checkpointed live turns render `parts.user_text` as a compact delta while
+/// also retaining the full-history `reset_user_text`; using the full text keeps
+/// the client context meter continuous instead of dipping to the delta size.
+pub fn estimate_prompt_text_tokens(custom_system_prompt: Option<&str>, user_text: &str) -> u64 {
+    let system_chars = custom_system_prompt.map_or(0, str::len);
     (system_chars
-        .saturating_add(parts.user_text.len())
+        .saturating_add(user_text.len())
         .saturating_add(3)
         / 4)
     .max(1) as u64
