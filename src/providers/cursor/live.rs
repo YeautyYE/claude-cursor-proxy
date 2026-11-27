@@ -1410,6 +1410,15 @@ impl PendingExecState {
         self.awaiting.is_empty() && self.collecting.is_empty()
     }
 
+    /// Whether a closed downstream sink should enter the orphan-reap /
+    /// `consumer_gone` path instead of parking for `tool_result`.
+    /// Only tools already exposed into `awaiting` have been delivered to the
+    /// downstream client; unexposed `collecting` entries can never produce a
+    /// client `tool_result` and must not pin the session until hard timeout.
+    fn closed_sink_is_orphan(&self) -> bool {
+        self.awaiting.is_empty()
+    }
+
     /// True when every pending exec is Claude-local (Workflow/Skill/…) — Cursor
     /// often emits `turn_ended` in the same chunk as the XML, so we must expose
     /// these before treating pending as a hard failure.
@@ -9301,9 +9310,11 @@ async fn drive_live_run(
         // segment is still generating, keep the run for LIVE_ATTACH_ORPHAN_GRACE
         // so an identical grok-build retry can attach instead of 503-storming.
         if sink.as_ref().is_some_and(mpsc::Sender::is_closed) {
-            // logical_tools_waiting alone must not pin the session: those are
-            // UI hints, not Anthropic-exposed pending tools.
-            if pending.is_empty() {
+            // `logical_tools_waiting` and unexposed `pending.collecting` entries
+            // must not pin the session: Claude Code has never seen them and can
+            // never submit a `tool_result`. Only exposed `awaiting` tools
+            // legitimately park the driver between segments.
+            if pending.closed_sink_is_orphan() {
                 let since = *sink_closed_since.get_or_insert_with(Instant::now);
                 if !consumer_gone_published {
                     consumer_gone_published = true;
@@ -11284,20 +11295,18 @@ async fn process_live_frame_impl(
             if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
                 return false;
             }
-            pending.queue(
-                ask_user_question_pending_exec(query.id, ask, emit_name),
-                Duration::ZERO,
-            );
+            let exec = ask_user_question_pending_exec(query.id, ask, emit_name);
+            if !pending_has_client_only(pending, &exec) {
+                pending.queue(exec, Duration::ZERO);
+            }
             *last_progress = Instant::now();
             *useful = true;
             // Do not auto-reject: expose ClientOnly AskUserQuestion and tear
             // down like Workflow. Cursor AskQuestionResult has no answer tags
             // in proto.rs, so the Claude tool_result path is ClientOnly.
-            // The live driver must first drain the authoritative END frame:
-            // it can carry a trailing error that invalidates this tool call.
-            if turn_ctx.is_some() {
-                return true;
-            }
+            // Expose immediately just like hosted_query_client_only_exec below:
+            // Cursor blocks on InteractionResponse and will not emit turn_ended
+            // / FLAG_END while the query is unanswered.
             return expose_collected_tools(pending, pending_shared, sink, replay).await;
         }
         if let Some(exec) = hosted_query_client_only_exec(&query, allowed_tool_names) {
@@ -11936,6 +11945,7 @@ async fn process_interaction_update(
                 return expose_collected_tools(pending, pending_shared, sink, replay).await;
             }
             if mapped.name == "AskUserQuestion"
+                && provider.is_empty()
                 && let Some(emit_name) = advertised_ask_user_question(allowed_tool_names)
             {
                 if !flush_turn_coalescer(sink, deferred, replay, turn_ctx.as_deref_mut()).await {
@@ -11946,14 +11956,15 @@ async fn process_interaction_update(
                 // `map_tool_call_started` already emits Claude Code's
                 // canonical AskUserQuestion shape. Preserve its header and
                 // option descriptions instead of rebuilding it through the
-                // legacy Cursor title/prompt representation.
+                // legacy Cursor title/prompt representation. Expose
+                // immediately like WebSearch/WebFetch/CreatePlan: Cursor next
+                // sends AskQuestionInteractionQuery and blocks waiting for
+                // InteractionResponse without emitting turn_ended.
                 exec.claude_input = adapt_client_tool_input(&emit_name, mapped.input.clone());
                 pending.queue(exec, Duration::ZERO);
                 *useful = true;
                 *last_progress = Instant::now();
-                if !defer_client_only_exposure {
-                    return expose_collected_tools(pending, pending_shared, sink, replay).await;
-                }
+                return expose_collected_tools(pending, pending_shared, sink, replay).await;
             }
             if mapped.name == "Glob"
                 && let Some(emit_name) = resolve_glob_client_name(
@@ -27486,6 +27497,273 @@ mod tests {
             }
             other => panic!("expected AskUserQuestion tool_use, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_interaction_query_exposes_immediately_with_turn_ctx() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, AskQuestionArgs, AskQuestionInteractionQuery, AskQuestionItem,
+            InteractionQuery, RequestContext,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: None,
+            kv_server_message: None,
+            interaction_query: Some(InteractionQuery {
+                id: 9,
+                ask_question_interaction_query: Some(AskQuestionInteractionQuery {
+                    args: Some(AskQuestionArgs {
+                        title: "Next step".into(),
+                        questions: vec![AskQuestionItem {
+                            id: "q1".into(),
+                            prompt: "How should we proceed".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    tool_call_id: "ask-live-1".into(),
+                }),
+                ..Default::default()
+            }),
+            exec_server_control_message: None,
+            exec_server_message: None,
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["AskUserQuestion".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-ask-live",
+            user_prompt: "continue",
+            compaction_mode: false,
+            post_tool_checkpoint: &mut post_tool_checkpoint,
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+            sand_empty_end: None,
+        };
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut segment_replay,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            Some(&mut turn),
+        )
+        .await;
+        assert!(
+            !cont,
+            "AskQuestionInteractionQuery must expose immediately even when turn_ctx is present"
+        );
+        assert!(
+            pending.collecting.is_empty(),
+            "AskUserQuestion must not stay trapped in pending.collecting waiting for turn_ended"
+        );
+        assert!(
+            request_rx.try_recv().is_err(),
+            "must not auto-reject advertised AskUserQuestion"
+        );
+        match event_rx.try_recv().expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "AskUserQuestion");
+            }
+            other => panic!("expected AskUserQuestion tool_use, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_tool_call_started_exposes_immediately_with_turn_ctx() {
+        use super::super::connect::encode_connect_frame;
+        use super::super::proto::{
+            AgentServerMessage, AskQuestionArgs, AskQuestionItem, AskQuestionOption,
+            AskQuestionToolCall, InteractionUpdate, RequestContext, ToolCall, ToolCallStarted,
+        };
+        use prost::Message;
+
+        let mut full = Vec::new();
+        AgentServerMessage {
+            conversation_checkpoint_update: None,
+            interaction_update: Some(InteractionUpdate {
+                tool_call_started: Some(ToolCallStarted {
+                    call_id: "ask-started-1".into(),
+                    tool_call: Some(ToolCall {
+                        ask_question_tool_call: Some(AskQuestionToolCall {
+                            args: Some(AskQuestionArgs {
+                                title: "Choose".into(),
+                                questions: vec![AskQuestionItem {
+                                    id: "q1".into(),
+                                    prompt: "Which target".into(),
+                                    options: vec![
+                                        AskQuestionOption {
+                                            id: "cpu".into(),
+                                            label: "CPU".into(),
+                                        },
+                                        AskQuestionOption {
+                                            id: "ane".into(),
+                                            label: "ANE".into(),
+                                        },
+                                    ],
+                                    allow_multiple: false,
+                                }],
+                                ..Default::default()
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                    model_call_id: String::new(),
+                }),
+                ..Default::default()
+            }),
+            kv_server_message: None,
+            interaction_query: None,
+            exec_server_control_message: None,
+            exec_server_message: None,
+            ..Default::default()
+        }
+        .encode(&mut full)
+        .unwrap();
+        let framed = encode_connect_frame(full, 0);
+        let mut decoder = super::super::connect::ConnectFrameDecoder::new();
+        let frames = decoder.push(&framed).unwrap();
+
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let outbound = ClientOutbound::Bidi(request_tx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut sink = Some(event_tx);
+        let mut deferred = VecDeque::new();
+        let mut segment_replay = SegmentReplayLog::default();
+        let mut pending = PendingExecState::default();
+        let pending_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut kv_blobs = HashMap::new();
+        let mut latest_checkpoint = None;
+        let terminal_error = Arc::new(Mutex::new(None));
+        let mut saw_text = false;
+        let mut useful = false;
+        let mut logical = LogicalToolTracker::default();
+        let mut last_progress = Instant::now();
+        let allowed = BTreeSet::from(["AskUserQuestion".to_string()]);
+        let mut xml_parser = CursorToolUseXmlParser::new(Some(allowed.clone()));
+        let request_context = RequestContext::default();
+        let mut decode_failures = 0;
+        let mut coalescer = LiveDeltaCoalescer::default();
+        let mut post_tool_checkpoint = PostToolCheckpointEvidence::default();
+        let mut turn = LiveTurnCtx {
+            session_id: "sess-ask-started",
+            user_prompt: "continue",
+            compaction_mode: false,
+            post_tool_checkpoint: &mut post_tool_checkpoint,
+            request_context: &request_context,
+            decode_failures: &mut decode_failures,
+            coalescer: &mut coalescer,
+            sand_empty_end: None,
+        };
+
+        let cont = process_live_frame(
+            frames.into_iter().next().unwrap(),
+            &outbound,
+            &mut sink,
+            &mut deferred,
+            &mut segment_replay,
+            &mut pending,
+            &pending_shared,
+            &mut kv_blobs,
+            &mut latest_checkpoint,
+            &terminal_error,
+            Some(&allowed),
+            &mut saw_text,
+            &mut useful,
+            &mut logical,
+            &mut last_progress,
+            Duration::from_millis(50),
+            &mut xml_parser,
+            Some(&mut turn),
+        )
+        .await;
+        assert!(
+            !cont,
+            "ToolCallStarted AskUserQuestion must expose immediately even when turn_ctx is present"
+        );
+        assert!(
+            pending.collecting.is_empty(),
+            "AskUserQuestion must not stay deferred in pending.collecting"
+        );
+        match event_rx.try_recv().expect("NativeToolBatch") {
+            Ok(LiveRunEvent::NativeToolBatch(tools)) => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "AskUserQuestion");
+                assert_eq!(tools[0].input["questions"][0]["options"][0]["label"], "CPU");
+                assert_eq!(tools[0].input["questions"][0]["options"][1]["label"], "ANE");
+            }
+            other => panic!("expected AskUserQuestion tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closed_sink_with_unexposed_collecting_only_is_orphan() {
+        let mut pending = PendingExecState::default();
+        assert!(
+            pending.closed_sink_is_orphan(),
+            "empty pending state must treat a closed sink as an orphan"
+        );
+
+        assert!(pending.queue(pending_client_only(1, "ask-1"), Duration::ZERO));
+        assert!(
+            !pending.is_empty(),
+            "collecting holds an unexposed client-only exec"
+        );
+        assert!(
+            pending.closed_sink_is_orphan(),
+            "unexposed collecting-only tools were never sent to the client and must not block orphan detection"
+        );
+
+        let exposed = pending.expose();
+        assert_eq!(exposed.len(), 1);
+        assert!(
+            !pending.closed_sink_is_orphan(),
+            "once exposed into awaiting, the closed sink parks for the client tool_result"
+        );
     }
 
     #[tokio::test]
